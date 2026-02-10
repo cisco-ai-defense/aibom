@@ -1,0 +1,329 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AI BOM API",
+    "description": "API for AI BOM component data",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "description": "Local development server"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "description": "Health check endpoint that returns server status and component count",
+        "operationId": "health_check",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "healthy"
+                    },
+                    "total_components": {
+                      "type": "integer",
+                      "example": 42
+                    }
+                  },
+                  "required": ["status", "total_components"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/components": {
+      "get": {
+        "summary": "Get Components",
+        "description": "Get all components with optional filtering by type and file path",
+        "operationId": "get_components_api_components_get",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Filter by component type",
+              "title": "Type"
+            },
+            "description": "Filter by component type",
+            "example": "llm_models"
+          },
+          {
+            "name": "file_path",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Filter by file path substring"
+            },
+            "description": "Filter by file path substring",
+            "example": "embeddings"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComponentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/components/types": {
+      "get": {
+        "summary": "Get Component Types",
+        "description": "Get unique component types available in the dataset",
+        "operationId": "get_component_types",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComponentTypesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/components/{component_id}": {
+      "get": {
+        "summary": "Get Component",
+        "description": "Get a specific component by its ID",
+        "operationId": "get_component",
+        "parameters": [
+          {
+            "name": "component_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Component ID"
+            },
+            "description": "Component ID",
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComponentModel"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Component not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "string",
+                      "example": "Component not found"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ComponentModel": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Unique identifier for the component",
+            "example": "1"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name of the AI component",
+            "example": "OpenAI GPT"
+          },
+          "file_path": {
+            "type": "string",
+            "description": "Path to the file containing the component",
+            "example": "/app/test.py"
+          },
+          "line_number": {
+            "type": "integer",
+            "description": "Line number where the component is defined",
+            "example": 10
+          },
+          "type": {
+            "type": "string",
+            "description": "Category/type of the AI component",
+            "example": "llm_models"
+          },
+          "text": {
+            "type": "string",
+            "nullable": true,
+            "description": "Associated text content (e.g., prompts)",
+            "example": null
+          },
+          "model_name": {
+            "type": "string",
+            "nullable": true,
+            "description": "Name of the AI model if applicable",
+            "example": "gpt-3.5-turbo"
+          },
+          "embedding_model": {
+            "type": "string",
+            "nullable": true,
+            "description": "Name of the embedding model if applicable",
+            "example": "sentence-transformers/all-MiniLM-L6-v2"
+          },
+          "additional_data": {
+            "type": "object",
+            "nullable": true,
+            "description": "Additional metadata about the component",
+            "example": {
+              "model_name": "gpt-3.5-turbo",
+              "source": "test_source"
+            }
+          }
+        },
+        "required": ["name", "file_path", "line_number", "type"],
+        "title": "ComponentModel",
+        "description": "Pydantic model for AI components"
+      },
+      "ComponentResponse": {
+        "type": "object",
+        "properties": {
+          "components": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComponentModel"
+            },
+            "description": "List of AI components"
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total number of components returned",
+            "example": 42
+          }
+        },
+        "required": ["components", "total"],
+        "title": "ComponentResponse",
+        "description": "Response model for component API"
+      },
+      "ComponentTypesResponse": {
+        "type": "object",
+        "properties": {
+          "types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of unique component types",
+            "example": ["llm_models", "embeddings", "agents", "prompts", "chains"]
+          }
+        },
+        "required": ["types"],
+        "title": "ComponentTypesResponse",
+        "description": "Response model for component types API"
+      },
+      "HTTPValidationError": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            }
+          }
+        },
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "type": "object",
+        "properties": {
+          "loc": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "required": ["loc", "msg", "type"],
+        "title": "ValidationError"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "components",
+      "description": "Operations related to AI components"
+    },
+    {
+      "name": "health",
+      "description": "Health check operations"
+    }
+  ]
+}

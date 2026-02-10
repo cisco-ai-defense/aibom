@@ -1,0 +1,59 @@
+sequenceDiagram
+    actor User
+    participant CLI as Typer CLI (`cisco-aibom`)
+    participant Env as Env/Manifest Loader
+    participant KB as DuckDB Loader
+    participant Source as Source Resolver (FS/Docker)
+    participant Parser as LibCST Parser
+    participant WF as Workflow Index (AST)
+    participant Categorizer
+    participant LLM as LLM Provider (optional)
+    participant Output as Report/UI
+    participant Post as Report Sender
+    participant Reporter as `report` Subcommand
+
+    User->>CLI: cisco-aibom analyze [sources...] [--images-file list.json]\n--output-format json|plaintext|ui --output-file report.json
+    CLI->>Env: load .env (AIBOM_ENV_FILE) + manifest.json
+    Env-->>CLI: config (db path/sha, optional post_url from env)
+    CLI->>KB: ensure_local_database()
+    KB-->>CLI: CatalogDB(db_path)
+    loop for each source
+        CLI->>Source: detect local path vs Docker image
+        alt container image
+            Source->>Source: docker run + copy /app or site-packages
+        end
+        Source-->>CLI: python file list
+        loop each Python file
+            CLI->>Parser: parse_source_code(file)\n(assignments/decorators/annotations/context managers)
+            Parser-->>CLI: CodeAnalysisResult
+        end
+        CLI->>WF: build_workflow_index(python_files)
+        WF-->>CLI: WorkflowIndex
+        CLI->>Categorizer: categorize_symbols(results, connector, llm_cfg, workflow_index)
+        Categorizer->>KB: find_components_by_suffixes
+        KB-->>Categorizer: catalog entries
+        opt LLM enabled
+            Categorizer->>LLM: extract model/tool details
+            LLM-->>Categorizer: enriched attributes
+        end
+        Categorizer-->>CLI: components + relationships + workflows
+        opt container source
+            CLI->>CLI: map host paths to /app paths
+        end
+    end
+
+    alt output_format == json
+        CLI->>Output: _generate_json_report (metadata + summaries)
+        opt post_url configured (flag/env)
+            CLI->>Post: post_report_with_retries\n(x-cisco-ai-defense-tenant-api-key)
+        end
+    else output_format == plaintext
+        CLI->>Output: _generate_plaintext_report
+    else output_format == ui
+        CLI->>Output: start_ui_server (FastAPI)
+    end
+    CLI-->>User: Rich summary (optional)
+
+    User->>CLI: cisco-aibom report report.json [--raw-json]
+    CLI->>Reporter: render summary/tables
+    Reporter-->>User: console output

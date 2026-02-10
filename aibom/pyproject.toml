@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cisco-aibom"
+version = "0.2.0"
+description = "A tool to generate an AI BOM from source code."
+requires-python = ">=3.11,<3.14"
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+]
+
+dependencies = [
+    "libcst>=1.0.0",
+    "duckdb>=1.0.0",
+    "typer>=0.9.0",
+    "litellm>=1.77.0",
+    "pandas>=2.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.6.0",
+    "httpx>=0.28.1",
+    "rich>=13.9.0",
+    "platformdirs>=4.0.0",
+]
+
+[project.scripts]
+cisco-aibom = "aibom.cli:cli_entry_point"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+    "pytest-cov>=6.2.1",
+    "respx>=0.22.0",
+    "black>=24.0.0",
+    "flake8>=7.0.0",
+    "isort>=5.13.0",
+    "mypy>=1.8.0",
+    "pre-commit>=3.6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.4.1",
+    "pytest-cov>=6.2.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "--maxfail=1 --cov=aibom"
+filterwarnings = [
+    "ignore:Pydantic serializer warnings:UserWarning:pydantic.*",
+]
+markers = [
+    "integration: mark for tests that hit external services (run with -m integration)",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aibom*"]
+
+[tool.setuptools.package-data]
+aibom = ["manifest.json"]
+
+# Code formatting and linting configuration
+[tool.black]
+line-length = 88
+target-version = ['py311', 'py312', 'py313']
+include = '\.pyi?$'
+extend-exclude = '''
+# A regex preceded by ^/ will apply only to files and directories
+# in the root of the project.
+^/setup.py
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503", "E501"]
+exclude = [".git", "__pycache__", "build", "dist", ".venv", "venv"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+disallow_untyped_decorators = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "litellm",
+]
+ignore_missing_imports = true
+
+[tool.uv]
+# uv is a fast, modern Python package manager.
+# https://github.com/astral-sh/uv

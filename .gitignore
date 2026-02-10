@@ -1,0 +1,100 @@
+# glide and package #
+#####################
+*/container/bin
+/.idea/
+vendor/
+generated
+.DS_Store
+container/
+go-cache/
+pip-cache/
+/.vscode/
+go.work
+go.work.sum
+
+# VIM swap files #
+##################
+*.swp
+*.swo
+
+# ctags for project searching #
+###############################
+.tags
+
+# Ignoring auto-generated files #
+###############################
+*.pb.go
+*.pb.gw.go
+*.pb.validate.go
+*pb.js
+*.swagger.json
+*.sol.go
+*.solc.go
+doc/
+*.abm.go
+
+# IDE project files #
+#####################
+.cproject
+.project
+
+# Python files #
+################
+.idea/
+venv/
+build/
+dist/
+*.egg-info/
+*.eggs/
+__pycache__/
+.pytest_cache/
+*.so
+*.py[cod]
+.mypy_cache
+.ruff_cache
+aibom/*.duckdb
+
+# Test coverage files #
+#######################
+tests/cover/*cover*
+*.cover
+
+# Build files #
+###############
+last_build*
+
+# Vagrant files #
+.vagrant/
+
+# Python configurations
+.favorites.json
+.flake8
+.isort.cfg
+.pre-commit-config.yaml
+
+# CLI bin
+cli/cli
+
+.gitkeep
+.python-version
+
+**/uuids.txt
+*.png
+
+# GGshield cache
+.cache_ggshield
+
+**/*.html
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+nox/
+.tox/
+!aibom_scraper/sphinx_docs/**
+
+# NPM files
+node_modules
+.env
+.env.local

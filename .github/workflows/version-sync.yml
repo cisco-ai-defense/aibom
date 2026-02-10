@@ -1,0 +1,69 @@
+name: Verify Version Sync
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  version-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify manifest and pyproject versions
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          import tomllib
+
+          root = Path.cwd()
+          pyproject_path = root / "aibom" / "pyproject.toml"
+          manifest_path = root / "aibom" / "src" / "aibom" / "manifest.json"
+
+          with pyproject_path.open("rb") as f:
+            pyproject = tomllib.load(f)
+          with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+          errors = []
+          version = pyproject.get("project", {}).get("version")
+          if not version:
+            errors.append("Missing [project].version in aibom/pyproject.toml")
+
+          analyzer_version = manifest.get("analyzer_version")
+          schema_version = manifest.get("schema_version")
+          duckdb_file = manifest.get("duckdb_file", "")
+
+          if analyzer_version != version:
+            errors.append(
+              f"manifest analyzer_version ({analyzer_version}) != pyproject version ({version})"
+            )
+          if schema_version != version:
+            errors.append(
+              f"manifest schema_version ({schema_version}) != pyproject version ({version})"
+            )
+          if version and version not in duckdb_file:
+            errors.append(
+              f"pyproject version ({version}) not found in manifest duckdb_file ({duckdb_file})"
+            )
+
+          if errors:
+            for error in errors:
+              print(error, file=sys.stderr)
+            raise SystemExit(1)
+
+          print(f"Version sync ok: {version}")
+          PY
