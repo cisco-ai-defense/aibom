@@ -26,6 +26,8 @@ jobs:
         uses: astral-sh/setup-uv@v6.7.0
       - name: Install Python 3.13
         run: uv python install 3.13
+      - name: Stage README for package metadata
+        run: cp ../README.md README.md
       - name: Build
         run: uv build
       - name: Publish package distributions to PyPI
