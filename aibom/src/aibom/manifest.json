@@ -1,8 +1,8 @@
 {
-  "analyzer_version": "0.2.1",
-  "schema_version": "0.2.1",
+  "analyzer_version": "0.2.2",
+  "schema_version": "0.2.2",
   "duckdb_sha256": "934f9a8adc109dddc86f3832b69ecbfb57c9ec54ddf3cf92e54c02014e1fb06d",
-  "duckdb_file": "~/.aibom/catalogs/aibom_catalog-0.2.1.duckdb",
+  "duckdb_file": "~/.aibom/catalogs/aibom_catalog-0.2.2.duckdb",
   "upload_mode": "direct",
   "max_direct_upload_mb": 25,
   "log_level": "INFO"
