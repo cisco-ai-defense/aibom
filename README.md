@@ -47,7 +47,7 @@ docs/    # UI/API documentation
 ### Installing as a CLI tool
 
 ```bash
-# Install UV
+# Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # or: brew install uv
 
@@ -72,7 +72,7 @@ cisco-aibom --help
 git clone https://github.com/cisco-ai-defense/aibom.git
 cd aibom/aibom
 
-# Install UV (if not already installed)
+# Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # or: brew install uv
 
@@ -90,9 +90,51 @@ When working from source, you can also run the CLI with `uv run cisco-aibom ...`
 
 ## Knowledge Base Configuration
 
-The analyzer uses a local DuckDB catalog described by `manifest.json`. Download the catalog from a release artifact and point the analyzer at it with `AIBOM_DB_PATH`. When running from source, execute from the `aibom/` directory or set `AIBOM_MANIFEST_PATH` to point at `aibom/src/aibom/manifest.json`.
+The analyzer uses a local DuckDB catalog described by `manifest.json`.
 The DuckDB file is a prebuilt, versioned knowledge-catalog artifact of AI frameworks. It is used as a read-only lookup dataset, with checksum verification for compatibility and integrity.
-For installed users, the packaged manifest provides a default checksum and default catalog location (`~/.aibom/catalogs/aibom_catalog-<version>.duckdb`). You can still override with `AIBOM_DB_PATH` and `AIBOM_DB_SHA256`.
+For users running the packaged CLI (for example via `uv tool install` or `pip`), the packaged manifest provides a default checksum and default catalog location (`~/.aibom/catalogs/aibom_catalog-<version>.duckdb`). You can still override with `AIBOM_DB_PATH` and `AIBOM_DB_SHA256`.
+When running from source, execute from the `aibom/` directory or set `AIBOM_MANIFEST_PATH` to point at `aibom/src/aibom/manifest.json`.
+
+### Download the DuckDB artifact from GitHub Releases
+
+```bash
+# Set this to the release tag that matches your catalog artifact (example: 0.2.1)
+VERSION="<version>"
+mkdir -p "${HOME}/.aibom/catalogs"
+
+# Option 1: GitHub CLI
+gh release download "${VERSION}" \
+  --repo cisco-ai-defense/aibom \
+  --pattern "aibom_catalog-${VERSION}.duckdb" \
+  --dir "${HOME}/.aibom/catalogs"
+
+# Option 2: direct download URL
+curl -fL \
+  -o "${HOME}/.aibom/catalogs/aibom_catalog-${VERSION}.duckdb" \
+  "https://github.com/cisco-ai-defense/aibom/releases/download/${VERSION}/aibom_catalog-${VERSION}.duckdb"
+```
+
+### Provide the DuckDB path to the analyzer
+
+```bash
+export AIBOM_DB_PATH="${HOME}/.aibom/catalogs/aibom_catalog-${VERSION}.duckdb"
+
+# Set only if your file is different from the manifest default (for example,
+# custom path/version) or if you see a checksum mismatch error:
+# export AIBOM_DB_SHA256="<sha256-of-${AIBOM_DB_PATH}>"
+```
+
+Compute SHA-256 when needed:
+
+```bash
+# macOS
+shasum -a 256 "${AIBOM_DB_PATH}"
+
+# Linux
+sha256sum "${AIBOM_DB_PATH}"
+```
+
+Use only the hash value (first column) as `AIBOM_DB_SHA256`.
 
 Override settings with environment variables:
 
@@ -160,7 +202,7 @@ You can also set `AIBOM_POST_URL` instead of `--post-url` and `AI_DEFENSE_API_KE
 The API key is sent as the `x-cisco-ai-defense-tenant-api-key` header. Use the same path in every region:
 `/api/ai-defense/v1/aibom/analysis`.
 
-Choose the base domain for your Cisco AI Defense Organization region:
+Choose the base domain for your Cisco AI Defense organization's region:
 
 - US: `https://api.security.cisco.com/api/ai-defense/v1/aibom/analysis`
 - APJ: `https://api.apj.security.cisco.com/api/ai-defense/v1/aibom/analysis`
@@ -198,7 +240,7 @@ uv run pytest tests -v
   "aibom_analysis": {
     "metadata": {
       "run_id": "...",
-      "analyzer_version": "0.1.0",
+      "analyzer_version": "<analyzer-version>",
       "started_at": "2025-01-01T00:00:00Z",
       "completed_at": "2025-01-01T00:00:10Z"
     },
