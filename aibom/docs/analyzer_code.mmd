@@ -8,11 +8,11 @@ sequenceDiagram
     participant WF as Workflow Index (AST)
     participant Categorizer
     participant LLM as LLM Provider (optional)
-    participant Output as Report/UI
+    participant Output as Report/API
     participant Post as Report Sender
     participant Reporter as `report` Subcommand
 
-    User->>CLI: cisco-aibom analyze [sources...] [--images-file list.json]\n--output-format json|plaintext|ui --output-file report.json
+    User->>CLI: cisco-aibom analyze [sources...] [--images-file list.json]\n--output-format json|plaintext|api --output-file report.json
     CLI->>Env: load .env (AIBOM_ENV_FILE) + manifest.json
     Env-->>CLI: config (db path/sha, optional post_url from env)
     CLI->>KB: ensure_local_database()
@@ -49,8 +49,8 @@ sequenceDiagram
         end
     else output_format == plaintext
         CLI->>Output: _generate_plaintext_report
-    else output_format == ui
-        CLI->>Output: start_ui_server (FastAPI)
+    else output_format == api
+        CLI->>Output: start_api_server (FastAPI)
     end
     CLI-->>User: Rich summary (optional)
 

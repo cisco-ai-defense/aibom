@@ -1,6 +1,6 @@
-# AI BOM UI Mode API Server
+# AI BOM API Mode Server
 
-The AI BOM tool can start a FastAPI server that serves component data for the React UI. This server runs in-memory and is created when you invoke the main `cisco-aibom` CLI with `--output-format ui`.
+The AI BOM tool can start a headless FastAPI server that serves component data. This server runs in-memory and is created when you invoke the main `cisco-aibom` CLI with `--output-format api`.
 
 ## Prerequisites
 
@@ -27,7 +27,7 @@ For local development installs, see `README.md` in the repo root.
 
 ```bash
 cd aibom
-cisco-aibom analyze /path/to/project --output-format ui
+cisco-aibom analyze /path/to/project --output-format api
 ```
 
 There is no separate server-only CLI; use the main `cisco-aibom` entry point for API server mode.
@@ -70,8 +70,8 @@ The server listens on `http://127.0.0.1:8000` by default.
 aibom/src/aibom/api/server.py          # FastAPI server
 aibom/src/aibom/models/component.py   # Pydantic models
 aibom/src/aibom/utils/dataframe_converter.py
-aibom/src/aibom/ui_handler.py         # Server startup logic
-aibom/src/aibom/cli.py                # --output-format ui entry point
+aibom/src/aibom/api_handler.py        # Server startup logic
+aibom/src/aibom/cli.py                # --output-format api entry point
 ```
 
 ## Testing
@@ -83,6 +83,6 @@ uv run pytest tests -v
 
 ## Notes
 
-- CORS is enabled for all origins to simplify local UI development.
+- CORS is enabled for all origins to simplify local development.
 - The server is in-memory only; it does not persist results.
-- If no components are found, the UI server exits early (the DataFrame is empty).
+- If no components are found, the API server still starts and serves empty results.

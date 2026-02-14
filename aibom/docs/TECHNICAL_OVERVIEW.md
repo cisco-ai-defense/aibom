@@ -11,7 +11,7 @@
 | **Parser (LibCST)** | Extracts assignments, decorators, standalone calls, type annotations, context managers, imports, and raw code snippets. |
 | **Workflow Index (AST)** | Builds a best-effort call graph with function boundaries and callsite metadata for workflow context. |
 | **Categorizer + Relationships** | Matches parsed symbols to catalog entries, assigns categories, optionally enriches model/tool details via LLM, and derives `USES_TOOL`/`USES_LLM` links. |
-| **Reporting + UI** | Emits plaintext or JSON reports, or starts the FastAPI UI server; optional POST of JSON with retries. |
+| **Reporting + API** | Emits plaintext or JSON reports, or starts the FastAPI API server; optional POST of JSON with retries. |
 
 ## 2. Execution Flow
 
@@ -22,7 +22,7 @@
 5. **Workflow Index** - Build an AST-based call graph for the source files to provide workflow context (distance, callsite, arguments).  
 6. **Categorization** - Query the catalog by suffix, keep exact symbol matches, assign categories, attach workflow context, and derive relationships. Optional LLM enrichment can add tool descriptions and model names.  
 7. **Reporting** - Convert container temp paths to container-style paths, build per-source summaries and run metadata, and emit plaintext or JSON reports.  
-8. **Publishing / UI** - Optionally POST the JSON report with retries, or start the in-memory UI API server (`--output-format ui`).  
+8. **Publishing / API** - Optionally POST the JSON report with retries, or start the in-memory API server (`--output-format api`).  
 9. **Console Summary** - Render Rich summaries and workflow examples when `--show-summary` is enabled.
 
 ## 3. Key Modules
@@ -36,7 +36,7 @@
 | `src/aibom/catalog_db.py` | DuckDB access layer for catalog lookup. |
 | `src/aibom/db_loader.py` | Manifest/env path resolution and SHA verification of the local catalog. |
 | `src/aibom/report_sender.py` | POSTs JSON report payloads with retry/backoff. |
-| `src/aibom/ui_handler.py` | Converts results to a DataFrame and starts the FastAPI UI server. |
+| `src/aibom/api_handler.py` | Converts results to a DataFrame and starts the FastAPI API server. |
 | `src/aibom/api/server.py` | FastAPI endpoints for component browsing and health checks. |
 | `tests/…` | Coverage for parsing, categorization, workflow indexing, and report generation. |
 
@@ -65,5 +65,5 @@
 | --- | --- |
 | Plaintext | Report file listing detected components and their workflow context. |
 | JSON | `aibom_analysis` with metadata, per-source components, workflow summaries, relationships, and errors. |
-| UI | FastAPI server that serves component data for the React UI (`/api/components`, `/health`). |
+| API | FastAPI server that serves component data (`/api/components`, `/health`). |
 | Report Command | `cisco-aibom report` renders JSON summaries and optionally the raw JSON. |
