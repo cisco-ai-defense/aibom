@@ -43,7 +43,7 @@ from .cst_parser import parse_source_code
 from .catalog_db import CatalogDB
 from .db_loader import ensure_local_database
 from .structures import CodeAnalysisResult
-from .ui_handler import start_ui_server
+from .api_handler import start_api_server
 from .workflow_analyzer import build_workflow_index, workflow_identifier
 
 console = Console()
@@ -619,7 +619,7 @@ def analyze(
         "plaintext",
         "--output-format",
         "-o",
-        help="Output format (json, plaintext, ui)",
+        help="Output format (json, plaintext, api)",
     ),
     output_file: Optional[Path] = typer.Option(
         None,
@@ -697,8 +697,10 @@ def analyze(
     logging.basicConfig(level=numeric_level, format='%(levelname)s: %(message)s')
 
     # Validate output format
-    if output_format not in ["plaintext", "json", "ui"]:
-        logging.error(f"Invalid output format '{output_format}'. Must be 'plaintext', 'json', or 'ui'.")
+    if output_format not in ["plaintext", "json", "api"]:
+        logging.error(
+            f"Invalid output format '{output_format}'. Must be 'plaintext', 'json', or 'api'."
+        )
         raise typer.Exit(code=1)
     
     # Validate LLM configuration if model extraction is requested
@@ -916,12 +918,12 @@ def analyze(
             except Exception as exc:  # noqa: BLE001
                 logging.error("Failed to POST report: %s", exc)
                 raise typer.Exit(code=1)
-    elif output_format == "ui":
-        logging.info("--- Starting UI Server ---")
+    elif output_format == "api":
+        logging.info("--- Starting API Server ---")
         component_map = {
             source: getattr(output, "components", output) for source, output in all_analysis_outputs.items()
         }
-        start_ui_server(component_map)
+        start_api_server(component_map)
     else:  # plaintext
         _generate_plaintext_report(all_analysis_outputs, output_file)
 

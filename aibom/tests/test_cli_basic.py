@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
 from typer.testing import CliRunner
 
 from aibom.cli import app
@@ -18,3 +17,10 @@ def test_analyze_requires_output_file_for_json():
 def test_analyze_rejects_invalid_output_format():
     result = runner.invoke(app, ["analyze", "src", "--output-format", "bad"])
     assert result.exit_code != 0
+    assert "'api'" in result.output
+
+
+def test_analyze_rejects_legacy_ui_output_format():
+    result = runner.invoke(app, ["analyze", "src", "--output-format", "ui"])
+    assert result.exit_code != 0
+    assert "'api'" in result.output
