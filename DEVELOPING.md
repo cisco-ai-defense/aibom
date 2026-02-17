@@ -5,14 +5,12 @@ This guide is for contributors working on this repository locally.
 ## Repository Layout
 
 - `aibom/`: Python analyzer package, CLI, tests, and manifest config
-- `ui/`: React + Vite frontend for exploring analyzer results
-- `docs/`: API/UI usage docs
+- `docs/`: API usage docs
 
 ## Prerequisites
 
 - Python `3.11` to `3.13`
 - `uv` (recommended Python package manager)
-- Node.js `>=22` (for `ui/`)
 - Docker (optional, needed for container-image analysis paths)
 
 ## Python Analyzer Development
@@ -43,46 +41,20 @@ uv run flake8 src tests
 uv run mypy src
 ```
 
-## UI Development
+## API Mode Development
 
-All UI commands below assume you are in `ui/`.
-
-```bash
-cd ui
-npm ci
-npm run dev
-```
-
-### Common commands
-
-```bash
-# Lint
-npm run lint
-
-# Production build
-npm run build
-```
-
-## Local End-to-End Flow (Analyzer API + UI)
-
-1. Start analyzer UI mode in one terminal:
+All API mode commands below assume you are in `aibom/`.
 
 ```bash
 cd aibom
-uv run cisco-aibom analyze /path/to/project --output-format ui
+uv run cisco-aibom analyze /path/to/project --output-format api
 ```
 
-2. Start the React UI in another terminal:
-
-```bash
-cd ui
-cat > .env.local <<'EOF'
-VITE_API_BASE_URL=http://127.0.0.1:8000
-EOF
-npm run dev
-```
-
-If `VITE_API_BASE_URL` is not set, UI requests are served by MSW mock handlers.
+This starts the headless FastAPI server and exposes:
+- `GET /api/components`
+- `GET /api/components/types`
+- `GET /api/components/{id}`
+- `GET /health`
 
 ## Knowledge Base and Versioning Rules
 

@@ -11,7 +11,7 @@ The AI BOM tool scans codebases and container images to inventory AI framework c
 - [Usage](#usage)
 - [Testing](#testing)
 - [Output Formats](#output-formats)
-- [UI Mode](#ui-mode)
+- [API Mode](#api-mode)
 - [Technical Details](#technical-details)
 - [Troubleshooting](#troubleshooting)
 
@@ -23,15 +23,14 @@ The AI BOM tool scans codebases and container images to inventory AI framework c
 - **Workflow context:** Builds a lightweight call graph to show which workflows reach each component.
 - **Derived relationships:** Infers `USES_TOOL` and `USES_LLM` links from agent arguments.
 - **Optional LLM enrichment:** Uses `litellm` to extract model/embedding names from code snippets.
-- **Multiple outputs:** Plaintext, JSON, or a FastAPI UI server.
+- **Multiple outputs:** Plaintext, JSON, or a FastAPI API server.
 - **Report submission:** Optional POST of the JSON report with retries.
 
 ## Repository Layout
 
 ```
 aibom/   # Python analyzer package + CLI
-ui/      # React UI for exploring results
-docs/    # UI/API documentation
+docs/    # API documentation
 ```
 
 ## Installation
@@ -41,7 +40,6 @@ docs/    # UI/API documentation
 - Python 3.11+
 - uv (Python package manager, recommended)
 - Docker (optional, for container image analysis)
-- Node.js 22+ (optional, for the React UI)
 - LLM provider API key (optional, for model extraction)
 
 ### Installing as a CLI tool
@@ -98,7 +96,7 @@ When running from source, execute from the `aibom/` directory or set `AIBOM_MANI
 ### Download the DuckDB artifact from GitHub Releases
 
 ```bash
-# Set this to the release tag that matches your catalog artifact (example: 0.2.3)
+# Set this to the release tag that matches your catalog artifact (example: 0.3.0)
 VERSION="<version>"
 mkdir -p "${HOME}/.aibom/catalogs"
 
@@ -301,12 +299,12 @@ uv run pytest tests -v
 }
 ```
 
-## UI Mode
+## API Mode
 
-`--output-format ui` starts a FastAPI server that serves the analyzed components:
+`--output-format api` starts a FastAPI server that serves the analyzed components:
 
 ```bash
-cisco-aibom analyze /path/to/project --output-format ui
+cisco-aibom analyze /path/to/project --output-format api
 ```
 
 Endpoints:
@@ -316,7 +314,7 @@ Endpoints:
 - `GET /api/components/{id}`
 - `GET /health`
 
-The React UI in `ui/` can connect to this server. See `docs/UI_README.md` and `docs/API_SERVER_README.md` for details.
+See `docs/API_SERVER_README.md` for detailed API usage.
 
 ## Technical Details
 
@@ -331,5 +329,5 @@ The React UI in `ui/` can connect to this server. See `docs/UI_README.md` and `d
 - **DuckDB catalog errors:** Ensure the catalog file exists at `AIBOM_DB_PATH` (or `duckdb_file` in manifest) and that `AIBOM_DB_SHA256` (or `duckdb_sha256` in manifest) matches the file checksum. When running from source, execute from `aibom/` or set `AIBOM_MANIFEST_PATH`.
 - **Docker issues:** Container analysis requires a working Docker CLI and daemon.
 - **LLM configuration errors:** `--llm-api-base` is required whenever `--llm-model` is set.
-- **UI server does not start:** If no components are found, the UI server exits early. Verify the target includes AI framework usage.
+- **API server questions:** Use `docs/API_SERVER_README.md` for API mode behavior and endpoint details.
 - **Missing output files:** `--output-file` is mandatory for `plaintext` and `json` formats.
