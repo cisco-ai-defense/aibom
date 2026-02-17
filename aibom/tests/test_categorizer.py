@@ -86,6 +86,148 @@ class TestCategorizer(unittest.TestCase):
         self.assertEqual(components["model"][0]["name"], "some.lib.Model")
         self.assertIn("workflows", components["model"][0])
 
+    def test_standalone_calls_detected(self):
+        """Improvement 1: standalone calls (not assigned) are categorized."""
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/utils.py",
+                assignments=[],
+                calls=[
+                    CallObservation(
+                        qualified_name="langchain.chat_models.init_chat_model",
+                        arguments={"model": "gpt-4"},
+                        line_number=14,
+                        raw_code='return init_chat_model("gpt-4")',
+                    )
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "langchain.chat_models.init_chat_model", "concept": "model", "label": "init_chat_model"}
+        ]
+
+        result = categorize_symbols(analysis_results, self.mock_connector)
+        self.assertIn("model", result.components)
+        self.assertEqual(len(result.components["model"]), 1)
+        self.assertEqual(result.components["model"][0]["name"], "langchain.chat_models.init_chat_model")
+
+    def test_memory_relationship_detected(self):
+        """Improvement 3: USES_MEMORY relationship derived from agent args."""
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/agent.py",
+                assignments=[
+                    AssignmentObservation(
+                        target_qualified_name="saver",
+                        call=CallObservation(
+                            qualified_name="langgraph.checkpoint.memory.MemorySaver",
+                            arguments={},
+                            line_number=5,
+                        ),
+                        line_number=5,
+                    ),
+                    AssignmentObservation(
+                        target_qualified_name="agent",
+                        call=CallObservation(
+                            qualified_name="langgraph.prebuilt.create_react_agent",
+                            arguments={"checkpointer": "VARIABLE:saver"},
+                            line_number=10,
+                        ),
+                        line_number=10,
+                    ),
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "langgraph.checkpoint.memory.MemorySaver", "concept": "memory", "label": "MemorySaver"},
+            {"id": "langgraph.prebuilt.create_react_agent", "concept": "agent", "label": "create_react_agent"},
+        ]
+
+        result = categorize_symbols(analysis_results, self.mock_connector)
+        self.assertTrue(any(r.label == "USES_MEMORY" for r in result.relationships))
+
+    def test_retriever_relationship_detected(self):
+        """Improvement 4: USES_RETRIEVER relationship."""
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/rag.py",
+                assignments=[
+                    AssignmentObservation(
+                        target_qualified_name="my_retriever",
+                        call=CallObservation(
+                            qualified_name="langchain_core.retrievers.BaseRetriever",
+                            arguments={},
+                            line_number=5,
+                        ),
+                        line_number=5,
+                    ),
+                    AssignmentObservation(
+                        target_qualified_name="agent",
+                        call=CallObservation(
+                            qualified_name="langgraph.prebuilt.create_react_agent",
+                            arguments={"retriever": "VARIABLE:my_retriever"},
+                            line_number=10,
+                        ),
+                        line_number=10,
+                    ),
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "langchain_core.retrievers.BaseRetriever", "concept": "retriever", "label": "BaseRetriever"},
+            {"id": "langgraph.prebuilt.create_react_agent", "concept": "agent", "label": "create_react_agent"},
+        ]
+
+        result = categorize_symbols(analysis_results, self.mock_connector)
+        self.assertTrue(any(r.label == "USES_RETRIEVER" for r in result.relationships))
+
+    def test_embedding_relationship_detected(self):
+        """Improvement 5: USES_EMBEDDING relationship."""
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/embed.py",
+                assignments=[
+                    AssignmentObservation(
+                        target_qualified_name="embeddings",
+                        call=CallObservation(
+                            qualified_name="langchain_openai.OpenAIEmbeddings",
+                            arguments={},
+                            line_number=5,
+                        ),
+                        line_number=5,
+                    ),
+                    AssignmentObservation(
+                        target_qualified_name="agent",
+                        call=CallObservation(
+                            qualified_name="langgraph.prebuilt.create_react_agent",
+                            arguments={"embedding": "VARIABLE:embeddings"},
+                            line_number=10,
+                        ),
+                        line_number=10,
+                    ),
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "langchain_openai.OpenAIEmbeddings", "concept": "embedding", "label": "OpenAIEmbeddings"},
+            {"id": "langgraph.prebuilt.create_react_agent", "concept": "agent", "label": "create_react_agent"},
+        ]
+
+        result = categorize_symbols(analysis_results, self.mock_connector)
+        self.assertTrue(any(r.label == "USES_EMBEDDING" for r in result.relationships))
+
     def test_is_symbol_match(self):
         self.assertTrue(_is_symbol_match("a.b.c", "a.b.c", []))
         self.assertFalse(

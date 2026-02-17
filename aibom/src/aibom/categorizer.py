@@ -34,10 +34,22 @@ from .workflow_analyzer import WorkflowIndex
 AGENT_CATEGORY_HINTS = {"agent"}
 TOOL_CATEGORY_HINTS = {"tool"}
 LLM_CATEGORY_HINTS = {"llm", "model"}
+MEMORY_CATEGORY_HINTS = {"memory"}
+RETRIEVER_CATEGORY_HINTS = {"retriever"}
+EMBEDDING_CATEGORY_HINTS = {"embedding"}
+DATASTORE_CATEGORY_HINTS = {"datastore"}
+
 TOOL_ARGUMENT_HINTS = {"tool", "tools", "skills", "abilities"}
 LLM_ARGUMENT_HINTS = {"llm", "language_model", "chat_model", "model"}
+MEMORY_ARGUMENT_HINTS = {"memory", "checkpointer", "store", "saver", "chat_history"}
+RETRIEVER_ARGUMENT_HINTS = {"retriever", "retrievers", "search", "search_kwargs"}
+EMBEDDING_ARGUMENT_HINTS = {"embedding", "embeddings", "embedding_function", "embed", "embed_model"}
+
 RELATIONSHIP_LABEL_TOOL = "USES_TOOL"
 RELATIONSHIP_LABEL_LLM = "USES_LLM"
+RELATIONSHIP_LABEL_MEMORY = "USES_MEMORY"
+RELATIONSHIP_LABEL_RETRIEVER = "USES_RETRIEVER"
+RELATIONSHIP_LABEL_EMBEDDING = "USES_EMBEDDING"
 
 def categorize_symbols(
     analysis_results: List[CodeAnalysisResult],
@@ -70,9 +82,14 @@ def categorize_symbols(
     symbols_to_find = set()
     
     for result in analysis_results:
-        for obs_type in ["assignments", "decorators"]:
+        for obs_type in ["assignments", "decorators", "calls"]:
             for obs in getattr(result, obs_type):
-                original_name = obs.decorator_qualified_name if obs_type == "decorators" else obs.call.qualified_name
+                if obs_type == "calls":
+                    original_name = obs.qualified_name
+                elif obs_type == "decorators":
+                    original_name = obs.decorator_qualified_name
+                else:
+                    original_name = obs.call.qualified_name
 
                 reconstructed_name = original_name
                 instance_variable = getattr(obs, 'instance_variable', None)
@@ -83,24 +100,42 @@ def categorize_symbols(
                         reconstructed_name = f"{base_class}.{attribute}"
                         logging.debug(f"Reconstructed decorator: {original_name} -> {reconstructed_name}")
 
-                # Enhanced observation tracking
+                # Method-chain resolution: e.g. "builder.compile" -> "langgraph.graph.StateGraph.compile"
+                if "." in reconstructed_name:
+                    parts = reconstructed_name.split(".", 1)
+                    local_var = parts[0]
+                    attr_tail = parts[1]
+                    if local_var in variable_map:
+                        resolved_base = variable_map[local_var]
+                        candidate = f"{resolved_base}.{attr_tail}"
+                        reconstructed_name = candidate
+                        logging.debug(f"Method-chain resolved: {original_name} -> {reconstructed_name}")
+
+                if obs_type == "calls":
+                    obs_arguments = obs.arguments
+                    obs_raw_code = obs.raw_code
+                elif obs_type == "assignments":
+                    obs_arguments = obs.call.arguments
+                    obs_raw_code = getattr(obs, 'raw_code', '') or getattr(obs.call, 'raw_code', '')
+                else:
+                    obs_arguments = {}
+                    obs_raw_code = getattr(obs, 'raw_code', '')
+
                 observation = {
                     "parser_name": reconstructed_name,
                     "original_parser_name": original_name,
                     "file_path": result.file_path,
                     "line_number": obs.line_number,
-                    "arguments": obs.call.arguments if obs_type == "assignments" else {},
+                    "arguments": obs_arguments,
                     "decorated_name": obs.decorated_function_name if obs_type == "decorators" else None,
-                    "type": obs_type[:-1],
-                    "raw_code": getattr(obs, 'raw_code', ''),  # Store raw code for LLM analysis
-                    "imports": getattr(result, 'imports', []),  # Track imports for disambiguation
-                    "instance_variable": instance_variable,  # Store instance variable for decorator reconstruction
+                    "type": obs_type[:-1] if obs_type != "calls" else "call",
+                    "raw_code": obs_raw_code,
+                    "imports": getattr(result, 'imports', []),
+                    "instance_variable": instance_variable,
                     "assigned_target": getattr(obs, 'target_qualified_name', None) if obs_type == "assignments" else None,
                 }
                 
                 all_observations.append(observation)
-
-                # Collect reconstructed qualified symbol names for exact database matching
                 symbols_to_find.add(reconstructed_name)
 
         for annotation in getattr(result, "type_annotations", []):
@@ -212,13 +247,12 @@ def categorize_symbols(
                 component_details["name"] = matched_obs["decorated_name"]
                 component_details["decorated_by"] = db_symbol_name
 
-            elif matched_obs["type"] == "assignment":
+            elif matched_obs["type"] in ("assignment", "call"):
                 if category == "prompt":
                     prompt_text = matched_obs["arguments"].get("template") or matched_obs["arguments"].get("prompt")
                     if prompt_text:
                         component_details["text"] = prompt_text
                 
-                # Enhanced: Extract model names using LLM for model and embedding categories
                 elif category in ["model", "embedding"] and llm_client:
                     class_name = db_symbol_name.split('.')[-1]
                     code_snippet = _reconstruct_code_snippet(matched_obs)
@@ -414,6 +448,88 @@ def _derive_relationships(
                     component,
                     target_component,
                     RELATIONSHIP_LABEL_LLM,
+                )
+
+            memory_refs = _collect_references(arguments, MEMORY_ARGUMENT_HINTS)
+            for reference in memory_refs:
+                target_component = _resolve_component_reference(
+                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                )
+                if not target_component:
+                    continue
+                if not _category_matches(target_component.get("category"), MEMORY_CATEGORY_HINTS):
+                    continue
+                _append_relationship(
+                    relationships,
+                    seen_relationships,
+                    component,
+                    target_component,
+                    RELATIONSHIP_LABEL_MEMORY,
+                )
+
+            retriever_refs = _collect_references(arguments, RETRIEVER_ARGUMENT_HINTS)
+            for reference in retriever_refs:
+                target_component = _resolve_component_reference(
+                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                )
+                if not target_component:
+                    continue
+                if not _category_matches(target_component.get("category"), RETRIEVER_CATEGORY_HINTS):
+                    continue
+                _append_relationship(
+                    relationships,
+                    seen_relationships,
+                    component,
+                    target_component,
+                    RELATIONSHIP_LABEL_RETRIEVER,
+                )
+
+            embedding_refs = _collect_references(arguments, EMBEDDING_ARGUMENT_HINTS)
+            for reference in embedding_refs:
+                target_component = _resolve_component_reference(
+                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                )
+                if not target_component:
+                    continue
+                if not _category_matches(target_component.get("category"), EMBEDDING_CATEGORY_HINTS):
+                    continue
+                _append_relationship(
+                    relationships,
+                    seen_relationships,
+                    component,
+                    target_component,
+                    RELATIONSHIP_LABEL_EMBEDDING,
+                )
+
+    # Also derive USES_EMBEDDING from datastore components
+    for category, components in categorized_components.items():
+        if not _category_matches(category, DATASTORE_CATEGORY_HINTS):
+            continue
+        for component in components:
+            instance_id = component.get("instance_id")
+            if not instance_id:
+                continue
+            metadata = component_metadata_by_instance.get(instance_id)
+            if not metadata:
+                continue
+            arguments = metadata.get("arguments") or {}
+            ds_file = metadata.get("file_path") or component.get("file_path")
+
+            embedding_refs = _collect_references(arguments, EMBEDDING_ARGUMENT_HINTS)
+            for reference in embedding_refs:
+                target_component = _resolve_component_reference(
+                    reference, ds_file, component_lookup_by_var, component_lookup_by_name
+                )
+                if not target_component:
+                    continue
+                if not _category_matches(target_component.get("category"), EMBEDDING_CATEGORY_HINTS):
+                    continue
+                _append_relationship(
+                    relationships,
+                    seen_relationships,
+                    component,
+                    target_component,
+                    RELATIONSHIP_LABEL_EMBEDDING,
                 )
 
     return relationships

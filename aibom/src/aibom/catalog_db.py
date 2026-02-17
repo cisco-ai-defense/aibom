@@ -12,11 +12,15 @@ from typing import Any, Dict, List, Sequence
 
 import duckdb
 
+from .supplemental_catalog import SUPPLEMENTAL_ENTRIES
+
 LOGGER = logging.getLogger(__name__)
 
 
 class CatalogDB:
-    """Provides read-only access to the DuckDB component catalog."""
+    """Provides read-only access to the DuckDB component catalog,
+    augmented with supplemental entries for frameworks not yet in the
+    prebuilt artifact (LangGraph, CrewAI, etc.)."""
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = Path(db_path)
@@ -26,6 +30,9 @@ class CatalogDB:
             self._connection = duckdb.connect(str(self._db_path), read_only=True)
         except TypeError:
             self._connection = duckdb.connect(str(self._db_path))
+        self._supplemental_index: Dict[str, Dict[str, Any]] = {
+            entry["id"]: entry for entry in SUPPLEMENTAL_ENTRIES
+        }
 
     def close(self) -> None:
         """Close the DuckDB connection."""
@@ -33,7 +40,12 @@ class CatalogDB:
             self._connection.close()
 
     def find_components_by_suffixes(self, suffixes: Sequence[str]) -> List[Dict[str, Any]]:
-        """Return catalog entries whose IDs end with any of the provided suffixes."""
+        """Return catalog entries whose IDs end with any of the provided suffixes.
+
+        Results are drawn from both the DuckDB catalog and the in-memory
+        supplemental catalog.  If a symbol appears in both, the DuckDB
+        entry takes precedence.
+        """
         if not suffixes:
             return []
 
@@ -47,4 +59,14 @@ class CatalogDB:
 
         cursor = self._connection.execute(query, params)
         columns = [desc[0] for desc in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        db_results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        seen_ids = {row["id"] for row in db_results}
+
+        for suffix in suffixes:
+            for entry_id, entry in self._supplemental_index.items():
+                if entry_id.endswith(suffix) and entry_id not in seen_ids:
+                    db_results.append(entry)
+                    seen_ids.add(entry_id)
+
+        return db_results

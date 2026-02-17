@@ -201,19 +201,18 @@ class SymbolVisitor(cst.CSTVisitor):
     def leave_Call(self, original_node: cst.Call) -> None:
         """Captures standalone calls that are not part of an assignment."""
         try:
-            # Check if the parent is an Assign node. If so, we've already handled it.
             parent = self.get_metadata(cst.metadata.ParentNodeProvider, original_node)
             if isinstance(parent, cst.Assign):
                 return
         except KeyError:
-            # This can happen if the call is at the top level of the module.
             pass
 
         qualified_name = self._get_qualified_name_for_node(original_node.func)
+        if not qualified_name and isinstance(original_node.func, cst.Attribute):
+            qualified_name = _format_attribute_name(original_node.func)
         if not qualified_name:
             return
 
-        # Process arguments
         args = {}
         for arg in original_node.args:
             if arg.keyword:
@@ -262,6 +261,8 @@ class SymbolVisitor(cst.CSTVisitor):
             return
 
         qualified_name = self._get_qualified_name_for_node(call_node.func)
+        if not qualified_name and isinstance(call_node.func, cst.Attribute):
+            qualified_name = _format_attribute_name(call_node.func)
         if not qualified_name:
             return
 

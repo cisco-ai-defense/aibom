@@ -38,10 +38,12 @@ from rich.tree import Tree
 from .report_sender import post_report_with_retries
 from .utils.version import resolve_package_version
 from .categorizer import categorize_symbols
+from .config_parser import parse_project_configs
 from .container_utils import extract_app_from_docker, is_docker_image
 from .cst_parser import parse_source_code
 from .catalog_db import CatalogDB
 from .db_loader import ensure_local_database
+from .notebook_parser import extract_code_from_notebook
 from .structures import CodeAnalysisResult
 from .ui_handler import start_ui_server
 from .workflow_analyzer import build_workflow_index, workflow_identifier
@@ -246,11 +248,13 @@ def _display_analysis_summary(all_analysis_outputs: Dict[str, Any], max_examples
 
 
 def _find_python_files(path: Path) -> List[Path]:
-    """Finds all .py files in a given path (file or directory)."""
-    if path.is_file() and path.suffix == ".py":
+    """Finds all .py and .ipynb files in a given path (file or directory)."""
+    if path.is_file() and path.suffix in (".py", ".ipynb"):
         return [path]
     if path.is_dir():
-        return list(path.rglob("*.py"))
+        py_files = list(path.rglob("*.py"))
+        nb_files = list(path.rglob("*.ipynb"))
+        return py_files + nb_files
     return []
 
 
@@ -819,9 +823,15 @@ def analyze(
                     shutil.rmtree(temp_dir)
                 continue
 
-            logging.info(f"Found {len(python_files)} Python file(s) to analyze...")
+            py_count = sum(1 for f in python_files if f.suffix == ".py")
+            nb_count = sum(1 for f in python_files if f.suffix == ".ipynb")
+            logging.info(f"Found {py_count} Python file(s) and {nb_count} notebook(s) to analyze...")
 
             analysis_results: List[CodeAnalysisResult] = []
+
+            config_results = parse_project_configs(path_to_analyze)
+            analysis_results.extend(config_results)
+
             with Progress(
                 SpinnerColumn(),
                 "[progress.description]{task.description}",
@@ -831,8 +841,13 @@ def analyze(
                 task_id = progress.add_task(f"[cyan]Parsing {source}", total=len(python_files))
                 for py_file in python_files:
                     try:
-                        with open(py_file, "r", encoding="utf-8") as f:
-                            source_code = f.read()
+                        if py_file.suffix == ".ipynb":
+                            source_code = extract_code_from_notebook(py_file)
+                            if not source_code.strip():
+                                continue
+                        else:
+                            with open(py_file, "r", encoding="utf-8") as f:
+                                source_code = f.read()
                         result = parse_source_code(str(py_file), source_code)
                         analysis_results.append(result)
                     except Exception as e:

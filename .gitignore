@@ -98,3 +98,6 @@ nox/
 node_modules
 .env
 .env.local
+
+# Benchmark cloned repos
+aibom/benchmarks/_repos/
