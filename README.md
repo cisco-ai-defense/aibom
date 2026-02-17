@@ -96,7 +96,7 @@ When running from source, execute from the `aibom/` directory or set `AIBOM_MANI
 ### Download the DuckDB artifact from GitHub Releases
 
 ```bash
-# Set this to the release tag that matches your catalog artifact (example: 0.2.3)
+# Set this to the release tag that matches your catalog artifact (example: 0.3.0)
 VERSION="<version>"
 mkdir -p "${HOME}/.aibom/catalogs"
 
