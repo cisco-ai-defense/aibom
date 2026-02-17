@@ -42,6 +42,11 @@ from .config_parser import parse_project_configs
 from .container_utils import extract_app_from_docker, is_docker_image
 from .cst_parser import parse_source_code
 from .catalog_db import CatalogDB
+from .custom_catalog import (
+    CustomCatalogConfig,
+    discover_custom_catalog,
+    load_custom_catalog,
+)
 from .db_loader import ensure_local_database
 from .notebook_parser import extract_code_from_notebook
 from .structures import CodeAnalysisResult
@@ -687,6 +692,20 @@ def analyze(
         "--show-summary/--no-show-summary",
         help="Display a Rich summary of the analysis results in the terminal.",
     ),
+    custom_catalog: Optional[Path] = typer.Option(
+        None,
+        "--custom-catalog",
+        help=(
+            "Path to a custom catalog file (.aibom.yaml, .aibom.yml, or .aibom.json) "
+            "that registers user-defined AI components, base-class rules, excludes, "
+            "and relationship hints.  If not provided, auto-discovers "
+            ".aibom.yaml/.yml/.json in each source directory."
+        ),
+        exists=False,
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+    ),
 ):
     """Analyzes a Python codebase to generate an AI BOM."""
     # Configure logging
@@ -757,6 +776,35 @@ def analyze(
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Knowledge base error:[/] {exc}")
         raise typer.Exit(code=1)
+
+    # Load custom catalog (explicit path or auto-discover)
+    custom_config: Optional[CustomCatalogConfig] = None
+    if custom_catalog:
+        custom_config = load_custom_catalog(Path(custom_catalog))
+    else:
+        for source in sources_to_process:
+            source_path = Path(source)
+            search_root = source_path if source_path.is_dir() else source_path.parent
+            discovered = discover_custom_catalog(search_root)
+            if discovered:
+                custom_config = load_custom_catalog(discovered)
+                break
+
+    if custom_config and not custom_config.is_empty:
+        connector.add_custom_entries(
+            [comp.to_catalog_dict() for comp in custom_config.components]
+        )
+        if custom_config.excludes:
+            connector.add_excludes(custom_config.excludes)
+        n_comp = len(custom_config.components)
+        n_base = len(custom_config.base_class_rules)
+        n_excl = len(custom_config.excludes)
+        n_rel = len(custom_config.custom_relationships)
+        console.print(
+            f"[dim]Custom catalog: {n_comp} component(s), {n_base} base-class rule(s), "
+            f"{n_excl} exclude(s), {n_rel} custom relationship(s)[/]"
+        )
+
     try:
         for source in sources_to_process:
             console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
@@ -870,7 +918,11 @@ def analyze(
                 logging.debug(f"Failed to build workflow index: {workflow_error}")
 
             analysis_output = categorize_symbols(
-                analysis_results, connector, llm_config, workflow_index
+                analysis_results,
+                connector,
+                llm_config,
+                workflow_index,
+                custom_config=custom_config,
             )
 
             if is_container and temp_dir:

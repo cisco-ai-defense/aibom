@@ -21,11 +21,14 @@ from typing import Any, Dict, List, Optional, Set, Union
 from .structures import (
     AssignmentObservation,
     CallObservation,
+    ClassDefObservation,
     CodeAnalysisResult,
     ContextManagerObservation,
     DecoratorObservation,
+    FunctionAnnotationObservation,
     TypeAnnotationObservation,
 )
+from .custom_catalog import parse_inline_annotation
 
 
 def _format_attribute_name(node: cst.Attribute) -> str:
@@ -169,6 +172,38 @@ class SymbolVisitor(cst.CSTVisitor):
             pass
         return ""
     
+    def _extract_aibom_annotation(self, node: cst.CSTNode) -> Optional[Dict[str, str]]:
+        """Extract an ``# aibom: ...`` annotation from leading lines or trailing comment.
+
+        Checks two places:
+        1. Leading comment lines immediately above the statement.
+        2. A trailing inline comment on the same line.
+        """
+        # Check leading lines (for ClassDef / FunctionDef these are in .leading_lines
+        # or attached to decorators).  We use the source code directly for reliability.
+        try:
+            position = self.get_metadata(cst.metadata.PositionProvider, node)
+            if self.source_code and position:
+                lines = self.source_code.split("\n")
+                start_line_idx = position.start.line - 1  # 0-based
+
+                # Check the line itself for a trailing comment
+                if 0 <= start_line_idx < len(lines):
+                    annotation = parse_inline_annotation(lines[start_line_idx])
+                    if annotation:
+                        return annotation
+
+                # Check the line immediately above for a leading comment
+                prev_idx = start_line_idx - 1
+                if 0 <= prev_idx < len(lines):
+                    annotation = parse_inline_annotation(lines[prev_idx])
+                    if annotation:
+                        return annotation
+        except (KeyError, IndexError, AttributeError):
+            pass
+
+        return None
+
     def leave_Import(self, original_node: cst.Import) -> None:
         """Capture import statements."""
         for alias in original_node.names:
@@ -226,8 +261,65 @@ class SymbolVisitor(cst.CSTVisitor):
         )
         self.result.calls.append(call_obs)
 
+    def leave_ClassDef(self, original_node: cst.ClassDef) -> None:
+        """Capture class definitions: base classes and ``# aibom:`` annotations."""
+        class_name = original_node.name.value
+
+        qualified_name = self._get_qualified_name_for_node(original_node.name)
+
+        base_classes: List[str] = []
+        for arg in original_node.bases:
+            base_expr = arg.value
+            base_name = self._get_qualified_name_for_node(base_expr)
+            if not base_name and isinstance(base_expr, cst.Attribute):
+                base_name = _format_attribute_name(base_expr)
+            if not base_name and isinstance(base_expr, cst.Name):
+                base_name = base_expr.value
+            if base_name:
+                base_classes.append(base_name)
+
+        annotation = self._extract_aibom_annotation(original_node)
+
+        try:
+            line_number = self.get_metadata(
+                cst.metadata.PositionProvider, original_node
+            ).start.line
+        except (KeyError, AttributeError):
+            line_number = 0
+
+        obs = ClassDefObservation(
+            class_name=class_name,
+            qualified_name=qualified_name,
+            base_classes=base_classes,
+            line_number=line_number,
+            aibom_annotation=annotation,
+        )
+        self.result.class_defs.append(obs)
+
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:
-        """Captures functions that have decorators."""
+        """Captures functions that have decorators and/or ``# aibom:`` annotations."""
+        # Check for inline aibom annotation
+        annotation = self._extract_aibom_annotation(original_node)
+        if annotation:
+            func_name = original_node.name.value
+            qualified_name = self._get_qualified_name_for_node(original_node.name)
+            try:
+                line_number = self.get_metadata(
+                    cst.metadata.PositionProvider, original_node
+                ).start.line
+            except (KeyError, AttributeError):
+                line_number = 0
+
+            self.result.function_annotations.append(
+                FunctionAnnotationObservation(
+                    function_name=func_name,
+                    qualified_name=qualified_name,
+                    line_number=line_number,
+                    aibom_annotation=annotation,
+                )
+            )
+
+        # Original decorator handling
         if not original_node.decorators:
             return
 

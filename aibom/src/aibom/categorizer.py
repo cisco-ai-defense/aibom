@@ -22,11 +22,14 @@ from .structures import (
     CodeAnalysisResult,
     AssignmentObservation,
     CallObservation,
+    ClassDefObservation,
     DecoratorObservation,
+    FunctionAnnotationObservation,
     ComponentRelationship,
     CategorizationOutput,
 )
 from .catalog_db import CatalogDB
+from .custom_catalog import CustomCatalogConfig
 from .llm_client import LLMClient
 from .workflow_analyzer import WorkflowIndex
 
@@ -56,10 +59,12 @@ def categorize_symbols(
     connector: CatalogDB,
     llm_config: Optional[Dict[str, Any]] = None,
     workflow_index: Optional[WorkflowIndex] = None,
+    custom_config: Optional[CustomCatalogConfig] = None,
 ) -> CategorizationOutput:
     """
     Orchestrates the symbol matching and categorization process using the 'concept' attribute from the catalog.
-    Enhanced to handle multiple matches, model extraction, and better import disambiguation.
+    Enhanced to handle multiple matches, model extraction, better import disambiguation,
+    inline annotations, base-class detection, and custom relationship types.
     """
     # Initialize LLM client if config provided
     llm_client = None
@@ -69,7 +74,29 @@ def categorize_symbols(
             logging.info("LLM client initialized for model extraction.")
         except Exception as e:
             logging.warning(f"Failed to initialize LLM client: {e}")
-    
+
+    # Extend argument hint sets with user-supplied hints (additive, scoped to this call)
+    effective_tool_hints = set(TOOL_ARGUMENT_HINTS)
+    effective_llm_hints = set(LLM_ARGUMENT_HINTS)
+    effective_memory_hints = set(MEMORY_ARGUMENT_HINTS)
+    effective_retriever_hints = set(RETRIEVER_ARGUMENT_HINTS)
+    effective_embedding_hints = set(EMBEDDING_ARGUMENT_HINTS)
+
+    if custom_config and custom_config.relationship_hints:
+        hints = custom_config.relationship_hints
+        effective_tool_hints.update(hints.get("tool_arguments", []))
+        effective_llm_hints.update(hints.get("llm_arguments", []))
+        effective_memory_hints.update(hints.get("memory_arguments", []))
+        effective_retriever_hints.update(hints.get("retriever_arguments", []))
+        effective_embedding_hints.update(hints.get("embedding_arguments", []))
+
+    # Build a metadata lookup from custom component entries
+    custom_metadata_by_id: Dict[str, Dict[str, Any]] = {}
+    if custom_config:
+        for comp in custom_config.components:
+            if comp.metadata:
+                custom_metadata_by_id[comp.id] = comp.metadata
+
     # Build variable mapping from assignments FIRST for decorator reconstruction
     variable_map = {}
     for result in analysis_results:
@@ -300,13 +327,125 @@ def categorize_symbols(
                     component_details,
                 )
 
+            # Merge user-provided metadata from custom catalog for this component
+            for custom_id, meta in custom_metadata_by_id.items():
+                if db_symbol_name.endswith(custom_id) or db_symbol_name == custom_id:
+                    component_details.update(meta)
+                    break
+
             _register_component_name(component_lookup_by_name, component_details["name"], component_details)
+
+    # ── Inline annotation pass: classes and functions tagged with # aibom: ──
+    for result in analysis_results:
+        for class_obs in getattr(result, "class_defs", []):
+            if class_obs.aibom_annotation:
+                concept = class_obs.aibom_annotation.get("concept", "other")
+                comp_name = class_obs.class_name
+                comp_details = {
+                    "name": comp_name,
+                    "file_path": result.file_path,
+                    "line_number": class_obs.line_number,
+                    "category": concept,
+                    "framework": class_obs.aibom_annotation.get("framework", "custom"),
+                    "detection_source": "inline_annotation",
+                }
+                label = class_obs.aibom_annotation.get("label")
+                if label:
+                    comp_details["name"] = label
+
+                if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+                    workflows = workflow_index.get_workflow_context(
+                        comp_details["file_path"], comp_details["line_number"],
+                    )
+                    if workflows:
+                        comp_details["workflows"] = workflows
+
+                categorized_components[concept].append(comp_details)
+                comp_details["instance_id"] = _build_instance_id(comp_details)
+                _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+                _register_component_target(
+                    component_lookup_by_var, result.file_path, comp_name, comp_details,
+                )
+
+        for func_obs in getattr(result, "function_annotations", []):
+            concept = func_obs.aibom_annotation.get("concept", "other")
+            comp_name = func_obs.function_name
+            comp_details = {
+                "name": comp_name,
+                "file_path": result.file_path,
+                "line_number": func_obs.line_number,
+                "category": concept,
+                "framework": func_obs.aibom_annotation.get("framework", "custom"),
+                "detection_source": "inline_annotation",
+            }
+            label = func_obs.aibom_annotation.get("label")
+            if label:
+                comp_details["name"] = label
+
+            if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+                workflows = workflow_index.get_workflow_context(
+                    comp_details["file_path"], comp_details["line_number"],
+                )
+                if workflows:
+                    comp_details["workflows"] = workflows
+
+            categorized_components[concept].append(comp_details)
+            comp_details["instance_id"] = _build_instance_id(comp_details)
+            _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+            _register_component_target(
+                component_lookup_by_var, result.file_path, comp_name, comp_details,
+            )
+
+    # ── Base class detection pass ───────────────────────────────────────
+    base_class_rules = custom_config.base_class_rules if custom_config else []
+    if base_class_rules:
+        for result in analysis_results:
+            for class_obs in getattr(result, "class_defs", []):
+                if class_obs.aibom_annotation:
+                    continue  # already handled above
+                for rule in base_class_rules:
+                    matched = any(
+                        base.endswith(rule.base_class) or base == rule.base_class
+                        for base in class_obs.base_classes
+                    )
+                    if matched:
+                        comp_name = class_obs.class_name
+                        comp_details = {
+                            "name": comp_name,
+                            "file_path": result.file_path,
+                            "line_number": class_obs.line_number,
+                            "category": rule.concept,
+                            "framework": "custom",
+                            "detection_source": "base_class_rule",
+                            "base_class_matched": rule.base_class,
+                        }
+
+                        if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+                            workflows = workflow_index.get_workflow_context(
+                                comp_details["file_path"], comp_details["line_number"],
+                            )
+                            if workflows:
+                                comp_details["workflows"] = workflows
+
+                        categorized_components[rule.concept].append(comp_details)
+                        comp_details["instance_id"] = _build_instance_id(comp_details)
+                        _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+                        _register_component_target(
+                            component_lookup_by_var, result.file_path, comp_name, comp_details,
+                        )
+                        break  # first matching rule wins
 
     relationships = _derive_relationships(
         categorized_components,
         component_metadata_by_instance,
         component_lookup_by_var,
         component_lookup_by_name,
+        effective_tool_hints=effective_tool_hints,
+        effective_llm_hints=effective_llm_hints,
+        effective_memory_hints=effective_memory_hints,
+        effective_retriever_hints=effective_retriever_hints,
+        effective_embedding_hints=effective_embedding_hints,
+        custom_relationships=custom_config.custom_relationships if custom_config else [],
     )
 
     return CategorizationOutput(components=dict(categorized_components), relationships=relationships)
@@ -399,9 +538,21 @@ def _derive_relationships(
     component_metadata_by_instance: Dict[str, Dict[str, Any]],
     component_lookup_by_var: Dict[Tuple[str, str], Dict[str, Any]],
     component_lookup_by_name: Dict[str, List[Dict[str, Any]]],
+    effective_tool_hints: Optional[Set[str]] = None,
+    effective_llm_hints: Optional[Set[str]] = None,
+    effective_memory_hints: Optional[Set[str]] = None,
+    effective_retriever_hints: Optional[Set[str]] = None,
+    effective_embedding_hints: Optional[Set[str]] = None,
+    custom_relationships: Optional[list] = None,
 ) -> List[ComponentRelationship]:
     relationships: List[ComponentRelationship] = []
     seen_relationships: Set[Tuple[str, str, str]] = set()
+
+    tool_hints = effective_tool_hints or TOOL_ARGUMENT_HINTS
+    llm_hints = effective_llm_hints or LLM_ARGUMENT_HINTS
+    memory_hints = effective_memory_hints or MEMORY_ARGUMENT_HINTS
+    retriever_hints = effective_retriever_hints or RETRIEVER_ARGUMENT_HINTS
+    embedding_hints = effective_embedding_hints or EMBEDDING_ARGUMENT_HINTS
 
     for category, components in categorized_components.items():
         if not _category_matches(category, AGENT_CATEGORY_HINTS):
@@ -416,7 +567,7 @@ def _derive_relationships(
             arguments = metadata.get("arguments") or {}
             agent_file = metadata.get("file_path") or component.get("file_path")
 
-            tool_refs = _collect_references(arguments, TOOL_ARGUMENT_HINTS)
+            tool_refs = _collect_references(arguments, tool_hints)
             for reference in tool_refs:
                 target_component = _resolve_component_reference(
                     reference, agent_file, component_lookup_by_var, component_lookup_by_name
@@ -433,7 +584,7 @@ def _derive_relationships(
                     RELATIONSHIP_LABEL_TOOL,
                 )
 
-            llm_refs = _collect_references(arguments, LLM_ARGUMENT_HINTS)
+            llm_refs = _collect_references(arguments, llm_hints)
             for reference in llm_refs:
                 target_component = _resolve_component_reference(
                     reference, agent_file, component_lookup_by_var, component_lookup_by_name
@@ -450,7 +601,7 @@ def _derive_relationships(
                     RELATIONSHIP_LABEL_LLM,
                 )
 
-            memory_refs = _collect_references(arguments, MEMORY_ARGUMENT_HINTS)
+            memory_refs = _collect_references(arguments, memory_hints)
             for reference in memory_refs:
                 target_component = _resolve_component_reference(
                     reference, agent_file, component_lookup_by_var, component_lookup_by_name
@@ -467,7 +618,7 @@ def _derive_relationships(
                     RELATIONSHIP_LABEL_MEMORY,
                 )
 
-            retriever_refs = _collect_references(arguments, RETRIEVER_ARGUMENT_HINTS)
+            retriever_refs = _collect_references(arguments, retriever_hints)
             for reference in retriever_refs:
                 target_component = _resolve_component_reference(
                     reference, agent_file, component_lookup_by_var, component_lookup_by_name
@@ -484,7 +635,7 @@ def _derive_relationships(
                     RELATIONSHIP_LABEL_RETRIEVER,
                 )
 
-            embedding_refs = _collect_references(arguments, EMBEDDING_ARGUMENT_HINTS)
+            embedding_refs = _collect_references(arguments, embedding_hints)
             for reference in embedding_refs:
                 target_component = _resolve_component_reference(
                     reference, agent_file, component_lookup_by_var, component_lookup_by_name
@@ -515,7 +666,7 @@ def _derive_relationships(
             arguments = metadata.get("arguments") or {}
             ds_file = metadata.get("file_path") or component.get("file_path")
 
-            embedding_refs = _collect_references(arguments, EMBEDDING_ARGUMENT_HINTS)
+            embedding_refs = _collect_references(arguments, embedding_hints)
             for reference in embedding_refs:
                 target_component = _resolve_component_reference(
                     reference, ds_file, component_lookup_by_var, component_lookup_by_name
@@ -531,6 +682,47 @@ def _derive_relationships(
                     target_component,
                     RELATIONSHIP_LABEL_EMBEDDING,
                 )
+
+    # ── Custom relationship types from .aibom.yaml ──────────────────────
+    if custom_relationships:
+        for rel_def in custom_relationships:
+            source_cat_set = set(rel_def.source_categories)
+            target_cat_set = set(rel_def.target_categories)
+            arg_hint_set = set(rel_def.argument_hints)
+
+            if not arg_hint_set:
+                continue
+
+            for category, components in categorized_components.items():
+                if category.lower() not in source_cat_set:
+                    continue
+                for component in components:
+                    instance_id = component.get("instance_id")
+                    if not instance_id:
+                        continue
+                    metadata = component_metadata_by_instance.get(instance_id)
+                    if not metadata:
+                        continue
+                    arguments = metadata.get("arguments") or {}
+                    comp_file = metadata.get("file_path") or component.get("file_path")
+
+                    refs = _collect_references(arguments, arg_hint_set)
+                    for reference in refs:
+                        target_component = _resolve_component_reference(
+                            reference, comp_file, component_lookup_by_var, component_lookup_by_name
+                        )
+                        if not target_component:
+                            continue
+                        target_cat = (target_component.get("category") or "").lower()
+                        if target_cat_set and target_cat not in target_cat_set:
+                            continue
+                        _append_relationship(
+                            relationships,
+                            seen_relationships,
+                            component,
+                            target_component,
+                            rel_def.label,
+                        )
 
     return relationships
 

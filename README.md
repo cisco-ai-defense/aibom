@@ -9,6 +9,7 @@ The AI BOM tool scans codebases and container images to inventory AI framework c
 - [Installation](#installation)
 - [Knowledge Base Configuration](#knowledge-base-configuration)
 - [Usage](#usage)
+- [Custom Catalog](#custom-catalog)
 - [Testing](#testing)
 - [Output Formats](#output-formats)
 - [UI Mode](#ui-mode)
@@ -17,11 +18,14 @@ The AI BOM tool scans codebases and container images to inventory AI framework c
 
 ## Features
 
-- **Static Python analysis:** Uses `libcst` to capture assignments, decorators, type annotations, and context managers.
+- **Static Python analysis:** Uses `libcst` to capture assignments, decorators, type annotations, context managers, class definitions, and inline annotations.
 - **Container image scanning:** Extracts `/app` from Docker images when available, otherwise scans `site-packages`.
 - **DuckDB catalog matching:** Maps fully qualified symbols to curated component categories.
+- **Custom catalog:** Users can register custom AI components, base-class detection rules, exclude patterns, relationship hints, and custom relationship types via a `.aibom.yaml` configuration file.
+- **Inline annotations:** Tag classes and functions directly in source code with `# aibom: concept=...` comments for instant recognition.
+- **Base class detection:** Automatically categorize classes that inherit from specified base classes.
 - **Workflow context:** Builds a lightweight call graph to show which workflows reach each component.
-- **Derived relationships:** Infers `USES_TOOL` and `USES_LLM` links from agent arguments.
+- **Derived relationships:** Infers `USES_TOOL`, `USES_LLM`, `USES_MEMORY`, `USES_RETRIEVER`, `USES_EMBEDDING`, and user-defined relationship links from component arguments.
 - **Optional LLM enrichment:** Uses `litellm` to extract model/embedding names from code snippets.
 - **Multiple outputs:** Plaintext, JSON, or a FastAPI UI server.
 - **Report submission:** Optional POST of the JSON report with retries.
@@ -209,6 +213,164 @@ Choose the base domain for your Cisco AI Defense organization's region:
 - EU: `https://api.eu.security.cisco.com/api/ai-defense/v1/aibom/analysis`
 - UAE: `https://api.uae.security.cisco.com/api/ai-defense/v1/aibom/analysis`
 
+## Custom Catalog
+
+The built-in DuckDB catalog covers popular AI frameworks (LangChain, LangGraph, CrewAI, PyTorch, scikit-learn, etc.), but many teams build custom wrappers, internal tools, or use niche libraries that the catalog does not know about. The **custom catalog** lets you teach the analyzer about these components using three complementary mechanisms:
+
+1. **Configuration file** (`.aibom.yaml`) -- register components, base-class rules, excludes, and relationships declaratively.
+2. **Inline annotations** (`# aibom: concept=...`) -- tag individual classes and functions directly in source code.
+3. **Base class detection** -- automatically categorize any class that inherits from a specified base class.
+
+### Using a configuration file
+
+Place a `.aibom.yaml` (or `.aibom.yml` / `.aibom.json`) in your project root. The analyzer auto-discovers it, or you can point to it explicitly:
+
+```bash
+# Auto-discovery (looks for .aibom.yaml/.yml/.json in the source directory)
+cisco-aibom analyze /path/to/project --output-format json --output-file report.json
+
+# Explicit path
+cisco-aibom analyze /path/to/project \
+  --custom-catalog /path/to/.aibom.yaml \
+  --output-format json \
+  --output-file report.json
+```
+
+### Configuration file reference
+
+A complete `.aibom.yaml` example (also available at `aibom/examples/.aibom.yaml`):
+
+```yaml
+# ─── Custom Components ───────────────────────────────────────────────
+# Register symbols the built-in catalog does not know about.
+# 'id' can be a short class/function name (e.g. MyLLMWrapper) or a
+# fully qualified name (e.g. myproject.llm.MyLLMWrapper).
+# Short names are matched via suffix matching, so 'MyLLMWrapper' will
+# match any qualified name ending in 'MyLLMWrapper'.
+components:
+  - id: MyLLMWrapper
+    concept: model                   # model | agent | tool | memory | ...
+    label: My Custom LLM             # human-readable label (optional)
+    framework: internal              # framework name (default: "custom")
+    metadata:                        # arbitrary key-value pairs (optional)
+      owner: ml-team
+      version: "2.1"
+
+  - id: myproject.tools.SearchTool
+    concept: tool
+
+  - id: SafetyFilter
+    concept: guardrail               # custom categories are allowed
+
+  - id: RequestRouter
+    concept: router
+
+# ─── Base Class Detection ────────────────────────────────────────────
+# Any class that inherits from a listed base is auto-categorized.
+base_classes:
+  - class: BaseTool
+    concept: tool
+  - class: mylib.BaseAgent
+    concept: agent
+  - class: BaseGuardrail
+    concept: guardrail
+
+# ─── Exclude Patterns ────────────────────────────────────────────────
+# Suppress false positives. Entries whose IDs end with (or equal) these
+# strings are filtered out of analysis results.
+excludes:
+  - langchain.deprecated.OldAgent
+  - some_noisy_helper_function
+
+# ─── Extended Relationship Hints ─────────────────────────────────────
+# Add argument names that the relationship engine should inspect.
+# These are additive -- they extend the built-in hints, not replace them.
+relationship_hints:
+  tool_arguments:        # extends: tool, tools, skills, abilities
+    - custom_tools
+    - plugins
+  llm_arguments:         # extends: llm, language_model, chat_model, model
+    - language_model
+  memory_arguments:      # extends: memory, checkpointer, store, saver, ...
+    - state_store
+  retriever_arguments:   # extends: retriever, retrievers, search, ...
+    - doc_search
+  embedding_arguments:   # extends: embedding, embeddings, embed, ...
+    - vectorizer
+
+# ─── Custom Relationship Types ───────────────────────────────────────
+# Define entirely new relationship labels with source/target constraints
+# and the argument names that trigger them.
+custom_relationships:
+  - label: ROUTES_TO
+    source_categories: [router]
+    target_categories: [agent]
+    argument_hints: [routes, destinations]
+
+  - label: GUARDS
+    source_categories: [guardrail]
+    target_categories: [model, agent]
+    argument_hints: [guarded_by, guard]
+```
+
+### Inline annotations
+
+Tag classes or functions directly in your source code. The comment must appear on the line immediately above the definition or as a trailing comment on the definition line:
+
+```python
+# aibom: concept=guardrail framework=internal
+class SafetyFilter:
+    """Custom content-safety guardrail."""
+
+    def check(self, text: str) -> bool:
+        ...
+
+
+# aibom: concept=tool label=WebSearch
+def search_web(query: str) -> list:
+    """Search the web and return results."""
+    ...
+
+
+class MyRouter:  # aibom: concept=router
+    """Routes requests to the appropriate agent."""
+    ...
+```
+
+Supported keys in the annotation: `concept` (required), `framework` (optional, default `"custom"`), `label` (optional).
+
+### Base class detection
+
+When `base_classes` rules are defined in `.aibom.yaml`, the analyzer inspects every class definition in the scanned code. If a class inherits (directly) from a listed base, it is auto-categorized without needing an explicit `components` entry or inline annotation:
+
+```yaml
+# .aibom.yaml
+base_classes:
+  - class: BaseTool
+    concept: tool
+```
+
+```python
+# my_tools.py -- these are automatically detected as "tool" components
+class SearchTool(BaseTool):
+    ...
+
+class CalculatorTool(BaseTool):
+    ...
+```
+
+### Precedence
+
+When the same symbol is detected by multiple mechanisms, the following precedence applies (highest first):
+
+1. **Inline annotation** (`# aibom: concept=...`)
+2. **Base class rule** (from `.aibom.yaml` `base_classes`)
+3. **Custom component entry** (from `.aibom.yaml` `components`)
+4. **Supplemental catalog** (built-in LangGraph/CrewAI entries)
+5. **DuckDB catalog** (prebuilt knowledge base)
+
+Exclude patterns override all of the above -- a matching exclude always removes the component from results.
+
 ## Testing
 
 ```bash
@@ -320,10 +482,13 @@ The React UI in `ui/` can connect to this server. See `docs/UI_README.md` and `d
 
 ## Technical Details
 
-- **Parsing:** `libcst` extracts fully qualified names for calls, decorators, type annotations, and context managers.
-- **Catalog matching:** Symbols are matched against the DuckDB `component_catalog` table using their fully qualified IDs.
+- **Parsing:** `libcst` extracts fully qualified names for calls, decorators, type annotations, context managers, class definitions (with base classes), and `# aibom:` inline annotations.
+- **Catalog matching:** Symbols are matched against the DuckDB `component_catalog` table using suffix matching on their fully qualified IDs. Custom entries from `.aibom.yaml` are merged into this lookup.
+- **Custom catalog:** The `custom_catalog` module loads `.aibom.yaml`/`.yml`/`.json` files and provides component entries, base-class rules, exclude patterns, extended relationship hints, and custom relationship types to the categorizer.
+- **Inline annotations:** The CST parser extracts `# aibom: concept=...` comments on class and function definitions, which the categorizer uses to create components without requiring catalog entries.
+- **Base class detection:** The CST parser captures base classes for every `class` statement. The categorizer matches these against base-class rules from the custom catalog configuration.
 - **Workflow analysis:** The AST-based workflow analyzer associates components with the functions that call into them.
-- **Relationships:** Agent arguments are inspected for tool/LLM references to derive `USES_TOOL` and `USES_LLM` links.
+- **Relationships:** Agent arguments are inspected for tool/LLM/memory/retriever/embedding references to derive `USES_TOOL`, `USES_LLM`, `USES_MEMORY`, `USES_RETRIEVER`, and `USES_EMBEDDING` links. User-defined relationship types from `.aibom.yaml` `custom_relationships` are also derived.
 - **LLM enrichment:** `litellm` is used only when `--llm-model` is supplied.
 
 ## Troubleshooting

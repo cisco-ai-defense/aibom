@@ -28,6 +28,7 @@ dependencies = [
     "httpx>=0.28.1",
     "rich>=13.9.0",
     "platformdirs>=4.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
