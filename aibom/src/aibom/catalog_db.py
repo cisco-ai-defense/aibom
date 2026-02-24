@@ -41,10 +41,17 @@ class CatalogDB:
         self._custom_index: Dict[str, Dict[str, Any]] = {}
         self._excludes: List[str] = []
 
+    def __enter__(self) -> "CatalogDB":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # noqa: ANN001
+        self.close()
+
     def close(self) -> None:
-        """Close the DuckDB connection."""
-        if self._connection:
+        """Close the DuckDB connection (idempotent)."""
+        if self._connection is not None:
             self._connection.close()
+            self._connection = None
 
     def add_custom_entries(self, entries: List[Dict[str, Any]]) -> None:
         """Merge user-provided custom catalog entries.

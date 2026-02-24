@@ -16,7 +16,7 @@
 
 import ast
 import libcst as cst
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
 
 from .structures import (
     AssignmentObservation,
