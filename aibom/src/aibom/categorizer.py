@@ -28,7 +28,7 @@ from .structures import (
     ComponentRelationship,
     CategorizationOutput,
 )
-from .catalog_db import CatalogDB
+from .catalog_db import CatalogDB, is_excluded
 from .custom_catalog import CustomCatalogConfig
 from .llm_client import LLMClient
 from .workflow_analyzer import WorkflowIndex
@@ -54,6 +54,10 @@ RELATIONSHIP_LABEL_MEMORY = "USES_MEMORY"
 RELATIONSHIP_LABEL_RETRIEVER = "USES_RETRIEVER"
 RELATIONSHIP_LABEL_EMBEDDING = "USES_EMBEDDING"
 
+
+_is_excluded = is_excluded  # re-export for backward compatibility
+
+
 def categorize_symbols(
     analysis_results: List[CodeAnalysisResult],
     connector: CatalogDB,
@@ -73,7 +77,7 @@ def categorize_symbols(
             llm_client = LLMClient(llm_config)
             logging.info("LLM client initialized for model extraction.")
         except Exception as e:
-            logging.warning(f"Failed to initialize LLM client: {e}")
+            logging.warning("Failed to initialize LLM client: %s", e)
 
     # Extend argument hint sets with user-supplied hints (additive, scoped to this call)
     effective_tool_hints = set(TOOL_ARGUMENT_HINTS)
@@ -125,7 +129,7 @@ def categorize_symbols(
                         base_class = variable_map[instance_variable]
                         attribute = original_name.split('.', 1)[-1] if '.' in original_name else original_name
                         reconstructed_name = f"{base_class}.{attribute}"
-                        logging.debug(f"Reconstructed decorator: {original_name} -> {reconstructed_name}")
+                        logging.debug("Reconstructed decorator: %s -> %s", original_name, reconstructed_name)
 
                 # Method-chain resolution: e.g. "builder.compile" -> "langgraph.graph.StateGraph.compile"
                 if "." in reconstructed_name:
@@ -136,7 +140,7 @@ def categorize_symbols(
                         resolved_base = variable_map[local_var]
                         candidate = f"{resolved_base}.{attr_tail}"
                         reconstructed_name = candidate
-                        logging.debug(f"Method-chain resolved: {original_name} -> {reconstructed_name}")
+                        logging.debug("Method-chain resolved: %s -> %s", original_name, reconstructed_name)
 
                 if obs_type == "calls":
                     obs_arguments = obs.arguments
@@ -205,17 +209,92 @@ def categorize_symbols(
             all_observations.append(observation)
             symbols_to_find.add(ctx.context_expr_qualified_name)
 
+    # Extract exclude patterns early so they can be applied globally
+    exclude_patterns: List[str] = custom_config.excludes if custom_config else []
+
     # Query the database to find all possible matches for our suffixes
     matched_symbols = connector.find_components_by_suffixes(list(symbols_to_find))
-    logging.debug(f"Found {len(matched_symbols)} matching symbols in the database.")
+    logging.debug("Found %d matching symbols in the database.", len(matched_symbols))
 
     categorized_components: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     component_lookup_by_var: Dict[Tuple[str, str], Dict[str, Any]] = {}
     component_lookup_by_name: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     component_metadata_by_instance: Dict[str, Dict[str, Any]] = {}
-    processed_observations = set()  # Track processed observations to avoid duplicates
 
-    # Enhanced matching: Find ALL matching observations for each database symbol
+    # Track detected locations across all passes to prevent duplicates.
+    # Precedence: inline annotation > DuckDB catalog > base-class rule.
+    detected_locations: Set[Tuple[str, int]] = set()  # (file_path, line_number)
+
+    # ── Pass 1: Inline annotation (highest precedence) ───────────────────
+    for result in analysis_results:
+        for class_obs in getattr(result, "class_defs", []):
+            if class_obs.aibom_annotation:
+                concept = class_obs.aibom_annotation.get("concept", "other")
+                comp_name = class_obs.class_name
+                if _is_excluded(comp_name, exclude_patterns):
+                    continue
+                comp_details = {
+                    "name": comp_name,
+                    "file_path": result.file_path,
+                    "line_number": class_obs.line_number,
+                    "category": concept,
+                    "framework": class_obs.aibom_annotation.get("framework", "custom"),
+                    "detection_source": "inline_annotation",
+                }
+                label = class_obs.aibom_annotation.get("label")
+                if label:
+                    comp_details["name"] = label
+
+                if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+                    workflows = workflow_index.get_workflow_context(
+                        comp_details["file_path"], comp_details["line_number"],
+                    )
+                    if workflows:
+                        comp_details["workflows"] = workflows
+
+                categorized_components[concept].append(comp_details)
+                comp_details["instance_id"] = _build_instance_id(comp_details)
+                detected_locations.add((result.file_path, class_obs.line_number))
+                _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+                _register_component_target(
+                    component_lookup_by_var, result.file_path, comp_name, comp_details,
+                )
+
+        for func_obs in getattr(result, "function_annotations", []):
+            concept = func_obs.aibom_annotation.get("concept", "other")
+            comp_name = func_obs.function_name
+            if _is_excluded(comp_name, exclude_patterns):
+                continue
+            comp_details = {
+                "name": comp_name,
+                "file_path": result.file_path,
+                "line_number": func_obs.line_number,
+                "category": concept,
+                "framework": func_obs.aibom_annotation.get("framework", "custom"),
+                "detection_source": "inline_annotation",
+            }
+            label = func_obs.aibom_annotation.get("label")
+            if label:
+                comp_details["name"] = label
+
+            if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+                workflows = workflow_index.get_workflow_context(
+                    comp_details["file_path"], comp_details["line_number"],
+                )
+                if workflows:
+                    comp_details["workflows"] = workflows
+
+            categorized_components[concept].append(comp_details)
+            comp_details["instance_id"] = _build_instance_id(comp_details)
+            detected_locations.add((result.file_path, func_obs.line_number))
+            _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+            _register_component_target(
+                component_lookup_by_var, result.file_path, comp_name, comp_details,
+            )
+
+    # ── Pass 2: DuckDB catalog matching ──────────────────────────────────
+    processed_observations: Set[Tuple[str, int, str]] = set()
+
     for db_symbol_data in matched_symbols:
         db_symbol_name = db_symbol_data["id"]
         category = db_symbol_data.get("concept")
@@ -229,23 +308,28 @@ def categorize_symbols(
         matching_observations = []
         for obs in all_observations:
             parser_name = obs["parser_name"]
-            
+
             # Enhanced matching logic with better disambiguation
             if _is_symbol_match(parser_name, db_symbol_name, obs.get("imports", [])):
                 matching_observations.append(obs)
-        
+
         if not matching_observations:
-            logging.debug(f"Skipping symbol '{db_symbol_name}' because it could not be matched to any code observation.")
+            logging.debug("Skipping symbol '%s' because it could not be matched to any code observation.", db_symbol_name)
             continue
 
         # Process each matching observation
         for matched_obs in matching_observations:
             obs_key = (matched_obs["file_path"], matched_obs["line_number"], matched_obs["parser_name"])
             if obs_key in processed_observations:
-                continue  # Skip if already processed
-            
+                continue  # Skip if already processed by another DB symbol
+
+            # Skip if this location was already detected by inline annotation
+            loc_key = (matched_obs["file_path"], matched_obs["line_number"])
+            if loc_key in detected_locations:
+                continue
+
             processed_observations.add(obs_key)
-            
+
             # Create component details
             component_details = {
                 "name": db_symbol_name,
@@ -263,10 +347,10 @@ def categorize_symbols(
                     try:
                         code_snippet = _reconstruct_code_snippet(matched_obs)
                         prompt = f"Please provide a concise, one-sentence description for the following tool based on its code. The tool's code is:\n\n{code_snippet}"
-                        logging.info(f"Generating description for tool: {db_symbol_name}")
+                        logging.info("Generating description for tool: %s", db_symbol_name)
                         description = llm_client.invoke(prompt)
                     except Exception as e:
-                        logging.warning(f"Failed to generate description for {db_symbol_name}: {e}")
+                        logging.warning("Failed to generate description for %s: %s", db_symbol_name, e)
                 if description:
                     component_details['description'] = description
 
@@ -279,16 +363,16 @@ def categorize_symbols(
                     prompt_text = matched_obs["arguments"].get("template") or matched_obs["arguments"].get("prompt")
                     if prompt_text:
                         component_details["text"] = prompt_text
-                
+
                 elif category in ["model", "embedding"] and llm_client:
                     class_name = db_symbol_name.split('.')[-1]
                     code_snippet = _reconstruct_code_snippet(matched_obs)
-                    
+
                     if category == "model":
                         model_name = llm_client.extract_model_name(code_snippet, class_name)
                         if model_name:
                             component_details["model_name"] = model_name
-                    
+
                     elif category == "embedding":
                         embedding_model = llm_client.extract_embedding_model(code_snippet, class_name)
                         if embedding_model:
@@ -310,6 +394,7 @@ def categorize_symbols(
 
             categorized_components[category].append(component_details)
             component_details["instance_id"] = _build_instance_id(component_details)
+            detected_locations.add(loc_key)
             component_metadata_by_instance[component_details["instance_id"]] = {
                 "file_path": matched_obs["file_path"],
                 "arguments": matched_obs.get("arguments", {}),
@@ -335,74 +420,19 @@ def categorize_symbols(
 
             _register_component_name(component_lookup_by_name, component_details["name"], component_details)
 
-    # ── Inline annotation pass: classes and functions tagged with # aibom: ──
-    for result in analysis_results:
-        for class_obs in getattr(result, "class_defs", []):
-            if class_obs.aibom_annotation:
-                concept = class_obs.aibom_annotation.get("concept", "other")
-                comp_name = class_obs.class_name
-                comp_details = {
-                    "name": comp_name,
-                    "file_path": result.file_path,
-                    "line_number": class_obs.line_number,
-                    "category": concept,
-                    "framework": class_obs.aibom_annotation.get("framework", "custom"),
-                    "detection_source": "inline_annotation",
-                }
-                label = class_obs.aibom_annotation.get("label")
-                if label:
-                    comp_details["name"] = label
-
-                if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
-                    workflows = workflow_index.get_workflow_context(
-                        comp_details["file_path"], comp_details["line_number"],
-                    )
-                    if workflows:
-                        comp_details["workflows"] = workflows
-
-                categorized_components[concept].append(comp_details)
-                comp_details["instance_id"] = _build_instance_id(comp_details)
-                _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
-                _register_component_target(
-                    component_lookup_by_var, result.file_path, comp_name, comp_details,
-                )
-
-        for func_obs in getattr(result, "function_annotations", []):
-            concept = func_obs.aibom_annotation.get("concept", "other")
-            comp_name = func_obs.function_name
-            comp_details = {
-                "name": comp_name,
-                "file_path": result.file_path,
-                "line_number": func_obs.line_number,
-                "category": concept,
-                "framework": func_obs.aibom_annotation.get("framework", "custom"),
-                "detection_source": "inline_annotation",
-            }
-            label = func_obs.aibom_annotation.get("label")
-            if label:
-                comp_details["name"] = label
-
-            if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
-                workflows = workflow_index.get_workflow_context(
-                    comp_details["file_path"], comp_details["line_number"],
-                )
-                if workflows:
-                    comp_details["workflows"] = workflows
-
-            categorized_components[concept].append(comp_details)
-            comp_details["instance_id"] = _build_instance_id(comp_details)
-            _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
-            _register_component_target(
-                component_lookup_by_var, result.file_path, comp_name, comp_details,
-            )
-
-    # ── Base class detection pass ───────────────────────────────────────
+    # ── Pass 3: Base class detection (lowest precedence) ─────────────────
     base_class_rules = custom_config.base_class_rules if custom_config else []
     if base_class_rules:
         for result in analysis_results:
             for class_obs in getattr(result, "class_defs", []):
                 if class_obs.aibom_annotation:
-                    continue  # already handled above
+                    continue  # already handled by inline pass
+
+                # Skip if already detected by inline or catalog pass
+                loc_key = (result.file_path, class_obs.line_number)
+                if loc_key in detected_locations:
+                    continue
+
                 for rule in base_class_rules:
                     matched = any(
                         base.endswith(rule.base_class) or base == rule.base_class
@@ -410,6 +440,8 @@ def categorize_symbols(
                     )
                     if matched:
                         comp_name = class_obs.class_name
+                        if _is_excluded(comp_name, exclude_patterns):
+                            continue
                         comp_details = {
                             "name": comp_name,
                             "file_path": result.file_path,
@@ -429,11 +461,35 @@ def categorize_symbols(
 
                         categorized_components[rule.concept].append(comp_details)
                         comp_details["instance_id"] = _build_instance_id(comp_details)
+                        detected_locations.add(loc_key)
                         _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
                         _register_component_target(
                             component_lookup_by_var, result.file_path, comp_name, comp_details,
                         )
                         break  # first matching rule wins
+
+    # ── Safety-net: final exclude sweep before relationship derivation ────
+    if exclude_patterns:
+        for category in list(categorized_components.keys()):
+            categorized_components[category] = [
+                c for c in categorized_components[category]
+                if not _is_excluded(c.get("name", ""), exclude_patterns)
+            ]
+
+    # ── Graph-wiring pass: augment agent metadata from add_node() calls ──
+    # LangGraph wires agents to tools/models via builder.add_node() rather
+    # than constructor kwargs.  Scan observations for these patterns and
+    # merge the variable references into the agent's metadata so that
+    # _derive_relationships can discover them.
+    _augment_agent_metadata_from_graph_wiring(
+        all_observations,
+        variable_map,
+        categorized_components,
+        component_metadata_by_instance,
+        component_lookup_by_var,
+        component_lookup_by_name,
+        analysis_results,
+    )
 
     relationships = _derive_relationships(
         categorized_components,
@@ -451,27 +507,441 @@ def categorize_symbols(
     return CategorizationOutput(components=dict(categorized_components), relationships=relationships)
 
 
-def _is_symbol_match(parser_name: str, db_symbol_name: str, imports: List[str]) -> bool:
+def _augment_agent_metadata_from_graph_wiring(
+    all_observations: List[Dict[str, Any]],
+    variable_map: Dict[str, str],
+    categorized_components: Dict[str, List[Dict[str, Any]]],
+    component_metadata_by_instance: Dict[str, Dict[str, Any]],
+    component_lookup_by_var: Dict[Tuple[str, str], Dict[str, Any]],
+    component_lookup_by_name: Dict[str, List[Dict[str, Any]]],
+    analysis_results: List["CodeAnalysisResult"],
+) -> None:
+    """Augment agent metadata with references found in ``add_node()`` calls.
+
+    LangGraph builds graphs via ``builder.add_node(name, action)`` where
+    *action* is a function or a component like ``ToolNode(tools)``.  The
+    standard relationship engine only inspects constructor kwargs, so it
+    misses these wiring patterns.
+
+    This function:
+    1. Scans observations for ``<agent_var>.add_node(...)`` calls.
+    2. Resolves direct variable references and nested calls (e.g. ``ToolNode(tools)``).
+    3. **Function-scope analysis**: when ``add_node`` references a function,
+       scans observations inside that function's scope for model/tool/memory usage.
+    4. **Cross-file import resolution**: when a variable can't be resolved locally,
+       traces imports to find components defined in other source files.
+    5. **Same-file inference**: links non-agent components detected in the same
+       file to the agent when no explicit wiring is found.
     """
-    Exact symbol matching using direct string comparison.
-    
-    Args:
-        parser_name: The parsed symbol name from code
-        db_symbol_name: The database symbol name
-        imports: List of import statements from the file (unused but kept for compatibility)
-        
+    # Build two reverse maps for agent components:
+    # 1. (file_path, variable_name) -> agent component (for local var lookup)
+    # 2. (file_path, qualified_name) -> agent component (for resolved name lookup)
+    agent_var_to_component: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    agent_name_to_component: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for category, components in categorized_components.items():
+        if not _category_matches(category, AGENT_CATEGORY_HINTS):
+            continue
+        for comp in components:
+            fp = comp.get("file_path", "")
+            target = comp.get("assigned_target")
+            if target and fp:
+                agent_var_to_component[(fp, target)] = comp
+            name = comp.get("name", "")
+            if name and fp:
+                agent_name_to_component[(fp, name)] = comp
+
+    if not agent_var_to_component and not agent_name_to_component:
+        return
+
+    import_map, components_by_file, func_scope_obs = _build_graph_wiring_indices(
+        analysis_results, categorized_components, all_observations,
+    )
+
+    # ── Main add_node scanning loop ─────────────────────────────────────
+
+    # Track which agents got explicit wiring (for same-file inference fallback)
+    agents_with_wiring: Set[str] = set()
+
+    for obs in all_observations:
+        parser_name = obs.get("parser_name", "")
+        if ".add_node" not in parser_name:
+            continue
+
+        file_path = obs.get("file_path", "")
+        # The base is everything before .add_node
+        base_name = parser_name.rsplit(".add_node", 1)[0]
+
+        # The parser_name has already been resolved through variable_map
+        # (e.g., "builder.add_node" → "langgraph.graph.StateGraph.add_node")
+        # So base_name is the resolved qualified name of the class.
+        # Match it against agent components by their detected name.
+        agent_comp = agent_name_to_component.get((file_path, base_name))
+
+        # Also try matching via assigned_target (local variable name)
+        if not agent_comp:
+            agent_comp = agent_var_to_component.get((file_path, base_name))
+
+        # Try suffix matching: base_name might be a full path like
+        # "langgraph.graph.StateGraph" and agent name could be just "StateGraph"
+        if not agent_comp:
+            for (fp, name), comp in agent_name_to_component.items():
+                if fp == file_path and (
+                    base_name.endswith(f".{name.rsplit('.', 1)[-1]}")
+                    or base_name == name
+                ):
+                    agent_comp = comp
+                    break
+
+        if not agent_comp:
+            continue
+
+        instance_id = agent_comp.get("instance_id")
+        if not instance_id:
+            continue
+
+        agents_with_wiring.add(instance_id)
+
+        # Extract all variable references from positional and keyword args,
+        # and detect nested calls to known components (e.g., ToolNode(tools)).
+        arguments = obs.get("arguments", {})
+        refs: Set[str] = set()
+        nested_call_names: Set[str] = set()
+        nested_call_inner_refs: Set[str] = set()
+        for key, value in arguments.items():
+            refs.update(_extract_variable_references(value))
+            # Collect nested call names (e.g., ToolNode from add_node("tools", ToolNode(tools)))
+            if isinstance(value, dict) and "_call" in value:
+                nested_call_names.add(value["_call"])
+                # Also collect inner args of nested calls (e.g., "tools" from ToolNode(tools))
+                for inner_arg in value.get("_args", []):
+                    if isinstance(inner_arg, str) and inner_arg.startswith("VARIABLE:"):
+                        nested_call_inner_refs.add(inner_arg.replace("VARIABLE:", ""))
+
+        # Merge into the agent's metadata arguments so _derive_relationships
+        # can discover these wiring connections.
+        metadata = component_metadata_by_instance.get(instance_id)
+        if not metadata:
+            metadata = {
+                "file_path": file_path,
+                "arguments": {},
+            }
+            component_metadata_by_instance[instance_id] = metadata
+
+        existing_args = metadata.get("arguments", {})
+
+        # First, check nested call names against detected components.
+        # If add_node contains ToolNode(...), look up ToolNode in detected components.
+        for call_name in nested_call_names:
+            for cat, comp_list in categorized_components.items():
+                for comp in comp_list:
+                    comp_name = comp.get("name", "")
+                    if comp_name.endswith(call_name) or comp_name == call_name:
+                        cat_lower = cat.lower()
+                        if "tool" in cat_lower:
+                            existing_args.setdefault("tools", []).append(f"VARIABLE:{call_name}")
+                        elif "model" in cat_lower:
+                            existing_args["llm"] = f"VARIABLE:{call_name}"
+                        elif "memory" in cat_lower:
+                            existing_args["memory"] = f"VARIABLE:{call_name}"
+                        break
+
+        # Resolve inner refs of nested calls via cross-file imports.
+        # e.g., ToolNode(TOOLS) where TOOLS is imported from another module.
+        for inner_ref in nested_call_inner_refs:
+            if component_lookup_by_var.get((file_path, inner_ref)):
+                continue  # already locally resolved
+            # Check imports
+            file_imps = import_map.get(file_path, {})
+            qualified = file_imps.get(inner_ref)
+            if qualified:
+                _resolve_cross_file_ref(
+                    inner_ref, qualified, components_by_file, analysis_results,
+                    categorized_components, existing_args,
+                )
+
+        # Check direct variable references
+        for ref in refs:
+            # Check if the ref is a detected component variable
+            target_comp = component_lookup_by_var.get((file_path, ref))
+            if target_comp:
+                _merge_component_ref_into_args(ref, target_comp, existing_args)
+                continue
+
+            # ── Function-scope analysis ─────────────────────────────────
+            # If ref is a function name, scan observations inside that function
+            # for component usage (models, tools, memory, etc.)
+            func_obs_in_file = func_scope_obs.get(file_path, {})
+            if ref in func_obs_in_file:
+                for inner_obs in func_obs_in_file[ref]:
+                    inner_name = inner_obs.get("parser_name", "")
+                    # Check if this inner observation matches a detected component
+                    matched_inner = False
+                    for cat, comp_list in categorized_components.items():
+                        for comp in comp_list:
+                            if comp.get("name") and (comp["name"] == inner_name or inner_name.endswith(comp["name"])):
+                                _merge_component_ref_into_args(
+                                    inner_obs.get("assigned_target", "").rsplit(".", 1)[-1] or inner_name,
+                                    comp, existing_args,
+                                )
+                                matched_inner = True
+                                break
+                        if matched_inner:
+                            break
+                    if matched_inner:
+                        continue
+                    # Transitive module-level inference: when the inner call
+                    # (e.g., utils.load_chat_model) doesn't match a component
+                    # directly, check if the called module contains components.
+                    # Try progressively shorter prefixes of the qualified name
+                    # to find the module file (e.g., "react_agent.utils.load_chat_model"
+                    # → try "react_agent.utils.load_chat_model", "react_agent.utils", "react_agent").
+                    if "." in inner_name:
+                        parts = inner_name.split(".")
+                        found_module = False
+                        for trim in range(1, len(parts)):
+                            module_part = ".".join(parts[:-trim])
+                            if not module_part:
+                                break
+                            for fp, file_comps in components_by_file.items():
+                                fp_norm = fp.replace("/", ".").replace("\\", ".")
+                                if fp_norm.endswith(".py"):
+                                    fp_norm = fp_norm[:-3]
+                                if fp_norm.endswith(module_part) or fp_norm.endswith("." + module_part):
+                                    for mod_comp in file_comps:
+                                        mod_cat = (mod_comp.get("category") or "").lower()
+                                        comp_ref = mod_comp.get("assigned_target") or mod_comp.get("name", "")
+                                        if not _category_matches(mod_cat, AGENT_CATEGORY_HINTS):
+                                            _merge_component_ref_into_args(comp_ref, mod_comp, existing_args)
+                                    found_module = True
+                                    break
+                            if found_module:
+                                break
+                continue
+
+            # ── Cross-file import resolution ────────────────────────────
+            # If the variable can't be resolved locally, trace through imports
+            file_imps = import_map.get(file_path, {})
+            qualified = file_imps.get(ref)
+            if qualified:
+                _resolve_cross_file_ref(
+                    ref, qualified, components_by_file, analysis_results,
+                    categorized_components, existing_args,
+                )
+                continue
+
+            # Fallback: check if the variable resolves to a known class
+            resolved = variable_map.get(ref, "")
+            if resolved:
+                for cat, comp_list in categorized_components.items():
+                    matched = False
+                    for comp in comp_list:
+                        if comp.get("name", "") == resolved or comp.get("name", "").endswith(f".{ref}"):
+                            _merge_component_ref_into_args(ref, comp, existing_args)
+                            matched = True
+                            break
+                    if matched:
+                        break
+
+        metadata["arguments"] = existing_args
+
+    _apply_same_file_inference(
+        agents_with_wiring, component_metadata_by_instance, components_by_file,
+    )
+
+
+def _build_graph_wiring_indices(
+    analysis_results: List["CodeAnalysisResult"],
+    categorized_components: Dict[str, List[Dict[str, Any]]],
+    all_observations: List[Dict[str, Any]],
+) -> tuple:
+    """Build helper indices used by the graph-wiring analysis.
+
     Returns:
-        True if the symbols match exactly
+        (import_map, components_by_file, func_scope_obs)
     """
-    logging.debug(f"EXACT MATCH DEBUG: Comparing parser='{parser_name}' vs db='{db_symbol_name}'")
-    
-    # Direct exact match (case-sensitive)
-    if parser_name == db_symbol_name:
-        logging.debug(f"EXACT MATCH DEBUG: ✓ PERFECT match")
-        return True
-    
-    logging.debug(f"EXACT MATCH DEBUG: ✗ NO EXACT MATCH found")
-    return False
+    # Build import map: { file_path: { local_name: qualified_module_path } }
+    import_map: Dict[str, Dict[str, str]] = {}
+    for result in analysis_results:
+        file_imports: Dict[str, str] = {}
+        for imp_str in result.imports:
+            if imp_str.startswith("from "):
+                parts = imp_str.split()
+                if len(parts) >= 4 and parts[2] == "import":
+                    module = parts[1]
+                    imported_names = " ".join(parts[3:]).split(",")
+                    for name_part in imported_names:
+                        name_part = name_part.strip()
+                        if " as " in name_part:
+                            original, alias = name_part.split(" as ", 1)
+                            file_imports[alias.strip()] = f"{module}.{original.strip()}"
+                        else:
+                            file_imports[name_part] = f"{module}.{name_part}"
+            elif imp_str.startswith("import "):
+                parts = imp_str.split()
+                if " as " in imp_str:
+                    idx = parts.index("as")
+                    full_module = " ".join(parts[1:idx])
+                    alias = parts[idx + 1]
+                    file_imports[alias] = full_module
+                else:
+                    full_module = parts[1]
+                    file_imports[full_module] = full_module
+        import_map[result.file_path] = file_imports
+
+    # Build per-file component index
+    components_by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for _cat, comp_list in categorized_components.items():
+        for comp in comp_list:
+            fp = comp.get("file_path", "")
+            if fp:
+                components_by_file.setdefault(fp, []).append(comp)
+
+    # Build per-file observation index for function-scope analysis
+    func_scope_obs: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for obs in all_observations:
+        target = obs.get("assigned_target") or ""
+        if ".<locals>." in target:
+            fp = obs.get("file_path", "")
+            func_name = target.split(".<locals>.", 1)[0]
+            if "." in func_name:
+                func_name = func_name.rsplit(".", 1)[-1]
+            func_scope_obs.setdefault(fp, {}).setdefault(func_name, []).append(obs)
+
+    return import_map, components_by_file, func_scope_obs
+
+
+def _apply_same_file_inference(
+    agents_with_wiring: Set[str],
+    component_metadata_by_instance: Dict[str, Dict[str, Any]],
+    components_by_file: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    """Fallback: infer relationships from same-file co-occurrence.
+
+    For agents that had ``add_node`` calls but no explicit model/tool/memory
+    wiring was discovered, scan for non-agent components detected in the same
+    file and create implicit relationships.
+    """
+    for instance_id in agents_with_wiring:
+        metadata = component_metadata_by_instance.get(instance_id)
+        if not metadata:
+            continue
+        existing_args = metadata.get("arguments", {})
+        if any(k in existing_args for k in ("llm", "model", "tools", "memory", "retriever", "embedding")):
+            continue
+
+        agent_file = metadata.get("file_path", "")
+        if not agent_file:
+            continue
+
+        for comp in components_by_file.get(agent_file, []):
+            cat = (comp.get("category") or "").lower()
+            comp_target = comp.get("assigned_target") or comp.get("name", "")
+            if _category_matches(cat, AGENT_CATEGORY_HINTS):
+                continue
+            if "model" in cat or "llm" in cat:
+                existing_args.setdefault("llm", f"VARIABLE:{comp_target}")
+            elif "tool" in cat:
+                existing_args.setdefault("tools", []).append(f"VARIABLE:{comp_target}")
+            elif "memory" in cat:
+                existing_args.setdefault("memory", f"VARIABLE:{comp_target}")
+            elif "retriever" in cat:
+                existing_args.setdefault("retriever", f"VARIABLE:{comp_target}")
+            elif "embedding" in cat:
+                existing_args.setdefault("embedding", f"VARIABLE:{comp_target}")
+
+        metadata["arguments"] = existing_args
+
+
+def _merge_component_ref_into_args(
+    ref: str,
+    comp: Dict[str, Any],
+    existing_args: Dict[str, Any],
+) -> None:
+    """Merge a component reference into the agent's metadata arguments dict."""
+    cat = (comp.get("category") or "").lower()
+    if "tool" in cat:
+        existing_args.setdefault("tools", []).append(f"VARIABLE:{ref}")
+    elif "model" in cat or "llm" in cat:
+        existing_args["llm"] = f"VARIABLE:{ref}"
+    elif "memory" in cat:
+        existing_args["memory"] = f"VARIABLE:{ref}"
+    elif "retriever" in cat:
+        existing_args["retriever"] = f"VARIABLE:{ref}"
+    elif "embedding" in cat:
+        existing_args["embedding"] = f"VARIABLE:{ref}"
+    else:
+        existing_args.setdefault("tools", []).append(f"VARIABLE:{ref}")
+
+
+def _resolve_cross_file_ref(
+    ref: str,
+    qualified_import: str,
+    components_by_file: Dict[str, List[Dict[str, Any]]],
+    analysis_results: List["CodeAnalysisResult"],
+    categorized_components: Dict[str, List[Dict[str, Any]]],
+    existing_args: Dict[str, Any],
+) -> None:
+    """Resolve a cross-file import reference to detected components.
+
+    When a variable like ``TOOLS`` is imported from another module (e.g.,
+    ``from react_agent.tools import TOOLS``), trace through analysis results
+    to find the source file and look for detected components there that
+    are assigned to that variable name.
+    """
+    # qualified_import is e.g. "react_agent.tools.TOOLS"
+    # The variable name in the source file is the last segment
+    remote_var = qualified_import.rsplit(".", 1)[-1] if "." in qualified_import else qualified_import
+    # The module path is everything before the last segment
+    module_path = qualified_import.rsplit(".", 1)[0] if "." in qualified_import else ""
+
+    # Find the source file by matching module paths in analysis_results
+    for result in analysis_results:
+        fp = result.file_path
+        # Convert file path to a module-like dotted name for matching
+        # e.g., "/path/to/react_agent/tools.py" → look for "react_agent.tools"
+        # Try matching the module_path as a suffix of the file path
+        fp_normalized = fp.replace("/", ".").replace("\\", ".")
+        if fp_normalized.endswith(".py"):
+            fp_normalized = fp_normalized[:-3]
+
+        if not fp_normalized.endswith(module_path) and not fp_normalized.endswith("." + module_path):
+            continue
+
+        # Found a candidate source file; look for components assigned to remote_var
+        for comp in components_by_file.get(fp, []):
+            comp_target = comp.get("assigned_target", "")
+            comp_name = comp.get("name", "")
+            # Check if this component was assigned to the imported variable name
+            if comp_target == remote_var or comp_target.endswith(f".{remote_var}"):
+                _merge_component_ref_into_args(ref, comp, existing_args)
+                return
+            # Also check by name suffix match
+            if comp_name.endswith(f".{remote_var}") or comp_name == remote_var:
+                _merge_component_ref_into_args(ref, comp, existing_args)
+                return
+
+    # If we can't find the source file directly, check if any detected component
+    # has a name that matches the qualified import path
+    for cat, comp_list in categorized_components.items():
+        for comp in comp_list:
+            comp_name = comp.get("name", "")
+            if comp_name == qualified_import or qualified_import.endswith(comp_name):
+                _merge_component_ref_into_args(ref, comp, existing_args)
+                return
+
+
+def _is_symbol_match(parser_name: str, db_symbol_name: str, imports: List[str]) -> bool:
+    """Exact symbol matching using direct string comparison.
+
+    Args:
+        parser_name: The parsed symbol name from code.
+        db_symbol_name: The database symbol name.
+        imports: List of import statements (unused, kept for API compatibility).
+
+    Returns:
+        True if the symbols match exactly.
+    """
+    return parser_name == db_symbol_name
 
 def _reconstruct_code_snippet(observation: Dict[str, Any]) -> str:
     """

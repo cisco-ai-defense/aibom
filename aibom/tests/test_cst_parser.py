@@ -53,9 +53,14 @@ class TestCstParser(unittest.TestCase):
         self.assertEqual(_extract_argument_value(cst.Integer('123')), 123)
         self.assertEqual(_extract_argument_value(cst.Name('True')), True)
         self.assertEqual(_extract_argument_value(cst.Name('my_var')), 'VARIABLE:my_var')
-        # A valid Call node requires a function
+        # Call nodes are now extracted with their function name and inner args
         dummy_call_node = cst.Call(func=cst.Name("dummy"))
-        self.assertEqual(_extract_argument_value(dummy_call_node), 'COMPLEX_TYPE:Call')
+        self.assertEqual(_extract_argument_value(dummy_call_node), {"_call": "dummy", "_args": []})
+        # Nested call with a variable argument
+        nested_call = cst.Call(func=cst.Name("ToolNode"), args=[cst.Arg(value=cst.Name("tools"))])
+        result = _extract_argument_value(nested_call)
+        self.assertEqual(result["_call"], "ToolNode")
+        self.assertEqual(result["_args"], ["VARIABLE:tools"])
 
     def test_syntax_error(self):
         code = "a = (\n"

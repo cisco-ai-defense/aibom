@@ -13,6 +13,20 @@
 # categories, and project-specific relationship types.
 #
 # All sections are optional -- include only what you need.
+#
+# ─── Detection Precedence ──────────────────────────────────────────────
+#
+# When the same symbol is detected by multiple sources, the highest-
+# priority source wins and the component appears only once:
+#
+#   1. Inline annotations  (# aibom: concept=...)   -- highest priority
+#   2. DuckDB catalog      (built-in knowledge base)
+#   3. Custom components   (this file, section 1)
+#   4. Base-class rules    (this file, section 2)   -- lowest priority
+#
+# Excludes (section 3) override ALL sources -- an excluded symbol will
+# never appear in the output, regardless of how it was detected.
+#
 # ============================================================================
 
 

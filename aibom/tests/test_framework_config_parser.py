@@ -2,17 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-from aibom.config_parser import parse_langgraph_json, parse_project_configs
+from aibom.framework_config_parser import parse_langgraph_json, parse_project_configs
 
 
 class TestLangGraphJsonParser(unittest.TestCase):
 
+    def setUp(self):
+        self._tmp_dirs: list[Path] = []
+
+    def tearDown(self):
+        for d in self._tmp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
     def _write_langgraph_json(self, data: dict) -> Path:
         tmp_dir = Path(tempfile.mkdtemp())
+        self._tmp_dirs.append(tmp_dir)
         config_path = tmp_dir / "langgraph.json"
         config_path.write_text(json.dumps(data), encoding="utf-8")
         return tmp_dir
@@ -56,10 +65,12 @@ class TestLangGraphJsonParser(unittest.TestCase):
 
     def test_returns_none_when_no_file(self):
         tmp_dir = Path(tempfile.mkdtemp())
+        self._tmp_dirs.append(tmp_dir)
         self.assertIsNone(parse_langgraph_json(tmp_dir))
 
     def test_returns_none_on_invalid_json(self):
         tmp_dir = Path(tempfile.mkdtemp())
+        self._tmp_dirs.append(tmp_dir)
         (tmp_dir / "langgraph.json").write_text("not json", encoding="utf-8")
         self.assertIsNone(parse_langgraph_json(tmp_dir))
 

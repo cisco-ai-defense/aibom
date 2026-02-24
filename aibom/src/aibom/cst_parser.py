@@ -91,8 +91,24 @@ def _extract_argument_value(node: cst.BaseExpression) -> Any:
     if isinstance(node, cst.Attribute):
         attr_name = _format_attribute_name(node)
         return f"ATTRIBUTE:{attr_name}"
-    
+
+    if isinstance(node, cst.Call):
+        # Extract the call target name and flatten inner variable references
+        # so that e.g. ToolNode(tools) → "CALL:ToolNode(VARIABLE:tools)"
+        func_name = None
+        if isinstance(node.func, cst.Name):
+            func_name = node.func.value
+        elif isinstance(node.func, cst.Attribute):
+            func_name = _format_attribute_name(node.func)
+        inner_parts = []
+        for arg in node.args:
+            inner_parts.append(_extract_argument_value(arg.value))
+        if func_name:
+            return {"_call": func_name, "_args": inner_parts}
+        return {"_call": "unknown", "_args": inner_parts}
+
     return f"COMPLEX_TYPE:{type(node).__name__}"
+
 
 class SymbolVisitor(cst.CSTVisitor):
     """A CST visitor that extracts assignments and calls, resolving qualified names."""
@@ -233,6 +249,23 @@ class SymbolVisitor(cst.CSTVisitor):
                     import_stmt = f"from {module_name} import {', '.join(imported_items)}"
                     self.result.imports.append(import_stmt)
 
+    @staticmethod
+    def _extract_all_arguments(args) -> Dict[str, Any]:
+        """Extract both keyword and positional arguments from a call.
+
+        Keyword arguments are stored under their name.  Positional arguments
+        are stored as ``_pos_0``, ``_pos_1``, etc.
+        """
+        result: Dict[str, Any] = {}
+        pos_idx = 0
+        for arg in args:
+            if arg.keyword:
+                result[arg.keyword.value] = _extract_argument_value(arg.value)
+            else:
+                result[f"_pos_{pos_idx}"] = _extract_argument_value(arg.value)
+                pos_idx += 1
+        return result
+
     def leave_Call(self, original_node: cst.Call) -> None:
         """Captures standalone calls that are not part of an assignment."""
         try:
@@ -248,10 +281,7 @@ class SymbolVisitor(cst.CSTVisitor):
         if not qualified_name:
             return
 
-        args = {}
-        for arg in original_node.args:
-            if arg.keyword:
-                args[arg.keyword.value] = _extract_argument_value(arg.value)
+        args = self._extract_all_arguments(original_node.args)
 
         call_obs = CallObservation(
             qualified_name=qualified_name,
@@ -358,11 +388,8 @@ class SymbolVisitor(cst.CSTVisitor):
         if not qualified_name:
             return
 
-        # Process arguments
-        args = {}
-        for arg in call_node.args:
-            if arg.keyword:
-                args[arg.keyword.value] = _extract_argument_value(arg.value)
+        # Process arguments (keyword + positional)
+        args = self._extract_all_arguments(call_node.args)
 
         call_obs = CallObservation(
             qualified_name=qualified_name,
@@ -407,10 +434,7 @@ class SymbolVisitor(cst.CSTVisitor):
         if not qualified_name:
             return
 
-        args = {}
-        for arg in call_node.args:
-            if arg.keyword:
-                args[arg.keyword.value] = _extract_argument_value(arg.value)
+        args = self._extract_all_arguments(call_node.args)
 
         call_obs = CallObservation(
             qualified_name=qualified_name,

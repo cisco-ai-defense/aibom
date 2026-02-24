@@ -2,7 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""DuckDB catalog access for the prebuilt knowledge base."""
+"""DuckDB catalog access for the prebuilt knowledge base.
+
+Precedence: DuckDB > custom.  Excluded IDs are filtered out.
+"""
 
 from __future__ import annotations
 
@@ -12,16 +15,20 @@ from typing import Any, Dict, List, Sequence
 
 import duckdb
 
-from .supplemental_catalog import SUPPLEMENTAL_ENTRIES
-
 LOGGER = logging.getLogger(__name__)
+
+
+def is_excluded(name: str, patterns: List[str]) -> bool:
+    """Return True if *name* suffix-matches or equals any pattern in *patterns*."""
+    for pattern in patterns:
+        if name.endswith(pattern) or name == pattern:
+            return True
+    return False
 
 
 class CatalogDB:
     """Provides read-only access to the DuckDB component catalog,
-    augmented with supplemental entries for frameworks not yet in the
-    prebuilt artifact (LangGraph, CrewAI, etc.) and user-defined custom
-    entries from ``.aibom.yaml``."""
+    augmented with user-defined custom entries from ``.aibom.yaml``."""
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = Path(db_path)
@@ -31,9 +38,6 @@ class CatalogDB:
             self._connection = duckdb.connect(str(self._db_path), read_only=True)
         except TypeError:
             self._connection = duckdb.connect(str(self._db_path))
-        self._supplemental_index: Dict[str, Dict[str, Any]] = {
-            entry["id"]: entry for entry in SUPPLEMENTAL_ENTRIES
-        }
         self._custom_index: Dict[str, Dict[str, Any]] = {}
         self._excludes: List[str] = []
 
@@ -45,17 +49,17 @@ class CatalogDB:
     def add_custom_entries(self, entries: List[Dict[str, Any]]) -> None:
         """Merge user-provided custom catalog entries.
 
-        Custom entries have the lowest precedence: DuckDB > supplemental > custom.
-        An entry is only added if its ``id`` is not already present in
-        the supplemental catalog.
+        All entries are stored in the custom index.  Precedence is enforced
+        at query time in ``find_components_by_suffixes``: DuckDB results are
+        returned first and custom entries are only included when their ID has
+        not already been seen in the DuckDB results.
         """
         for entry in entries:
             entry_id = entry.get("id")
             if not entry_id:
                 continue
-            if entry_id not in self._supplemental_index:
-                self._custom_index[entry_id] = entry
-                LOGGER.debug("Added custom catalog entry: %s", entry_id)
+            self._custom_index[entry_id] = entry
+            LOGGER.debug("Added custom catalog entry: %s", entry_id)
 
     def add_excludes(self, patterns: List[str]) -> None:
         """Register exclude patterns.  Entries whose IDs suffix-match any
@@ -64,17 +68,13 @@ class CatalogDB:
 
     def _is_excluded(self, entry_id: str) -> bool:
         """Check if *entry_id* matches any exclude pattern (suffix match)."""
-        for pattern in self._excludes:
-            if entry_id.endswith(pattern) or entry_id == pattern:
-                return True
-        return False
+        return is_excluded(entry_id, self._excludes)
 
     def find_components_by_suffixes(self, suffixes: Sequence[str]) -> List[Dict[str, Any]]:
         """Return catalog entries whose IDs end with any of the provided suffixes.
 
-        Results are drawn from the DuckDB catalog, the in-memory
-        supplemental catalog, and user custom entries.  Precedence:
-        DuckDB > supplemental > custom.  Excluded IDs are filtered out.
+        Results are drawn from the DuckDB catalog and user custom entries.
+        Precedence: DuckDB > custom.  Excluded IDs are filtered out.
         """
         if not suffixes:
             return []
@@ -93,14 +93,7 @@ class CatalogDB:
 
         seen_ids = {row["id"] for row in db_results}
 
-        # Add supplemental entries (lower precedence than DuckDB)
-        for suffix in suffixes:
-            for entry_id, entry in self._supplemental_index.items():
-                if entry_id.endswith(suffix) and entry_id not in seen_ids:
-                    db_results.append(entry)
-                    seen_ids.add(entry_id)
-
-        # Add custom entries (lowest precedence)
+        # Add custom entries (lower precedence than DuckDB)
         for suffix in suffixes:
             for entry_id, entry in self._custom_index.items():
                 if entry_id.endswith(suffix) and entry_id not in seen_ids:

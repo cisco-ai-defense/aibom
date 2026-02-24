@@ -500,5 +500,268 @@ class TestCategorizer(unittest.TestCase):
         self.assertIn("bool_arg=True", result)
 
 
+class TestPrecedenceAndExcludes(unittest.TestCase):
+    """Tests for inline-annotation precedence, excludes, and deduplication (Phase 7)."""
+
+    def setUp(self):
+        self.mock_connector = MagicMock()
+
+    def test_inline_annotation_overrides_catalog_concept(self):
+        """DuckDB says concept='model', inline says concept='tool' -> appears once as 'tool'."""
+        from aibom.structures import ClassDefObservation
+        from aibom.custom_catalog import CustomCatalogConfig
+
+        # The DuckDB catalog would match this symbol as 'model'
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "mylib.MyClass", "concept": "model", "label": "MyClass"}
+        ]
+
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/inline.py",
+                # An assignment that would match the catalog entry
+                assignments=[
+                    AssignmentObservation(
+                        target_qualified_name="obj",
+                        call=CallObservation(
+                            qualified_name="mylib.MyClass",
+                            arguments={},
+                            line_number=10,
+                        ),
+                        line_number=10,
+                    )
+                ],
+                # The same class at line 10 also has an inline annotation saying concept=tool
+                class_defs=[
+                    ClassDefObservation(
+                        class_name="MyClass",
+                        line_number=10,
+                        aibom_annotation={"concept": "tool", "framework": "custom"},
+                    )
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        result = categorize_symbols(analysis_results, self.mock_connector)
+
+        # The inline annotation should win: appears in 'tool', NOT in 'model'
+        tool_names = [c["name"] for c in result.components.get("tool", [])]
+        model_at_line_10 = [
+            c for c in result.components.get("model", [])
+            if c.get("line_number") == 10
+        ]
+        self.assertIn("MyClass", tool_names)
+        self.assertEqual(len(model_at_line_10), 0)
+
+    def test_excludes_filter_inline_annotations(self):
+        """Symbol excluded in config, detected via # aibom: -> does NOT appear."""
+        from aibom.structures import ClassDefObservation
+        from aibom.custom_catalog import CustomCatalogConfig
+
+        self.mock_connector.find_components_by_suffixes.return_value = []
+
+        config = CustomCatalogConfig(excludes=["MyAgent"])
+
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/excluded.py",
+                class_defs=[
+                    ClassDefObservation(
+                        class_name="MyAgent",
+                        line_number=5,
+                        aibom_annotation={"concept": "agent", "framework": "custom"},
+                    )
+                ],
+                imports=[],
+            )
+        ]
+
+        result = categorize_symbols(
+            analysis_results, self.mock_connector, custom_config=config
+        )
+
+        # MyAgent should be excluded
+        agent_names = [c["name"] for c in result.components.get("agent", [])]
+        self.assertNotIn("MyAgent", agent_names)
+
+    def test_excludes_filter_base_class_detections(self):
+        """Symbol excluded in config, detected via base-class rule -> does NOT appear."""
+        from aibom.structures import ClassDefObservation
+        from aibom.custom_catalog import CustomCatalogConfig, BaseClassRule
+
+        self.mock_connector.find_components_by_suffixes.return_value = []
+
+        config = CustomCatalogConfig(
+            base_class_rules=[BaseClassRule(base_class="BaseTool", concept="tool")],
+            excludes=["InternalTool"],
+        )
+
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/base.py",
+                class_defs=[
+                    ClassDefObservation(
+                        class_name="InternalTool",
+                        base_classes=["BaseTool"],
+                        line_number=20,
+                    )
+                ],
+                imports=[],
+            )
+        ]
+
+        result = categorize_symbols(
+            analysis_results, self.mock_connector, custom_config=config
+        )
+
+        tool_names = [c["name"] for c in result.components.get("tool", [])]
+        self.assertNotIn("InternalTool", tool_names)
+
+    def test_no_duplicates_across_detection_paths(self):
+        """Same symbol at same line detected by catalog AND inline -> appears once."""
+        from aibom.structures import ClassDefObservation, FunctionAnnotationObservation
+
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "mylib.MyTool", "concept": "tool", "label": "MyTool"}
+        ]
+
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/dedup.py",
+                assignments=[
+                    AssignmentObservation(
+                        target_qualified_name="t",
+                        call=CallObservation(
+                            qualified_name="mylib.MyTool",
+                            arguments={},
+                            line_number=5,
+                        ),
+                        line_number=5,
+                    )
+                ],
+                function_annotations=[
+                    FunctionAnnotationObservation(
+                        function_name="MyTool",
+                        line_number=5,
+                        aibom_annotation={"concept": "tool"},
+                    )
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        result = categorize_symbols(analysis_results, self.mock_connector)
+
+        # Should appear exactly once across all categories
+        all_at_line_5 = []
+        for category, components in result.components.items():
+            for c in components:
+                if c.get("line_number") == 5 and c.get("file_path") == "/test/dedup.py":
+                    all_at_line_5.append(c)
+        self.assertEqual(len(all_at_line_5), 1)
+
+    def test_base_class_skipped_when_catalog_detected(self):
+        """Symbol detected by DuckDB at same location as base-class rule -> appears once with DuckDB data."""
+        from aibom.structures import ClassDefObservation
+        from aibom.custom_catalog import CustomCatalogConfig, BaseClassRule
+
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "mylib.Agent", "concept": "agent", "label": "Agent"}
+        ]
+
+        config = CustomCatalogConfig(
+            base_class_rules=[BaseClassRule(base_class="BaseAgent", concept="agent")],
+        )
+
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/overlap.py",
+                assignments=[
+                    AssignmentObservation(
+                        target_qualified_name="a",
+                        call=CallObservation(
+                            qualified_name="mylib.Agent",
+                            arguments={},
+                            line_number=10,
+                        ),
+                        line_number=10,
+                    )
+                ],
+                class_defs=[
+                    ClassDefObservation(
+                        class_name="Agent",
+                        base_classes=["BaseAgent"],
+                        line_number=10,
+                    )
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        result = categorize_symbols(
+            analysis_results, self.mock_connector, custom_config=config
+        )
+
+        agents = result.components.get("agent", [])
+        agents_at_10 = [c for c in agents if c.get("line_number") == 10]
+        self.assertEqual(len(agents_at_10), 1)
+        # Should be the catalog-detected version (name = full qualified id)
+        self.assertEqual(agents_at_10[0]["name"], "mylib.Agent")
+
+    def test_multiple_suffix_match_deterministic(self):
+        """When multiple custom entries match via suffix, results are deterministic."""
+        self.mock_connector.find_components_by_suffixes.return_value = [
+            {"id": "pkg1.Agent", "concept": "agent", "label": "Agent"},
+            {"id": "pkg2.Agent", "concept": "agent", "label": "Agent"},
+        ]
+
+        analysis_results = [
+            CodeAnalysisResult(
+                file_path="/test/multi.py",
+                assignments=[
+                    AssignmentObservation(
+                        target_qualified_name="a1",
+                        call=CallObservation(
+                            qualified_name="pkg1.Agent",
+                            arguments={},
+                            line_number=5,
+                        ),
+                        line_number=5,
+                    ),
+                    AssignmentObservation(
+                        target_qualified_name="a2",
+                        call=CallObservation(
+                            qualified_name="pkg2.Agent",
+                            arguments={},
+                            line_number=10,
+                        ),
+                        line_number=10,
+                    ),
+                ],
+                decorators=[],
+                imports=[],
+            )
+        ]
+
+        result = categorize_symbols(analysis_results, self.mock_connector)
+
+        # Both should appear as distinct agents
+        agents = result.components.get("agent", [])
+        self.assertEqual(len(agents), 2)
+
+        # Run again to verify determinism
+        result2 = categorize_symbols(analysis_results, self.mock_connector)
+        agents2 = result2.components.get("agent", [])
+        self.assertEqual(len(agents2), 2)
+        self.assertEqual(
+            [a["name"] for a in agents],
+            [a["name"] for a in agents2],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

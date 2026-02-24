@@ -38,7 +38,7 @@ from rich.tree import Tree
 from .report_sender import post_report_with_retries
 from .utils.version import resolve_package_version
 from .categorizer import categorize_symbols
-from .config_parser import parse_project_configs
+from .framework_config_parser import parse_project_configs
 from .container_utils import extract_app_from_docker, is_docker_image
 from .cst_parser import parse_source_code
 from .catalog_db import CatalogDB
