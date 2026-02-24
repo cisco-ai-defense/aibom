@@ -11,20 +11,20 @@
 | **Parser (LibCST)** | Extracts assignments, decorators, standalone calls, type annotations, context managers, imports, class definitions (with base classes), `# aibom:` inline annotations, and raw code snippets. |
 | **Custom Catalog** | Loads `.aibom.yaml`/`.yml`/`.json` user configuration: custom component entries, base-class rules, exclude patterns, extended relationship hints, and custom relationship types. |
 | **Workflow Index (AST)** | Builds a best-effort call graph with function boundaries and callsite metadata for workflow context. |
-| **Categorizer + Relationships** | Matches parsed symbols to catalog entries (DuckDB + supplemental + custom), processes inline annotations and base-class rules, assigns categories, optionally enriches model/tool details via LLM, and derives built-in and user-defined relationship links. |
-| **Reporting + UI** | Emits plaintext or JSON reports, or starts the FastAPI UI server; optional POST of JSON with retries. |
+| **Categorizer + Relationships** | Matches parsed symbols to catalog entries (DuckDB + custom), processes inline annotations and base-class rules, assigns categories, optionally enriches model/tool details via LLM, and derives built-in and user-defined relationship links. |
+| **Reporting + API** | Emits plaintext or JSON reports, or starts the FastAPI API server; optional POST of JSON with retries. |
 
 ## 2. Execution Flow
 
 1. **Startup** - Load `.env` (from `AIBOM_ENV_FILE` or local defaults), parse CLI args, validate output/LLM options, and apply manifest config for DuckDB path/checksum defaults.  
 2. **Knowledge Base** - Call `ensure_local_database()` to resolve and verify the local DuckDB catalog with SHA-256 validation.  
-3. **Custom Catalog** - Load `.aibom.yaml`/`.yml`/`.json` (from `--custom-catalog` or auto-discovered in the source directory). Merge custom component entries into the catalog, register exclude patterns, and pass base-class rules, relationship hints, and custom relationship types to the categorizer.  
-4. **Source Acquisition** - For each source: detect Docker vs local path, extract `/app` or `site-packages` for images, and list `.py` files.  
-5. **Parsing** - Run the LibCST visitor per file to collect assignments, decorators, type annotations, context managers, imports, class definitions (with base classes), and `# aibom:` inline annotations; parse errors are logged as warnings.  
-6. **Workflow Index** - Build an AST-based call graph for the source files to provide workflow context (distance, callsite, arguments).  
-7. **Categorization** - Query the catalog by suffix (DuckDB + supplemental + custom entries, minus excludes), keep exact symbol matches, assign categories, process inline annotations and base-class rules, attach workflow context, and derive built-in and user-defined relationships. Optional LLM enrichment can add tool descriptions and model names.  
-8. **Reporting** - Convert container temp paths to container-style paths, build per-source summaries and run metadata, and emit plaintext or JSON reports.  
-9. **Publishing / UI** - Optionally POST the JSON report with retries, or start the in-memory UI API server (`--output-format ui`).  
+3. **Custom Catalog** - Load `.aibom.yaml`/`.yml`/`.json` (from `--custom-catalog` or auto-discovered in the source directory). Merge custom component entries into the catalog, register exclude patterns, and pass base-class rules, relationship hints, and custom relationship types to the categorizer.
+4. **Source Acquisition** - For each source: detect Docker vs local path, extract `/app` or `site-packages` for images, and list `.py` files.
+5. **Parsing** - Run the LibCST visitor per file to collect assignments, decorators, type annotations, context managers, imports, class definitions (with base classes), and `# aibom:` inline annotations; parse errors are logged as warnings.
+6. **Workflow Index** - Build an AST-based call graph for the source files to provide workflow context (distance, callsite, arguments).
+7. **Categorization** - Query the catalog by suffix (DuckDB + custom entries, minus excludes), keep exact symbol matches, assign categories, process inline annotations and base-class rules, attach workflow context, and derive built-in and user-defined relationships. Optional LLM enrichment can add tool descriptions and model names.
+8. **Reporting** - Convert container temp paths to container-style paths, build per-source summaries and run metadata, and emit plaintext or JSON reports.
+9. **Publishing / API** - Optionally POST the JSON report with retries, or start the in-memory API server (`--output-format api`).
 10. **Console Summary** - Render Rich summaries and workflow examples when `--show-summary` is enabled.
 
 ## 3. Key Modules
@@ -39,7 +39,7 @@
 | `src/aibom/catalog_db.py` | DuckDB access layer for catalog lookup; supports custom entry merging and exclude filtering. |
 | `src/aibom/db_loader.py` | Manifest/env path resolution and SHA verification of the local catalog. |
 | `src/aibom/report_sender.py` | POSTs JSON report payloads with retry/backoff. |
-| `src/aibom/ui_handler.py` | Converts results to a DataFrame and starts the FastAPI UI server. |
+| `src/aibom/api_handler.py` | Converts results to a DataFrame and starts the FastAPI API server. |
 | `src/aibom/api/server.py` | FastAPI endpoints for component browsing and health checks. |
 | `tests/…` | Coverage for parsing, categorization, workflow indexing, custom catalog loading, and report generation. |
 
@@ -69,5 +69,5 @@
 | --- | --- |
 | Plaintext | Report file listing detected components and their workflow context. |
 | JSON | `aibom_analysis` with metadata, per-source components, workflow summaries, relationships, and errors. |
-| UI | FastAPI server that serves component data for the React UI (`/api/components`, `/health`). |
+| API | FastAPI server that serves component data (`/api/components`, `/health`). |
 | Report Command | `cisco-aibom report` renders JSON summaries and optionally the raw JSON. |
