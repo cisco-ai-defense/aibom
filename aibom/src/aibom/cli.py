@@ -770,88 +770,41 @@ def analyze(
         "output_format": output_format,
         "sources_requested": len(sources_to_process),
     }
-    connector: Optional[CatalogDB] = None
     db_path: Optional[Path] = None
     try:
         db_path = ensure_local_database(console=console)
-        connector = CatalogDB(db_path)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Knowledge base error:[/] {exc}")
         raise typer.Exit(code=1)
 
-    # Load custom catalog (explicit path or auto-discover)
-    custom_config: Optional[CustomCatalogConfig] = None
+    # Load explicit custom catalog (global override for all sources).
+    # Per-source auto-discovery is handled inside the source loop below.
+    explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
-        custom_config = load_custom_catalog(Path(custom_catalog))
-    else:
-        for source in sources_to_process:
-            source_path = Path(source)
-            search_root = source_path if source_path.is_dir() else source_path.parent
-            discovered = discover_custom_catalog(search_root)
-            if discovered:
-                custom_config = load_custom_catalog(discovered)
-                break
+        explicit_config = load_custom_catalog(Path(custom_catalog))
 
-    if custom_config and not custom_config.is_empty:
-        connector.add_custom_entries(
-            [comp.to_catalog_dict() for comp in custom_config.components]
-        )
-        if custom_config.excludes:
-            connector.add_excludes(custom_config.excludes)
-        n_comp = len(custom_config.components)
-        n_base = len(custom_config.base_class_rules)
-        n_excl = len(custom_config.excludes)
-        n_rel = len(custom_config.custom_relationships)
-        console.print(
-            f"[dim]Custom catalog: {n_comp} component(s), {n_base} base-class rule(s), "
-            f"{n_excl} exclude(s), {n_rel} custom relationship(s)[/]"
-        )
+    for source in sources_to_process:
+        console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
+        temp_dir = None
+        is_container = is_docker_image(source)
+        path_to_analyze = Path(source)
+        source_summary = {
+            "source_kind": "container" if is_container else "local-path",
+            "status": "in_progress",
+            "status_detail": None,
+            "assets_discovered": 0,
+            "branches_scanned": None,
+            "last_generated_at": None,
+            "errors": [],
+        }
+        source_outcomes[source] = source_summary
 
-    try:
-        for source in sources_to_process:
-            console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
-            temp_dir = None
-            is_container = is_docker_image(source)
-            path_to_analyze = Path(source)
-            source_summary = {
-                "source_kind": "container" if is_container else "local-path",
-                "status": "in_progress",
-                "status_detail": None,
-                "assets_discovered": 0,
-                "branches_scanned": None,
-                "last_generated_at": None,
-                "errors": [],
-            }
-            source_outcomes[source] = source_summary
-
-            if is_container:
-                logging.info(f"Source '{source}' detected as a container image.")
-                temp_dir = tempfile.mkdtemp(prefix="aibom_")
-                extract_info = extract_app_from_docker(source, temp_dir)
-                if "error" in extract_info:
-                    message = f"Error extracting from Docker image: {extract_info['error']}"
-                    logging.error(message)
-                    _record_analysis_error(
-                        run_errors,
-                        source_summary,
-                        source,
-                        message,
-                        severity="fatal",
-                    )
-                    if temp_dir:
-                        shutil.rmtree(temp_dir)
-                    continue
-                path_to_analyze = Path(extract_info.get("extracted_to", temp_dir))
-
-            if is_container:
-                source_summary["source_path"] = "/app" if path_to_analyze.name == "app" else str(path_to_analyze)
-                source_summary["source_name"] = str(source)
-            else:
-                source_summary["source_path"] = str(path_to_analyze.resolve())
-                source_summary["source_name"] = Path(source).name or str(source)
-
-            if not path_to_analyze.exists():
-                message = f"Path or image '{source}' not found or could not be processed."
+        if is_container:
+            logging.info(f"Source '{source}' detected as a container image.")
+            temp_dir = tempfile.mkdtemp(prefix="aibom_")
+            extract_info = extract_app_from_docker(source, temp_dir)
+            if "error" in extract_info:
+                message = f"Error extracting from Docker image: {extract_info['error']}"
                 logging.error(message)
                 _record_analysis_error(
                     run_errors,
@@ -863,86 +816,130 @@ def analyze(
                 if temp_dir:
                     shutil.rmtree(temp_dir)
                 continue
+            path_to_analyze = Path(extract_info.get("extracted_to", temp_dir))
 
-            python_files = _find_python_files(path_to_analyze)
-            if not python_files:
-                logging.warning("No Python files found to analyze in this source.")
-                source_summary["status"] = "skipped"
-                source_summary["status_detail"] = "no_python_files"
-                if temp_dir:
-                    shutil.rmtree(temp_dir)
-                continue
+        if is_container:
+            source_summary["source_path"] = "/app" if path_to_analyze.name == "app" else str(path_to_analyze)
+            source_summary["source_name"] = str(source)
+        else:
+            source_summary["source_path"] = str(path_to_analyze.resolve())
+            source_summary["source_name"] = Path(source).name or str(source)
 
-            py_count = sum(1 for f in python_files if f.suffix == ".py")
-            nb_count = sum(1 for f in python_files if f.suffix == ".ipynb")
-            logging.info(f"Found {py_count} Python file(s) and {nb_count} notebook(s) to analyze...")
+        if not path_to_analyze.exists():
+            message = f"Path or image '{source}' not found or could not be processed."
+            logging.error(message)
+            _record_analysis_error(
+                run_errors,
+                source_summary,
+                source,
+                message,
+                severity="fatal",
+            )
+            if temp_dir:
+                shutil.rmtree(temp_dir)
+            continue
 
-            analysis_results: List[CodeAnalysisResult] = []
+        python_files = _find_python_files(path_to_analyze)
+        if not python_files:
+            logging.warning("No Python files found to analyze in this source.")
+            source_summary["status"] = "skipped"
+            source_summary["status_detail"] = "no_python_files"
+            if temp_dir:
+                shutil.rmtree(temp_dir)
+            continue
 
-            config_results = parse_project_configs(path_to_analyze)
-            analysis_results.extend(config_results)
+        py_count = sum(1 for f in python_files if f.suffix == ".py")
+        nb_count = sum(1 for f in python_files if f.suffix == ".ipynb")
+        logging.info(f"Found {py_count} Python file(s) and {nb_count} notebook(s) to analyze...")
 
-            with Progress(
-                SpinnerColumn(),
-                "[progress.description]{task.description}",
-                TimeElapsedColumn(),
-                transient=True,
-            ) as progress:
-                task_id = progress.add_task(f"[cyan]Parsing {source}", total=len(python_files))
-                for py_file in python_files:
-                    try:
-                        if py_file.suffix == ".ipynb":
-                            source_code = extract_code_from_notebook(py_file)
-                            if not source_code.strip():
-                                continue
-                        else:
-                            with open(py_file, "r", encoding="utf-8") as f:
-                                source_code = f.read()
-                        result = parse_source_code(str(py_file), source_code)
-                        analysis_results.append(result)
-                    except Exception as e:
-                        logging.warning(f"Could not parse {py_file}. Error: {e}")
-                        _record_analysis_error(
-                            run_errors,
-                            source_summary,
-                            source,
-                            f"Could not parse {py_file}: {e}",
-                            file_path=str(py_file),
-                        )
-                    finally:
-                        progress.advance(task_id)
+        analysis_results: List[CodeAnalysisResult] = []
 
-            workflow_index = None
-            try:
-                with console.status(f"[green]Building workflow index for {source}"):
-                    workflow_index = build_workflow_index(python_files)
-            except Exception as workflow_error:
-                logging.debug(f"Failed to build workflow index: {workflow_error}")
+        config_root = path_to_analyze if path_to_analyze.is_dir() else path_to_analyze.parent
+        config_results = parse_project_configs(config_root)
+        analysis_results.extend(config_results)
+
+        with Progress(
+            SpinnerColumn(),
+            "[progress.description]{task.description}",
+            TimeElapsedColumn(),
+            transient=True,
+        ) as progress:
+            task_id = progress.add_task(f"[cyan]Parsing {source}", total=len(python_files))
+            for py_file in python_files:
+                try:
+                    if py_file.suffix == ".ipynb":
+                        source_code = extract_code_from_notebook(py_file)
+                        if not source_code.strip():
+                            continue
+                    else:
+                        with open(py_file, "r", encoding="utf-8") as f:
+                            source_code = f.read()
+                    result = parse_source_code(str(py_file), source_code)
+                    analysis_results.append(result)
+                except Exception as e:
+                    logging.warning(f"Could not parse {py_file}. Error: {e}")
+                    _record_analysis_error(
+                        run_errors,
+                        source_summary,
+                        source,
+                        f"Could not parse {py_file}: {e}",
+                        file_path=str(py_file),
+                    )
+                finally:
+                    progress.advance(task_id)
+
+        workflow_index = None
+        try:
+            with console.status(f"[green]Building workflow index for {source}"):
+                workflow_index = build_workflow_index(python_files)
+        except Exception as workflow_error:
+            logging.debug(f"Failed to build workflow index: {workflow_error}")
+
+        # Resolve custom catalog for this source: explicit flag is a
+        # global override; otherwise auto-discover per source directory.
+        config_root = path_to_analyze if path_to_analyze.is_dir() else path_to_analyze.parent
+        source_custom: Optional[CustomCatalogConfig] = explicit_config
+        if source_custom is None:
+            discovered = discover_custom_catalog(config_root)
+            source_custom = load_custom_catalog(discovered) if discovered else None
+
+        with CatalogDB(db_path) as connector:
+            if source_custom and not source_custom.is_empty:
+                connector.add_custom_entries(
+                    [comp.to_catalog_dict() for comp in source_custom.components]
+                )
+                if source_custom.excludes:
+                    connector.add_excludes(source_custom.excludes)
+                n_comp = len(source_custom.components)
+                n_base = len(source_custom.base_class_rules)
+                n_excl = len(source_custom.excludes)
+                n_rel = len(source_custom.custom_relationships)
+                console.print(
+                    f"[dim]Custom catalog: {n_comp} component(s), {n_base} base-class rule(s), "
+                    f"{n_excl} exclude(s), {n_rel} custom relationship(s)[/]"
+                )
 
             analysis_output = categorize_symbols(
                 analysis_results,
                 connector,
                 llm_config,
                 workflow_index,
-                custom_config=custom_config,
+                custom_config=source_custom,
             )
 
-            if is_container and temp_dir:
-                analysis_output = _convert_paths_in_output(analysis_output, temp_dir)
+        if is_container and temp_dir:
+            analysis_output = _convert_paths_in_output(analysis_output, temp_dir)
 
-            all_analysis_outputs[source] = analysis_output
-            categorized_components = getattr(analysis_output, "components", analysis_output)
-            total_components = sum(len(items or []) for items in categorized_components.values())
-            source_summary["assets_discovered"] = total_components
-            source_summary["last_generated_at"] = _utcnow_iso()
-            if source_summary["status"] == "in_progress":
-                source_summary["status"] = "completed"
+        all_analysis_outputs[source] = analysis_output
+        categorized_components = getattr(analysis_output, "components", analysis_output)
+        total_components = sum(len(items or []) for items in categorized_components.values())
+        source_summary["assets_discovered"] = total_components
+        source_summary["last_generated_at"] = _utcnow_iso()
+        if source_summary["status"] == "in_progress":
+            source_summary["status"] = "completed"
 
-            if temp_dir:
-                shutil.rmtree(temp_dir)
-    finally:
-        if connector:
-            connector.close()
+        if temp_dir:
+            shutil.rmtree(temp_dir)
 
     run_metadata["completed_at"] = _utcnow_iso()
     run_metadata["error_count"] = len(run_errors)

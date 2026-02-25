@@ -191,12 +191,12 @@ class SymbolVisitor(cst.CSTVisitor):
     def _extract_aibom_annotation(self, node: cst.CSTNode) -> Optional[Dict[str, str]]:
         """Extract an ``# aibom: ...`` annotation from leading lines or trailing comment.
 
-        Checks two places:
-        1. Leading comment lines immediately above the statement.
-        2. A trailing inline comment on the same line.
+        Checks:
+        1. A trailing inline comment on the definition line itself.
+        2. Comment lines above the definition, scanning upward past blank lines
+           and decorator lines (``@...``) so that annotations above decorators
+           are captured.
         """
-        # Check leading lines (for ClassDef / FunctionDef these are in .leading_lines
-        # or attached to decorators).  We use the source code directly for reliability.
         try:
             position = self.get_metadata(cst.metadata.PositionProvider, node)
             if self.source_code and position:
@@ -209,12 +209,20 @@ class SymbolVisitor(cst.CSTVisitor):
                     if annotation:
                         return annotation
 
-                # Check the line immediately above for a leading comment
-                prev_idx = start_line_idx - 1
-                if 0 <= prev_idx < len(lines):
-                    annotation = parse_inline_annotation(lines[prev_idx])
+                # Scan upward past blank lines and decorator lines
+                idx = start_line_idx - 1
+                while 0 <= idx < len(lines):
+                    line = lines[idx].strip()
+                    if not line:
+                        idx -= 1
+                        continue
+                    annotation = parse_inline_annotation(lines[idx])
                     if annotation:
                         return annotation
+                    if line.startswith("@"):
+                        idx -= 1
+                        continue
+                    break
         except (KeyError, IndexError, AttributeError):
             pass
 

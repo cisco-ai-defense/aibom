@@ -69,5 +69,77 @@ class TestCstParser(unittest.TestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(len(result.decorators), 0)
 
+    def test_aibom_annotation_trailing_comment(self):
+        code = (
+            "def my_tool():  # aibom: concept=tool\n"
+            "    pass\n"
+        )
+        result = parse_source_code('test.py', code)
+        self.assertEqual(len(result.function_annotations), 1)
+        ann = result.function_annotations[0]
+        self.assertEqual(ann.function_name, 'my_tool')
+        self.assertEqual(ann.aibom_annotation['concept'], 'tool')
+
+    def test_aibom_annotation_immediate_previous_line(self):
+        code = (
+            "# aibom: concept=model\n"
+            "class MyModel:\n"
+            "    pass\n"
+        )
+        result = parse_source_code('test.py', code)
+        self.assertEqual(len(result.class_defs), 1)
+        cls = result.class_defs[0]
+        self.assertEqual(cls.class_name, 'MyModel')
+        self.assertIsNotNone(cls.aibom_annotation)
+        self.assertEqual(cls.aibom_annotation['concept'], 'model')
+
+    def test_aibom_annotation_above_decorator_function(self):
+        code = (
+            "from my_decorators import tool\n"
+            "\n"
+            "# aibom: concept=tool\n"
+            "@tool\n"
+            "def my_function():\n"
+            "    pass\n"
+        )
+        result = parse_source_code('test.py', code)
+        self.assertEqual(len(result.function_annotations), 1)
+        ann = result.function_annotations[0]
+        self.assertEqual(ann.function_name, 'my_function')
+        self.assertEqual(ann.aibom_annotation['concept'], 'tool')
+
+    def test_aibom_annotation_above_multiple_decorators(self):
+        code = (
+            "from my_decorators import tool, validate\n"
+            "\n"
+            "# aibom: concept=agent framework=langchain\n"
+            "@validate\n"
+            "@tool\n"
+            "def my_agent():\n"
+            "    pass\n"
+        )
+        result = parse_source_code('test.py', code)
+        self.assertEqual(len(result.function_annotations), 1)
+        ann = result.function_annotations[0]
+        self.assertEqual(ann.function_name, 'my_agent')
+        self.assertEqual(ann.aibom_annotation['concept'], 'agent')
+        self.assertEqual(ann.aibom_annotation['framework'], 'langchain')
+
+    def test_aibom_annotation_above_decorator_class(self):
+        code = (
+            "from dataclasses import dataclass\n"
+            "\n"
+            "# aibom: concept=model\n"
+            "@dataclass\n"
+            "class MyModel:\n"
+            "    name: str\n"
+        )
+        result = parse_source_code('test.py', code)
+        self.assertEqual(len(result.class_defs), 1)
+        cls = result.class_defs[0]
+        self.assertEqual(cls.class_name, 'MyModel')
+        self.assertIsNotNone(cls.aibom_annotation)
+        self.assertEqual(cls.aibom_annotation['concept'], 'model')
+
 if __name__ == '__main__':
     unittest.main()

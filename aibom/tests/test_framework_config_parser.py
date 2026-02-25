@@ -83,6 +83,27 @@ class TestLangGraphJsonParser(unittest.TestCase):
         results = parse_project_configs(root)
         self.assertEqual(len(results), 1)
 
+    def test_parse_project_configs_with_file_parent(self):
+        """Config parsing should work when given a file's parent directory.
+
+        Regression: when the CLI receives a single file path, it should
+        pass the parent directory to ``parse_project_configs`` so that
+        sibling config files like ``langgraph.json`` are still discovered.
+        """
+        root = self._write_langgraph_json(
+            {
+                "graphs": {"agent": "./agent.py:graph"},
+            }
+        )
+        dummy_file = root / "agent.py"
+        dummy_file.write_text("x = 1\n", encoding="utf-8")
+
+        # Simulate the CLI fix: use file.parent when input is a file
+        config_root = dummy_file.parent
+        results = parse_project_configs(config_root)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].assignments[0].target_qualified_name, "agent")
+
 
 if __name__ == "__main__":
     unittest.main()
