@@ -61,6 +61,25 @@ class ContextManagerObservation:
 
 
 @dataclass
+class ClassDefObservation:
+    """Represents a class definition with its base classes and optional aibom annotation."""
+    class_name: str
+    qualified_name: Optional[str] = None
+    base_classes: List[str] = field(default_factory=list)
+    line_number: int = 0
+    aibom_annotation: Optional[Dict[str, str]] = None
+
+
+@dataclass
+class FunctionAnnotationObservation:
+    """Represents a function/method tagged with an ``# aibom:`` inline annotation."""
+    function_name: str
+    qualified_name: Optional[str] = None
+    line_number: int = 0
+    aibom_annotation: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class CodeAnalysisResult:
     """Holds all observations from a single source file analysis."""
     file_path: str
@@ -69,6 +88,8 @@ class CodeAnalysisResult:
     decorators: List[DecoratorObservation] = field(default_factory=list)
     type_annotations: List[TypeAnnotationObservation] = field(default_factory=list)
     context_managers: List[ContextManagerObservation] = field(default_factory=list)
+    class_defs: List[ClassDefObservation] = field(default_factory=list)
+    function_annotations: List[FunctionAnnotationObservation] = field(default_factory=list)
     imports: List[str] = field(default_factory=list)  # Import statements for disambiguation
 
     def get_all_qualified_names(self) -> Set[str]:

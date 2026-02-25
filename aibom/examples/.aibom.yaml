@@ -1,0 +1,178 @@
+# ============================================================================
+# Example .aibom.yaml -- Custom Catalog Configuration
+# ============================================================================
+#
+# Place this file in your project root as  .aibom.yaml  (or .aibom.yml /
+# .aibom.json).  The AI BOM analyzer auto-discovers it, or you can point
+# to it explicitly with:
+#
+#   cisco-aibom analyze /path/to/project --custom-catalog .aibom.yaml
+#
+# This file lets you teach the analyzer about components that the built-in
+# catalog does not cover: internal wrappers, niche libraries, custom
+# categories, and project-specific relationship types.
+#
+# All sections are optional -- include only what you need.
+#
+# ─── Detection Precedence ──────────────────────────────────────────────
+#
+# When the same symbol is detected by multiple sources, the highest-
+# priority source wins and the component appears only once:
+#
+#   1. Inline annotations  (# aibom: concept=...)   -- highest priority
+#   2. DuckDB catalog      (built-in knowledge base)
+#   3. Custom components   (this file, section 1)
+#   4. Base-class rules    (this file, section 2)   -- lowest priority
+#
+# Excludes (section 3) override ALL sources -- an excluded symbol will
+# never appear in the output, regardless of how it was detected.
+#
+# ============================================================================
+
+
+# ─── 1. Custom Components ───────────────────────────────────────────────
+#
+# Register symbols (classes, functions, modules) that the built-in catalog
+# does not know about.
+#
+# Fields:
+#   id        (required)  Short class/function name or fully qualified name.
+#                          Short names use suffix matching, so "MyLLMWrapper"
+#                          matches any qualified name ending in "MyLLMWrapper".
+#   concept   (required)  Category: model, agent, tool, memory, retriever,
+#                          embedding, datastore, prompt, other, or any custom
+#                          name you define (e.g. guardrail, router, evaluator).
+#   label     (optional)  Human-readable display name.
+#   framework (optional)  Framework or library name (default: "custom").
+#   metadata  (optional)  Arbitrary key-value pairs attached to the component.
+#
+components:
+  # A custom LLM wrapper used internally
+  - id: MyLLMWrapper
+    concept: model
+    label: My Custom LLM
+    framework: internal
+    metadata:
+      owner: ml-team
+      version: "2.1"
+      docs: https://wiki.internal/ml/llm-wrapper
+
+  # A custom tool with a fully qualified name
+  - id: myproject.tools.SearchTool
+    concept: tool
+
+  # Components using custom categories (not limited to built-in names)
+  - id: SafetyFilter
+    concept: guardrail
+
+  - id: RequestRouter
+    concept: router
+
+  - id: QualityChecker
+    concept: evaluator
+    metadata:
+      threshold: "0.95"
+
+
+# ─── 2. Base Class Detection ────────────────────────────────────────────
+#
+# Automatically categorize any class that inherits from a listed base class.
+# This is powerful for projects with a consistent class hierarchy -- you
+# only need to declare the rule once, and every subclass is detected.
+#
+# Fields:
+#   class   (required)  Base class name (short or fully qualified).
+#   concept (required)  Category to assign to subclasses.
+#
+# Example: if your project defines tools by subclassing BaseTool, adding a
+# rule here will detect SearchTool(BaseTool), CalcTool(BaseTool), etc.
+#
+base_classes:
+  - class: BaseTool
+    concept: tool
+
+  - class: mylib.BaseAgent
+    concept: agent
+
+  - class: BaseGuardrail
+    concept: guardrail
+
+
+# ─── 3. Exclude Patterns ────────────────────────────────────────────────
+#
+# Suppress false positives.  Any component whose ID ends with (or equals)
+# one of these patterns is removed from analysis results.  Excludes
+# override all other detection mechanisms.
+#
+excludes:
+  - langchain.deprecated.OldAgent
+  - some_noisy_helper_function
+  - test_utilities.MockModel
+
+
+# ─── 4. Extended Relationship Hints ─────────────────────────────────────
+#
+# The analyzer inspects constructor/function arguments to derive
+# relationships (e.g. an agent that receives a "tools" argument is linked
+# to those tool components).  The built-in argument names are:
+#
+#   tool_arguments:      tool, tools, skills, abilities
+#   llm_arguments:       llm, language_model, chat_model, model
+#   memory_arguments:    memory, checkpointer, store, saver, chat_history
+#   retriever_arguments: retriever, retrievers, search, search_kwargs
+#   embedding_arguments: embedding, embeddings, embedding_function, embed, embed_model
+#
+# Add your own argument names below.  These are ADDITIVE -- they extend
+# the built-in lists, they do not replace them.
+#
+relationship_hints:
+  tool_arguments:
+    - custom_tools
+    - plugins
+    - actions
+
+  llm_arguments:
+    - language_model
+    - chat_engine
+
+  memory_arguments:
+    - state_store
+    - cache_backend
+
+  retriever_arguments:
+    - doc_search
+    - knowledge_base
+
+  embedding_arguments:
+    - vectorizer
+    - text_embedder
+
+
+# ─── 5. Custom Relationship Types ───────────────────────────────────────
+#
+# Define entirely new relationship labels.  Each definition specifies:
+#
+#   label             (required)  Relationship name (auto-uppercased).
+#   source_categories (optional)  Which source component categories to scan.
+#   target_categories (optional)  Which target categories to accept.
+#   argument_hints    (required)  Constructor argument names that trigger
+#                                 the relationship.
+#
+# Example: a "router" component that receives a "routes" argument pointing
+# to "agent" components creates a ROUTES_TO relationship.
+#
+custom_relationships:
+  - label: ROUTES_TO
+    source_categories: [router]
+    target_categories: [agent]
+    argument_hints: [routes, destinations, route_map]
+
+  - label: GUARDS
+    source_categories: [guardrail]
+    target_categories: [model, agent]
+    argument_hints: [guarded_by, guard, protected_component]
+
+  - label: EVALUATES
+    source_categories: [evaluator]
+    target_categories: [model, agent]
+    argument_hints: [evaluates, target, subject]

@@ -27,7 +27,7 @@ def _create_catalog(path: Path) -> None:
     con.execute(
         """
         CREATE TABLE component_catalog (
-            id TEXT,
+            id TEXT PRIMARY KEY,
             label TEXT,
             concept TEXT,
             framework TEXT,
@@ -54,9 +54,8 @@ def test_find_components_by_suffixes_returns_matches():
         db_file = Path(tmpdir) / "catalog.duckdb"
         _create_catalog(db_file)
 
-        connector = CatalogDB(db_file)
-        results = connector.find_components_by_suffixes(["Agent", "Tool.run"])
-        connector.close()
+        with CatalogDB(db_file) as connector:
+            results = connector.find_components_by_suffixes(["Agent", "Tool.run"])
 
         ids = {row["id"] for row in results}
         assert "pkg.Agent" in ids
@@ -69,8 +68,71 @@ def test_find_components_by_suffixes_empty_input():
         db_file = Path(tmpdir) / "catalog.duckdb"
         _create_catalog(db_file)
 
-        connector = CatalogDB(db_file)
-        results = connector.find_components_by_suffixes([])
-        connector.close()
+        with CatalogDB(db_file) as connector:
+            results = connector.find_components_by_suffixes([])
 
         assert results == []
+
+
+def test_two_tier_precedence_duckdb_over_custom():
+    """DuckDB entry beats custom entry with same ID."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog(db_file)
+
+        with CatalogDB(db_file) as connector:
+            connector.add_custom_entries([
+                {
+                    "id": "pkg.Agent",
+                    "label": "Agent",
+                    "concept": "tool",
+                    "framework": "custom",
+                    "sig_name": None,
+                    "type": None,
+                    "catalog_label": None,
+                }
+            ])
+            results = connector.find_components_by_suffixes(["Agent"])
+
+        agent_results = [r for r in results if r["id"] == "pkg.Agent"]
+        assert len(agent_results) == 1
+        assert agent_results[0]["concept"] == "agent"
+
+
+def test_custom_entries_added_when_not_in_duckdb():
+    """Custom entries are returned when not present in DuckDB."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog(db_file)
+
+        with CatalogDB(db_file) as connector:
+            connector.add_custom_entries([
+                {
+                    "id": "custom.MyModel",
+                    "label": "MyModel",
+                    "concept": "model",
+                    "framework": "custom",
+                    "sig_name": None,
+                    "type": None,
+                    "catalog_label": None,
+                }
+            ])
+            results = connector.find_components_by_suffixes(["MyModel"])
+
+        ids = {row["id"] for row in results}
+        assert "custom.MyModel" in ids
+
+
+def test_excludes_filter_results():
+    """Excluded IDs are filtered out of query results."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog(db_file)
+
+        with CatalogDB(db_file) as connector:
+            connector.add_excludes(["pkg.Agent"])
+            results = connector.find_components_by_suffixes(["Agent", "Tool.run"])
+
+        ids = {row["id"] for row in results}
+        assert "pkg.Agent" not in ids
+        assert "pkg.Tool.run" in ids

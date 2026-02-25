@@ -16,16 +16,19 @@
 
 import ast
 import libcst as cst
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
 
 from .structures import (
     AssignmentObservation,
     CallObservation,
+    ClassDefObservation,
     CodeAnalysisResult,
     ContextManagerObservation,
     DecoratorObservation,
+    FunctionAnnotationObservation,
     TypeAnnotationObservation,
 )
+from .custom_catalog import parse_inline_annotation
 
 
 def _format_attribute_name(node: cst.Attribute) -> str:
@@ -88,8 +91,24 @@ def _extract_argument_value(node: cst.BaseExpression) -> Any:
     if isinstance(node, cst.Attribute):
         attr_name = _format_attribute_name(node)
         return f"ATTRIBUTE:{attr_name}"
-    
+
+    if isinstance(node, cst.Call):
+        # Extract the call target name and flatten inner variable references
+        # so that e.g. ToolNode(tools) → "CALL:ToolNode(VARIABLE:tools)"
+        func_name = None
+        if isinstance(node.func, cst.Name):
+            func_name = node.func.value
+        elif isinstance(node.func, cst.Attribute):
+            func_name = _format_attribute_name(node.func)
+        inner_parts = []
+        for arg in node.args:
+            inner_parts.append(_extract_argument_value(arg.value))
+        if func_name:
+            return {"_call": func_name, "_args": inner_parts}
+        return {"_call": "unknown", "_args": inner_parts}
+
     return f"COMPLEX_TYPE:{type(node).__name__}"
+
 
 class SymbolVisitor(cst.CSTVisitor):
     """A CST visitor that extracts assignments and calls, resolving qualified names."""
@@ -169,6 +188,46 @@ class SymbolVisitor(cst.CSTVisitor):
             pass
         return ""
     
+    def _extract_aibom_annotation(self, node: cst.CSTNode) -> Optional[Dict[str, str]]:
+        """Extract an ``# aibom: ...`` annotation from leading lines or trailing comment.
+
+        Checks:
+        1. A trailing inline comment on the definition line itself.
+        2. Comment lines above the definition, scanning upward past blank lines
+           and decorator lines (``@...``) so that annotations above decorators
+           are captured.
+        """
+        try:
+            position = self.get_metadata(cst.metadata.PositionProvider, node)
+            if self.source_code and position:
+                lines = self.source_code.split("\n")
+                start_line_idx = position.start.line - 1  # 0-based
+
+                # Check the line itself for a trailing comment
+                if 0 <= start_line_idx < len(lines):
+                    annotation = parse_inline_annotation(lines[start_line_idx])
+                    if annotation:
+                        return annotation
+
+                # Scan upward past blank lines and decorator lines
+                idx = start_line_idx - 1
+                while 0 <= idx < len(lines):
+                    line = lines[idx].strip()
+                    if not line:
+                        idx -= 1
+                        continue
+                    annotation = parse_inline_annotation(lines[idx])
+                    if annotation:
+                        return annotation
+                    if line.startswith("@"):
+                        idx -= 1
+                        continue
+                    break
+        except (KeyError, IndexError, AttributeError):
+            pass
+
+        return None
+
     def leave_Import(self, original_node: cst.Import) -> None:
         """Capture import statements."""
         for alias in original_node.names:
@@ -198,26 +257,39 @@ class SymbolVisitor(cst.CSTVisitor):
                     import_stmt = f"from {module_name} import {', '.join(imported_items)}"
                     self.result.imports.append(import_stmt)
 
+    @staticmethod
+    def _extract_all_arguments(args) -> Dict[str, Any]:
+        """Extract both keyword and positional arguments from a call.
+
+        Keyword arguments are stored under their name.  Positional arguments
+        are stored as ``_pos_0``, ``_pos_1``, etc.
+        """
+        result: Dict[str, Any] = {}
+        pos_idx = 0
+        for arg in args:
+            if arg.keyword:
+                result[arg.keyword.value] = _extract_argument_value(arg.value)
+            else:
+                result[f"_pos_{pos_idx}"] = _extract_argument_value(arg.value)
+                pos_idx += 1
+        return result
+
     def leave_Call(self, original_node: cst.Call) -> None:
         """Captures standalone calls that are not part of an assignment."""
         try:
-            # Check if the parent is an Assign node. If so, we've already handled it.
             parent = self.get_metadata(cst.metadata.ParentNodeProvider, original_node)
             if isinstance(parent, cst.Assign):
                 return
         except KeyError:
-            # This can happen if the call is at the top level of the module.
             pass
 
         qualified_name = self._get_qualified_name_for_node(original_node.func)
+        if not qualified_name and isinstance(original_node.func, cst.Attribute):
+            qualified_name = _format_attribute_name(original_node.func)
         if not qualified_name:
             return
 
-        # Process arguments
-        args = {}
-        for arg in original_node.args:
-            if arg.keyword:
-                args[arg.keyword.value] = _extract_argument_value(arg.value)
+        args = self._extract_all_arguments(original_node.args)
 
         call_obs = CallObservation(
             qualified_name=qualified_name,
@@ -227,8 +299,65 @@ class SymbolVisitor(cst.CSTVisitor):
         )
         self.result.calls.append(call_obs)
 
+    def leave_ClassDef(self, original_node: cst.ClassDef) -> None:
+        """Capture class definitions: base classes and ``# aibom:`` annotations."""
+        class_name = original_node.name.value
+
+        qualified_name = self._get_qualified_name_for_node(original_node.name)
+
+        base_classes: List[str] = []
+        for arg in original_node.bases:
+            base_expr = arg.value
+            base_name = self._get_qualified_name_for_node(base_expr)
+            if not base_name and isinstance(base_expr, cst.Attribute):
+                base_name = _format_attribute_name(base_expr)
+            if not base_name and isinstance(base_expr, cst.Name):
+                base_name = base_expr.value
+            if base_name:
+                base_classes.append(base_name)
+
+        annotation = self._extract_aibom_annotation(original_node)
+
+        try:
+            line_number = self.get_metadata(
+                cst.metadata.PositionProvider, original_node
+            ).start.line
+        except (KeyError, AttributeError):
+            line_number = 0
+
+        obs = ClassDefObservation(
+            class_name=class_name,
+            qualified_name=qualified_name,
+            base_classes=base_classes,
+            line_number=line_number,
+            aibom_annotation=annotation,
+        )
+        self.result.class_defs.append(obs)
+
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:
-        """Captures functions that have decorators."""
+        """Captures functions that have decorators and/or ``# aibom:`` annotations."""
+        # Check for inline aibom annotation
+        annotation = self._extract_aibom_annotation(original_node)
+        if annotation:
+            func_name = original_node.name.value
+            qualified_name = self._get_qualified_name_for_node(original_node.name)
+            try:
+                line_number = self.get_metadata(
+                    cst.metadata.PositionProvider, original_node
+                ).start.line
+            except (KeyError, AttributeError):
+                line_number = 0
+
+            self.result.function_annotations.append(
+                FunctionAnnotationObservation(
+                    function_name=func_name,
+                    qualified_name=qualified_name,
+                    line_number=line_number,
+                    aibom_annotation=annotation,
+                )
+            )
+
+        # Original decorator handling
         if not original_node.decorators:
             return
 
@@ -262,14 +391,13 @@ class SymbolVisitor(cst.CSTVisitor):
             return
 
         qualified_name = self._get_qualified_name_for_node(call_node.func)
+        if not qualified_name and isinstance(call_node.func, cst.Attribute):
+            qualified_name = _format_attribute_name(call_node.func)
         if not qualified_name:
             return
 
-        # Process arguments
-        args = {}
-        for arg in call_node.args:
-            if arg.keyword:
-                args[arg.keyword.value] = _extract_argument_value(arg.value)
+        # Process arguments (keyword + positional)
+        args = self._extract_all_arguments(call_node.args)
 
         call_obs = CallObservation(
             qualified_name=qualified_name,
@@ -314,10 +442,7 @@ class SymbolVisitor(cst.CSTVisitor):
         if not qualified_name:
             return
 
-        args = {}
-        for arg in call_node.args:
-            if arg.keyword:
-                args[arg.keyword.value] = _extract_argument_value(arg.value)
+        args = self._extract_all_arguments(call_node.args)
 
         call_obs = CallObservation(
             qualified_name=qualified_name,
