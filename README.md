@@ -1,5 +1,9 @@
 # AI BOM
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.com/invite/nKWtDcXxtx)
+[![Cisco AI Defense](https://img.shields.io/badge/Cisco-AI%20Defense-049fd9?logo=cisco&logoColor=white)](https://www.cisco.com/site/us/en/products/security/ai-defense/index.html)
+[![AI Security and Safety Framework](https://img.shields.io/badge/AI%20Security-Framework-orange)](https://learn-cloudsecurity.cisco.com/ai-security-framework)
+
 The AI BOM tool scans codebases and container images to inventory AI framework components (models, agents, tools, prompts, and more). It currently parses Python source code, resolves fully qualified symbols, and matches them against a DuckDB catalog to produce an AI bill of materials (AI BOM). Optional LLM enrichment extracts model names, and a workflow pass annotates components with call-path context.
 
 ## Table of Contents
