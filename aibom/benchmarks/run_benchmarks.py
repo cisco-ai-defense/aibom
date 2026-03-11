@@ -29,9 +29,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from aibom.categorizer import categorize_symbols
 from aibom.catalog_db import CatalogDB
+from aibom.completeness import compute_completeness_score
 from aibom.framework_config_parser import parse_project_configs
 from aibom.cst_parser import parse_source_code
 from aibom.db_loader import ensure_local_database
+from aibom.js_parser import is_js_file, parse_js_source_code
 from aibom.notebook_parser import extract_code_from_notebook
 from aibom.structures import CodeAnalysisResult
 from aibom.workflow_analyzer import build_workflow_index
@@ -60,6 +62,10 @@ BENCHMARK_REPOS: List[Dict[str, str]] = [
     # ── Notable community / reference repos ──────────────────────────────
     {"org": "langchain-ai", "repo": "opengpts"},
     {"org": "langchain-ai", "repo": "langserve"},
+    # ── JS/TS AI repos ──────────────────────────────────────────────────
+    {"org": "langchain-ai", "repo": "langchainjs", "sparse": "langchain/src"},
+    {"org": "vercel", "repo": "ai", "sparse": "packages/ai/core"},
+    {"org": "huggingface", "repo": "transformers.js", "sparse": "src"},
 ]
 
 
@@ -113,14 +119,17 @@ def clone_repo(
     return repo_dir
 
 
+_SOURCE_EXTENSIONS = {".py", ".ipynb", ".js", ".jsx", ".ts", ".tsx"}
+_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".tox", ".venv", "venv", "dist", "build", ".eggs"}
+
+
 def find_files(path: Path) -> List[Path]:
-    """Find all .py and .ipynb files, excluding common junk directories."""
-    excludes = {".git", "__pycache__", "node_modules", ".tox", ".venv", "venv", "dist", "build", ".eggs"}
+    """Find all source files (Python, JS/TS, notebooks), excluding junk directories."""
     results: List[Path] = []
     for item in path.rglob("*"):
-        if any(part in excludes for part in item.parts):
+        if any(part in _EXCLUDE_DIRS for part in item.parts):
             continue
-        if item.suffix in (".py", ".ipynb") and item.is_file():
+        if item.suffix in _SOURCE_EXTENSIONS and item.is_file():
             results.append(item)
     return results
 
@@ -133,6 +142,7 @@ def analyze_repo(
     files = find_files(repo_path)
     py_files = [f for f in files if f.suffix == ".py"]
     nb_files = [f for f in files if f.suffix == ".ipynb"]
+    js_files = [f for f in files if is_js_file(f)]
 
     analysis_results: List[CodeAnalysisResult] = []
 
@@ -156,6 +166,14 @@ def analyze_repo(
         except Exception:
             LOGGER.debug("Failed to parse notebook %s", nb_file, exc_info=True)
 
+    for js_file in js_files:
+        try:
+            source_code = js_file.read_text(encoding="utf-8")
+            result = parse_js_source_code(str(js_file), source_code)
+            analysis_results.append(result)
+        except Exception:
+            LOGGER.debug("Failed to parse JS/TS file %s", js_file, exc_info=True)
+
     workflow_index = None
     try:
         workflow_index = build_workflow_index(py_files)
@@ -175,15 +193,19 @@ def analyze_repo(
     for rel in output.relationships:
         relationship_counts[rel.label] = relationship_counts.get(rel.label, 0) + 1
 
+    completeness_report = compute_completeness_score(output)
+
     return {
-        "files_scanned": len(py_files) + len(nb_files),
+        "files_scanned": len(py_files) + len(nb_files) + len(js_files),
         "py_files": len(py_files),
         "nb_files": len(nb_files),
+        "js_files": len(js_files),
         "config_files_parsed": len(config_results),
         "total_components": total,
         "categories": category_counts,
         "total_relationships": len(output.relationships),
         "relationship_types": relationship_counts,
+        "completeness": completeness_report.to_dict(),
         "components_detail": {
             cat: [
                 {

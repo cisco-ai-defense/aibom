@@ -104,6 +104,71 @@ def parse_langgraph_json(project_root: Path) -> Optional[CodeAnalysisResult]:
     return None
 
 
+_AI_PACKAGES: Dict[str, str] = {
+    "@langchain/openai": "langchainjs",
+    "@langchain/core": "langchainjs",
+    "@langchain/langgraph": "langchainjs",
+    "@langchain/anthropic": "langchainjs",
+    "@langchain/community": "langchainjs",
+    "langchain": "langchainjs",
+    "ai": "vercel_ai",
+    "@ai-sdk/openai": "vercel_ai",
+    "@ai-sdk/anthropic": "vercel_ai",
+    "@ai-sdk/google": "vercel_ai",
+    "openai": "openai_js",
+    "@anthropic-ai/sdk": "anthropic_js",
+    "@tensorflow/tfjs": "tensorflowjs",
+    "@tensorflow/tfjs-node": "tensorflowjs",
+    "@huggingface/transformers": "transformersjs",
+}
+
+
+def parse_package_json(project_root: Path) -> Optional[CodeAnalysisResult]:
+    """Parse ``package.json`` to detect AI SDK dependencies."""
+    pkg_path = project_root / "package.json"
+    if not pkg_path.is_file():
+        return None
+
+    try:
+        data = json.loads(pkg_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        LOGGER.warning("Failed to parse %s: %s", pkg_path, exc)
+        return None
+
+    all_deps: Dict[str, Any] = {}
+    for key in ("dependencies", "devDependencies"):
+        all_deps.update(data.get(key, {}))
+
+    result = CodeAnalysisResult(file_path=str(pkg_path))
+    line_counter = 1
+
+    for pkg_name, framework in _AI_PACKAGES.items():
+        if pkg_name in all_deps:
+            version = all_deps[pkg_name]
+            result.assignments.append(
+                AssignmentObservation(
+                    target_qualified_name=f"pkg_{pkg_name}",
+                    call=CallObservation(
+                        qualified_name=f"{pkg_name}.default",
+                        arguments={"version": version},
+                        line_number=line_counter,
+                        raw_code=f'# package.json dependency: "{pkg_name}": "{version}"',
+                    ),
+                    line_number=line_counter,
+                )
+            )
+            line_counter += 1
+
+    if result.assignments:
+        LOGGER.info(
+            "Detected %d AI SDK dependency(ies) from package.json",
+            len(result.assignments),
+        )
+        return result
+
+    return None
+
+
 def parse_project_configs(project_root: Path) -> List[CodeAnalysisResult]:
     """Parse all supported config files and return any synthetic analysis results."""
     results: List[CodeAnalysisResult] = []
@@ -111,5 +176,9 @@ def parse_project_configs(project_root: Path) -> List[CodeAnalysisResult]:
     lg_result = parse_langgraph_json(project_root)
     if lg_result:
         results.append(lg_result)
+
+    pkg_result = parse_package_json(project_root)
+    if pkg_result:
+        results.append(pkg_result)
 
     return results

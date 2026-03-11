@@ -41,6 +41,7 @@ from .categorizer import categorize_symbols
 from .framework_config_parser import parse_project_configs
 from .container_utils import extract_app_from_docker, is_docker_image
 from .cst_parser import parse_source_code
+from .js_parser import is_js_file, parse_js_source_code
 from .catalog_db import CatalogDB
 from .custom_catalog import (
     CustomCatalogConfig,
@@ -51,6 +52,7 @@ from .db_loader import ensure_local_database
 from .notebook_parser import extract_code_from_notebook
 from .structures import CodeAnalysisResult
 from .api_handler import start_api_server
+from .completeness import compute_completeness_score
 from .workflow_analyzer import build_workflow_index, workflow_identifier
 
 console = Console()
@@ -252,14 +254,37 @@ def _display_analysis_summary(all_analysis_outputs: Dict[str, Any], max_examples
         console.print()  # spacing
 
 
+_PYTHON_EXTENSIONS = {".py", ".ipynb"}
+_JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
+SUPPORTED_LANGUAGES = {"python", "javascript"}
+
+
 def _find_python_files(path: Path) -> List[Path]:
     """Finds all .py and .ipynb files in a given path (file or directory)."""
-    if path.is_file() and path.suffix in (".py", ".ipynb"):
+    return _find_source_files(path, languages=["python"])
+
+
+def _find_source_files(
+    path: Path,
+    languages: Optional[List[str]] = None,
+) -> List[Path]:
+    """Finds source files for the requested languages."""
+    if languages is None:
+        languages = ["python", "javascript"]
+
+    exts: set = set()
+    if "python" in languages:
+        exts.update(_PYTHON_EXTENSIONS)
+    if "javascript" in languages:
+        exts.update(_JS_EXTENSIONS)
+
+    if path.is_file() and path.suffix in exts:
         return [path]
     if path.is_dir():
-        py_files = list(path.rglob("*.py"))
-        nb_files = list(path.rglob("*.ipynb"))
-        return py_files + nb_files
+        files: List[Path] = []
+        for ext in sorted(exts):
+            files.extend(path.rglob(f"*{ext}"))
+        return files
     return []
 
 
@@ -419,6 +444,7 @@ def _generate_json_report(
     metadata: Optional[Dict[str, Any]] = None,
     source_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
     run_errors: Optional[List[Dict[str, Any]]] = None,
+    completeness_reports: Optional[Dict[str, Any]] = None,
 ):
     """Generate JSON report format."""
     metadata = metadata or {}
@@ -512,6 +538,9 @@ def _generate_json_report(
         }
         if summary_payload.get("errors"):
             source_data["summary"]["errors"] = summary_payload["errors"]
+        if completeness_reports and source in completeness_reports:
+            cr = completeness_reports[source]
+            source_data["completeness"] = cr.to_dict()
         report["aibom_analysis"]["sources"][source] = source_data
         grand_total += source_total
     
@@ -706,8 +735,18 @@ def analyze(
         dir_okay=False,
         resolve_path=True,
     ),
+    languages: Optional[str] = typer.Option(
+        "python,javascript",
+        "--languages",
+        help="Comma-separated list of languages to scan (python, javascript).",
+    ),
+    completeness: bool = typer.Option(
+        False,
+        "--completeness/--no-completeness",
+        help="Run completeness analysis and include score in the report.",
+    ),
 ):
-    """Analyzes a Python codebase to generate an AI BOM."""
+    """Analyzes source code to generate an AI BOM."""
     # Configure logging
     numeric_level = getattr(logging, log_level.upper(), None)
     if not isinstance(numeric_level, int):
@@ -839,18 +878,36 @@ def analyze(
                 shutil.rmtree(temp_dir)
             continue
 
-        python_files = _find_python_files(path_to_analyze)
-        if not python_files:
-            logging.warning("No Python files found to analyze in this source.")
+        lang_list_raw = [l.strip() for l in (languages or "python,javascript").split(",")]
+        lang_list = []
+        for lang in lang_list_raw:
+            if lang in SUPPORTED_LANGUAGES:
+                lang_list.append(lang)
+            else:
+                logging.warning("Unsupported language '%s' -- ignoring (supported: %s)", lang, ", ".join(sorted(SUPPORTED_LANGUAGES)))
+        if not lang_list:
+            logging.error("No valid languages specified. Supported: %s", ", ".join(sorted(SUPPORTED_LANGUAGES)))
+            raise typer.Exit(code=1)
+        source_files = _find_source_files(path_to_analyze, languages=lang_list)
+        if not source_files:
+            logging.warning("No source files found to analyze in this source.")
             source_summary["status"] = "skipped"
-            source_summary["status_detail"] = "no_python_files"
+            source_summary["status_detail"] = "no_source_files"
             if temp_dir:
                 shutil.rmtree(temp_dir)
             continue
 
-        py_count = sum(1 for f in python_files if f.suffix == ".py")
-        nb_count = sum(1 for f in python_files if f.suffix == ".ipynb")
-        logging.info(f"Found {py_count} Python file(s) and {nb_count} notebook(s) to analyze...")
+        py_count = sum(1 for f in source_files if f.suffix == ".py")
+        nb_count = sum(1 for f in source_files if f.suffix == ".ipynb")
+        js_count = sum(1 for f in source_files if is_js_file(f))
+        parts = []
+        if py_count:
+            parts.append(f"{py_count} Python file(s)")
+        if nb_count:
+            parts.append(f"{nb_count} notebook(s)")
+        if js_count:
+            parts.append(f"{js_count} JS/TS file(s)")
+        logging.info("Found %s to analyze...", ", ".join(parts) if parts else "0 files")
 
         analysis_results: List[CodeAnalysisResult] = []
 
@@ -864,30 +921,36 @@ def analyze(
             TimeElapsedColumn(),
             transient=True,
         ) as progress:
-            task_id = progress.add_task(f"[cyan]Parsing {source}", total=len(python_files))
-            for py_file in python_files:
+            task_id = progress.add_task(f"[cyan]Parsing {source}", total=len(source_files))
+            for src_file in source_files:
                 try:
-                    if py_file.suffix == ".ipynb":
-                        source_code = extract_code_from_notebook(py_file)
+                    if src_file.suffix == ".ipynb":
+                        source_code = extract_code_from_notebook(src_file)
                         if not source_code.strip():
                             continue
-                    else:
-                        with open(py_file, "r", encoding="utf-8") as f:
+                        result = parse_source_code(str(src_file), source_code)
+                    elif is_js_file(src_file):
+                        with open(src_file, "r", encoding="utf-8") as f:
                             source_code = f.read()
-                    result = parse_source_code(str(py_file), source_code)
+                        result = parse_js_source_code(str(src_file), source_code)
+                    else:
+                        with open(src_file, "r", encoding="utf-8") as f:
+                            source_code = f.read()
+                        result = parse_source_code(str(src_file), source_code)
                     analysis_results.append(result)
                 except Exception as e:
-                    logging.warning(f"Could not parse {py_file}. Error: {e}")
+                    logging.warning(f"Could not parse {src_file}. Error: {e}")
                     _record_analysis_error(
                         run_errors,
                         source_summary,
                         source,
-                        f"Could not parse {py_file}: {e}",
-                        file_path=str(py_file),
+                        f"Could not parse {src_file}: {e}",
+                        file_path=str(src_file),
                     )
                 finally:
                     progress.advance(task_id)
 
+        python_files = [f for f in source_files if f.suffix in _PYTHON_EXTENSIONS]
         workflow_index = None
         try:
             with console.status(f"[green]Building workflow index for {source}"):
@@ -957,6 +1020,14 @@ def analyze(
     else:
         run_metadata["status"] = "completed"
 
+    completeness_reports = {}
+    if completeness:
+        for source_name, output in all_analysis_outputs.items():
+            try:
+                completeness_reports[source_name] = compute_completeness_score(output)
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Completeness scoring failed for %s: %s", source_name, exc)
+
     # Phase 4: Generate the report
     report_data = None
     if output_format == "json":
@@ -966,6 +1037,7 @@ def analyze(
             metadata=run_metadata,
             source_summaries=source_outcomes,
             run_errors=run_errors,
+            completeness_reports=completeness_reports if completeness else None,
         )
         if post_url:
             try:
@@ -993,6 +1065,119 @@ def analyze(
 
     if show_summary:
         _display_analysis_summary(all_analysis_outputs)
+
+@app.command("interactive")
+def interactive_command():
+    """Guided, step-by-step AI BOM generation."""
+    from rich.prompt import Confirm, Prompt
+
+    console.print(
+        Panel("[bold cyan]AIBOM Interactive Mode[/]\nAnswer the prompts below to configure your analysis."),
+    )
+
+    # Step 1: Source selection
+    sources_raw = Prompt.ask(
+        "[bold]Enter source path(s) or container image(s)[/] (comma-separated)",
+        default=".",
+    )
+    sources = [s.strip() for s in sources_raw.split(",") if s.strip()]
+
+    # Step 2: Language selection
+    lang_choice = Prompt.ask(
+        "[bold]Which languages?[/] [1] Python only  [2] JS/TS only  [3] Both",
+        choices=["1", "2", "3"],
+        default="3",
+    )
+    lang_map = {"1": "python", "2": "javascript", "3": "python,javascript"}
+    languages = lang_map[lang_choice]
+
+    # Step 3: Output format
+    fmt_choice = Prompt.ask(
+        "[bold]Output format?[/] [1] plaintext  [2] json  [3] api",
+        choices=["1", "2", "3"],
+        default="2",
+    )
+    fmt_map = {"1": "plaintext", "2": "json", "3": "api"}
+    output_format = fmt_map[fmt_choice]
+
+    output_file: Optional[Path] = None
+    if output_format in ("plaintext", "json"):
+        default_ext = "json" if output_format == "json" else "txt"
+        output_file_str = Prompt.ask(
+            "[bold]Output file path[/]",
+            default=f"./aibom-report.{default_ext}",
+        )
+        output_file = Path(output_file_str).resolve()
+
+    # Step 4: Completeness
+    run_completeness = Confirm.ask(
+        "[bold]Run completeness analysis?[/]",
+        default=True,
+    )
+
+    # Step 5: LLM enrichment
+    llm_model = None
+    llm_api_key = None
+    llm_api_base = None
+    llm_api_version = None
+    if Confirm.ask("[bold]Enable LLM-based model name extraction?[/]", default=False):
+        llm_model = Prompt.ask("LLM model name", default="gpt-4o-mini")
+        llm_api_base = Prompt.ask("LLM API base URL (leave blank for default)", default="") or None
+        llm_api_key = Prompt.ask("LLM API key", password=True, default="") or None
+        llm_api_version = Prompt.ask("LLM API version (leave blank if N/A)", default="") or None
+
+    # Step 6: Custom catalog
+    custom_catalog_path: Optional[Path] = None
+    if Confirm.ask("[bold]Use a custom catalog file?[/]", default=False):
+        cc_str = Prompt.ask("Custom catalog file path")
+        custom_catalog_path = Path(cc_str).resolve()
+
+    # Step 7: Confirmation table
+    summary_table = Table(title="Analysis Configuration", box=box.SIMPLE_HEAVY)
+    summary_table.add_column("Setting", style="bold")
+    summary_table.add_column("Value")
+    summary_table.add_row("Sources", ", ".join(sources))
+    summary_table.add_row("Languages", languages)
+    out_desc = f"{output_format}"
+    if output_file:
+        out_desc += f" -> {output_file}"
+    summary_table.add_row("Output", out_desc)
+    summary_table.add_row("Completeness", "Enabled" if run_completeness else "Disabled")
+    summary_table.add_row("LLM Enrichment", llm_model or "Disabled")
+    summary_table.add_row("Custom Catalog", str(custom_catalog_path) if custom_catalog_path else "None")
+    console.print(summary_table)
+
+    if not Confirm.ask("\n[bold]Proceed with analysis?[/]", default=True):
+        console.print("[yellow]Aborted.[/]")
+        raise typer.Exit()
+
+    # Build args and invoke analyze
+    args = [
+        "analyze",
+        *sources,
+        "-o", output_format,
+        "--languages", languages,
+    ]
+    if output_file:
+        args.extend(["-O", str(output_file)])
+    if run_completeness:
+        args.append("--completeness")
+    else:
+        args.append("--no-completeness")
+    if llm_model:
+        args.extend(["--llm-model", llm_model])
+    if llm_api_key:
+        args.extend(["--llm-api-key", llm_api_key])
+    if llm_api_base:
+        args.extend(["--llm-api-base", llm_api_base])
+    if llm_api_version:
+        args.extend(["--llm-api-version", llm_api_version])
+    if custom_catalog_path:
+        args.extend(["--custom-catalog", str(custom_catalog_path)])
+
+    ctx = typer.Context(app)
+    app(args, standalone_mode=False)
+
 
 def cli_entry_point() -> None:
     """Entry point for console_scripts."""

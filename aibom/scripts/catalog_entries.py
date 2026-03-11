@@ -243,4 +243,103 @@ _ALL_ENTRIES: List[Dict[str, Any]] = [
     {"id": "google.generativeai.ChatSession", "label": "ChatSession", "concept": "agent", "framework": "google_genai", "sig_name": None, "type": None, "catalog_label": None},
     {"id": "google.generativeai.configure", "label": "configure", "concept": "other", "framework": "google_genai", "sig_name": None, "type": None, "catalog_label": None},
     {"id": "vertexai.generative_models.GenerativeModel", "label": "GenerativeModel", "concept": "model", "framework": "vertexai", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # Prompt Templates (Python)
+    # ========================================================================
+    {"id": "langchain_core.prompts.ChatPromptTemplate", "label": "ChatPromptTemplate", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain_core.prompts.PromptTemplate", "label": "PromptTemplate", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain_core.prompts.MessagesPlaceholder", "label": "MessagesPlaceholder", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain.prompts.ChatPromptTemplate", "label": "ChatPromptTemplate", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain.prompts.PromptTemplate", "label": "PromptTemplate", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain_core.messages.SystemMessage", "label": "SystemMessage", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain_core.messages.HumanMessage", "label": "HumanMessage", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain_core.prompts.ChatPromptTemplate.from_messages", "label": "ChatPromptTemplate.from_messages", "concept": "prompt", "framework": "langchain", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # LangChain.js  (JavaScript / TypeScript)
+    # ========================================================================
+
+    # ── LangChain.js agents ──────────────────────────────────────────────
+    {"id": "@langchain/langgraph.StateGraph", "label": "StateGraph", "concept": "agent", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/langgraph.StateGraph.compile", "label": "StateGraph.compile", "concept": "agent", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/langgraph.MessageGraph", "label": "MessageGraph", "concept": "agent", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/langgraph/prebuilt.createReactAgent", "label": "createReactAgent", "concept": "agent", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain/agents.AgentExecutor", "label": "AgentExecutor", "concept": "agent", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain/agents.initializeAgentExecutorWithOptions", "label": "initializeAgentExecutorWithOptions", "concept": "agent", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── LangChain.js models ──────────────────────────────────────────────
+    {"id": "@langchain/openai.ChatOpenAI", "label": "ChatOpenAI", "concept": "model", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/openai.OpenAI", "label": "OpenAI", "concept": "model", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/anthropic.ChatAnthropic", "label": "ChatAnthropic", "concept": "model", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/google-genai.ChatGoogleGenerativeAI", "label": "ChatGoogleGenerativeAI", "concept": "model", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/community/llms/ollama.Ollama", "label": "Ollama", "concept": "model", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── LangChain.js tools ───────────────────────────────────────────────
+    {"id": "@langchain/core/tools.tool", "label": "tool", "concept": "tool", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/core/tools.StructuredTool", "label": "StructuredTool", "concept": "tool", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/langgraph/prebuilt.ToolNode", "label": "ToolNode", "concept": "tool", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/community/tools/tavily_search.TavilySearchResults", "label": "TavilySearchResults", "concept": "tool", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── LangChain.js memory ──────────────────────────────────────────────
+    {"id": "@langchain/langgraph.MemorySaver", "label": "MemorySaver", "concept": "memory", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/langgraph/checkpoint/memory.MemorySaver", "label": "MemorySaver", "concept": "memory", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "langchain/memory.BufferMemory", "label": "BufferMemory", "concept": "memory", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── LangChain.js embeddings ──────────────────────────────────────────
+    {"id": "@langchain/openai.OpenAIEmbeddings", "label": "OpenAIEmbeddings", "concept": "embedding", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── LangChain.js vector stores ───────────────────────────────────────
+    {"id": "@langchain/community/vectorstores/faiss.FaissStore", "label": "FaissStore", "concept": "datastore", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/community/vectorstores/chroma.Chroma", "label": "Chroma", "concept": "datastore", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/pinecone.PineconeStore", "label": "PineconeStore", "concept": "datastore", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── LangChain.js prompts ─────────────────────────────────────────────
+    {"id": "@langchain/core/prompts.ChatPromptTemplate", "label": "ChatPromptTemplate", "concept": "prompt", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/core/prompts.PromptTemplate", "label": "PromptTemplate", "concept": "prompt", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/core/messages.SystemMessage", "label": "SystemMessage", "concept": "prompt", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@langchain/core/messages.HumanMessage", "label": "HumanMessage", "concept": "prompt", "framework": "langchainjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # Vercel AI SDK  (JavaScript / TypeScript)
+    # ========================================================================
+    # generateText/streamText/generateObject/streamObject orchestrate model+tools+prompt -> agent
+    {"id": "ai.generateText", "label": "generateText", "concept": "agent", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "ai.streamText", "label": "streamText", "concept": "agent", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "ai.generateObject", "label": "generateObject", "concept": "agent", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "ai.streamObject", "label": "streamObject", "concept": "agent", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "ai.embed", "label": "embed", "concept": "embedding", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "ai.embedMany", "label": "embedMany", "concept": "embedding", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "ai.tool", "label": "tool", "concept": "tool", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    # Provider functions are the actual models
+    {"id": "@ai-sdk/openai.openai", "label": "openai", "concept": "model", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@ai-sdk/anthropic.anthropic", "label": "anthropic", "concept": "model", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@ai-sdk/google.google", "label": "google", "concept": "model", "framework": "vercel_ai", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # OpenAI SDK  (JavaScript / TypeScript)
+    # ========================================================================
+    {"id": "openai.OpenAI", "label": "OpenAI", "concept": "model", "framework": "openai_js", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "openai.default", "label": "OpenAI", "concept": "model", "framework": "openai_js", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # Anthropic SDK  (JavaScript / TypeScript)
+    # ========================================================================
+    {"id": "@anthropic-ai/sdk.Anthropic", "label": "Anthropic", "concept": "model", "framework": "anthropic_js", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@anthropic-ai/sdk.default", "label": "Anthropic", "concept": "model", "framework": "anthropic_js", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # TensorFlow.js
+    # ========================================================================
+    {"id": "@tensorflow/tfjs.sequential", "label": "sequential", "concept": "model", "framework": "tensorflowjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@tensorflow/tfjs.model", "label": "model", "concept": "model", "framework": "tensorflowjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@tensorflow/tfjs.loadLayersModel", "label": "loadLayersModel", "concept": "model", "framework": "tensorflowjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@tensorflow/tfjs.loadGraphModel", "label": "loadGraphModel", "concept": "model", "framework": "tensorflowjs", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # Transformers.js  (Hugging Face)
+    # ========================================================================
+    {"id": "@huggingface/transformers.pipeline", "label": "pipeline", "concept": "model", "framework": "transformersjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@huggingface/transformers.AutoModel", "label": "AutoModel", "concept": "model", "framework": "transformersjs", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "@huggingface/transformers.AutoTokenizer", "label": "AutoTokenizer", "concept": "other", "framework": "transformersjs", "sig_name": None, "type": None, "catalog_label": None},
 ]

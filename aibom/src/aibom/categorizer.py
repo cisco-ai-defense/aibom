@@ -30,7 +30,7 @@ from .structures import (
 )
 from .catalog_db import CatalogDB, is_excluded
 from .custom_catalog import CustomCatalogConfig
-from .llm_client import LLMClient
+from .llm_client import LLMClient, extract_model_name_regex
 from .workflow_analyzer import WorkflowIndex
 
 
@@ -41,18 +41,21 @@ MEMORY_CATEGORY_HINTS = {"memory"}
 RETRIEVER_CATEGORY_HINTS = {"retriever"}
 EMBEDDING_CATEGORY_HINTS = {"embedding"}
 DATASTORE_CATEGORY_HINTS = {"datastore"}
+PROMPT_CATEGORY_HINTS = {"prompt"}
 
 TOOL_ARGUMENT_HINTS = {"tool", "tools", "skills", "abilities"}
 LLM_ARGUMENT_HINTS = {"llm", "language_model", "chat_model", "model"}
 MEMORY_ARGUMENT_HINTS = {"memory", "checkpointer", "store", "saver", "chat_history"}
 RETRIEVER_ARGUMENT_HINTS = {"retriever", "retrievers", "search", "search_kwargs"}
 EMBEDDING_ARGUMENT_HINTS = {"embedding", "embeddings", "embedding_function", "embed", "embed_model"}
+PROMPT_ARGUMENT_HINTS = {"prompt", "prompt_template", "system_prompt", "messages", "template"}
 
 RELATIONSHIP_LABEL_TOOL = "USES_TOOL"
 RELATIONSHIP_LABEL_LLM = "USES_LLM"
 RELATIONSHIP_LABEL_MEMORY = "USES_MEMORY"
 RELATIONSHIP_LABEL_RETRIEVER = "USES_RETRIEVER"
 RELATIONSHIP_LABEL_EMBEDDING = "USES_EMBEDDING"
+RELATIONSHIP_LABEL_PROMPT = "USES_PROMPT"
 
 
 _is_excluded = is_excluded  # re-export for backward compatibility
@@ -364,17 +367,23 @@ def categorize_symbols(
                     if prompt_text:
                         component_details["text"] = prompt_text
 
-                elif category in ["model", "embedding"] and llm_client:
+                elif category in ["model", "embedding"]:
                     class_name = db_symbol_name.split('.')[-1]
                     code_snippet = _reconstruct_code_snippet(matched_obs)
 
+                    regex_name = extract_model_name_regex(code_snippet)
+
                     if category == "model":
-                        model_name = llm_client.extract_model_name(code_snippet, class_name)
+                        model_name = regex_name
+                        if not model_name and llm_client:
+                            model_name = llm_client.extract_model_name(code_snippet, class_name)
                         if model_name:
                             component_details["model_name"] = model_name
 
                     elif category == "embedding":
-                        embedding_model = llm_client.extract_embedding_model(code_snippet, class_name)
+                        embedding_model = regex_name
+                        if not embedding_model and llm_client:
+                            embedding_model = llm_client.extract_embedding_model(code_snippet, class_name)
                         if embedding_model:
                             component_details["model_name"] = embedding_model
 
@@ -981,7 +990,8 @@ def _reconstruct_code_snippet(observation: Dict[str, Any]) -> str:
 def _build_instance_id(component: Dict[str, Any]) -> str:
     name = component.get("name") or "component"
     line = component.get("line_number") or 0
-    return f"{name}_{line}"
+    fpath = component.get("file_path") or ""
+    return f"{fpath}:{name}_{line}"
 
 
 def _register_component_target(
@@ -1122,6 +1132,23 @@ def _derive_relationships(
                     RELATIONSHIP_LABEL_EMBEDDING,
                 )
 
+            prompt_refs = _collect_references(arguments, PROMPT_ARGUMENT_HINTS)
+            for reference in prompt_refs:
+                target_component = _resolve_component_reference(
+                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                )
+                if not target_component:
+                    continue
+                if not _category_matches(target_component.get("category"), PROMPT_CATEGORY_HINTS):
+                    continue
+                _append_relationship(
+                    relationships,
+                    seen_relationships,
+                    component,
+                    target_component,
+                    RELATIONSHIP_LABEL_PROMPT,
+                )
+
     # Also derive USES_EMBEDDING from datastore components
     for category, components in categorized_components.items():
         if not _category_matches(category, DATASTORE_CATEGORY_HINTS):
@@ -1152,6 +1179,52 @@ def _derive_relationships(
                     target_component,
                     RELATIONSHIP_LABEL_EMBEDDING,
                 )
+
+    # ── File-level co-occurrence fallback ────────────────────────────────
+    # When argument-hint scanning finds no relationships for an agent,
+    # fall back to linking it with models/tools/memory/etc. found in the
+    # same source file.  This covers frameworks like LangGraph where
+    # composition is done via graph nodes, not constructor arguments.
+    agents_with_rels: Set[str] = {r.source_instance_id for r in relationships}
+    _FILE_COOCCURRENCE_MAP = [
+        (LLM_CATEGORY_HINTS, RELATIONSHIP_LABEL_LLM),
+        (TOOL_CATEGORY_HINTS, RELATIONSHIP_LABEL_TOOL),
+        (MEMORY_CATEGORY_HINTS, RELATIONSHIP_LABEL_MEMORY),
+        (RETRIEVER_CATEGORY_HINTS, RELATIONSHIP_LABEL_RETRIEVER),
+        (EMBEDDING_CATEGORY_HINTS, RELATIONSHIP_LABEL_EMBEDDING),
+        (PROMPT_CATEGORY_HINTS, RELATIONSHIP_LABEL_PROMPT),
+    ]
+
+    file_to_components: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for _cat, comps in categorized_components.items():
+        for comp in comps:
+            fpath = comp.get("file_path")
+            if fpath:
+                file_to_components[fpath].append(comp)
+
+    for category, components in categorized_components.items():
+        if not _category_matches(category, AGENT_CATEGORY_HINTS):
+            continue
+        for agent in components:
+            agent_id = agent.get("instance_id")
+            if not agent_id or agent_id in agents_with_rels:
+                continue
+            agent_file = agent.get("file_path")
+            if not agent_file:
+                continue
+            for sibling in file_to_components.get(agent_file, []):
+                if sibling.get("instance_id") == agent_id:
+                    continue
+                sibling_cat = (sibling.get("category") or "").lower()
+                for cat_hints, label in _FILE_COOCCURRENCE_MAP:
+                    if sibling_cat in cat_hints:
+                        _append_relationship(
+                            relationships,
+                            seen_relationships,
+                            agent,
+                            sibling,
+                            label,
+                        )
 
     # ── Custom relationship types from .aibom.yaml ──────────────────────
     if custom_relationships:
@@ -1239,6 +1312,12 @@ def _resolve_component_reference(
     for name in normalized_names:
         candidates = lookup_by_name.get(name, [])
         if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            if file_path:
+                same_file = [c for c in candidates if c.get("file_path") == file_path]
+                if same_file:
+                    return same_file[0]
             return candidates[0]
 
     return None

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Dict, Any, Optional
 
 # Set litellm log level to WARNING via environment variable
@@ -29,6 +30,21 @@ try:
     import litellm
 except ImportError:  # pragma: no cover
     litellm = None  # type: ignore
+
+
+_MODEL_ARG_PATTERN = re.compile(
+    r"""model(?:_name|_id)?\s*=\s*["']([^"']+)["']"""
+)
+
+
+def extract_model_name_regex(code_snippet: str) -> Optional[str]:
+    """Try to extract a model name from a code snippet using a regex.
+
+    Returns the first match or ``None``.  This is a lightweight fallback
+    that avoids LLM calls for obvious patterns like ``model="gpt-4"``.
+    """
+    match = _MODEL_ARG_PATTERN.search(code_snippet)
+    return match.group(1) if match else None
 
 
 class LLMClient:

@@ -99,5 +99,10 @@ node_modules
 .env
 .env.local
 
-# Benchmark cloned repos
+# Benchmark cloned repos and results
 aibom/benchmarks/_repos/
+aibom/benchmarks/results.json
+
+# IDE / AI assistant directories
+.cursor/
+.windsurf/

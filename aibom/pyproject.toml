@@ -56,13 +56,22 @@ test = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = "--maxfail=1 --cov=aibom"
+addopts = "--maxfail=3 --cov=aibom --cov-report=term-missing"
 filterwarnings = [
     "ignore:Pydantic serializer warnings:UserWarning:pydantic.*",
 ]
 markers = [
     "integration: mark for tests that hit external services (run with -m integration)",
 ]
+
+[tool.coverage.run]
+source = ["aibom"]
+omit = ["*/tests/*", "*/benchmarks/*"]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
