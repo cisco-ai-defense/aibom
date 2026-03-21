@@ -1,0 +1,333 @@
+# Copyright 2026 Cisco Systems, Inc. and its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for the KB Enrichment Scanner.
+
+These tests exercise the scanner's filtering, matching tiers, framework
+disambiguation, and graceful fallback behaviour.  Tests that hit the live
+DuckDB KB (from ``~/.aibom/catalogs/``) are marked ``integration`` so they
+can be skipped in CI where the KB may not be present.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+
+from aibom.models import AIComponentType, DetectionSource, ScanContext
+from aibom.scanners.kb_enrichment_scanner import (
+    ALLOWED_CONCEPTS,
+    KBEnrichmentScanner,
+    _extract_class_segment,
+    _frameworks_related,
+    _match_observation,
+    _resolve_kb_path,
+)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for helper functions
+# ---------------------------------------------------------------------------
+
+
+class TestExtractClassSegment:
+    def test_simple_dotted(self):
+        assert _extract_class_segment("langchain_openai.ChatOpenAI") == "ChatOpenAI"
+
+    def test_factory_method(self):
+        assert _extract_class_segment("langchain_community.vectorstores.FAISS.from_texts") == "FAISS"
+
+    def test_deep_method_chain(self):
+        assert _extract_class_segment("openai.OpenAI.chat.completions.create") == "OpenAI"
+
+    def test_single_name(self):
+        assert _extract_class_segment("ChatOpenAI") is None
+
+    def test_all_lowercase(self):
+        assert _extract_class_segment("foo.bar.baz") is None
+
+    def test_module_only(self):
+        assert _extract_class_segment("crewai.agent") is None
+
+
+class TestFrameworksRelated:
+    def test_same_family(self):
+        assert _frameworks_related("langchain_openai", "langchain_community") is True
+
+    def test_exact_match(self):
+        assert _frameworks_related("crewai", "crewai") is True
+
+    def test_unrelated(self):
+        assert _frameworks_related("openai", "langchain_community") is False
+
+    def test_empty_module(self):
+        assert _frameworks_related("", "langchain_community") is True
+
+    def test_empty_framework(self):
+        assert _frameworks_related("openai", "") is True
+
+
+class TestMatchObservation:
+    """Unit tests for _match_observation with a fake kb_by_id."""
+
+    @pytest.fixture()
+    def sample_kb(self) -> dict[str, dict[str, Any]]:
+        return {
+            "langchain_openai.ChatOpenAI": {
+                "id": "langchain_openai.ChatOpenAI",
+                "concept": "model",
+                "framework": "langchain_openai",
+            },
+            "langchain_community.vectorstores.faiss.FAISS": {
+                "id": "langchain_community.vectorstores.faiss.FAISS",
+                "concept": "datastore",
+                "framework": "langchain_community",
+            },
+            "crewai.Agent": {
+                "id": "crewai.Agent",
+                "concept": "agent",
+                "framework": "crewai",
+            },
+        }
+
+    def test_tier1_exact(self, sample_kb: dict):
+        result = _match_observation("crewai.Agent", sample_kb, {"crewai"})
+        assert result is not None
+        assert result["concept"] == "agent"
+
+    def test_tier2_suffix(self, sample_kb: dict):
+        result = _match_observation(
+            "ChatOpenAI",
+            {"langchain_openai.ChatOpenAI": sample_kb["langchain_openai.ChatOpenAI"]},
+            {"langchain_openai"},
+        )
+        assert result is not None
+        assert result["concept"] == "model"
+
+    def test_tier3_class_segment(self, sample_kb: dict):
+        result = _match_observation(
+            "langchain_community.vectorstores.FAISS.from_texts",
+            sample_kb,
+            {"langchain_community"},
+        )
+        assert result is not None
+        assert result["concept"] == "datastore"
+
+    def test_no_match(self, sample_kb: dict):
+        result = _match_observation("totally.Unknown", sample_kb, set())
+        assert result is None
+
+    def test_tier3_rejects_unrelated_framework(self):
+        kb = {
+            "langchain_community.llms.openai.OpenAI": {
+                "id": "langchain_community.llms.openai.OpenAI",
+                "concept": "model",
+                "framework": "langchain_community",
+            },
+        }
+        result = _match_observation("openai.OpenAI", kb, {"openai"})
+        assert result is None
+
+    def test_tier3_lowercase_short_name_skipped(self):
+        kb = {
+            "crewai.cli.cli.ToolCommand.create": {
+                "id": "crewai.cli.cli.ToolCommand.create",
+                "concept": "tool",
+                "framework": "crewai",
+            },
+        }
+        result = _match_observation(
+            "openai.OpenAI.chat.completions.create", kb, {"openai"}
+        )
+        # "create" is lowercase, but class segment "OpenAI" is uppercase.
+        # However, the framework check should reject because openai != crewai.
+        assert result is None
+
+
+class TestAllowedConcepts:
+    def test_expected_concepts(self):
+        assert "agent" in ALLOWED_CONCEPTS
+        assert "model" in ALLOWED_CONCEPTS
+        assert "tool" in ALLOWED_CONCEPTS
+        assert "datastore" in ALLOWED_CONCEPTS
+        assert "embedding" in ALLOWED_CONCEPTS
+        assert "prompt" in ALLOWED_CONCEPTS
+        assert "memory" in ALLOWED_CONCEPTS
+        assert "retriever" in ALLOWED_CONCEPTS
+
+    def test_other_excluded(self):
+        assert "other" not in ALLOWED_CONCEPTS
+
+
+# ---------------------------------------------------------------------------
+# Scanner-level tests (KB presence required)
+# ---------------------------------------------------------------------------
+
+
+def _kb_available() -> bool:
+    ctx = ScanContext(paths=["/tmp"])
+    return _resolve_kb_path(ctx) is not None
+
+
+@pytest.mark.skipif(not _kb_available(), reason="No KB DuckDB installed")
+class TestKBEnrichmentScannerIntegration:
+    """Integration tests that exercise the scanner against the real KB."""
+
+    def test_supports_with_kb(self, tmp_path: Path):
+        ctx = ScanContext(paths=[str(tmp_path)])
+        assert KBEnrichmentScanner().supports(ctx) is True
+
+    def test_empty_directory(self, tmp_path: Path):
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, rels = KBEnrichmentScanner().scan(ctx)
+        assert comps == []
+        assert rels == []
+
+    def test_detects_model_usage(self, tmp_path: Path):
+        (tmp_path / "app.py").write_text(
+            "from langchain_openai import ChatOpenAI\n"
+            "llm = ChatOpenAI(model='gpt-4o')\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        models = [c for c in comps if c.component_type == AIComponentType.MODEL]
+        assert len(models) >= 1
+        assert models[0].kb_concept == "model"
+        assert models[0].detection_source == DetectionSource.KB_ENRICHMENT
+
+    def test_detects_tool_decorator(self, tmp_path: Path):
+        (tmp_path / "tools.py").write_text(
+            "from langchain_core.tools import tool\n"
+            "@tool\n"
+            "def greet(name: str) -> str:\n"
+            "    return f'Hello {name}'\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert len(tools) >= 1
+        assert tools[0].name == "greet"
+
+    def test_detects_agent(self, tmp_path: Path):
+        (tmp_path / "graph.py").write_text(
+            "from langgraph.graph import StateGraph\n"
+            "graph = StateGraph()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert len(agents) >= 1
+        assert any("StateGraph" in a.name for a in agents)
+
+    def test_detects_embedding(self, tmp_path: Path):
+        (tmp_path / "embed.py").write_text(
+            "from langchain_openai import OpenAIEmbeddings\n"
+            "embeddings = OpenAIEmbeddings()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        embeddings = [c for c in comps if c.component_type == AIComponentType.EMBEDDING]
+        assert len(embeddings) >= 1
+
+    def test_detects_vector_store(self, tmp_path: Path):
+        (tmp_path / "store.py").write_text(
+            "from langchain_community.vectorstores import FAISS\n"
+            "from langchain_openai import OpenAIEmbeddings\n"
+            "vs = FAISS.from_texts(['hello'], OpenAIEmbeddings())\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        stores = [c for c in comps if c.component_type == AIComponentType.VECTOR_STORE]
+        assert len(stores) >= 1
+
+    def test_filters_other_concept(self, tmp_path: Path):
+        (tmp_path / "client.py").write_text(
+            "import openai\n"
+            "client = openai.OpenAI()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        # openai.OpenAI has concept=other in KB → should be filtered out
+        assert all(c.kb_concept != "other" for c in comps)
+
+    def test_method_call_noise_suppressed(self, tmp_path: Path):
+        (tmp_path / "app.py").write_text(
+            "import openai\n"
+            "client = openai.OpenAI()\n"
+            "resp = client.chat.completions.create(model='gpt-4o')\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        # The completions.create call should not be emitted as a component
+        names = [c.name for c in comps]
+        assert not any("create" in n for n in names)
+
+    def test_dedup_same_line(self, tmp_path: Path):
+        (tmp_path / "app.py").write_text(
+            "from crewai import Agent\n"
+            "a = Agent(role='r')\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        line_2 = [c for c in comps if c.line_number == 2]
+        assert len(line_2) <= 1
+
+    def test_skips_non_python_files(self, tmp_path: Path):
+        (tmp_path / "config.yaml").write_text("agent: true\n")
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        assert comps == []
+
+    def test_multiple_files(self, tmp_path: Path):
+        (tmp_path / "a.py").write_text(
+            "from crewai import Agent\n"
+            "a = Agent(role='r')\n"
+        )
+        (tmp_path / "b.py").write_text(
+            "from langgraph.graph import StateGraph\n"
+            "g = StateGraph()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        files = {c.file_path for c in comps}
+        assert len(files) == 2
+
+
+class TestKBEnrichmentScannerNoKB:
+    """Tests for graceful behaviour when no KB is installed."""
+
+    def test_supports_false_without_kb(self, tmp_path: Path):
+        ctx = ScanContext(paths=[str(tmp_path)])
+        with patch(
+            "aibom.scanners.kb_enrichment_scanner._resolve_kb_path", return_value=None
+        ):
+            assert KBEnrichmentScanner().supports(ctx) is False
+
+    def test_scan_returns_empty_without_kb(self, tmp_path: Path):
+        (tmp_path / "app.py").write_text(
+            "from langchain_openai import ChatOpenAI\n"
+            "llm = ChatOpenAI(model='gpt-4')\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        with patch(
+            "aibom.scanners.kb_enrichment_scanner._resolve_kb_path", return_value=None
+        ):
+            comps, rels = KBEnrichmentScanner().scan(ctx)
+            assert comps == []
+            assert rels == []
