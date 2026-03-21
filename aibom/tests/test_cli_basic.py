@@ -17,10 +17,10 @@ def test_analyze_requires_output_file_for_json():
 def test_analyze_rejects_invalid_output_format():
     result = runner.invoke(app, ["analyze", "src", "--output-format", "bad"])
     assert result.exit_code != 0
-    assert "'api'" in result.output
+    assert "Invalid output format" in result.output
 
 
 def test_analyze_rejects_legacy_ui_output_format():
     result = runner.invoke(app, ["analyze", "src", "--output-format", "ui"])
     assert result.exit_code != 0
-    assert "'api'" in result.output
+    assert "Invalid output format" in result.output

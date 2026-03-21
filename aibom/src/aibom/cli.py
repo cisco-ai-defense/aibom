@@ -52,11 +52,16 @@ from .notebook_parser import extract_code_from_notebook
 from .structures import CodeAnalysisResult
 from .api_handler import start_api_server
 from .workflow_analyzer import build_workflow_index, workflow_identifier
+from .reporters import get_reporter, reporter_registry
+from .models.enums import Severity as SeverityEnum
+from .kb.manager import KBManager, KBError
 
 console = Console()
 
+_VALID_OUTPUT_FORMATS = {"plaintext", "json", "api"} | {r.name for r in reporter_registry}
+
 app = typer.Typer(
-    help="Generate an AI BOM from Python source code.",
+    help="Generate an AI BOM from source code.",
     no_args_is_help=True,
 )
 
@@ -155,9 +160,92 @@ def main_callback(ctx: typer.Context) -> None:
     """Ensure a subcommand is provided when invoking the CLI."""
     if ctx.invoked_subcommand is None:
         console.print(
-            "[bold red]No subcommand provided.[/] Please use [green]analyze[/] or [green]report[/]."
+            "[bold red]No subcommand provided.[/] Please use [green]analyze[/], [green]report[/], or [green]kb[/]."
         )
         raise typer.Exit(code=1)
+
+
+def _build_scan_result(
+    all_analysis_outputs: Dict[str, Any],
+    run_metadata: Dict[str, Any],
+    run_errors: List[Dict[str, Any]],
+) -> "ScanResult":
+    """Bridge legacy CategorizationOutput to the v2 ScanResult model."""
+    from .models import (
+        AIComponent as V2Component,
+        AIComponentType,
+        ComponentRelationship as V2Relationship,
+        ScanResult,
+        SourceResult,
+    )
+
+    _TYPE_MAP = {
+        "model": AIComponentType.MODEL,
+        "agent": AIComponentType.AGENT,
+        "tool": AIComponentType.TOOL,
+        "mcp_server": AIComponentType.MCP_SERVER,
+        "mcp_client": AIComponentType.MCP_CLIENT,
+        "embedding": AIComponentType.EMBEDDING,
+        "vector_store": AIComponentType.VECTOR_STORE,
+        "datastore": AIComponentType.VECTOR_STORE,
+        "dataset": AIComponentType.DATASET,
+        "prompt": AIComponentType.PROMPT,
+        "guardrail": AIComponentType.GUARDRAIL,
+        "memory": AIComponentType.MEMORY,
+        "retriever": AIComponentType.RETRIEVER,
+    }
+
+    sources = []
+    for source_path, output in all_analysis_outputs.items():
+        categorized = getattr(output, "components", output)
+        relationships = getattr(output, "relationships", [])
+
+        components: List[V2Component] = []
+        for category, items in categorized.items():
+            comp_type = _TYPE_MAP.get(category, AIComponentType.OTHER)
+            for item in (items or []):
+                components.append(V2Component(
+                    name=item.get("name", "unknown"),
+                    component_type=comp_type,
+                    file_path=item.get("file_path", ""),
+                    line_number=item.get("line_number", 0),
+                    framework=item.get("framework", ""),
+                    model_name=item.get("model_name"),
+                    embedding_model=item.get("embedding_model"),
+                    description=item.get("description"),
+                    text=item.get("text"),
+                    instance_id=item.get("instance_id", ""),
+                    metadata={
+                        k: v for k, v in item.items()
+                        if k not in {
+                            "name", "file_path", "line_number", "framework",
+                            "model_name", "embedding_model", "description",
+                            "text", "instance_id", "category",
+                        }
+                    },
+                ))
+
+        v2_rels: List[V2Relationship] = []
+        for rel in relationships:
+            v2_rels.append(V2Relationship(
+                source_instance_id=getattr(rel, "source_instance_id", ""),
+                target_instance_id=getattr(rel, "target_instance_id", ""),
+                label=getattr(rel, "label", ""),
+                source_name=getattr(rel, "source_name", ""),
+                target_name=getattr(rel, "target_name", ""),
+            ))
+
+        sources.append(SourceResult(
+            path=source_path,
+            components=components,
+            relationships=v2_rels,
+        ))
+
+    return ScanResult(
+        metadata=run_metadata,
+        sources=sources,
+        errors=[e.get("message", str(e)) for e in run_errors],
+    )
 
 
 def _render_component_table(source: str, categorized_components: Dict[str, List[Dict[str, Any]]]) -> None:
@@ -628,7 +716,10 @@ def analyze(
         "plaintext",
         "--output-format",
         "-o",
-        help="Output format (json, plaintext, api)",
+        help=(
+            "Output format: plaintext, json, api, cyclonedx, sarif, spdx, "
+            "html, markdown, csv, junit"
+        ),
     ),
     output_file: Optional[Path] = typer.Option(
         None,
@@ -706,6 +797,24 @@ def analyze(
         dir_okay=False,
         resolve_path=True,
     ),
+    fail_on: Optional[str] = typer.Option(
+        None,
+        "--fail-on",
+        help=(
+            "Exit with non-zero code if risk severity meets or exceeds this "
+            "threshold: critical, high, medium, low."
+        ),
+    ),
+    min_severity: str = typer.Option(
+        "info",
+        "--severity",
+        help="Minimum severity of findings to include in the report.",
+    ),
+    validate: bool = typer.Option(
+        False,
+        "--validate",
+        help="Validate the output against the format's schema and report errors.",
+    ),
 ):
     """Analyzes a Python codebase to generate an AI BOM."""
     # Configure logging
@@ -720,10 +829,23 @@ def analyze(
     logging.basicConfig(level=numeric_level, format='%(levelname)s: %(message)s')
 
     # Validate output format
-    if output_format not in ["plaintext", "json", "api"]:
-        logging.error(
-            f"Invalid output format '{output_format}'. Must be 'plaintext', 'json', or 'api'."
-        )
+    if output_format not in _VALID_OUTPUT_FORMATS:
+        valid = ", ".join(sorted(_VALID_OUTPUT_FORMATS))
+        logging.error(f"Invalid output format '{output_format}'. Must be one of: {valid}")
+        raise typer.Exit(code=1)
+
+    # Validate severity options
+    fail_on_severity: Optional[SeverityEnum] = None
+    if fail_on:
+        try:
+            fail_on_severity = SeverityEnum(fail_on.lower())
+        except ValueError:
+            logging.error(f"Invalid --fail-on value '{fail_on}'. Must be: critical, high, medium, low, info")
+            raise typer.Exit(code=1)
+    try:
+        severity_filter = SeverityEnum(min_severity.lower())
+    except ValueError:
+        logging.error(f"Invalid --severity value '{min_severity}'. Must be: critical, high, medium, low, info")
         raise typer.Exit(code=1)
     
     # Validate LLM configuration if model extraction is requested
@@ -959,7 +1081,50 @@ def analyze(
 
     # Phase 4: Generate the report
     report_data = None
-    if output_format == "json":
+    reporter = get_reporter(output_format)
+
+    if reporter and output_format not in ("json", "plaintext"):
+        from .models import (
+            AIComponent as V2Component,
+            AIComponentType,
+            ComponentRelationship as V2Relationship,
+            ScanResult,
+            SourceResult,
+        )
+        from .risk import RiskScorer
+
+        scan_result = _build_scan_result(
+            all_analysis_outputs, run_metadata, run_errors,
+        )
+        scorer = RiskScorer()
+        scan_result.risk = scorer.score(scan_result)
+
+        if validate:
+            errors = reporter.validate(scan_result)
+            if errors:
+                for err in errors:
+                    console.print(f"[yellow]Validation: {err}[/]")
+            else:
+                console.print("[green]Validation passed.[/]")
+
+        if output_file:
+            import io
+            buf = io.StringIO()
+            reporter.render(scan_result, buf)
+            output_file.write_text(buf.getvalue(), encoding="utf-8")
+            console.print(f"[green]Report written to {output_file}[/]")
+        else:
+            import sys
+            reporter.render(scan_result, sys.stdout)
+
+        if fail_on_severity and scorer.should_fail(scan_result.risk, fail_on_severity):
+            console.print(
+                f"[bold red]Risk threshold exceeded: {scan_result.risk.severity.value} "
+                f">= {fail_on_severity.value}[/]"
+            )
+            raise typer.Exit(code=2)
+
+    elif output_format == "json":
         report_data = _generate_json_report(
             all_analysis_outputs,
             output_file,
@@ -993,6 +1158,152 @@ def analyze(
 
     if show_summary:
         _display_analysis_summary(all_analysis_outputs)
+
+kb_app = typer.Typer(help="Manage the AIBOM knowledge base.", no_args_is_help=True)
+app.add_typer(kb_app, name="kb")
+
+
+@kb_app.command("download")
+def kb_download(
+    version: Optional[str] = typer.Option(None, "--version", "-v", help="Specific KB version to download (latest if omitted)."),
+    url: Optional[str] = typer.Option(None, "--url", help="Override the manifest URL."),
+) -> None:
+    """Download the knowledge base from Cisco's public repository."""
+    mgr = KBManager()
+    try:
+        path = mgr.download(version=version, url=url)
+        console.print(f"[green]KB downloaded to {path}[/]")
+    except KBError as exc:
+        console.print(f"[bold red]Download failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+@kb_app.command("check")
+def kb_check() -> None:
+    """Check if a newer knowledge base version is available."""
+    mgr = KBManager()
+    try:
+        info = mgr.check()
+        console.print(f"Current version: {info['current_version']}")
+        console.print(f"Latest version:  {info['latest_version']}")
+        if info["update_available"]:
+            console.print("[yellow]Update available![/] Run: cisco-aibom kb download")
+        else:
+            console.print("[green]You have the latest version.[/]")
+    except KBError as exc:
+        console.print(f"[bold red]Check failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+@kb_app.command("info")
+def kb_info() -> None:
+    """Display information about the locally installed knowledge base."""
+    mgr = KBManager()
+    try:
+        info = mgr.info()
+        table = Table(title="Knowledge Base Info", box=box.SIMPLE_HEAVY)
+        table.add_column("Property", style="bold")
+        table.add_column("Value")
+        for key, value in info.items():
+            table.add_row(key, str(value))
+        console.print(table)
+    except KBError as exc:
+        console.print(f"[bold red]Info failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+@kb_app.command("verify")
+def kb_verify() -> None:
+    """Verify the integrity of the locally installed knowledge base."""
+    mgr = KBManager()
+    if mgr.verify():
+        console.print("[green]Knowledge base integrity verified.[/]")
+    else:
+        console.print("[bold red]Knowledge base integrity check failed.[/]")
+        raise typer.Exit(code=1)
+
+
+@kb_app.command("request")
+def kb_request(
+    sdk: str = typer.Option(..., "--sdk", help="SDK name (e.g., langchain, openai)."),
+    version: str = typer.Option(..., "--version", "-v", help="SDK version to request KB build for."),
+    language: str = typer.Option("python", "--language", "-l", help="Programming language."),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key", envvar="CISCO_AI_DEFENSE_API_KEY",
+        help="Cisco AI Defense API key.",
+    ),
+    api_base: Optional[str] = typer.Option(
+        None, "--api-base", envvar="CISCO_AI_DEFENSE_API_BASE",
+        help="Cisco AI Defense API base URL.",
+    ),
+) -> None:
+    """Request a knowledge base build for a specific SDK version."""
+    mgr = KBManager()
+    try:
+        result = mgr.request_build(sdk=sdk, version=version, language=language, api_key=api_key, api_base=api_base)
+        console.print(f"[green]Request submitted:[/] {result.get('request_id', 'unknown')}")
+        console.print(f"Status: {result.get('status', 'unknown')}")
+    except KBError as exc:
+        console.print(f"[bold red]Request failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+@kb_app.command("request-status")
+def kb_request_status(
+    request_id: str = typer.Argument(..., help="Request ID to check."),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key", envvar="CISCO_AI_DEFENSE_API_KEY",
+    ),
+    api_base: Optional[str] = typer.Option(
+        None, "--api-base", envvar="CISCO_AI_DEFENSE_API_BASE",
+    ),
+) -> None:
+    """Check the status of a KB build request."""
+    mgr = KBManager()
+    try:
+        result = mgr.request_status(request_id, api_key=api_key, api_base=api_base)
+        for key, value in result.items():
+            console.print(f"{key}: {value}")
+    except KBError as exc:
+        console.print(f"[bold red]Status check failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+@kb_app.command("list-requests")
+def kb_list_requests(
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key", envvar="CISCO_AI_DEFENSE_API_KEY",
+    ),
+    api_base: Optional[str] = typer.Option(
+        None, "--api-base", envvar="CISCO_AI_DEFENSE_API_BASE",
+    ),
+) -> None:
+    """List all pending KB build requests."""
+    mgr = KBManager()
+    try:
+        requests = mgr.list_requests(api_key=api_key, api_base=api_base)
+        if not requests:
+            console.print("No pending requests.")
+            return
+        table = Table(title="KB Build Requests", box=box.SIMPLE_HEAVY)
+        table.add_column("Request ID")
+        table.add_column("SDK")
+        table.add_column("Version")
+        table.add_column("Language")
+        table.add_column("Status")
+        for req in requests:
+            table.add_row(
+                req.get("request_id", ""),
+                req.get("sdk", ""),
+                req.get("version", ""),
+                req.get("language", ""),
+                req.get("status", ""),
+            )
+        console.print(table)
+    except KBError as exc:
+        console.print(f"[bold red]List failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
 
 def cli_entry_point() -> None:
     """Entry point for console_scripts."""

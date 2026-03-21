@@ -14,32 +14,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .enums import (
-    AIComponentType,
-    DetectionSource,
-    RelationshipType,
-    Severity,
-)
-from .scan import (
-    AIComponent,
-    ComponentRelationship,
-    RiskFlag,
-    RiskScore,
-    ScanContext,
-    ScanResult,
-    SourceResult,
-)
+from .base import BaseScanner, scanner_registry, run_scanners
 
-__all__ = [
-    "AIComponent",
-    "AIComponentType",
-    "ComponentRelationship",
-    "DetectionSource",
-    "RelationshipType",
-    "RiskFlag",
-    "RiskScore",
-    "ScanContext",
-    "ScanResult",
-    "Severity",
-    "SourceResult",
-]
+__all__ = ["BaseScanner", "scanner_registry", "run_scanners"]
