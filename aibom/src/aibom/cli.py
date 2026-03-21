@@ -321,8 +321,44 @@ def _render_relationship_table(relationships: List[Any]) -> None:
     console.print(table)
 
 
+def _display_v2_summary(source: str, components: list, relationships: list) -> None:
+    """Rich summary for v2 detector output."""
+    from collections import Counter
+    panel_title = f"[bold green]Analysis Summary (v2)[/] • {source}"
+    console.print(Panel(panel_title, style="green", expand=False))
+    if not components:
+        console.print(Panel.fit("No AI components detected.", title=source, style="yellow"))
+        return
+    by_type: Counter = Counter()
+    grouped: Dict[str, list] = {}
+    for comp in components:
+        ctype = comp.component_type.value if hasattr(comp.component_type, "value") else str(comp.component_type)
+        by_type[ctype] += 1
+        grouped.setdefault(ctype, []).append(comp)
+    table = Table("Category", "Count", title=f"Components in {source}", box=box.SIMPLE_HEAVY, header_style="bold magenta")
+    for ctype, count in sorted(by_type.items()):
+        table.add_row(ctype, str(count))
+    console.print(table)
+    for ctype, items in sorted(grouped.items()):
+        console.print(Panel.fit(f"{ctype.upper()} details", style="bold white"))
+        for comp in items[:5]:
+            loc = f"{comp.file_path}:{comp.line_path}" if hasattr(comp, "line_path") else f"{comp.file_path}:{comp.line_number}"
+            extra = ""
+            if comp.model_name:
+                extra = f" model={comp.model_name}"
+            elif comp.framework:
+                extra = f" framework={comp.framework}"
+            provider = comp.metadata.get("provider", "")
+            if provider and provider != "unknown":
+                extra += f" provider={provider}"
+            console.print(f"  [cyan]{comp.name}[/]{extra} [dim]{loc}[/]")
+
+
 def _display_analysis_summary(all_analysis_outputs: Dict[str, Any], max_examples: int = 3) -> None:
     for source, output in all_analysis_outputs.items():
+        if isinstance(output, dict) and output.get("_v2"):
+            _display_v2_summary(source, output["components"], output["relationships"])
+            continue
         categorized_components = getattr(output, "components", output)
         panel_title = f"[bold green]Analysis Summary[/] • {source}"
         console.print(Panel(panel_title, style="green", expand=False))
@@ -815,6 +851,14 @@ def analyze(
         "--validate",
         help="Validate the output against the format's schema and report errors.",
     ),
+    legacy_mode: bool = typer.Option(
+        False,
+        "--legacy-mode",
+        help=(
+            "Use the v1 KB-symbol-matching pipeline instead of the v2 "
+            "targeted detectors.  Intended for backward compatibility only."
+        ),
+    ),
 ):
     """Analyzes a Python codebase to generate an AI BOM."""
     # Configure logging
@@ -893,14 +937,13 @@ def analyze(
         "sources_requested": len(sources_to_process),
     }
     db_path: Optional[Path] = None
-    try:
-        db_path = ensure_local_database(console=console)
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[bold red]Knowledge base error:[/] {exc}")
-        raise typer.Exit(code=1)
+    if legacy_mode:
+        try:
+            db_path = ensure_local_database(console=console)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[bold red]Knowledge base error:[/] {exc}")
+            raise typer.Exit(code=1)
 
-    # Load explicit custom catalog (global override for all sources).
-    # Per-source auto-discovery is handled inside the source loop below.
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
         explicit_config = load_custom_catalog(Path(custom_catalog))
@@ -961,6 +1004,43 @@ def analyze(
                 shutil.rmtree(temp_dir)
             continue
 
+        # -----------------------------------------------------------------
+        # v2 path: targeted detectors via run_scanners()
+        # -----------------------------------------------------------------
+        if not legacy_mode:
+            from .models import ScanContext as V2ScanContext
+            from .scanners import run_scanners
+
+            scan_path = str(path_to_analyze)
+            v2_ctx = V2ScanContext(
+                paths=[scan_path],
+                output_format=output_format,
+                output_file=str(output_file) if output_file else None,
+                llm_config=llm_config,
+                kb_path=str(db_path) if db_path else None,
+                fail_on=fail_on_severity,
+                min_severity=severity_filter,
+            )
+            with console.status(f"[cyan]Scanning {source} (v2 detectors)"):
+                v2_components, v2_relationships = run_scanners(v2_ctx)
+
+            all_analysis_outputs[source] = {
+                "_v2": True,
+                "components": v2_components,
+                "relationships": v2_relationships,
+            }
+            source_summary["assets_discovered"] = len(v2_components)
+            source_summary["last_generated_at"] = _utcnow_iso()
+            if source_summary["status"] == "in_progress":
+                source_summary["status"] = "completed"
+
+            if temp_dir:
+                shutil.rmtree(temp_dir)
+            continue
+
+        # -----------------------------------------------------------------
+        # Legacy path: KB-driven symbol matching (v1)
+        # -----------------------------------------------------------------
         python_files = _find_python_files(path_to_analyze)
         if not python_files:
             logging.warning("No Python files found to analyze in this source.")
@@ -1017,8 +1097,6 @@ def analyze(
         except Exception as workflow_error:
             logging.debug(f"Failed to build workflow index: {workflow_error}")
 
-        # Resolve custom catalog for this source: explicit flag is a
-        # global override; otherwise auto-discover per source directory.
         config_root = path_to_analyze if path_to_analyze.is_dir() else path_to_analyze.parent
         source_custom: Optional[CustomCatalogConfig] = explicit_config
         if source_custom is None:
@@ -1083,7 +1161,12 @@ def analyze(
     report_data = None
     reporter = get_reporter(output_format)
 
-    if reporter and output_format not in ("json", "plaintext"):
+    has_v2_output = any(
+        isinstance(o, dict) and o.get("_v2")
+        for o in all_analysis_outputs.values()
+    )
+
+    if has_v2_output or (reporter and output_format not in ("json", "plaintext")):
         from .models import (
             AIComponent as V2Component,
             AIComponentType,
@@ -1093,29 +1176,70 @@ def analyze(
         )
         from .risk import RiskScorer
 
-        scan_result = _build_scan_result(
-            all_analysis_outputs, run_metadata, run_errors,
-        )
+        if has_v2_output:
+            v2_sources = []
+            for source_path, output in all_analysis_outputs.items():
+                if isinstance(output, dict) and output.get("_v2"):
+                    v2_sources.append(SourceResult(
+                        path=source_path,
+                        components=output["components"],
+                        relationships=output["relationships"],
+                    ))
+                else:
+                    legacy_sr = _build_scan_result(
+                        {source_path: output}, run_metadata, [],
+                    )
+                    v2_sources.extend(legacy_sr.sources)
+            scan_result = ScanResult(
+                metadata=run_metadata,
+                sources=v2_sources,
+                errors=[e.get("message", str(e)) for e in run_errors],
+            )
+        else:
+            scan_result = _build_scan_result(
+                all_analysis_outputs, run_metadata, run_errors,
+            )
+
         scorer = RiskScorer()
         scan_result.risk = scorer.score(scan_result)
 
-        if validate:
-            errors = reporter.validate(scan_result)
-            if errors:
-                for err in errors:
-                    console.print(f"[yellow]Validation: {err}[/]")
-            else:
-                console.print("[green]Validation passed.[/]")
+        if not reporter:
+            reporter = get_reporter(output_format)
 
-        if output_file:
+        if reporter:
+            if validate:
+                errors = reporter.validate(scan_result)
+                if errors:
+                    for err in errors:
+                        console.print(f"[yellow]Validation: {err}[/]")
+                else:
+                    console.print("[green]Validation passed.[/]")
+
+            if output_file:
+                import io
+                buf = io.StringIO()
+                reporter.render(scan_result, buf)
+                output_file.write_text(buf.getvalue(), encoding="utf-8")
+                console.print(f"[green]Report written to {output_file}[/]")
+            else:
+                import sys
+                reporter.render(scan_result, sys.stdout)
+        elif output_format == "json":
             import io
-            buf = io.StringIO()
-            reporter.render(scan_result, buf)
-            output_file.write_text(buf.getvalue(), encoding="utf-8")
-            console.print(f"[green]Report written to {output_file}[/]")
-        else:
-            import sys
-            reporter.render(scan_result, sys.stdout)
+            json_rep = get_reporter("json")
+            if json_rep and output_file:
+                buf = io.StringIO()
+                json_rep.render(scan_result, buf)
+                output_file.write_text(buf.getvalue(), encoding="utf-8")
+                console.print(f"[green]Report written to {output_file}[/]")
+        elif output_format == "plaintext":
+            plaintext_rep = get_reporter("plaintext")
+            if plaintext_rep and output_file:
+                import io
+                buf = io.StringIO()
+                plaintext_rep.render(scan_result, buf)
+                output_file.write_text(buf.getvalue(), encoding="utf-8")
+                console.print(f"[green]Report written to {output_file}[/]")
 
         if fail_on_severity and scorer.should_fail(scan_result.risk, fail_on_severity):
             console.print(

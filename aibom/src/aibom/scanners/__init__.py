@@ -15,5 +15,45 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .base import BaseScanner, scanner_registry, run_scanners
+from .config_scanner import ConfigScanner
+from .dependency_scanner import DependencyScanner
+from .kb_enrichment_scanner import KBEnrichmentScanner
+from .mcp_detector import McpDetector
+from .ml_lifecycle_detector import MLLifecycleDetector
+from .model_detector import ModelDetector
+from .multi_language_scanner import MultiLanguageScanner
+from .secret_detector import SecretDetector
+from .shadow_ai_detector import ShadowAIDetector
+from .skill_detector import SkillDetector
+from .vuln_scanner import (
+    BaseVulnProvider,
+    GrypeProvider,
+    OsvProvider,
+    PackageRef,
+    VulnScanner,
+    Vulnerability,
+    vuln_provider_registry,
+)
 
-__all__ = ["BaseScanner", "scanner_registry", "run_scanners"]
+__all__ = [
+    "BaseScanner",
+    "BaseVulnProvider",
+    "ConfigScanner",
+    "DependencyScanner",
+    "GrypeProvider",
+    "KBEnrichmentScanner",
+    "McpDetector",
+    "MLLifecycleDetector",
+    "ModelDetector",
+    "MultiLanguageScanner",
+    "OsvProvider",
+    "PackageRef",
+    "SecretDetector",
+    "ShadowAIDetector",
+    "SkillDetector",
+    "VulnScanner",
+    "Vulnerability",
+    "run_scanners",
+    "scanner_registry",
+    "vuln_provider_registry",
+]
