@@ -14,32 +14,22 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .enums import (
-    AIComponentType,
-    DetectionSource,
-    RelationshipType,
-    Severity,
-)
-from .scan import (
-    AIComponent,
-    ComponentRelationship,
-    RiskFlag,
-    RiskScore,
-    ScanContext,
-    ScanResult,
-    SourceResult,
-)
+from __future__ import annotations
 
-__all__ = [
-    "AIComponent",
-    "AIComponentType",
-    "ComponentRelationship",
-    "DetectionSource",
-    "RelationshipType",
-    "RiskFlag",
-    "RiskScore",
-    "ScanContext",
-    "ScanResult",
-    "Severity",
-    "SourceResult",
-]
+from pydantic import BaseModel, Field
+
+
+class KBManifest(BaseModel):
+    kb_version: str
+    min_cli_version: str = ""
+    duckdb_sha256: str
+    duckdb_url: str
+    size_bytes: int = 0
+    entity_count: int = 0
+    created_at: str = ""
+    sdk_versions: dict[str, str] = Field(default_factory=dict)
+
+
+class KBManifestIndex(BaseModel):
+    latest: KBManifest
+    versions: list[KBManifest] = Field(default_factory=list)

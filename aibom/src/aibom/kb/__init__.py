@@ -14,32 +14,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .enums import (
-    AIComponentType,
-    DetectionSource,
-    RelationshipType,
-    Severity,
-)
-from .scan import (
-    AIComponent,
-    ComponentRelationship,
-    RiskFlag,
-    RiskScore,
-    ScanContext,
-    ScanResult,
-    SourceResult,
-)
+from __future__ import annotations
 
-__all__ = [
-    "AIComponent",
-    "AIComponentType",
-    "ComponentRelationship",
-    "DetectionSource",
-    "RelationshipType",
-    "RiskFlag",
-    "RiskScore",
-    "ScanContext",
-    "ScanResult",
-    "Severity",
-    "SourceResult",
-]
+from .manager import KBManager
+
+__all__ = ["KBManager"]
