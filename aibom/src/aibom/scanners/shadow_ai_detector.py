@@ -26,9 +26,13 @@ from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
 from .dependency_scanner import AI_PACKAGES, DependencyScanner, _iter_scan_paths
 
-_LANGCHAIN = frozenset(
-    {"langchain", "langchain-core", "langchain-community", "langchain-openai"},
-)
+_LANGCHAIN = frozenset({
+    "langchain", "langchain-core", "langchain-community", "langchain-openai",
+    "langchain-anthropic", "langchain-huggingface", "langchain-chroma",
+    "langchain-pinecone", "langchain-google-genai", "langchain-google-vertexai",
+    "langchain-cohere", "langchain-mistralai", "langchain-fireworks",
+    "langchain-groq", "langchain-together", "langchain-aws",
+})
 _AUTOGEN = frozenset({"autogen", "autogen-agentchat"})
 _LLAMA_INDEX = frozenset({"llama-index", "llama-index-core"})
 
@@ -45,6 +49,18 @@ def _build_module_to_pypi() -> dict[str, frozenset[str]]:
         "langchain_core",
         "langchain_community",
         "langchain_openai",
+        "langchain_anthropic",
+        "langchain_huggingface",
+        "langchain_chroma",
+        "langchain_pinecone",
+        "langchain_google_genai",
+        "langchain_google_vertexai",
+        "langchain_cohere",
+        "langchain_mistralai",
+        "langchain_fireworks",
+        "langchain_groq",
+        "langchain_together",
+        "langchain_aws",
     ):
         add(mod, _LANGCHAIN)
     for mod in ("autogen", "autogen_agentchat"):
@@ -250,7 +266,7 @@ class ShadowAIDetector(BaseScanner):
                 declared.add(c.name.strip().lower())
 
         findings: list[AIComponent] = []
-        seen: set[tuple[str, int, str]] = set()
+        seen: set[tuple[str, str]] = set()
         for path in _iter_scan_paths(context):
             if path.suffix != ".py":
                 continue
@@ -261,7 +277,7 @@ class ShadowAIDetector(BaseScanner):
                 if _is_declared(declared, pkgs):
                     continue
                 pkg_name = _pypi_display_name(mod_spec, pkgs)
-                key = (str(path.resolve()), lineno, pkg_name)
+                key = (str(path.resolve()), pkg_name)
                 if key in seen:
                     continue
                 seen.add(key)

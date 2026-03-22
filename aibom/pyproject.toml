@@ -55,6 +55,23 @@ test = [
     "pytest>=8.4.1",
     "pytest-cov>=6.2.1",
 ]
+analysis = [
+    "detect-secrets>=1.5.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-languages>=1.10.0",
+]
+security = [
+    "cisco-ai-mcp-scanner>=4.3.0",
+    "cisco-ai-skill-scanner>=2.0.0",
+]
+agentic = [
+    "deepagents>=0.4.12",
+    "langchain>=1.2.11",
+    "langchain-core>=1.2.18",
+]
+all = [
+    "cisco-aibom[analysis,security,agentic]",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -117,6 +134,20 @@ strict_equality = true
 [[tool.mypy.overrides]]
 module = [
     "litellm",
+    "deepagents",
+    "deepagents.*",
+    "langchain",
+    "langchain.*",
+    "langchain_core",
+    "langchain_core.*",
+    "detect_secrets",
+    "detect_secrets.*",
+    "tree_sitter",
+    "tree_sitter_languages",
+    "mcpscanner",
+    "mcpscanner.*",
+    "skill_scanner",
+    "skill_scanner.*",
 ]
 ignore_missing_imports = true
 
