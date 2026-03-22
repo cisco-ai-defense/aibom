@@ -34,7 +34,9 @@ from aibom.models import AIComponentType, DetectionSource, ScanContext
 from aibom.scanners.kb_enrichment_scanner import (
     ALLOWED_CONCEPTS,
     KBEnrichmentScanner,
+    _build_kb_patterns,
     _extract_class_segment,
+    _extract_leaf_class,
     _frameworks_related,
     _match_observation,
     _resolve_kb_path,
@@ -160,6 +162,119 @@ class TestMatchObservation:
         assert result is None
 
 
+def _kb_available() -> bool:
+    ctx = ScanContext(paths=["/tmp"])
+    return _resolve_kb_path(ctx) is not None
+
+
+class TestExtractLeafClass:
+    """Unit tests for _extract_leaf_class KB id parsing."""
+
+    def test_valid_class(self):
+        assert _extract_leaf_class("langchain_core.tools.tool.Tool") == "Tool"
+
+    def test_valid_deep_class(self):
+        assert (
+            _extract_leaf_class("langchain_community.tools.ddg_search.tool.DuckDuckGoSearchRun")
+            == "DuckDuckGoSearchRun"
+        )
+
+    def test_rejects_lowercase_leaf(self):
+        assert _extract_leaf_class("langchain.tools.render.format_tool_to_openai_function") is None
+
+    def test_rejects_all_uppercase(self):
+        assert _extract_leaf_class("langchain.constants.API") is None
+
+    def test_rejects_short_leaf(self):
+        assert _extract_leaf_class("some.module.OK") is None
+
+    def test_rejects_generic_class(self):
+        assert _extract_leaf_class("langchain.tools.base.Awaitable") is None
+
+    def test_rejects_data_class_suffix(self):
+        assert _extract_leaf_class("langchain.agents.schema.AgentAction") is None
+
+    def test_rejects_method_on_class(self):
+        assert _extract_leaf_class("langchain_core.tools.Tool.from_function") is None
+
+    def test_no_dot(self):
+        assert _extract_leaf_class("Tool") is None
+
+    def test_excluded_class_blocked(self):
+        assert _extract_leaf_class("langchain.text_splitter.RecursiveCharacterTextSplitter") is None
+
+
+@pytest.mark.skipif(not _kb_available(), reason="No KB DuckDB installed")
+class TestBuildKBPatterns:
+    """Integration tests for _build_kb_patterns against real KB."""
+
+    def test_returns_all_component_types(self, tmp_path: Path):
+        from aibom.catalog_db import CatalogDB
+
+        ctx = ScanContext(paths=[str(tmp_path)])
+        kb_path = _resolve_kb_path(ctx)
+        assert kb_path is not None
+
+        with CatalogDB(kb_path) as db:
+            patterns = _build_kb_patterns(db)
+            assert AIComponentType.TOOL in patterns
+            assert AIComponentType.MEMORY in patterns
+            assert AIComponentType.PROMPT in patterns
+            assert AIComponentType.AGENT in patterns
+
+    def test_tool_patterns_exceed_static(self, tmp_path: Path):
+        from aibom.catalog_db import CatalogDB
+
+        ctx = ScanContext(paths=[str(tmp_path)])
+        kb_path = _resolve_kb_path(ctx)
+        assert kb_path is not None
+
+        with CatalogDB(kb_path) as db:
+            patterns = _build_kb_patterns(db)
+            assert len(patterns[AIComponentType.TOOL]) > 10
+
+    def test_patterns_include_static_fallbacks(self, tmp_path: Path):
+        from aibom.catalog_db import CatalogDB
+
+        ctx = ScanContext(paths=[str(tmp_path)])
+        kb_path = _resolve_kb_path(ctx)
+        assert kb_path is not None
+
+        with CatalogDB(kb_path) as db:
+            patterns = _build_kb_patterns(db)
+            assert "Tool" in patterns[AIComponentType.TOOL]
+            assert "StructuredTool" in patterns[AIComponentType.TOOL]
+            assert "ConversationBufferMemory" in patterns[AIComponentType.MEMORY]
+            assert "PromptTemplate" in patterns[AIComponentType.PROMPT]
+
+    def test_excluded_classes_not_in_patterns(self, tmp_path: Path):
+        from aibom.catalog_db import CatalogDB
+
+        ctx = ScanContext(paths=[str(tmp_path)])
+        kb_path = _resolve_kb_path(ctx)
+        assert kb_path is not None
+
+        with CatalogDB(kb_path) as db:
+            patterns = _build_kb_patterns(db)
+            all_names = set()
+            for names in patterns.values():
+                all_names |= names
+            assert "RecursiveCharacterTextSplitter" not in all_names
+            assert "ABC" not in all_names
+
+    def test_detects_duckduckgo_tool_from_kb(self, tmp_path: Path):
+        """KB-derived patterns should include DuckDuckGoSearchRun without
+        needing it in the static list."""
+        (tmp_path / "search.py").write_text(
+            "from langchain_community.tools import DuckDuckGoSearchRun\n"
+            "search = DuckDuckGoSearchRun()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert any("DuckDuckGoSearchRun" in t.name or "search" in t.name for t in tools)
+
+
 class TestAllowedConcepts:
     def test_expected_concepts(self):
         assert "agent" in ALLOWED_CONCEPTS
@@ -178,11 +293,6 @@ class TestAllowedConcepts:
 # ---------------------------------------------------------------------------
 # Scanner-level tests (KB presence required)
 # ---------------------------------------------------------------------------
-
-
-def _kb_available() -> bool:
-    ctx = ScanContext(paths=["/tmp"])
-    return _resolve_kb_path(ctx) is not None
 
 
 @pytest.mark.skipif(not _kb_available(), reason="No KB DuckDB installed")

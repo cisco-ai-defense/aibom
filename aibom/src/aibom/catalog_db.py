@@ -77,6 +77,22 @@ class CatalogDB:
         """Check if *entry_id* matches any exclude pattern (suffix match)."""
         return is_excluded(entry_id, self._excludes)
 
+    def find_ids_by_path_and_concept(
+        self, path_segment: str, concepts: Sequence[str]
+    ) -> List[str]:
+        """Return distinct entry IDs whose path contains *path_segment*
+        and whose concept is in *concepts*."""
+        if not concepts:
+            return []
+        placeholders = ",".join("?" for _ in concepts)
+        query = f"""
+            SELECT DISTINCT id FROM component_catalog
+            WHERE id LIKE ? AND LOWER(concept) IN ({placeholders})
+        """
+        params: list[str] = [f"%{path_segment}%"] + [c.lower() for c in concepts]
+        rows = self._connection.execute(query, params).fetchall()
+        return [r[0] for r in rows]
+
     def find_components_by_suffixes(self, suffixes: Sequence[str]) -> List[Dict[str, Any]]:
         """Return catalog entries whose IDs end with any of the provided suffixes.
 

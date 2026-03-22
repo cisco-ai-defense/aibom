@@ -749,7 +749,7 @@ class ModelDetector(BaseScanner):
         self, context: ScanContext
     ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
         components: list[AIComponent] = []
-        seen: set[tuple[str, int, str, str]] = set()
+        seen: set[tuple[str, str]] = set()
 
         for fpath, _rel in _iter_files(context):
             suffix = fpath.suffix.lower()
@@ -779,7 +779,7 @@ class ModelDetector(BaseScanner):
 
             fp_str = str(fpath)
             for model_name, line_no, method in extracted:
-                key = (fp_str, line_no, model_name, method)
+                key = (fp_str, model_name)
                 if key in seen:
                     continue
                 seen.add(key)
