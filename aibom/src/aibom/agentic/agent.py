@@ -81,7 +81,20 @@ def create_aibom_agent(
         if llm_config.get("api_base"):
             init_kwargs["base_url"] = llm_config["api_base"]
 
-    model = init_chat_model(model_string, **init_kwargs)
+    model_id = model_string
+    if "/" in model_string:
+        provider_prefix, _, model_id = model_string.partition("/")
+        init_kwargs.setdefault("model_provider", provider_prefix)
+
+    try:
+        model = init_chat_model(model_id, **init_kwargs)
+    except ImportError as exc:
+        provider = init_kwargs.get("model_provider", "unknown")
+        raise ImportError(
+            f"Provider '{provider}' requires its LangChain integration package. "
+            f"Install it with: pip install langchain-{provider}\n"
+            f"Original error: {exc}"
+        ) from exc
     tools = build_tools()
 
     agent = create_deep_agent(

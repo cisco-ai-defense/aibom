@@ -233,6 +233,7 @@ def _regex_scan_line(
             continue
         if not pat.regex.search(line):
             continue
+        is_low_confidence = pat.confidence < 0.6
         comp = AIComponent(
             name=pat.name,
             component_type=AIComponentType.SECRET,
@@ -240,6 +241,8 @@ def _regex_scan_line(
             line_number=line_number,
             detection_source=DetectionSource.CODE_ANALYSIS,
             confidence=pat.confidence,
+            needs_agentic=is_low_confidence,
+            agentic_hint=f"Generic hex pattern for {pat.name}; needs context verification" if is_low_confidence else "",
             description=f"Potential {pat.name} detected",
             text=None,
             metadata={

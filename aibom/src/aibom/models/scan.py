@@ -33,6 +33,8 @@ class AIComponent(BaseModel):
     framework: str = ""
     detection_source: DetectionSource = DetectionSource.CODE_ANALYSIS
     confidence: float = 1.0
+    needs_agentic: bool = False
+    agentic_hint: str = ""
 
     model_name: Optional[str] = None
     embedding_model: Optional[str] = None
@@ -153,14 +155,25 @@ class ScanResult(BaseModel):
         return [r for s in self.sources for r in s.relationships]
 
     @property
+    def confirmed_components(self) -> list[AIComponent]:
+        return [c for c in self.all_components if not c.needs_agentic]
+
+    @property
+    def agentic_candidates(self) -> list[AIComponent]:
+        return [c for c in self.all_components if c.needs_agentic]
+
+    @property
     def summary(self) -> dict[str, Any]:
         components = self.all_components
         by_type: dict[str, int] = {}
         for c in components:
-            by_type[c.component_type.value] = by_type.get(c.component_type.value, 0) + 1
+            if not c.needs_agentic:
+                by_type[c.component_type.value] = by_type.get(c.component_type.value, 0) + 1
+        agentic = [c for c in components if c.needs_agentic]
         return {
             "total_sources": len(self.sources),
-            "total_components": len(components),
+            "total_components": len(components) - len(agentic),
+            "agentic_candidates": len(agentic),
             "component_types": by_type,
             "total_relationships": len(self.all_relationships),
             "risk_score": self.risk.score,
