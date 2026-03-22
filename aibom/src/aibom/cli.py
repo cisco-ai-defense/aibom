@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional
 import typer
 from rich import box
 from rich.console import Console
+
+_LOGGER = logging.getLogger(__name__)
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
 from rich.syntax import Syntax
@@ -797,7 +799,11 @@ def analyze(
     llm_model: Optional[str] = typer.Option(
         None,
         "--llm-model",
-        help="LLM model name for semantic model extraction (e.g., gpt-3.5-turbo)",
+        help=(
+            "LLM model name (e.g. gpt-4o, claude-sonnet-4-20250514).  "
+            "In v2 mode this enables agentic enrichment after the "
+            "deterministic scan (requires 'cisco-aibom[agentic]')."
+        ),
     ),
     llm_api_key: Optional[str] = typer.Option(
         None,
@@ -1024,10 +1030,54 @@ def analyze(
             with console.status(f"[cyan]Scanning {source} (v2 detectors)"):
                 v2_components, v2_relationships = run_scanners(v2_ctx)
 
+            # ---- Agentic enrichment (triggered when --llm-model is set) ----
+            agentic_risk_flags: list = []
+            if llm_config and v2_components:
+                try:
+                    from .agentic.agent import (
+                        AgenticEnrichmentError,
+                        run_agentic_enrichment,
+                    )
+
+                    model_str = llm_config["model"]
+                    with console.status(
+                        f"[magenta]Enriching {source} with agentic analysis "
+                        f"({model_str})"
+                    ):
+                        (
+                            v2_components,
+                            agentic_rels,
+                            agentic_risk_flags,
+                        ) = run_agentic_enrichment(
+                            model_string=model_str,
+                            deterministic_components=v2_components,
+                            deterministic_relationships=v2_relationships,
+                            scan_paths=[scan_path],
+                            llm_config=llm_config,
+                        )
+                    v2_relationships = v2_relationships + agentic_rels
+                    console.print(
+                        f"  [magenta]Agentic enrichment added "
+                        f"{len(agentic_rels)} relationships, "
+                        f"{len(agentic_risk_flags)} risk flags[/]"
+                    )
+                except ImportError:
+                    console.print(
+                        "[yellow]Warning: agentic enrichment with --llm-model "
+                        "requires 'cisco-aibom[agentic]'.  Install with: "
+                        "pip install 'cisco-aibom[agentic]'[/]"
+                    )
+                except Exception as exc:
+                    _LOGGER.warning("Agentic enrichment failed: %s", exc)
+                    console.print(
+                        f"[yellow]Warning: agentic enrichment failed: {exc}[/]"
+                    )
+
             all_analysis_outputs[source] = {
                 "_v2": True,
                 "components": v2_components,
                 "relationships": v2_relationships,
+                "_agentic_risk_flags": agentic_risk_flags,
             }
             source_summary["assets_discovered"] = len(v2_components)
             source_summary["last_generated_at"] = _utcnow_iso()
@@ -1202,6 +1252,11 @@ def analyze(
 
         scorer = RiskScorer()
         scan_result.risk = scorer.score(scan_result)
+
+        for output in all_analysis_outputs.values():
+            if isinstance(output, dict):
+                for rf in output.get("_agentic_risk_flags", []):
+                    scan_result.risk.add_flag(rf)
 
         if not reporter:
             reporter = get_reporter(output_format)
