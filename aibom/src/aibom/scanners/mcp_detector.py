@@ -225,18 +225,35 @@ def _components_from_python(path: Path) -> list[AIComponent]:
         )
 
     mdec = _RE_MCP_TOOL_DECORATOR.search(text)
+    has_mcp = bool(m_imp or m_srv_imp or _RE_FASTMCP.search(text))
     if mdec:
-        out.append(
-            AIComponent(
-                name=f"{path.stem}_mcp_tooling",
-                component_type=AIComponentType.TOOL,
-                file_path=fp,
-                line_number=_line_for_match(text, mdec.start()),
-                framework="mcp",
-                detection_source=DetectionSource.CODE_ANALYSIS,
-                metadata={"mcp_decorators": True},
+        if has_mcp:
+            out.append(
+                AIComponent(
+                    name=f"{path.stem}_mcp_tooling",
+                    component_type=AIComponentType.TOOL,
+                    file_path=fp,
+                    line_number=_line_for_match(text, mdec.start()),
+                    framework="mcp",
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    metadata={"mcp_decorators": True},
+                )
             )
-        )
+        else:
+            out.append(
+                AIComponent(
+                    name=f"{path.stem}_mcp_tooling",
+                    component_type=AIComponentType.TOOL,
+                    file_path=fp,
+                    line_number=_line_for_match(text, mdec.start()),
+                    framework="mcp",
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    confidence=0.3,
+                    needs_agentic=True,
+                    agentic_hint="@tool decorator without MCP imports in file",
+                    metadata={"mcp_decorators": True},
+                )
+            )
 
     client_hits: list[tuple[str, int]] = []
     for label, pat in (

@@ -16,7 +16,9 @@
 
 from .base import BaseScanner, scanner_registry, run_scanners
 from .config_scanner import ConfigScanner
+from .deployment_detector import DeploymentDetector
 from .dependency_scanner import DependencyScanner
+from .env_var_resolver import EnvVarResolver
 from .kb_enrichment_scanner import KBEnrichmentScanner
 from .mcp_detector import McpDetector
 from .ml_lifecycle_detector import MLLifecycleDetector
@@ -39,7 +41,9 @@ __all__ = [
     "BaseScanner",
     "BaseVulnProvider",
     "ConfigScanner",
+    "DeploymentDetector",
     "DependencyScanner",
+    "EnvVarResolver",
     "GrypeProvider",
     "KBEnrichmentScanner",
     "McpDetector",
