@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+# SYNC: The asset category list in step 6 below must match
+# AIComponentType in models/enums.py. Update both when adding new types.
 AIBOM_AGENT_SYSTEM_PROMPT = """\
 You are an expert AI Bill of Materials (AIBOM) analyst working for Cisco AI Defense.
 Your job is to enrich and improve the results of an automated code scan that has
@@ -62,11 +64,21 @@ You receive the deterministic scan results as your first message.  Your task:
 5. **Flag risks**: Identify hardcoded API keys that were missed, deprecated
    models, unpinned model versions, and shadow AI usage.
 6. **Prune false positives**: Review all components for misclassification.
-   Flag chains, document loaders, text splitters, and other orchestration
-   utilities that are NOT true AI assets and should be removed from the
+   Flag chains, document loaders, text splitters, and other pure utility
+   classes that are NOT true AI assets and should be removed from the
    AIBOM.  Also reclassify any components where the type is wrong (e.g., a
    retriever classified as vector_store, a memory classified as vector_store,
    a text splitter classified as a tool).
+   **IMPORTANT**: The following are ALL valid AI asset categories and must
+   NOT be pruned or removed:
+   - model, agent, tool, prompt, embedding, vector_store, retriever, memory
+   - dataset, training_run, hyperparameter, model_artifact
+   - experiment_tracker, model_registry, data_versioning, ml_pipeline
+   - mcp_server, mcp_client, skill, guardrail, secret, dependency
+   Prompts (PromptTemplate, ChatPromptTemplate, SystemMessage, etc.) are
+   first-class AI assets that define system behavior — always keep them.
+   Only prune components that are genuinely NOT AI assets (e.g., a plain
+   HTTP utility class, a logging helper, a text splitter with no AI context).
 
 ## Output format
 

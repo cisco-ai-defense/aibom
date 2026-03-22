@@ -75,16 +75,23 @@ def create_aibom_agent(
     from .tools import build_tools
 
     init_kwargs: dict[str, Any] = {}
+
+    model_id = model_string
+    provider_prefix = ""
+    if "/" in model_string:
+        provider_prefix, _, model_id = model_string.partition("/")
+        init_kwargs.setdefault("model_provider", provider_prefix)
+
     if llm_config:
         if llm_config.get("api_key"):
             init_kwargs["api_key"] = llm_config["api_key"]
         if llm_config.get("api_base"):
-            init_kwargs["base_url"] = llm_config["api_base"]
-
-    model_id = model_string
-    if "/" in model_string:
-        provider_prefix, _, model_id = model_string.partition("/")
-        init_kwargs.setdefault("model_provider", provider_prefix)
+            if provider_prefix == "azure_openai":
+                init_kwargs["azure_endpoint"] = llm_config["api_base"]
+            else:
+                init_kwargs["base_url"] = llm_config["api_base"]
+        if llm_config.get("api_version") and provider_prefix == "azure_openai":
+            init_kwargs["api_version"] = llm_config["api_version"]
 
     try:
         model = init_chat_model(model_id, **init_kwargs)
