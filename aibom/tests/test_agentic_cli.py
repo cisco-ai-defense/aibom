@@ -116,6 +116,9 @@ class TestAgenticEnrichmentViaCLI:
         assert result.exit_code == 0
 
     def test_llm_model_help_mentions_agentic(self):
+        import re
+
         result = runner.invoke(app, ["analyze", "--help"])
-        assert "--llm-model" in result.output
-        assert "agentic" in result.output
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--llm-model" in clean
+        assert "agentic" in clean
