@@ -18,7 +18,12 @@ from enum import Enum
 
 
 class AIComponentType(str, Enum):
-    """All recognized AI asset types that AIBOM can detect."""
+    """All recognized AI asset types that AIBOM can detect.
+
+    SYNC NOTE: The agentic system prompt in ``agentic/prompts.py``
+    lists these categories as protected (must-not-prune). When adding
+    or removing values here, update that prompt to match.
+    """
 
     MODEL = "model"
     AGENT = "agent"
