@@ -852,10 +852,70 @@ def analyze(
         "--severity",
         help="Minimum severity of findings to include in the report.",
     ),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Only emit high-confidence detections; suppress items that need agentic reasoning.",
+    ),
     validate: bool = typer.Option(
         False,
         "--validate",
         help="Validate the output against the format's schema and report errors.",
+    ),
+    repos_file: Optional[Path] = typer.Option(
+        None,
+        "--repos-file",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help=(
+            "Path to a file listing repo paths or git URLs "
+            "(JSON array or newline-delimited text)."
+        ),
+    ),
+    discover_repos: bool = typer.Option(
+        False,
+        "--discover-repos",
+        help=(
+            "Treat each positional source as a parent directory and "
+            "auto-discover all git repositories underneath."
+        ),
+    ),
+    github_org: Optional[str] = typer.Option(
+        None,
+        "--github-org",
+        help="Discover and scan repos from a GitHub org/user.",
+        envvar="AIBOM_GITHUB_ORG",
+    ),
+    gitlab_group: Optional[str] = typer.Option(
+        None,
+        "--gitlab-group",
+        help="Discover and scan repos from a GitLab group.",
+        envvar="AIBOM_GITLAB_GROUP",
+    ),
+    bitbucket_project: Optional[str] = typer.Option(
+        None,
+        "--bitbucket-project",
+        help="Discover and scan repos from a Bitbucket workspace/project.",
+        envvar="AIBOM_BITBUCKET_PROJECT",
+    ),
+    platform_token: Optional[str] = typer.Option(
+        None,
+        "--platform-token",
+        help="Auth token for GitHub/GitLab/Bitbucket API access.",
+        envvar="AIBOM_PLATFORM_TOKEN",
+    ),
+    repo_name_filter: Optional[str] = typer.Option(
+        None,
+        "--repo-filter",
+        help="Filter discovered repos by name substring.",
+    ),
+    repo_topic_filter: Optional[str] = typer.Option(
+        None,
+        "--repo-topic",
+        help="Filter discovered repos by topic/tag.",
     ),
     legacy_mode: bool = typer.Option(
         False,
@@ -898,12 +958,8 @@ def analyze(
         logging.error(f"Invalid --severity value '{min_severity}'. Must be: critical, high, medium, low, info")
         raise typer.Exit(code=1)
     
-    # Validate LLM configuration if model extraction is requested
     llm_config = None
     if llm_model:
-        if not llm_api_base:
-            logging.error("--llm-api-base is required when --llm-model is specified.")
-            raise typer.Exit(code=1)
         llm_config = {
             "model": llm_model,
             "api_key": llm_api_key,
@@ -923,6 +979,57 @@ def analyze(
         except json.JSONDecodeError:
             logging.error(f"Could not decode JSON from {images_file}")
             raise typer.Exit(code=1)
+
+    if repos_file:
+        from .multi_repo import read_repos_file
+        sources_to_process.extend(read_repos_file(repos_file))
+
+    if discover_repos:
+        from .multi_repo import discover_repos as _discover
+        expanded: list[str] = []
+        for src in sources_to_process:
+            p = Path(src)
+            if p.is_dir() and not (p / ".git").exists():
+                repos = _discover(p)
+                if repos:
+                    console.print(
+                        f"  [dim]Discovered {len(repos)} repo(s) under {src}[/]"
+                    )
+                    expanded.extend(str(r) for r in repos)
+                else:
+                    expanded.append(src)
+            else:
+                expanded.append(src)
+        sources_to_process = expanded
+
+    _platform_pairs: list[tuple[str, str]] = []
+    if github_org:
+        _platform_pairs.append(("github", github_org))
+    if gitlab_group:
+        _platform_pairs.append(("gitlab", gitlab_group))
+    if bitbucket_project:
+        _platform_pairs.append(("bitbucket", bitbucket_project))
+
+    if _platform_pairs:
+        from .platform_adapters import get_adapter
+
+        for plat, ns in _platform_pairs:
+            try:
+                adapter = get_adapter(plat, token=platform_token)
+                repos = adapter.list_repos(
+                    ns,
+                    name_filter=repo_name_filter,
+                    topic_filter=repo_topic_filter,
+                )
+                console.print(
+                    f"  [dim]{plat}: discovered {len(repos)} repo(s) "
+                    f"in {ns}[/]"
+                )
+                sources_to_process.extend(r.clone_url for r in repos)
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Warning: {plat} discovery failed: {exc}[/]"
+                )
 
     if not sources_to_process:
         logging.error("No sources provided. Please specify a path or an images file.")
@@ -954,13 +1061,35 @@ def analyze(
     if custom_catalog:
         explicit_config = load_custom_catalog(Path(custom_catalog))
 
+    clone_managers: list[Any] = []
+
     for source in sources_to_process:
         console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
         temp_dir = None
-        is_container = is_docker_image(source)
-        path_to_analyze = Path(source)
+        clone_ctx = None
+
+        from .multi_repo import is_git_url, ClonedRepo
+
+        if is_git_url(source):
+            try:
+                clone_ctx = ClonedRepo(source)
+                cloned_path = clone_ctx.__enter__()
+                clone_managers.append(clone_ctx)
+                path_to_analyze = cloned_path
+            except RuntimeError as exc:
+                console.print(f"[red]Clone failed:[/] {exc}")
+                continue
+            is_container = False
+        else:
+            is_container = is_docker_image(source)
+            path_to_analyze = Path(source)
+
         source_summary = {
-            "source_kind": "container" if is_container else "local-path",
+            "source_kind": (
+                "git-url" if clone_ctx
+                else "container" if is_container
+                else "local-path"
+            ),
             "status": "in_progress",
             "status_detail": None,
             "assets_discovered": 0,
@@ -1011,75 +1140,64 @@ def analyze(
             continue
 
         # -----------------------------------------------------------------
-        # v2 path: targeted detectors via run_scanners()
+        # v2 path: four-stage pipeline (scan → cross-ref → agentic → assemble)
         # -----------------------------------------------------------------
         if not legacy_mode:
-            from .models import ScanContext as V2ScanContext
-            from .scanners import run_scanners
+            from .scan_pipeline import ScanPipeline
 
             scan_path = str(path_to_analyze)
-            v2_ctx = V2ScanContext(
-                paths=[scan_path],
+            pipeline = ScanPipeline(
+                scan_paths=[scan_path],
                 output_format=output_format,
                 output_file=str(output_file) if output_file else None,
                 llm_config=llm_config,
                 kb_path=str(db_path) if db_path else None,
                 fail_on=fail_on_severity,
                 min_severity=severity_filter,
+                strict=strict,
             )
-            with console.status(f"[cyan]Scanning {source} (v2 detectors)"):
-                v2_components, v2_relationships = run_scanners(v2_ctx)
+            with console.status(f"[cyan]Scanning {source} (v2 pipeline)"):
+                result = pipeline.run()
 
-            # ---- Agentic enrichment (triggered when --llm-model is set) ----
-            agentic_risk_flags: list = []
-            if llm_config and v2_components:
-                try:
-                    from .agentic.agent import (
-                        AgenticEnrichmentError,
-                        run_agentic_enrichment,
-                    )
+            if llm_config and result.agentic_risk_flags:
+                console.print(
+                    f"  [magenta]Agentic enrichment added "
+                    f"{len(result.agentic_risk_flags)} risk flags[/]"
+                )
 
-                    model_str = llm_config["model"]
-                    with console.status(
-                        f"[magenta]Enriching {source} with agentic analysis "
-                        f"({model_str})"
-                    ):
-                        (
-                            v2_components,
-                            agentic_rels,
-                            agentic_risk_flags,
-                        ) = run_agentic_enrichment(
-                            model_string=model_str,
-                            deterministic_components=v2_components,
-                            deterministic_relationships=v2_relationships,
-                            scan_paths=[scan_path],
-                            llm_config=llm_config,
+            if result.external_deps:
+                escaping = [d for d in result.external_deps if d.escapes_root]
+                if escaping:
+                    lines = [
+                        f"[yellow bold]{len(escaping)} dependency(ies) reference "
+                        f"repos not included in this scan:[/]\n"
+                    ]
+                    for d in escaping[:10]:
+                        label = d.name or d.url_or_path
+                        lines.append(
+                            f"  • [bold]{label}[/] ({d.dep_type}) "
+                            f"from {Path(d.source_file).name}"
                         )
-                    v2_relationships = v2_relationships + agentic_rels
-                    console.print(
-                        f"  [magenta]Agentic enrichment added "
-                        f"{len(agentic_rels)} relationships, "
-                        f"{len(agentic_risk_flags)} risk flags[/]"
+                    if len(escaping) > 10:
+                        lines.append(f"  … and {len(escaping) - 10} more")
+                    lines.append(
+                        "\n[dim]Include these repos in your scan for "
+                        "better cross-reference resolution.[/]"
                     )
-                except ImportError:
-                    console.print(
-                        "[yellow]Warning: agentic enrichment with --llm-model "
-                        "requires 'cisco-aibom[agentic]'.  Install with: "
-                        "pip install 'cisco-aibom[agentic]'[/]"
-                    )
-                except Exception as exc:
-                    _LOGGER.warning("Agentic enrichment failed: %s", exc)
-                    console.print(
-                        f"[yellow]Warning: agentic enrichment failed: {exc}[/]"
-                    )
+                    console.print(Panel(
+                        "\n".join(lines),
+                        title="[bold]Missing Repositories[/]",
+                        border_style="yellow",
+                    ))
 
             all_analysis_outputs[source] = {
                 "_v2": True,
-                "components": v2_components,
-                "relationships": v2_relationships,
-                "_agentic_risk_flags": agentic_risk_flags,
+                "components": result.components,
+                "relationships": result.relationships,
+                "_agentic_risk_flags": result.agentic_risk_flags,
+                "_agentic_candidate_count": result.agentic_candidate_count,
             }
-            source_summary["assets_discovered"] = len(v2_components)
+            source_summary["assets_discovered"] = len(result.components)
             source_summary["last_generated_at"] = _utcnow_iso()
             if source_summary["status"] == "in_progress":
                 source_summary["status"] = "completed"
@@ -1335,6 +1453,29 @@ def analyze(
     else:  # plaintext
         _generate_plaintext_report(all_analysis_outputs, output_file)
 
+    for cm in clone_managers:
+        cm.__exit__(None, None, None)
+
+    total_agentic = sum(
+        v.get("_agentic_candidate_count", 0)
+        for v in all_analysis_outputs.values()
+        if isinstance(v, dict)
+    )
+    if total_agentic > 0 and not llm_config:
+        console.print()
+        console.print(
+            Panel.fit(
+                f"[yellow bold]{total_agentic} detection(s) need agentic reasoning[/]\n\n"
+                "These are ambiguous patterns (e.g., model names in IaC values,\n"
+                ".fit() calls without ML imports, generic Agent/Tool usage)\n"
+                "that require LLM reasoning to confirm or discard.\n\n"
+                "[green]Re-run with --llm-model <model> to resolve them.[/]\n"
+                "[dim]Use --strict to suppress these from the report.[/]",
+                title="[bold]Agentic Reasoning Recommended[/]",
+                border_style="yellow",
+            )
+        )
+
     if show_summary:
         _display_analysis_summary(all_analysis_outputs)
 
@@ -1486,6 +1627,8 @@ def kb_list_requests(
 
 def cli_entry_point() -> None:
     """Entry point for console_scripts."""
+    import sys
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
     app()
 
 

@@ -113,7 +113,8 @@ class TestModelDetector:
         )
         assert len(comps) == 1
         assert comps[0].model_name == "totally-unknown-custom-llm-id"
-        assert comps[0].confidence == 0.7
+        assert comps[0].confidence == 0.4
+        assert comps[0].needs_agentic is True
         assert comps[0].metadata.get("provider") == "unknown"
 
     def test_model_card_url_open_vs_closed(self, tmp_path: Path) -> None:
@@ -217,7 +218,8 @@ class TestModelDetector:
                 {"app.py": 'model="someorg/nonexistent-model"\n'},
             )
         assert len(comps) == 1
-        assert comps[0].confidence == 0.7
+        assert comps[0].confidence == 0.4
+        assert comps[0].needs_agentic is True
         assert comps[0].metadata["registry_source"] == "none"
 
     def test_bedrock_arn_resolves_via_alias(self, tmp_path: Path) -> None:

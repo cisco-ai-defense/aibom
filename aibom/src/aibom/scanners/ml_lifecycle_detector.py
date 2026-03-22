@@ -27,6 +27,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
+from .import_context import has_any_ai_imports, has_data_imports, has_ml_imports
 
 
 @dataclass(frozen=True)
@@ -303,6 +304,13 @@ _CONCEPT_PATTERNS: list[ConceptPattern] = [
 
 _YAML_DATA_SECTION_RE = re.compile(r"^\s*data:\s*(?:#.*)?$")
 
+_K8S_DATA_SECTION_RE = re.compile(
+    r"^\s*kind:\s*(ConfigMap|Secret|Deployment|StatefulSet|DaemonSet|Service|"
+    r"Ingress|Job|CronJob|ServiceAccount|Role|RoleBinding|ClusterRole|"
+    r"ClusterRoleBinding|PersistentVolumeClaim|HorizontalPodAutoscaler)\s*$",
+    re.MULTILINE,
+)
+
 
 def _emit(
     concept: AIComponentType,
@@ -315,6 +323,9 @@ def _emit(
     hyperparameters: Optional[dict[str, Any]] = None,
     storage_uri: Optional[str] = None,
     text: Optional[str] = None,
+    confidence: float = 0.85,
+    needs_agentic: bool = False,
+    agentic_hint: str = "",
 ) -> AIComponent:
     hp = hyperparameters or {}
     name = concept.value
@@ -327,12 +338,66 @@ def _emit(
         line_number=line_number,
         framework=framework,
         detection_source=detection_source,
-        confidence=0.85,
+        confidence=confidence,
+        needs_agentic=needs_agentic,
+        agentic_hint=agentic_hint,
         description=description,
         text=text,
         storage_uri=storage_uri,
         hyperparameters=hp,
     )
+
+
+_AMBIGUOUS_TRAINING_FW = frozenset({
+    "keras/pytorch", "pytorch/tensorflow", "pytorch",
+})
+
+_AMBIGUOUS_DATASET_FW = frozenset({
+    "pandas", "cloud-storage", "azure-blob",
+})
+
+
+def _concept_confidence(
+    concept: AIComponentType,
+    suffix: str,
+    file_has_ml: bool,
+    file_has_ai: bool,
+    file_has_data: bool,
+    framework: str,
+) -> tuple[float, bool, str]:
+    """Return (confidence, needs_agentic, hint) based on import context."""
+    if suffix != ".py":
+        return (0.75, False, "")
+
+    if concept == AIComponentType.TRAINING_RUN:
+        if file_has_ml:
+            return (0.9, False, "")
+        return (0.3, True, f".fit()/{framework} without ML imports in file")
+
+    if concept == AIComponentType.DATASET:
+        if file_has_ml or file_has_data:
+            return (0.85, False, "")
+        if framework in _AMBIGUOUS_DATASET_FW:
+            return (0.3, True, f"pd.read_csv/{framework} without ML/data imports")
+        return (0.7, False, "")
+
+    if concept == AIComponentType.HYPERPARAMETER:
+        if file_has_ml:
+            return (0.85, False, "")
+        return (0.35, True, "hyperparameter kwarg without ML imports")
+
+    if concept in (AIComponentType.MODEL_ARTIFACT, AIComponentType.DATA_VERSIONING):
+        return (0.9, False, "")
+
+    if concept in (AIComponentType.EXPERIMENT_TRACKER, AIComponentType.MODEL_REGISTRY):
+        return (0.85, False, "")
+
+    if concept == AIComponentType.ML_PIPELINE:
+        if file_has_ai or file_has_ml:
+            return (0.85, False, "")
+        return (0.5, True, "pipeline pattern without AI/ML imports")
+
+    return (0.85, False, "")
 
 
 class MLLifecycleDetector(BaseScanner):
@@ -369,6 +434,10 @@ class MLLifecycleDetector(BaseScanner):
                 text = fpath.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+
+            file_has_ml = has_ml_imports(text) if suffix == ".py" else False
+            file_has_ai = has_any_ai_imports(text) if suffix == ".py" else False
+            file_has_data = has_data_imports(text) if suffix == ".py" else False
 
             is_ci = (
                 rel.startswith(".github/workflows/")
@@ -426,21 +495,25 @@ class MLLifecycleDetector(BaseScanner):
                 stripped = line.strip()
 
                 if is_yaml and _YAML_DATA_SECTION_RE.match(line):
-                    uri = _extract_uri_from_line(line)
-                    add(
-                        _emit(
-                            AIComponentType.DATASET,
-                            "yaml-config",
-                            "YAML data section",
-                            fp_str,
-                            line_no,
-                            detection_source=DetectionSource.CONFIG_FILE,
-                            storage_uri=uri,
-                            text=stripped[:200],
+                    is_k8s_manifest = _K8S_DATA_SECTION_RE.search(text) is not None
+                    if not is_k8s_manifest:
+                        uri = _extract_uri_from_line(line)
+                        add(
+                            _emit(
+                                AIComponentType.DATASET,
+                                "yaml-config",
+                                "YAML data section",
+                                fp_str,
+                                line_no,
+                                detection_source=DetectionSource.CONFIG_FILE,
+                                storage_uri=uri,
+                                text=stripped[:200],
+                            )
                         )
-                    )
 
                 if suffix == ".py":
+                    hp_conf = 0.85 if file_has_ml else 0.35
+                    hp_agentic = not file_has_ml
                     for hp_rx, hp_key in _HP_RULES:
                         for m in hp_rx.finditer(line):
                             raw = m.group(1).strip()
@@ -453,6 +526,9 @@ class MLLifecycleDetector(BaseScanner):
                                 line_no,
                                 hyperparameters={hp_key: val},
                                 text=stripped[:200],
+                                confidence=hp_conf,
+                                needs_agentic=hp_agentic,
+                                agentic_hint=f"'{hp_key}' kwarg without ML imports in file" if hp_agentic else "",
                             )
                             key = (
                                 fp_str,
@@ -490,6 +566,10 @@ class MLLifecycleDetector(BaseScanner):
                                 AIComponentType.MODEL_ARTIFACT,
                             ):
                                 uri = _extract_uri_from_line(line)
+
+                            ctx_conf, ctx_agentic, ctx_hint = _concept_confidence(
+                                cp.concept, suffix, file_has_ml, file_has_ai, file_has_data, fw
+                            )
                             add(
                                 _emit(
                                     cp.concept,
@@ -499,6 +579,9 @@ class MLLifecycleDetector(BaseScanner):
                                     line_no,
                                     storage_uri=uri,
                                     text=stripped[:200],
+                                    confidence=ctx_conf,
+                                    needs_agentic=ctx_agentic,
+                                    agentic_hint=ctx_hint,
                                 )
                             )
 
