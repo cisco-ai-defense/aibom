@@ -118,4 +118,69 @@ def run_scanners(
             except Exception:
                 _LOGGER.exception("Scanner %s failed", scanner.name)
 
+    all_components = _merge_model_duplicates(all_components)
     return all_components, all_relationships
+
+
+_MERGE_LINE_PROXIMITY = 5
+
+
+def _merge_model_duplicates(
+    components: list[AIComponent],
+) -> list[AIComponent]:
+    """Merge model_detector name entries with KB enrichment wrapper class
+    entries when they refer to the same LLM constructor call.
+
+    Heuristic: same file, both MODEL type, within ``_MERGE_LINE_PROXIMITY``
+    lines, one has ``model_name`` set (model_detector) and the other has
+    ``kb_id`` in metadata (KB enrichment).  The merged component keeps the
+    model name as the display name and absorbs the wrapper class into metadata.
+    """
+    from ..models.enums import AIComponentType, DetectionSource
+
+    name_entries: list[tuple[int, AIComponent]] = []
+    kb_entries: list[tuple[int, AIComponent]] = []
+
+    for idx, c in enumerate(components):
+        if c.component_type != AIComponentType.MODEL:
+            continue
+        if c.detection_source == DetectionSource.KB_ENRICHMENT and c.metadata.get("kb_id"):
+            kb_entries.append((idx, c))
+        elif c.model_name and c.detection_source in (
+            DetectionSource.CODE_ANALYSIS,
+            DetectionSource.CONFIG_FILE,
+        ):
+            name_entries.append((idx, c))
+
+    if not name_entries or not kb_entries:
+        return components
+
+    merged_indices: set[int] = set()
+
+    for name_idx, name_comp in name_entries:
+        for kb_idx, kb_comp in kb_entries:
+            if kb_idx in merged_indices:
+                continue
+            if name_comp.file_path != kb_comp.file_path:
+                continue
+            if abs(name_comp.line_number - kb_comp.line_number) > _MERGE_LINE_PROXIMITY:
+                continue
+
+            merged_meta = dict(name_comp.metadata)
+            merged_meta["wrapper_class"] = kb_comp.name
+            merged_meta["kb_id"] = kb_comp.metadata.get("kb_id", "")
+            if kb_comp.framework and name_comp.framework in ("unknown", ""):
+                fw = kb_comp.framework
+            else:
+                fw = name_comp.framework
+
+            components[name_idx] = name_comp.model_copy(
+                update={"metadata": merged_meta, "framework": fw}
+            )
+            merged_indices.add(kb_idx)
+            break
+
+    if not merged_indices:
+        return components
+
+    return [c for i, c in enumerate(components) if i not in merged_indices]
