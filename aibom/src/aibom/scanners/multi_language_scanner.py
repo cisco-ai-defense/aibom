@@ -756,20 +756,83 @@ def _regex_scan_file(
                 if _is_plausible_model_id(val):
                     add_model(_line_at(text, m.start()), val)
 
+    has_ai_dep = len(components) > 0
+
     for pat in _MODEL_GENERIC_RES:
         for m in pat.finditer(text):
             gd = m.groupdict()
             if gd.get("val"):
                 val = _normalize_model_literal(gd["val"])
                 if _is_plausible_model_id(val):
-                    add_model(_line_at(text, m.start()), val)
+                    if has_ai_dep:
+                        add_model(_line_at(text, m.start()), val)
+                    else:
+                        ln = _line_at(text, m.start())
+                        key = (ln, "model", val)
+                        if key not in seen:
+                            seen.add(key)
+                            components.append(
+                                AIComponent(
+                                    name=val,
+                                    component_type=AIComponentType.MODEL,
+                                    file_path=rel,
+                                    line_number=ln,
+                                    framework=ecosystem,
+                                    detection_source=DetectionSource.CODE_ANALYSIS,
+                                    confidence=0.3,
+                                    model_name=val,
+                                    needs_agentic=True,
+                                    agentic_hint=f"'model: {val}' without AI SDK imports in file",
+                                    metadata={"scanner": "multi_language_scanner"},
+                                )
+                            )
 
     for m in _AGENT_RE.finditer(text):
-        add_agent(_line_at(text, m.start()))
+        ln = _line_at(text, m.start())
+        if has_ai_dep:
+            add_agent(ln)
+        else:
+            key = (ln, "agent", "Agent")
+            if key not in seen:
+                seen.add(key)
+                components.append(
+                    AIComponent(
+                        name="Agent",
+                        component_type=AIComponentType.AGENT,
+                        file_path=rel,
+                        line_number=ln,
+                        framework=ecosystem,
+                        detection_source=DetectionSource.CODE_ANALYSIS,
+                        confidence=0.25,
+                        needs_agentic=True,
+                        agentic_hint="'new Agent()' without AI SDK imports in file",
+                        metadata={"scanner": "multi_language_scanner"},
+                    )
+                )
 
     for i, tr in enumerate(_TOOL_RES):
         for m in tr.finditer(text):
-            add_tool(_line_at(text, m.start()), f"tool_pattern_{i}")
+            ln = _line_at(text, m.start())
+            if has_ai_dep:
+                add_tool(ln, f"tool_pattern_{i}")
+            else:
+                key = (ln, "tool", f"tool_pattern_{i}")
+                if key not in seen:
+                    seen.add(key)
+                    components.append(
+                        AIComponent(
+                            name=f"tool_pattern_{i}",
+                            component_type=AIComponentType.TOOL,
+                            file_path=rel,
+                            line_number=ln,
+                            framework=ecosystem,
+                            detection_source=DetectionSource.CODE_ANALYSIS,
+                            confidence=0.25,
+                            needs_agentic=True,
+                            agentic_hint="Tool pattern without AI SDK imports in file",
+                            metadata={"scanner": "multi_language_scanner"},
+                        )
+                    )
 
     for line, pkg in _tree_sitter_imports(lang, path.suffix, text, packages):
         add_dep(line, pkg)

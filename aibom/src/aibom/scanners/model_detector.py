@@ -289,6 +289,11 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     r"^gpt-4o$": {"provider": "openai", "family": "gpt-4o", "deprecated": False},
     r"^gpt-4-turbo$": {"provider": "openai", "family": "gpt-4", "deprecated": False},
     r"^gpt-4$": {"provider": "openai", "family": "gpt-4", "deprecated": False},
+    r"^gpt-4-32k": {"provider": "openai", "family": "gpt-4", "deprecated": True},
+    r"^gpt-4\.1$": {"provider": "openai", "family": "gpt-4.1", "deprecated": False},
+    r"^gpt-4\.1-mini$": {"provider": "openai", "family": "gpt-4.1", "deprecated": False},
+    r"^gpt-4\.1-nano$": {"provider": "openai", "family": "gpt-4.1", "deprecated": False},
+    r"^gpt-4\.5": {"provider": "openai", "family": "gpt-4.5", "deprecated": False},
     r"^gpt-3\.5-turbo$": {
         "provider": "openai",
         "family": "gpt-3.5",
@@ -300,6 +305,8 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     r"^o3-mini$": {"provider": "openai", "family": "o3", "deprecated": False},
     r"^o3$": {"provider": "openai", "family": "o3", "deprecated": False},
     r"^o4-mini$": {"provider": "openai", "family": "o4", "deprecated": False},
+    r"^text-embedding-ada-002$": {"provider": "openai", "family": "embedding", "deprecated": True},
+    r"^text-embedding-3-(small|large)$": {"provider": "openai", "family": "embedding", "deprecated": False},
     r"^claude-3-5-sonnet-\d{8}$": {
         "provider": "anthropic",
         "family": "claude-3-5-sonnet",
@@ -711,7 +718,7 @@ def _make_component(
                     md[hf_key] = meta[hf_key]
     else:
         provider = "unknown"
-        confidence = 0.7
+        confidence = 0.4
         url = _model_card_url(model_name, provider)
         md = {
             "model_card_url": url,
@@ -726,6 +733,7 @@ def _make_component(
         if method in ("config_file", "env_var")
         else DetectionSource.CODE_ANALYSIS
     )
+    needs_agentic = meta is None
     return AIComponent(
         name=model_name,
         component_type=AIComponentType.MODEL,
@@ -734,6 +742,8 @@ def _make_component(
         framework=provider,
         detection_source=src,
         confidence=confidence,
+        needs_agentic=needs_agentic,
+        agentic_hint=f"'{model_name}' not found in model registry; may be private or misidentified" if needs_agentic else "",
         model_name=model_name,
         metadata=md,
     )

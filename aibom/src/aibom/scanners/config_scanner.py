@@ -53,9 +53,34 @@ _ENV_LINE = re.compile(
 )
 
 _MODEL_NAME_RE = re.compile(
-    r"(?i)^(gpt-|claude-|o\d|gemini-|mistral|meta-llama|llama[-_]?[0-9]|text-embedding|"
-    r"command-|jamba-|cohere|azure/|models/|[a-z0-9][a-z0-9_.-]{0,40}/[a-z0-9_.-]+)"
+    r"(?i)^(gpt-|claude-|o[1-9]-|gemini-|mistral|meta-llama|llama[-_]?[0-9]|text-embedding|"
+    r"command-|jamba-|cohere|azure/|anthropic\.|amazon\.|models/|"
+    r"(?:(?:meta-llama|mistralai|google|openai|microsoft|nvidia|huggingface|"
+    r"sentence-transformers|bigscience|stabilityai|deepseek|qwen|tiiuae|"
+    r"databricks|together|cohere|anthropic)/[a-zA-Z0-9_.-]+))"
 )
+
+_NOT_MODEL_RE = re.compile(
+    r"(?i)"
+    r"(\.com/|\.io/|\.org/|\.dev/|dkr\.ecr|"
+    r"\.yaml$|\.yml$|\.json$|\.py$|\.tf$|\.crt$|\.key$|\.pem$|\.sh$|"
+    r"^arn:|^https?://|^ssh://|^git@|"
+    r"kubernetes\.io/|helm\.sh/|"
+    r"^actions/|@v\d+$|"
+    r"/secrets?/|/configmaps?/|/templates?/|"
+    r"^envoyproxy/|^nginx/|^redis/|^postgres/|^mysql/|^mongo)"
+)
+
+
+def _is_model_name(value: str) -> bool:
+    if not value or len(value) > 120:
+        return False
+    stripped = value.strip()
+    if not _MODEL_NAME_RE.match(stripped):
+        return False
+    if _NOT_MODEL_RE.search(stripped):
+        return False
+    return True
 
 _FROM_RE = re.compile(r"^\s*FROM\s+(--platform=\S+\s+)?(\S+)", re.IGNORECASE)
 _ENV_RE = re.compile(
@@ -168,11 +193,13 @@ def _looks_like_model_name(value: str) -> bool:
     v = value.strip().strip("\"'")
     if not v or len(v) > 256:
         return False
-    if v.startswith("http://") or v.startswith("https://"):
-        return False
-    if _MODEL_NAME_RE.match(v):
-        return True
-    if "/" in v and re.match(r"^[a-z0-9_.-]+/[a-zA-Z0-9_.-]+$", v):
+    try:
+        from .model_detector import _registry_lookup
+        if _registry_lookup(v) is not None:
+            return True
+    except ImportError:
+        pass
+    if _is_model_name(v):
         return True
     return False
 
