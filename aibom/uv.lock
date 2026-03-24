@@ -238,7 +238,7 @@ wheels = [
 
 [[package]]
 name = "cisco-aibom"
-version = "0.5.1"
+version = "0.5.2"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
@@ -280,7 +280,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.104.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "libcst", specifier = ">=1.0.0" },
-    { name = "litellm", specifier = ">=1.77.0" },
+    { name = "litellm", specifier = "==1.80.16" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "platformdirs", specifier = ">=4.0.0" },
     { name = "pydantic", specifier = ">=2.6.0" },
