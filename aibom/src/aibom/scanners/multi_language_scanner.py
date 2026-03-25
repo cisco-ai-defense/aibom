@@ -25,6 +25,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
+from .file_cache import read_text_cached
 
 try:
     from tree_sitter import Language as _TSLanguage
@@ -846,8 +847,25 @@ def _regex_scan_file(
 
 
 def _iter_scan_files(context: ScanContext) -> list[tuple[Path, str, str]]:
+    idx = context.file_index()
+    if idx:
+        out: list[tuple[Path, str, str]] = []
+        for ext, entries in idx.items():
+            if ext == ".py":
+                continue
+            lang = _EXTENSION_TO_LANG.get(ext)
+            if lang is None:
+                continue
+            for entry in entries:
+                try:
+                    rel = entry.path.relative_to(entry.root).as_posix()
+                except ValueError:
+                    rel = entry.path.as_posix()
+                out.append((entry.path, rel, lang))
+        return out
+
     spec = _build_pathspec(context.exclude_patterns)
-    out: list[tuple[Path, str, str]] = []
+    out2: list[tuple[Path, str, str]] = []
     for scan_root in context.paths:
         root = Path(scan_root)
         if not root.exists():
@@ -861,7 +879,7 @@ def _iter_scan_files(context: ScanContext) -> list[tuple[Path, str, str]]:
             rel = root.name
             if spec and spec.match_file(rel):
                 continue
-            out.append((root.resolve(), rel, lang))
+            out2.append((root.resolve(), rel, lang))
             continue
         base = root.resolve()
         for f in root.rglob("*"):
@@ -878,8 +896,8 @@ def _iter_scan_files(context: ScanContext) -> list[tuple[Path, str, str]]:
                 rel = f.as_posix()
             if spec and spec.match_file(rel):
                 continue
-            out.append((f.resolve(), rel, lang))
-    return out
+            out2.append((f.resolve(), rel, lang))
+    return out2
 
 
 class MultiLanguageScanner(BaseScanner):
@@ -894,7 +912,7 @@ class MultiLanguageScanner(BaseScanner):
         components: list[AIComponent] = []
         for path, rel, lang in _iter_scan_files(context):
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                text = read_text_cached(path)
             except OSError:
                 continue
             components.extend(_regex_scan_file(path, rel, lang, text))

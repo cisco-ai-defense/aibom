@@ -23,7 +23,7 @@ they test the helper functions and mock the external dependencies.
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -45,7 +45,35 @@ class TestBuildContextMessage:
         msg = _build_context_message(comps, [], ["/tmp/repo"])
         assert "gpt-4o" in msg
         assert "/tmp/repo" in msg
-        assert "deterministic scan results" in msg
+        assert "deterministic scan results" in msg.lower()
+
+    def test_full_context_separates_batch_from_others(self):
+        batch_comp = AIComponent(
+            name="dataset",
+            component_type=AIComponentType.DATASET,
+            file_path="data.py",
+            line_number=5,
+        )
+        other_comp = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="app.py",
+            line_number=10,
+            model_name="gpt-4o",
+        )
+        msg = _build_context_message(
+            [batch_comp], [], ["/tmp"],
+            all_components=[batch_comp, other_comp],
+        )
+        json_start = msg.index("```json\n") + 8
+        json_end = msg.index("\n```", json_start)
+        data = json.loads(msg[json_start:json_end])
+        assert len(data["enrich_these"]) == 1
+        assert data["enrich_these"][0]["name"] == "dataset"
+        assert data["enrich_these"][0]["ENRICH"] is True
+        assert len(data["other_detected_components"]) == 1
+        assert data["other_detected_components"][0]["name"] == "gpt-4o"
+        assert "ENRICH" not in data["other_detected_components"][0]
 
     def test_json_is_parseable(self):
         comps = [
@@ -60,8 +88,46 @@ class TestBuildContextMessage:
         json_start = msg.index("```json\n") + 8
         json_end = msg.index("\n```", json_start)
         data = json.loads(msg[json_start:json_end])
-        assert data["total_components"] == 1
+        assert len(data["enrich_these"]) == 1
+        assert data["enrich_these"][0]["ENRICH"] is True
         assert data["scan_paths"] == ["/code"]
+        assert data["other_detected_components"] == []
+
+    def test_includes_code_context_for_real_file(self, tmp_path):
+        src = tmp_path / "example.py"
+        src.write_text("import openai\nclient = openai.OpenAI()\nresult = client.chat.completions.create(model='gpt-4o')\n")
+        comps = [
+            AIComponent(
+                name="gpt-4o",
+                component_type=AIComponentType.MODEL,
+                file_path=str(src),
+                line_number=3,
+                model_name="gpt-4o",
+            )
+        ]
+        msg = _build_context_message(comps, [], [str(tmp_path)])
+        json_start = msg.index("```json\n") + 8
+        json_end = msg.index("\n```", json_start)
+        data = json.loads(msg[json_start:json_end])
+        comp = data["enrich_these"][0]
+        assert "code_context" in comp
+        assert "import openai" in comp["code_context"]
+        assert "model='gpt-4o'" in comp["code_context"]
+
+    def test_no_code_context_for_missing_file(self):
+        comps = [
+            AIComponent(
+                name="x",
+                component_type=AIComponentType.MODEL,
+                file_path="/nonexistent/path.py",
+                line_number=1,
+            )
+        ]
+        msg = _build_context_message(comps, [], ["/tmp"])
+        json_start = msg.index("```json\n") + 8
+        json_end = msg.index("\n```", json_start)
+        data = json.loads(msg[json_start:json_end])
+        assert "code_context" not in data["enrich_these"][0]
 
 
 class TestExtractFinalMessage:
@@ -158,15 +224,160 @@ class TestRunAgenticEnrichment:
 
     @patch("aibom.agentic.agent.create_aibom_agent")
     def test_handles_agent_failure_gracefully(self, mock_create):
-        from aibom.agentic.agent import AgenticEnrichmentError, run_agentic_enrichment
+        from aibom.agentic.agent import run_agentic_enrichment
 
         mock_create.return_value = MagicMock(
             invoke=MagicMock(side_effect=RuntimeError("LLM unavailable"))
         )
-        with pytest.raises(AgenticEnrichmentError, match="LLM unavailable"):
-            run_agentic_enrichment(
-                model_string="bad-model",
-                deterministic_components=[],
-                deterministic_relationships=[],
-                scan_paths=["/tmp"],
+        comp = AIComponent(
+            name="test-model",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        comps, rels, flags = run_agentic_enrichment(
+            model_string="bad-model",
+            deterministic_components=[comp],
+            deterministic_relationships=[],
+            scan_paths=["/tmp"],
+        )
+        assert len(comps) == 1
+        assert comps[0].name == "test-model"
+
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_batching_splits_large_input(self, mock_create):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        mock_agent = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.content = json.dumps({
+            "enriched_components": [],
+            "new_components": [],
+            "new_relationships": [],
+            "risk_findings": [],
+        })
+        mock_agent.invoke.return_value = {"messages": [mock_msg]}
+        mock_agent.ainvoke = AsyncMock(return_value={"messages": [mock_msg]})
+        mock_create.return_value = mock_agent
+
+        comps = [
+            AIComponent(
+                name=f"model-{i}",
+                component_type=AIComponentType.MODEL,
+                file_path=f"f{i}.py",
+                line_number=i,
+                model_name=f"gpt-{i}",
             )
+            for i in range(12)
+        ]
+        result_comps, _, _ = run_agentic_enrichment(
+            model_string="test-model",
+            deterministic_components=comps,
+            deterministic_relationships=[],
+            scan_paths=["/tmp"],
+            batch_size=5,
+        )
+        assert mock_agent.ainvoke.call_count == 3  # 5 + 5 + 2, parallel
+
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_single_batch_uses_sequential(self, mock_create):
+        """A single batch should use invoke (sequential), not ainvoke."""
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        mock_agent = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.content = json.dumps({
+            "enriched_components": [],
+            "new_components": [],
+            "new_relationships": [],
+            "risk_findings": [],
+        })
+        mock_agent.invoke.return_value = {"messages": [mock_msg]}
+        mock_create.return_value = mock_agent
+
+        comps = [
+            AIComponent(
+                name="gpt-4o",
+                component_type=AIComponentType.MODEL,
+                file_path="a.py",
+                line_number=1,
+                model_name="gpt-4o",
+            )
+        ]
+        run_agentic_enrichment(
+            model_string="test-model",
+            deterministic_components=comps,
+            deterministic_relationships=[],
+            scan_paths=["/tmp"],
+            batch_size=5,
+        )
+        assert mock_agent.invoke.call_count == 1
+
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_tiered_model_uses_fast_for_simple(self, mock_create):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        mock_agent = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.content = json.dumps({
+            "enriched_components": [],
+            "new_components": [],
+            "new_relationships": [],
+            "risk_findings": [],
+        })
+        mock_agent.invoke.return_value = {"messages": [mock_msg]}
+        mock_create.return_value = mock_agent
+
+        simple = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="a.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        complex_ = AIComponent(
+            name="some-agent",
+            component_type=AIComponentType.AGENT,
+            file_path="b.py",
+            line_number=5,
+        )
+        run_agentic_enrichment(
+            model_string="expensive-model",
+            deterministic_components=[simple, complex_],
+            deterministic_relationships=[],
+            scan_paths=["/tmp"],
+            fast_model="cheap-model",
+        )
+        calls = mock_create.call_args_list
+        assert calls[0][0][0] == "cheap-model"
+        assert calls[1][0][0] == "expensive-model"
+
+
+class TestToolStats:
+    def test_tool_stats_isolated_per_reset(self):
+        from aibom.agentic.tools import _reset_tool_stats, get_tool_stats, _get_stats_dict
+
+        _reset_tool_stats()
+        assert get_tool_stats() == {}
+        stats = _get_stats_dict()
+        stats["test_tool"] = {"calls": 1, "total_s": 0.5, "errors": 0}
+        assert get_tool_stats()["test_tool"]["calls"] == 1
+
+        _reset_tool_stats()
+        assert get_tool_stats() == {}
+
+    def test_track_tool_decorator(self):
+        from aibom.agentic.tools import _reset_tool_stats, get_tool_stats, _track_tool
+
+        _reset_tool_stats()
+
+        @_track_tool("my_tool")
+        def dummy(x):
+            return x * 2
+
+        assert dummy(5) == 10
+        stats = get_tool_stats()
+        assert "my_tool" in stats
+        assert stats["my_tool"]["calls"] == 1
+        assert stats["my_tool"]["errors"] == 0

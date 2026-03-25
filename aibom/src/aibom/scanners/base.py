@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,8 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 
 _LOGGER = logging.getLogger(__name__)
+
+scanner_timings: dict[str, float] = {}
 
 scanner_registry: list[type["BaseScanner"]] = []
 
@@ -71,15 +74,21 @@ def _load_aibomignore(paths: list[str]) -> Optional[PathSpec]:
     return None
 
 
-def run_scanners(
+async def _async_timed_scan(
+    scanner: BaseScanner, ctx: ScanContext,
+) -> tuple[str, float, list[AIComponent], list[ComponentRelationship]]:
+    """Run a scanner in a thread (to release the event loop) and time it."""
+    t0 = time.monotonic()
+    comps, rels = await asyncio.to_thread(scanner.scan, ctx)
+    elapsed = time.monotonic() - t0
+    return scanner.name, elapsed, comps, rels
+
+
+async def _run_scanners_async(
     context: ScanContext,
-    workers: int = 4,
     extra_scanners: Optional[list[type[BaseScanner]]] = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
-    """Instantiate and run all registered scanners in parallel.
-
-    Returns the merged component and relationship lists.
-    """
+    """Run all applicable scanners concurrently using asyncio."""
     ignore_spec = _load_aibomignore(context.paths)
     if ignore_spec:
         merged = list(context.exclude_patterns)
@@ -87,6 +96,16 @@ def run_scanners(
         context = context.model_copy(update={"exclude_patterns": merged})
 
     all_scanner_types = list(scanner_registry)
+
+    try:
+        from ..plugins import discover_scanner_plugins
+
+        for plugin_cls in discover_scanner_plugins():
+            if plugin_cls not in all_scanner_types:
+                all_scanner_types.append(plugin_cls)
+    except Exception:
+        _LOGGER.debug("Plugin discovery failed", exc_info=True)
+
     if extra_scanners:
         all_scanner_types.extend(extra_scanners)
 
@@ -102,24 +121,48 @@ def run_scanners(
 
     all_components: list[AIComponent] = []
     all_relationships: list[ComponentRelationship] = []
+    scanner_timings.clear()
 
-    if len(applicable) == 1:
-        comps, rels = applicable[0].scan(context)
-        return comps, rels
+    tasks = [_async_timed_scan(s, context) for s in applicable]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    with ThreadPoolExecutor(max_workers=min(workers, len(applicable))) as pool:
-        futures = {pool.submit(s.scan, context): s for s in applicable}
-        for future in as_completed(futures):
-            scanner = futures[future]
-            try:
-                comps, rels = future.result()
-                all_components.extend(comps)
-                all_relationships.extend(rels)
-            except Exception:
-                _LOGGER.exception("Scanner %s failed", scanner.name)
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            _LOGGER.exception("Scanner %s failed", applicable[i].name, exc_info=result)
+            continue
+        name, elapsed, comps, rels = result
+        scanner_timings[name] = elapsed
+        all_components.extend(comps)
+        all_relationships.extend(rels)
 
     all_components = _merge_model_duplicates(all_components)
     return all_components, all_relationships
+
+
+def run_scanners(
+    context: ScanContext,
+    workers: int = 4,
+    extra_scanners: Optional[list[type[BaseScanner]]] = None,
+) -> tuple[list[AIComponent], list[ComponentRelationship]]:
+    """Instantiate and run all registered scanners concurrently via asyncio.
+
+    Uses ``asyncio.to_thread`` per scanner to release the GIL for I/O-heavy
+    scanners while still allowing true concurrency for native async work.
+    The *workers* parameter is retained for API compatibility but no longer
+    controls a thread pool size — asyncio manages scheduling.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, _run_scanners_async(context, extra_scanners))
+            return future.result()
+
+    return asyncio.run(_run_scanners_async(context, extra_scanners))
 
 
 _MERGE_LINE_PROXIMITY = 5
