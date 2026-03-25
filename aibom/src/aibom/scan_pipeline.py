@@ -26,6 +26,7 @@ Stages:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,8 +41,18 @@ from .cross_ref import (
 from .models import ScanContext
 from .models.scan import AIComponent, ComponentRelationship
 from .scanners import run_scanners
+from .scanners.file_cache import cache_stats, clear_cache
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class StageTiming:
+    """Wall-clock elapsed time for a single pipeline stage."""
+
+    name: str
+    elapsed_s: float
+    detail: str = ""
 
 
 @dataclass
@@ -55,6 +66,8 @@ class PipelineResult:
     env_index: CrossRefIndex | None = None
     pkg_index: CrossRefIndex | None = None
     external_deps: list[ExternalRepoDep] = field(default_factory=list)
+    timings: list[StageTiming] = field(default_factory=list)
+    total_elapsed_s: float = 0.0
 
 
 class ScanPipeline:
@@ -72,6 +85,9 @@ class ScanPipeline:
         min_severity: Any | None = None,
         strict: bool = False,
         exclude_patterns: list[str] | None = None,
+        agentic_scope: str = "candidates",
+        agentic_batch_size: int = 5,
+        agentic_fast_model: str | None = None,
     ) -> None:
         self.scan_paths = scan_paths
         self.output_format = output_format
@@ -82,8 +98,15 @@ class ScanPipeline:
         self.min_severity = min_severity
         self.strict = strict
         self.exclude_patterns = exclude_patterns or []
+        self.agentic_scope = agentic_scope
+        self.agentic_batch_size = agentic_batch_size
+        self.agentic_fast_model = agentic_fast_model
 
     def run(self) -> PipelineResult:
+        clear_cache()
+        pipeline_start = time.monotonic()
+        timings: list[StageTiming] = []
+
         ctx_kwargs: dict[str, Any] = {
             "paths": self.scan_paths,
             "output_format": self.output_format,
@@ -101,14 +124,46 @@ class ScanPipeline:
             ctx_kwargs["min_severity"] = self.min_severity
         ctx = ScanContext(**ctx_kwargs)
 
+        t0 = time.monotonic()
         components, relationships = self._stage_scan(ctx)
+        elapsed = time.monotonic() - t0
+        fc = cache_stats()
+        timings.append(StageTiming(
+            "scan", elapsed,
+            f"{len(components)} components, {len(relationships)} relationships, "
+            f"file cache {fc['hits']} hits / {fc['misses']} misses",
+        ))
+
+        t0 = time.monotonic()
         components, env_idx, pkg_idx, ext_deps = self._stage_cross_ref(
             components
         )
+        elapsed = time.monotonic() - t0
+        timings.append(StageTiming(
+            "cross_ref", elapsed,
+            f"{sum(len(v) for v in env_idx.env.values())} env vars, "
+            f"{len(pkg_idx.packages)} packages, {len(ext_deps)} external deps",
+        ))
+
+        t0 = time.monotonic()
         components, relationships, agentic_flags = self._stage_agentic(
             components, relationships
         )
+        elapsed = time.monotonic() - t0
+        skipped = not self.llm_config
+        timings.append(StageTiming(
+            "agentic", elapsed,
+            "skipped (no --llm-model)" if skipped else f"{len(agentic_flags)} risk flags",
+        ))
+
+        t0 = time.monotonic()
         components, agentic_count = self._stage_assemble(components)
+        elapsed = time.monotonic() - t0
+        timings.append(StageTiming(
+            "assemble", elapsed, f"{len(components)} final, {agentic_count} agentic",
+        ))
+
+        total_elapsed = time.monotonic() - pipeline_start
 
         return PipelineResult(
             components=components,
@@ -118,17 +173,61 @@ class ScanPipeline:
             env_index=env_idx,
             pkg_index=pkg_idx,
             external_deps=ext_deps,
+            timings=timings,
+            total_elapsed_s=total_elapsed,
         )
 
     # ------------------------------------------------------------------
-    # Stage 1: Run all registered scanners
+    # Stage 1: Two-pass scanning
+    #   Pass 1 — manifest + config (structural, zero FPs) → ai_package_set
+    #   Pass 2 — all other scanners scoped by the discovered package set
     # ------------------------------------------------------------------
 
     def _stage_scan(
         self, ctx: ScanContext
     ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
         _LOGGER.info("Stage 1/4 — scanning %d path(s)", len(self.scan_paths))
-        return run_scanners(ctx)
+
+        from .scanners.dependency_scanner import discover_ai_package_set
+
+        ai_pkgs = discover_ai_package_set(ctx)
+        if ai_pkgs:
+            _LOGGER.info(
+                "Pass 1: discovered %d AI package(s) from manifests: %s",
+                len(ai_pkgs),
+                ", ".join(sorted(ai_pkgs)[:10])
+                + ("…" if len(ai_pkgs) > 10 else ""),
+            )
+        else:
+            _LOGGER.debug("Pass 1: no AI packages found in manifests")
+
+        ctx_pass2 = ctx.model_copy(update={"ai_package_set": ai_pkgs})
+
+        idx = ctx_pass2.file_index()
+        if idx:
+            import asyncio
+            from .scanners.file_cache import warm_cache_async
+
+            all_paths = [e.path for entries in idx.values() for e in entries]
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                    warmed = pool.submit(
+                        asyncio.run, warm_cache_async(all_paths)
+                    ).result()
+            else:
+                warmed = asyncio.run(warm_cache_async(all_paths))
+            _LOGGER.info(
+                "Pass 2 prep: pre-cached %d / %d files via async I/O",
+                warmed, len(all_paths),
+            )
+
+        return run_scanners(ctx_pass2)
 
     # ------------------------------------------------------------------
     # Stage 2: Cross-reference resolution
@@ -175,27 +274,55 @@ class ScanPipeline:
         if not self.llm_config or not components:
             return components, relationships, []
 
-        _LOGGER.info("Stage 3/4 — agentic enrichment")
+        candidates = [c for c in components if c.needs_agentic]
+        confirmed = [c for c in components if not c.needs_agentic]
+
+        if self.agentic_scope == "candidates":
+            to_enrich = candidates
+            _LOGGER.info(
+                "Stage 3/4 — agentic enrichment (%d candidates of %d total)",
+                len(to_enrich), len(components),
+            )
+        else:
+            to_enrich = components
+            _LOGGER.info(
+                "Stage 3/4 — agentic enrichment (all %d components)", len(components),
+            )
+
+        if not to_enrich:
+            _LOGGER.info("Stage 3/4 — no agentic candidates, skipping LLM calls")
+            return components, relationships, []
+
         try:
             from .agentic.agent import run_agentic_enrichment
-
-            model_str = self.llm_config["model"]
-            components, agentic_rels, agentic_flags = run_agentic_enrichment(
-                model_string=model_str,
-                deterministic_components=components,
-                deterministic_relationships=relationships,
-                scan_paths=self.scan_paths,
-                llm_config=self.llm_config,
-            )
-            relationships = relationships + agentic_rels
-            return components, relationships, agentic_flags
-
         except ImportError:
             _LOGGER.warning(
                 "Agentic enrichment requires 'cisco-aibom[agentic]'. Skipping."
             )
+            return components, relationships, []
+
+        try:
+            model_str = self.llm_config["model"]
+            enriched, agentic_rels, agentic_flags = run_agentic_enrichment(
+                model_string=model_str,
+                deterministic_components=to_enrich,
+                deterministic_relationships=relationships,
+                scan_paths=self.scan_paths,
+                llm_config=self.llm_config,
+                batch_size=self.agentic_batch_size,
+                fast_model=self.agentic_fast_model,
+            )
+            relationships = relationships + agentic_rels
+
+            if self.agentic_scope == "candidates":
+                components = confirmed + enriched
+            else:
+                components = enriched
+
+            return components, relationships, agentic_flags
+
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Agentic enrichment failed: %s", exc)
+            _LOGGER.warning("Agentic enrichment failed: %s", exc, exc_info=True)
 
         return components, relationships, []
 

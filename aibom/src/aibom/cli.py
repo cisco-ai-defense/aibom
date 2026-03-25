@@ -129,6 +129,39 @@ def _utcnow_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+def _print_timing_table(console: "rich.console.Console", result: "PipelineResult") -> None:  # type: ignore[name-defined]
+    from rich.table import Table
+
+    from .scanners import scanner_timings
+
+    table = Table(title="Pipeline Timing", show_footer=True)
+    table.add_column("Stage", footer="Total")
+    table.add_column("Elapsed", justify="right", footer=f"{result.total_elapsed_s:.2f}s")
+    table.add_column("%", justify="right")
+    table.add_column("Detail")
+
+    for st in result.timings:
+        pct = (st.elapsed_s / result.total_elapsed_s * 100) if result.total_elapsed_s else 0
+        table.add_row(st.name, f"{st.elapsed_s:.2f}s", f"{pct:.1f}%", st.detail)
+
+    console.print(table)
+
+    if scanner_timings:
+        sc_table = Table(title="Per-Scanner Timing")
+        sc_table.add_column("Scanner")
+        sc_table.add_column("Elapsed", justify="right")
+        sc_table.add_column("%", justify="right")
+
+        scan_stage = next((t for t in result.timings if t.name == "scan"), None)
+        scan_total = scan_stage.elapsed_s if scan_stage else 1.0
+        for name, elapsed in sorted(scanner_timings.items(), key=lambda x: -x[1]):
+            pct = (elapsed / scan_total * 100) if scan_total else 0
+            table_style = "bold red" if pct > 30 else ""
+            sc_table.add_row(name, f"{elapsed:.2f}s", f"{pct:.1f}%", style=table_style)
+
+        console.print(sc_table)
+
+
 def _record_analysis_error(
     run_errors: List[Dict[str, Any]],
     source_summary: Optional[Dict[str, Any]],
@@ -857,6 +890,42 @@ def analyze(
         "--strict",
         help="Only emit high-confidence detections; suppress items that need agentic reasoning.",
     ),
+    timing: bool = typer.Option(
+        False,
+        "--timing",
+        help="Print a per-stage and per-scanner timing breakdown after analysis.",
+    ),
+    agentic_scope: str = typer.Option(
+        "candidates",
+        "--agentic-scope",
+        help=(
+            "Which components to send to the LLM for agentic enrichment. "
+            "'candidates' (default) sends only needs_agentic items; "
+            "'all' sends every component."
+        ),
+    ),
+    agentic_batch_size: int = typer.Option(
+        5,
+        "--agentic-batch-size",
+        help="Max components per agentic LLM invocation (default 5).",
+    ),
+    agentic_fast_model: Optional[str] = typer.Option(
+        None,
+        "--agentic-fast-model",
+        help=(
+            "Cheaper/faster LLM for simple confirmations (model lookups, "
+            "dependency checks). Falls back to --llm-model if not set."
+        ),
+    ),
+    cache_dir: Optional[Path] = typer.Option(
+        None,
+        "--cache-dir",
+        help=(
+            "Directory for caching scan results keyed by repo@commit_sha. "
+            "Repeated scans of the same codebase at the same revision are instant. "
+            "Use 'cisco-aibom cache clear' to purge."
+        ),
+    ),
     validate: bool = typer.Option(
         False,
         "--validate",
@@ -917,6 +986,23 @@ def analyze(
         "--repo-topic",
         help="Filter discovered repos by topic/tag.",
     ),
+    max_repos: Optional[int] = typer.Option(
+        None,
+        "--max-repos",
+        help=(
+            "Maximum number of repos to scan when using --discover-repos, "
+            "--github-org, --gitlab-group, or --repos-file.  Repos are sorted "
+            "by last-push date (most recent first)."
+        ),
+    ),
+    parallel_repos: int = typer.Option(
+        1,
+        "--parallel-repos",
+        help=(
+            "Number of repositories to scan in parallel (default 1 = sequential).  "
+            "Higher values speed up org-scale scans but require more memory."
+        ),
+    ),
     legacy_mode: bool = typer.Option(
         False,
         "--legacy-mode",
@@ -942,6 +1028,12 @@ def analyze(
     if output_format not in _VALID_OUTPUT_FORMATS:
         valid = ", ".join(sorted(_VALID_OUTPUT_FORMATS))
         logging.error(f"Invalid output format '{output_format}'. Must be one of: {valid}")
+        raise typer.Exit(code=1)
+
+    if agentic_scope not in ("candidates", "all"):
+        logging.error(
+            f"Invalid --agentic-scope '{agentic_scope}'. Must be: candidates, all"
+        )
         raise typer.Exit(code=1)
 
     # Validate severity options
@@ -1030,6 +1122,45 @@ def analyze(
                 console.print(
                     f"[yellow]Warning: {plat} discovery failed: {exc}[/]"
                 )
+
+    if len(sources_to_process) > 1 and llm_model:
+        from .repo_triage import RepoTriager
+
+        triage_llm_cfg = {"model": llm_model}
+        if llm_base:
+            triage_llm_cfg["api_base"] = llm_base
+        if llm_key:
+            triage_llm_cfg["api_key"] = llm_key
+
+        triager = RepoTriager(llm_config=triage_llm_cfg)
+        triage_results = triager.triage_repos(sources_to_process)
+
+        deep = [t.repo_path for t in triage_results if t.decision == "deep-scan"]
+        clone = [t.repo_path for t in triage_results if t.decision == "needs-clone"]
+        skipped = [t.repo_path for t in triage_results if t.decision == "skip"]
+
+        if skipped:
+            console.print(
+                f"  [dim]Repo triage: skipping {len(skipped)} non-AI repo(s)[/]"
+            )
+            for t in triage_results:
+                if t.decision == "skip":
+                    _LOGGER.info("Triage skip: %s — %s (%s)", t.repo_path, t.reason, t.method)
+
+        sources_to_process = deep + clone
+
+    if max_repos and len(sources_to_process) > max_repos:
+        console.print(
+            f"  [dim]Limiting to {max_repos} of {len(sources_to_process)} "
+            f"discovered repos (--max-repos)[/]"
+        )
+        sources_to_process = sources_to_process[:max_repos]
+
+    if parallel_repos > 1 and len(sources_to_process) > 1:
+        console.print(
+            f"  [dim]Scanning {len(sources_to_process)} repos with "
+            f"--parallel-repos={parallel_repos}[/]"
+        )
 
     if not sources_to_process:
         logging.error("No sources provided. Please specify a path or an images file.")
@@ -1146,6 +1277,21 @@ def analyze(
             from .scan_pipeline import ScanPipeline
 
             scan_path = str(path_to_analyze)
+
+            _scan_cache_hit = False
+            if cache_dir:
+                from .scan_cache import cache_key, load_cached, save_cached
+
+                _ck = cache_key([scan_path])
+                cached = load_cached(cache_dir, _ck)
+                if cached:
+                    _scan_cache_hit = True
+                    console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
+                    all_analysis_outputs[source] = cached
+                    if temp_dir:
+                        shutil.rmtree(temp_dir)
+                    continue
+
             pipeline = ScanPipeline(
                 scan_paths=[scan_path],
                 output_format=output_format,
@@ -1155,6 +1301,9 @@ def analyze(
                 fail_on=fail_on_severity,
                 min_severity=severity_filter,
                 strict=strict,
+                agentic_scope=agentic_scope,
+                agentic_batch_size=agentic_batch_size,
+                agentic_fast_model=agentic_fast_model,
             )
             with console.status(f"[cyan]Scanning {source} (v2 pipeline)"):
                 result = pipeline.run()
@@ -1190,13 +1339,34 @@ def analyze(
                         border_style="yellow",
                     ))
 
-            all_analysis_outputs[source] = {
+            if timing and result.timings:
+                _print_timing_table(console, result)
+
+            output_data: dict[str, Any] = {
                 "_v2": True,
                 "components": result.components,
                 "relationships": result.relationships,
                 "_agentic_risk_flags": result.agentic_risk_flags,
                 "_agentic_candidate_count": result.agentic_candidate_count,
             }
+            all_analysis_outputs[source] = output_data
+
+            if cache_dir and not _scan_cache_hit:
+                from .scan_cache import cache_key, save_cached
+
+                _ck = cache_key([scan_path])
+                _serializable = {
+                    "_v2": True,
+                    "components": [c.model_dump(mode="json") for c in result.components],
+                    "relationships": [r.model_dump(mode="json") for r in result.relationships],
+                    "_agentic_risk_flags": [
+                        f.model_dump(mode="json") if hasattr(f, "model_dump") else str(f)
+                        for f in result.agentic_risk_flags
+                    ],
+                    "_agentic_candidate_count": result.agentic_candidate_count,
+                }
+                save_cached(cache_dir, _ck, _serializable)
+
             source_summary["assets_discovered"] = len(result.components)
             source_summary["last_generated_at"] = _utcnow_iso()
             if source_summary["status"] == "in_progress":
@@ -1324,6 +1494,38 @@ def analyze(
         run_metadata["status"] = "completed_with_errors"
     else:
         run_metadata["status"] = "completed"
+
+    # Cross-repo coordination (agentic, multi-source only)
+    v2_outputs = {
+        k: v for k, v in all_analysis_outputs.items()
+        if isinstance(v, dict) and v.get("_v2")
+    }
+    if llm_config and len(v2_outputs) > 1:
+        try:
+            from .agentic.agent import run_cross_repo_coordination
+
+            console.print(
+                f"  [cyan]Cross-repo coordination across "
+                f"{len(v2_outputs)} repos…[/]"
+            )
+            xrepo_rels, xrepo_flags = run_cross_repo_coordination(
+                model_string=llm_config["model"],
+                per_repo_results=v2_outputs,
+                llm_config=llm_config,
+            )
+            if xrepo_rels or xrepo_flags:
+                first_key = next(iter(v2_outputs))
+                first = all_analysis_outputs[first_key]
+                first.setdefault("relationships", []).extend(xrepo_rels)
+                first.setdefault("_agentic_risk_flags", []).extend(xrepo_flags)
+                console.print(
+                    f"  [magenta]Cross-repo: {len(xrepo_rels)} relationships, "
+                    f"{len(xrepo_flags)} risk flags[/]"
+                )
+        except ImportError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Cross-repo coordination failed: %s", exc)
 
     # Phase 4: Generate the report
     report_data = None
@@ -1481,6 +1683,94 @@ def analyze(
 
 kb_app = typer.Typer(help="Manage the AIBOM knowledge base.", no_args_is_help=True)
 app.add_typer(kb_app, name="kb")
+
+
+# ---------------------------------------------------------------------------
+# cisco-aibom cache  — manage scan result cache
+# ---------------------------------------------------------------------------
+
+cache_app = typer.Typer(help="Manage the scan result cache.", no_args_is_help=True)
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("clear")
+def cache_clear(
+    cache_dir: Path = typer.Option(
+        Path.home() / ".aibom" / "cache",
+        "--cache-dir",
+        help="Directory where cached scan results are stored.",
+    ),
+) -> None:
+    """Remove all cached scan results."""
+    from .scan_cache import clear_cache as _clear
+
+    removed = _clear(cache_dir)
+    console.print(f"[green]Removed {removed} cached scan result(s) from {cache_dir}[/]")
+
+
+@cache_app.command("list")
+def cache_list(
+    cache_dir: Path = typer.Option(
+        Path.home() / ".aibom" / "cache",
+        "--cache-dir",
+        help="Directory where cached scan results are stored.",
+    ),
+) -> None:
+    """List all cached scan results."""
+    from rich.table import Table
+
+    from .scan_cache import cache_info
+
+    entries = cache_info(cache_dir)
+    if not entries:
+        console.print("[dim]No cached scan results found.[/]")
+        return
+
+    table = Table(title=f"Scan Cache ({cache_dir})")
+    table.add_column("Key")
+    table.add_column("Cached At")
+    table.add_column("Size", justify="right")
+    for e in entries:
+        table.add_row(e["key"][:16] + "…", e["cached_at"], f"{e['size_kb']} KB")
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# cisco-aibom plugin  — discover and manage plugins
+# ---------------------------------------------------------------------------
+
+plugin_app = typer.Typer(help="Discover and manage AIBOM plugins.", no_args_is_help=True)
+app.add_typer(plugin_app, name="plugin")
+
+
+@plugin_app.command("list")
+def plugin_list() -> None:
+    """List all discovered plugins (entry_points, MCP servers, manifests)."""
+    from rich.table import Table
+
+    from .plugins import list_plugins
+
+    plugins = list_plugins()
+
+    for category, items in plugins.items():
+        if not items:
+            continue
+        table = Table(title=f"{category.replace('_', ' ').title()}")
+        if items:
+            for col in items[0]:
+                table.add_column(col.replace("_", " ").title())
+            for item in items:
+                table.add_row(*item.values())
+        console.print(table)
+
+    total = sum(len(v) for v in plugins.values())
+    if total == 0:
+        console.print("[dim]No plugins discovered.[/]")
+        console.print(
+            "\n[dim]To create a scanner plugin, add to your pyproject.toml:[/]\n"
+            '  [project.entry-points."aibom.scanners"]\n'
+            '  my_scanner = "my_package:MyScannerClass"\n'
+        )
 
 
 @kb_app.command("download")

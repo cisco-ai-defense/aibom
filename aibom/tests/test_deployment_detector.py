@@ -362,3 +362,29 @@ data:
         comps, _ = run_scanner(DeploymentDetector, tmp_path, {"x.yaml": yml})
         assert comps
         assert all(c.detection_source == DetectionSource.CONFIG_FILE for c in comps)
+
+    def test_vendored_venv_skipped(self, tmp_path: Path) -> None:
+        venv_dir = tmp_path / "myapp_venv" / "lib" / "python3.11" / "site-packages"
+        venv_dir.mkdir(parents=True)
+        (venv_dir / "values.yaml").write_text(
+            "image: vllm/vllm-openai:latest\n"
+        )
+        (tmp_path / "real.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\n"
+            "spec:\n  template:\n    spec:\n      containers:\n"
+            "        - image: vllm/vllm-openai:latest\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = DeploymentDetector().scan(ctx)
+        paths = [c.file_path for c in comps]
+        assert not any("myapp_venv" in p for p in paths)
+
+    def test_site_packages_skipped(self, tmp_path: Path) -> None:
+        sp_dir = tmp_path / "site-packages" / "openai"
+        sp_dir.mkdir(parents=True)
+        (sp_dir / "deploy.yaml").write_text(
+            "apiVersion: v1\nkind: ConfigMap\ndata:\n  MODEL: gpt-4o\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = DeploymentDetector().scan(ctx)
+        assert len(comps) == 0

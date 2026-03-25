@@ -46,9 +46,7 @@ __all__ = [
     "resolve_iac_ref_tool",
 ]
 
-_SKIP_DIR_NAMES = frozenset(
-    {"node_modules", ".git", ".venv", "venv", "__pycache__", ".tox"}
-)
+from ..utils.path_filter import should_skip_dir
 
 _TF_DEFAULT_STR = re.compile(
     r"default\s*=\s*(\"([^\"\\]*(?:\\.[^\"\\]*)*)\"|'([^'\\]*(?:\\.[^'\\]*)*)')",
@@ -95,7 +93,7 @@ class CrossRepoSummaryArgs(BaseModel):
 
 
 def _should_skip_path(path: Path) -> bool:
-    return any(p in _SKIP_DIR_NAMES for p in path.parts)
+    return any(should_skip_dir(p) for p in path.parts)
 
 
 def _iter_files(paths: list[str], suffixes: tuple[str, ...] | None = None) -> Iterator[Path]:

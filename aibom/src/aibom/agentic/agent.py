@@ -23,14 +23,18 @@ when the user passes ``--agent-model`` to the CLI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
+from pathlib import Path
 from typing import Any, Optional
 
 from ..models import (
     AIComponent,
     ComponentRelationship,
     DetectionSource,
+    RelationshipType,
     RiskFlag,
     ScanResult,
     SourceResult,
@@ -43,6 +47,25 @@ _LOGGER = logging.getLogger(__name__)
 
 class AgenticEnrichmentError(Exception):
     """Raised when the agentic enrichment pipeline fails."""
+
+
+def _configure_rate_limiter(init_kwargs: dict[str, Any]) -> None:
+    """Attach a client-side rate limiter to the LLM unless one is already set.
+
+    ``rate_limiter`` is a first-class field on LangChain's ``BaseChatModel``,
+    so it works for *every* provider (Bedrock, OpenAI, Anthropic, Azure,
+    Ollama, etc.) without provider-specific branching.  It proactively
+    throttles outgoing requests so the provider never sees a burst — preventing
+    rate-limit errors rather than recovering from them after the fact.
+    """
+    if "rate_limiter" not in init_kwargs:
+        from langchain_core.rate_limiters import InMemoryRateLimiter
+
+        init_kwargs["rate_limiter"] = InMemoryRateLimiter(
+            requests_per_second=1.0,
+            check_every_n_seconds=0.1,
+            max_bucket_size=10,
+        )
 
 
 def create_aibom_agent(
@@ -93,17 +116,20 @@ def create_aibom_agent(
         if llm_config.get("api_version") and provider_prefix == "azure_openai":
             init_kwargs["api_version"] = llm_config["api_version"]
 
+    _configure_rate_limiter(init_kwargs)
+
     try:
         model = init_chat_model(model_id, **init_kwargs)
     except ImportError as exc:
-        provider = init_kwargs.get("model_provider", "unknown")
-        raise ImportError(
-            f"Provider '{provider}' requires its LangChain integration package. "
-            f"Install it with: pip install langchain-{provider}\n"
-            f"Original error: {exc}"
-        ) from exc
+        raise ImportError(str(exc)) from exc
     tools = build_tools()
 
+    # NOTE: LangGraph's recommended proactive approach (RemainingSteps in
+    # the graph state) cannot be used here because Deep Agents merges all
+    # middleware state schemas into Input/Output schemas where managed
+    # channels are forbidden.  We rely on the reactive approach instead:
+    # _RECURSION_LIMIT=1000 (safety net) + GraphRecursionError catch in
+    # _run_batch / _run_batch_async.
     agent = create_deep_agent(
         model=model,
         tools=tools,
@@ -113,94 +139,421 @@ def create_aibom_agent(
     return agent
 
 
+_DEFAULT_BATCH_SIZE = 5
+
+# LangGraph default since v1.0.6 and also the Deep Agents default.
+# Set explicitly so the intent is clear: this is a safety net against
+# infinite loops, NOT a workload budget.
+_RECURSION_LIMIT = 1000
+
+_MAX_CONCURRENT_BATCHES = 1
+
+_SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
+
+
+def _classify_candidates(
+    components: list[AIComponent],
+) -> tuple[list[AIComponent], list[AIComponent]]:
+    """Split candidates into simple (registry-confirmable) vs complex.
+
+    Simple candidates: known model/dependency/embedding with a model_name
+    that just needs registry lookup confirmation.
+    Complex candidates: everything else — ambiguous types, missing model
+    names, multi-file reasoning required.
+    """
+    simple: list[AIComponent] = []
+    complex_: list[AIComponent] = []
+    for c in components:
+        is_simple = (
+            c.component_type.value in _SIMPLE_CANDIDATE_TYPES
+            and c.model_name
+            and not c.metadata.get("env_var_ref")
+            and not c.metadata.get("env")
+            and not c.metadata.get("partial_kb_id")
+            and not c.metadata.get("suggestive_signal")
+        )
+        if is_simple:
+            simple.append(c)
+        else:
+            complex_.append(c)
+    return simple, complex_
+
+
+def _run_batch(
+    agent: Any,
+    middleware: AIBOMScannerMiddleware,
+    batch: list[AIComponent],
+    relationships: list[ComponentRelationship],
+    scan_paths: list[str],
+    batch_num: int,
+    total_batches: int,
+    all_components: list[AIComponent] | None = None,
+) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    """Invoke the agent on a single batch and return parsed results."""
+    from .tools import _reset_tool_stats, get_tool_stats
+
+    _reset_tool_stats()
+    _LOGGER.info(
+        "Agentic batch %d/%d — %d components [%s]",
+        batch_num, total_batches, len(batch),
+        ", ".join(c.name for c in batch),
+    )
+    summary = _build_context_message(
+        batch, relationships, scan_paths, all_components=all_components,
+    )
+    t0 = time.monotonic()
+
+    try:
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": summary}]},
+            config={"recursion_limit": _RECURSION_LIMIT},
+        )
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        stats = get_tool_stats()
+        _LOGGER.warning(
+            "Batch %d failed after %.1fs: %s | tool_stats=%s",
+            batch_num, elapsed, exc, json.dumps(stats),
+        )
+        return batch, [], [], []
+
+    elapsed = time.monotonic() - t0
+    stats = get_tool_stats()
+    total_tool_calls = sum(s["calls"] for s in stats.values())
+    total_tool_time = sum(s["total_s"] for s in stats.values())
+
+    _LOGGER.info(
+        "Batch %d completed in %.1fs — %d tool calls (%.1fs tool time) | breakdown=%s",
+        batch_num, elapsed, total_tool_calls, total_tool_time,
+        json.dumps(stats),
+    )
+
+    final_message = _extract_final_message(result)
+    if not final_message:
+        _LOGGER.warning("Batch %d returned no usable output", batch_num)
+        return batch, [], [], []
+
+    new_components, new_rels, risk_flags = middleware.extract_findings(final_message)
+    enriched = middleware.apply_enrichments(batch, final_message)
+    return enriched, new_components, new_rels, risk_flags
+
+
+async def _run_batch_async(
+    agent: Any,
+    middleware: AIBOMScannerMiddleware,
+    batch: list[AIComponent],
+    relationships: list[ComponentRelationship],
+    scan_paths: list[str],
+    batch_num: int,
+    total_batches: int,
+    all_components: list[AIComponent] | None = None,
+) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    """Async version of _run_batch using agent.ainvoke()."""
+    from .tools import _reset_tool_stats, get_tool_stats
+
+    _reset_tool_stats()
+    _LOGGER.info(
+        "Agentic batch %d/%d — %d components [%s]",
+        batch_num, total_batches, len(batch),
+        ", ".join(c.name for c in batch),
+    )
+    summary = _build_context_message(
+        batch, relationships, scan_paths, all_components=all_components,
+    )
+    t0 = time.monotonic()
+
+    try:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": summary}]},
+            config={"recursion_limit": _RECURSION_LIMIT},
+        )
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        stats = get_tool_stats()
+        _LOGGER.warning(
+            "Batch %d failed after %.1fs: %s | tool_stats=%s",
+            batch_num, elapsed, exc, json.dumps(stats),
+        )
+        return batch, [], [], []
+
+    elapsed = time.monotonic() - t0
+    stats = get_tool_stats()
+    total_tool_calls = sum(s["calls"] for s in stats.values())
+    total_tool_time = sum(s["total_s"] for s in stats.values())
+
+    _LOGGER.info(
+        "Batch %d completed in %.1fs — %d tool calls (%.1fs tool time) | breakdown=%s",
+        batch_num, elapsed, total_tool_calls, total_tool_time,
+        json.dumps(stats),
+    )
+
+    final_message = _extract_final_message(result)
+    if not final_message:
+        _LOGGER.warning("Batch %d returned no usable output", batch_num)
+        return batch, [], [], []
+
+    new_components, new_rels, risk_flags = middleware.extract_findings(final_message)
+    enriched = middleware.apply_enrichments(batch, final_message)
+    return enriched, new_components, new_rels, risk_flags
+
+
+async def _run_batches_parallel(
+    agent: Any,
+    middleware: AIBOMScannerMiddleware,
+    batches: list[list[AIComponent]],
+    relationships: list[ComponentRelationship],
+    scan_paths: list[str],
+    all_components: list[AIComponent] | None = None,
+    max_concurrent: int = _MAX_CONCURRENT_BATCHES,
+) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    """Run batches concurrently, capped at *max_concurrent* simultaneous LLM conversations."""
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _guarded(batch: list[AIComponent], idx: int) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+        async with sem:
+            return await _run_batch_async(
+                agent, middleware, batch,
+                relationships, scan_paths,
+                idx, len(batches),
+                all_components=all_components,
+            )
+
+    tasks = [_guarded(batch, idx) for idx, batch in enumerate(batches, 1)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_enriched: list[AIComponent] = []
+    all_new: list[AIComponent] = []
+    all_rels: list[ComponentRelationship] = []
+    all_flags: list[RiskFlag] = []
+
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            _LOGGER.warning("Parallel batch %d raised: %s", i + 1, r)
+            all_enriched.extend(batches[i])
+            continue
+        enriched, new, rels, flags = r
+        all_enriched.extend(enriched)
+        all_new.extend(new)
+        all_rels.extend(rels)
+        all_flags.extend(flags)
+
+    return all_enriched, all_new, all_rels, all_flags
+
+
 def run_agentic_enrichment(
     model_string: str,
     deterministic_components: list[AIComponent],
     deterministic_relationships: list[ComponentRelationship],
     scan_paths: list[str],
     llm_config: dict[str, Any] | None = None,
+    batch_size: int = _DEFAULT_BATCH_SIZE,
+    fast_model: str | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
-    """Run the full agentic enrichment pipeline.
+    """Run the full agentic enrichment pipeline with batching and tiered models.
 
-    1. Creates the AIBOM agent with the specified model.
-    2. Feeds the deterministic scan results as context.
-    3. Invokes the agent to enrich, resolve, and discover.
-    4. Parses the agent's output and merges into AIBOM model objects.
+    Parameters
+    ----------
+    model_string:
+        Primary LLM model (used for complex candidates).
+    deterministic_components:
+        Components from the deterministic pipeline.
+    deterministic_relationships:
+        Relationships from the deterministic pipeline.
+    scan_paths:
+        Paths being scanned.
+    llm_config:
+        LLM connection config (api_key, api_base, etc.).
+    batch_size:
+        Max components per agent invocation (default 5).
+    fast_model:
+        Optional cheaper/faster model for simple confirmations.
+        Falls back to ``model_string`` if not provided.
 
     Returns
     -------
     Tuple of (enriched_components, new_relationships, risk_flags).
-    The enriched_components list includes both the original components
-    (with any updates applied) and any new components the agent discovered.
     """
-    agent = create_aibom_agent(model_string, llm_config=llm_config)
-    middleware = AIBOMScannerMiddleware()
+    from .tools import set_allowed_search_roots
 
-    summary = _build_context_message(
-        deterministic_components, deterministic_relationships, scan_paths
-    )
+    set_allowed_search_roots([str(Path(p).resolve()) for p in scan_paths])
+
+    simple, complex_ = _classify_candidates(deterministic_components)
 
     _LOGGER.info(
-        "Running agentic enrichment with %s (%d components, %d relationships)",
+        "Running agentic enrichment with %s (%d simple, %d complex, %d relationships)",
         model_string,
-        len(deterministic_components),
+        len(simple),
+        len(complex_),
         len(deterministic_relationships),
     )
 
-    try:
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": summary}]}
+    all_enriched: list[AIComponent] = []
+    all_new: list[AIComponent] = []
+    all_rels: list[ComponentRelationship] = []
+    all_flags: list[RiskFlag] = []
+    middleware = AIBOMScannerMiddleware()
+
+    tier_model = fast_model or model_string
+    if simple:
+        _LOGGER.info(
+            "Tier 1 (simple confirmations): %d candidates via %s",
+            len(simple), tier_model,
         )
-    except Exception as exc:
-        raise AgenticEnrichmentError(
-            f"Agent invocation failed: {exc}"
-        ) from exc
+        agent = create_aibom_agent(tier_model, llm_config=llm_config)
+        batches = [
+            simple[i : i + batch_size] for i in range(0, len(simple), batch_size)
+        ]
+        if len(batches) > 1:
+            _LOGGER.info("Running %d simple batches in parallel", len(batches))
+            enriched, new, rels, flags = asyncio.run(
+                _run_batches_parallel(
+                    agent, middleware, batches,
+                    deterministic_relationships, scan_paths,
+                    all_components=deterministic_components,
+                )
+            )
+            all_enriched.extend(enriched)
+            all_new.extend(new)
+            all_rels.extend(rels)
+            all_flags.extend(flags)
+        else:
+            for idx, batch in enumerate(batches, 1):
+                enriched, new, rels, flags = _run_batch(
+                    agent, middleware, batch,
+                    deterministic_relationships, scan_paths,
+                    idx, len(batches),
+                    all_components=deterministic_components,
+                )
+                all_enriched.extend(enriched)
+                all_new.extend(new)
+                all_rels.extend(rels)
+                all_flags.extend(flags)
 
-    final_message = _extract_final_message(result)
-    if not final_message:
-        _LOGGER.warning("Agent returned no usable output")
-        return list(deterministic_components), [], []
+    if complex_:
+        _LOGGER.info(
+            "Tier 2 (complex reasoning): %d candidates via %s",
+            len(complex_), model_string,
+        )
+        agent = create_aibom_agent(model_string, llm_config=llm_config)
+        batches = [
+            complex_[i : i + batch_size] for i in range(0, len(complex_), batch_size)
+        ]
+        if len(batches) > 1:
+            _LOGGER.info("Running %d complex batches in parallel", len(batches))
+            enriched, new, rels, flags = asyncio.run(
+                _run_batches_parallel(
+                    agent, middleware, batches,
+                    deterministic_relationships, scan_paths,
+                    all_components=deterministic_components,
+                )
+            )
+            all_enriched.extend(enriched)
+            all_new.extend(new)
+            all_rels.extend(rels)
+            all_flags.extend(flags)
+        else:
+            for idx, batch in enumerate(batches, 1):
+                enriched, new, rels, flags = _run_batch(
+                    agent, middleware, batch,
+                    deterministic_relationships, scan_paths,
+                    idx, len(batches),
+                    all_components=deterministic_components,
+                )
+                all_enriched.extend(enriched)
+                all_new.extend(new)
+                all_rels.extend(rels)
+                all_flags.extend(flags)
 
-    new_components, new_relationships, risk_flags = middleware.extract_findings(
-        final_message
-    )
-    enriched = middleware.apply_enrichments(deterministic_components, final_message)
-
-    all_components = enriched + new_components
+    all_components = all_enriched + all_new
 
     _LOGGER.info(
         "Agentic enrichment complete: %d enriched, %d new components, "
         "%d new relationships, %d risk flags",
-        len(enriched),
-        len(new_components),
-        len(new_relationships),
-        len(risk_flags),
+        len(all_enriched),
+        len(all_new),
+        len(all_rels),
+        len(all_flags),
     )
 
-    return all_components, new_relationships, risk_flags
+    return all_components, all_rels, all_flags
+
+
+_CODE_CONTEXT_RADIUS = 15
+
+
+def _read_code_window(file_path: str, line: int) -> str | None:
+    """Read a window of source code around *line* (±15 lines)."""
+    from pathlib import Path
+
+    p = Path(file_path)
+    if not p.is_file():
+        return None
+    try:
+        lines = p.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    start = max(0, line - _CODE_CONTEXT_RADIUS - 1)
+    end = min(len(lines), line + _CODE_CONTEXT_RADIUS)
+    numbered = [f"{i + 1:>5}| {lines[i]}" for i in range(start, end)]
+    return "\n".join(numbered)
+
+
+def _component_to_summary(
+    c: AIComponent,
+    *,
+    include_code: bool = False,
+    enrich_target: bool = False,
+) -> dict[str, Any]:
+    """Serialize a single component for the agent prompt."""
+    entry: dict[str, Any] = {
+        "instance_id": c.instance_id,
+        "name": c.name,
+        "type": c.component_type.value,
+        "file": c.file_path,
+        "line": c.line_number,
+        "framework": c.framework,
+    }
+    if c.model_name:
+        entry["model_name"] = c.model_name
+    if c.metadata:
+        entry["metadata"] = c.metadata
+    if enrich_target:
+        entry["ENRICH"] = True
+
+    if include_code and c.file_path and c.line_number:
+        snippet = _read_code_window(c.file_path, c.line_number)
+        if snippet:
+            entry["code_context"] = snippet
+
+    return entry
 
 
 def _build_context_message(
-    components: list[AIComponent],
+    batch: list[AIComponent],
     relationships: list[ComponentRelationship],
     scan_paths: list[str],
+    all_components: list[AIComponent] | None = None,
 ) -> str:
-    """Build the user message that seeds the agent with deterministic results."""
-    comp_summaries = []
-    for c in components:
-        entry: dict[str, Any] = {
-            "instance_id": c.instance_id,
-            "name": c.name,
-            "type": c.component_type.value,
-            "file": c.file_path,
-            "line": c.line_number,
-            "framework": c.framework,
-        }
-        if c.model_name:
-            entry["model_name"] = c.model_name
-        if c.metadata:
-            entry["metadata"] = c.metadata
-        comp_summaries.append(entry)
+    """Build the user message that seeds the agent with deterministic results.
+
+    *batch* — components the agent must enrich (with code context).
+    *all_components* — full scan results for situational awareness (without
+    code context, to keep the prompt compact).
+    """
+    batch_ids = {c.instance_id for c in batch}
+
+    enrich_summaries = [
+        _component_to_summary(c, include_code=True, enrich_target=True)
+        for c in batch
+    ]
+
+    context_summaries: list[dict[str, Any]] = []
+    if all_components:
+        context_summaries = [
+            _component_to_summary(c)
+            for c in all_components
+            if c.instance_id not in batch_ids
+        ]
 
     rel_summaries = [
         {
@@ -211,17 +564,19 @@ def _build_context_message(
         for r in relationships
     ]
 
-    context = {
+    context: dict[str, Any] = {
         "scan_paths": scan_paths,
-        "total_components": len(components),
-        "total_relationships": len(relationships),
-        "components": comp_summaries,
+        "enrich_these": enrich_summaries,
+        "other_detected_components": context_summaries,
         "relationships": rel_summaries,
     }
 
     return (
-        "Here are the deterministic scan results from the AIBOM scanners. "
-        "Please enrich these findings following the workflow in your instructions.\n\n"
+        "Below are the deterministic scan results. Components in "
+        "`enrich_these` (marked ENRICH=true) need your analysis — each "
+        "includes a code_context window. `other_detected_components` shows "
+        "everything else already found; use it to discover relationships and "
+        "missing components but do NOT re-enrich those.\n\n"
         f"```json\n{json.dumps(context, indent=2)}\n```"
     )
 
@@ -237,3 +592,172 @@ def _extract_final_message(result: Any) -> Optional[str]:
     if isinstance(last, dict):
         return str(last.get("content", ""))
     return str(last)
+
+
+_CROSS_REPO_COORDINATOR_PROMPT = """\
+You are an AI-BOM cross-repository coordinator. You have received scan results
+from multiple repositories. Your job is to resolve cross-repo references that
+individual per-repo scans could not resolve on their own.
+
+Focus on:
+1. **Env var resolution**: If repo A uses os.getenv("MODEL_NAME") and repo B
+   sets MODEL_NAME=gpt-4o in docker-compose.yaml, link them.
+2. **Shared model references**: If multiple repos reference the same model
+   by different names or through env vars, unify them.
+3. **Service-to-service links**: If repo A calls POST /api/predict and repo B
+   serves that endpoint, create a relationship.
+4. **Shared dependencies**: If repos share internal packages via git references
+   or local paths, note the cross-repo dependency.
+
+Return a JSON object:
+```json
+{
+  "resolved_references": [
+    {
+      "source_repo": "...",
+      "target_repo": "...",
+      "reference_type": "env_var|model|service|dependency",
+      "source_component_id": "...",
+      "resolved_value": "...",
+      "explanation": "..."
+    }
+  ],
+  "new_relationships": [
+    {
+      "source_name": "...",
+      "target_name": "...",
+      "relationship_type": "USES_MODEL|DEPENDS_ON|CALLS_SERVICE|..."
+    }
+  ],
+  "risk_findings": [
+    {
+      "flag": "cross_repo_env_var_mismatch|...",
+      "description": "...",
+      "severity": "high|medium|low|info"
+    }
+  ]
+}
+```
+"""
+
+
+def run_cross_repo_coordination(
+    model_string: str,
+    per_repo_results: dict[str, dict[str, Any]],
+    llm_config: dict[str, Any] | None = None,
+) -> tuple[list[ComponentRelationship], list[RiskFlag]]:
+    """Coordinate findings across multiple repos using an LLM.
+
+    After all per-repo scans are complete, this function invokes the agent
+    to resolve cross-repo references (env vars, shared models, service links)
+    that individual scans could not resolve.
+
+    Parameters
+    ----------
+    model_string:
+        LLM model identifier.
+    per_repo_results:
+        Dict mapping source name → scan output dict (must contain
+        ``components`` and optionally ``_unresolved_env_vars``).
+    llm_config:
+        LLM connection config.
+
+    Returns
+    -------
+    Tuple of (new_cross_repo_relationships, risk_flags).
+    """
+    if len(per_repo_results) < 2:
+        return [], []
+
+    repo_summaries: list[dict[str, Any]] = []
+    for source, data in per_repo_results.items():
+        components = data.get("components", [])
+        comp_list = []
+        for c in components:
+            if hasattr(c, "model_dump"):
+                comp_list.append({
+                    "name": c.name,
+                    "type": c.component_type.value,
+                    "model_name": c.model_name,
+                    "file": c.file_path,
+                    "metadata": c.metadata,
+                })
+            elif isinstance(c, dict):
+                comp_list.append(c)
+
+        unresolved = data.get("_unresolved_env_vars", [])
+        repo_summaries.append({
+            "repo": source,
+            "component_count": len(comp_list),
+            "components": comp_list[:50],
+            "unresolved_env_vars": unresolved[:20],
+        })
+
+    context = json.dumps(repo_summaries, indent=2, default=str)
+    prompt = (
+        "Here are scan results from multiple repositories. "
+        "Please identify cross-repo references and resolve them.\n\n"
+        f"```json\n{context}\n```"
+    )
+
+    _LOGGER.info(
+        "Running cross-repo coordination across %d repos with %s",
+        len(per_repo_results), model_string,
+    )
+
+    try:
+        agent = create_aibom_agent(
+            model_string,
+            llm_config=llm_config,
+            system_prompt=_CROSS_REPO_COORDINATOR_PROMPT,
+        )
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": prompt}]}
+        )
+    except Exception as exc:
+        _LOGGER.warning("Cross-repo coordination failed: %s", exc)
+        return [], []
+
+    final = _extract_final_message(result)
+    if not final:
+        return [], []
+
+    middleware = AIBOMScannerMiddleware()
+    data = middleware._parse_json(final)
+    if not data:
+        return [], []
+
+    rels: list[ComponentRelationship] = []
+    for item in data.get("new_relationships", []):
+        try:
+            rel_type = RelationshipType(item.get("relationship_type", "CUSTOM"))
+        except ValueError:
+            rel_type = RelationshipType.CUSTOM
+        rels.append(ComponentRelationship(
+            source_instance_id="",
+            target_instance_id="",
+            source_name=item.get("source_name", ""),
+            target_name=item.get("target_name", ""),
+            relationship_type=rel_type,
+        ))
+
+    from ..models import Severity as Sev
+
+    flags: list[RiskFlag] = []
+    for item in data.get("risk_findings", []):
+        try:
+            sev = Sev(item.get("severity", "info"))
+        except ValueError:
+            sev = Sev.INFO
+        flags.append(RiskFlag(
+            flag=item.get("flag", "cross_repo_issue"),
+            severity=sev,
+            weight=5,
+            description=item.get("description", ""),
+        ))
+
+    _LOGGER.info(
+        "Cross-repo coordination: %d relationships, %d risk flags",
+        len(rels), len(flags),
+    )
+    return rels, flags

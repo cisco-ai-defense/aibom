@@ -34,6 +34,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
+from .file_cache import read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -131,6 +132,17 @@ def _build_pathspec(patterns: list[str] | tuple[str, ...]) -> PathSpec | None:
 
 
 def _iter_files(context: ScanContext) -> Iterator[tuple[Path, str]]:
+    idx = context.file_index()
+    if idx:
+        for entries in idx.values():
+            for entry in entries:
+                try:
+                    rel = entry.path.relative_to(entry.root).as_posix()
+                except ValueError:
+                    rel = entry.path.as_posix()
+                yield entry.path, rel
+        return
+
     spec = _build_pathspec(context.exclude_patterns)
     for scan_root in context.paths:
         root = Path(scan_root)
@@ -253,7 +265,7 @@ class EnvVarResolver(BaseScanner):
                 continue
 
             try:
-                text = fpath.read_text(encoding="utf-8", errors="replace")
+                text = read_text_cached(fpath)
             except OSError:
                 continue
 

@@ -32,6 +32,7 @@ dependencies = [
     "pathspec>=0.12.0",
     "cyclonedx-python-lib>=9.0.0",
     "jinja2>=3.1.0",
+    "aiofiles>=24.1.0",
 ]
 
 [project.scripts]

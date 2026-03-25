@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Callable, Iterator, Optional
@@ -858,6 +859,8 @@ def _display_name(ecosystem: str, name: str) -> str:
 
 
 def _iter_scan_paths(context: ScanContext) -> Iterator[Path]:
+    from ..utils.path_filter import should_skip_dir
+
     spec: Optional[PathSpec] = None
     if context.exclude_patterns:
         spec = PathSpec.from_lines("gitwildmatch", context.exclude_patterns)
@@ -872,16 +875,19 @@ def _iter_scan_paths(context: ScanContext) -> Iterator[Path]:
                     continue
             yield root
             continue
-        for f in root.rglob("*"):
-            if not f.is_file():
-                continue
-            try:
-                rel = f.relative_to(root).as_posix()
-            except ValueError:
-                rel = str(f)
-            if spec and spec.match_file(rel):
-                continue
-            yield f
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames if not should_skip_dir(d)
+            ]
+            for fname in filenames:
+                f = Path(dirpath) / fname
+                try:
+                    rel = f.relative_to(root).as_posix()
+                except ValueError:
+                    rel = str(f)
+                if spec and spec.match_file(rel):
+                    continue
+                yield f
 
 
 def _parse_manifest(path: Path) -> list[tuple[str, str, int, Optional[str], str]]:
@@ -900,6 +906,28 @@ def _parse_manifest(path: Path) -> list[tuple[str, str, int, Optional[str], str]
     except OSError:
         return []
     return parser(path, text)
+
+
+def discover_ai_package_set(context: ScanContext) -> frozenset[str]:
+    """Run a fast manifest-only pass and return the set of AI package names.
+
+    This is Pass 1 of the two-pass pipeline: structural parsing of manifests
+    (requirements.txt, pyproject.toml, poetry.lock, package.json, go.mod, etc.)
+    to discover which AI packages the project actually uses.  The result is
+    used to scope Pass 2 scanners so they only deep-scan relevant files.
+
+    Package names are normalised (lowered, hyphens/underscores unified for PyPI).
+    """
+    pkgs: set[str] = set()
+    for path in _iter_scan_paths(context):
+        key = path.name.lower()
+        if key not in _MANIFEST_PARSERS and not key.endswith(".csproj"):
+            continue
+        for name, _spec, _line, _ver, ecosystem in _parse_manifest(path):
+            if not _is_ai(ecosystem, name):
+                continue
+            pkgs.add(_display_name(ecosystem, name))
+    return frozenset(pkgs)
 
 
 class DependencyScanner(BaseScanner):

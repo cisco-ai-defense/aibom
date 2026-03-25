@@ -9,9 +9,17 @@ from unittest.mock import patch
 
 import pytest
 
-from aibom.scanners.model_detector import ModelDetector, _litellm_alias_keys
+from aibom.scanners.model_detector import ModelDetector, _litellm_alias_keys, _registry_cache
 
 from .conftest import run_scanner
+
+
+@pytest.fixture(autouse=True)
+def _clear_registry_cache():
+    """Ensure the model registry cache is fresh for every test."""
+    _registry_cache.clear()
+    yield
+    _registry_cache.clear()
 
 
 class TestLiteLLMAliasKeys:

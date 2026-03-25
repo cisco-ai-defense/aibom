@@ -81,10 +81,11 @@ class TestAgenticEnrichmentViaCLI:
                 "--output-file", str(out),
                 "--llm-model", "test-model",
                 "--llm-api-base", "http://localhost:11434",
+                "--agentic-scope", "all",
             ],
         )
         assert result.exit_code == 0
-        mock_create.assert_called_once()
+        assert mock_create.call_count >= 1
 
     def test_llm_model_with_legacy_mode_skips_agentic(self, sample_dir, tmp_path):
         import duckdb

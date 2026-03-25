@@ -22,7 +22,13 @@ import duckdb
 from aibom.catalog_db import CatalogDB
 
 
-def _create_catalog(path: Path) -> None:
+def _create_catalog(path: Path, *, with_token_table: bool = True) -> None:
+    """Build a minimal test catalog.
+
+    When *with_token_table* is True (the default), the pre-built
+    ``component_catalog_last_seg`` table is included, simulating a
+    new-format KB.  Set to False to test the old-KB fallback path.
+    """
     con = duckdb.connect(str(path))
     con.execute(
         """
@@ -46,6 +52,14 @@ def _create_catalog(path: Path) -> None:
             ('other.Unused', 'Unused', NULL, 'other', 'Unused', 'class', 'Unused');
         """
     )
+    if with_token_table:
+        con.execute(
+            """
+            CREATE TABLE component_catalog_last_seg AS
+            SELECT id, split_part(id, '.', -1) AS last_seg
+            FROM component_catalog;
+            """
+        )
     con.close()
 
 
@@ -136,3 +150,95 @@ def test_excludes_filter_results():
         ids = {row["id"] for row in results}
         assert "pkg.Agent" not in ids
         assert "pkg.Tool.run" in ids
+
+
+# ── Old-KB fallback (no pre-built token table) ───────────────────────
+
+
+def test_old_kb_fallback_builds_temp_token_table():
+    """When the catalog has no component_catalog_last_seg table,
+    CatalogDB builds a temporary one and lookups still work."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog(db_file, with_token_table=False)
+
+        with CatalogDB(db_file) as connector:
+            results = connector.find_components_by_suffixes(["Agent", "run"])
+
+        ids = {row["id"] for row in results}
+        assert "pkg.Agent" in ids
+        assert "pkg.Tool.run" in ids
+        assert "other.Unused" not in ids
+
+
+def test_old_kb_full_path_exact_match():
+    """Full dotted path used as a suffix resolves via exact id match."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog(db_file, with_token_table=False)
+
+        with CatalogDB(db_file) as connector:
+            results = connector.find_components_by_suffixes(["pkg.Tool.run"])
+
+        ids = {row["id"] for row in results}
+        assert "pkg.Tool.run" in ids
+
+
+# ── Large suffix list ─────────────────────────────────────────────────
+
+
+def test_large_suffix_list():
+    """Verify that hundreds of suffixes don't cause query issues."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+
+        con = duckdb.connect(str(db_file))
+        con.execute(
+            """
+            CREATE TABLE component_catalog (
+                id TEXT PRIMARY KEY, label TEXT, concept TEXT,
+                framework TEXT, sig_name TEXT, type TEXT, catalog_label TEXT
+            );
+            """
+        )
+        entries = []
+        for i in range(500):
+            entries.append((
+                f"fw.mod{i}.Class{i}", f"Class{i}", "model",
+                "fw", None, "class", None,
+            ))
+        con.executemany(
+            "INSERT INTO component_catalog VALUES (?, ?, ?, ?, ?, ?, ?)",
+            entries,
+        )
+        con.execute(
+            """
+            CREATE TABLE component_catalog_last_seg AS
+            SELECT id, split_part(id, '.', -1) AS last_seg
+            FROM component_catalog;
+            """
+        )
+        con.close()
+
+        suffixes = [f"Class{i}" for i in range(500)]
+        suffixes += [f"nonexistent_{i}" for i in range(500)]
+
+        with CatalogDB(db_file) as connector:
+            results = connector.find_components_by_suffixes(suffixes)
+
+        ids = {row["id"] for row in results}
+        assert len(ids) == 500
+        assert "fw.mod0.Class0" in ids
+        assert "fw.mod499.Class499" in ids
+
+
+def test_find_ids_by_path_and_concept():
+    """find_ids_by_path_and_concept still works through the VIEW alias."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog(db_file)
+
+        with CatalogDB(db_file) as connector:
+            ids = connector.find_ids_by_path_and_concept("pkg", ["agent"])
+
+        assert "pkg.Agent" in ids

@@ -33,7 +33,7 @@ from .base import BaseScanner
 
 _LOGGER = logging.getLogger(__name__)
 
-_SKIP_DIR_NAMES = frozenset({"node_modules", ".git", ".venv", "venv", "__pycache__"})
+from ..utils.path_filter import should_skip_dir
 
 _AI_COMPOSE_IMAGE_MARKERS = (
     "ollama/ollama",
@@ -142,6 +142,14 @@ def _is_config_target(name: str) -> bool:
 
 
 def _iter_config_files(context: ScanContext) -> Iterator[tuple[Path, Path]]:
+    idx = context.file_index()
+    if idx:
+        for entries in idx.values():
+            for entry in entries:
+                if _is_config_target(entry.path.name):
+                    yield entry.path, entry.root
+        return
+
     spec = _load_exclude_spec(context)
     for root_str in context.paths:
         root = Path(root_str).resolve()
@@ -161,9 +169,9 @@ def _iter_config_files(context: ScanContext) -> Iterator[tuple[Path, Path]]:
             dirnames[:] = [
                 d
                 for d in dirnames
-                if d not in _SKIP_DIR_NAMES
+                if not should_skip_dir(d)
                 and not any(
-                    p in _SKIP_DIR_NAMES for p in (rel_root + "/" + d).split("/") if p
+                    should_skip_dir(p) for p in (rel_root + "/" + d).split("/") if p
                 )
             ]
             for fn in filenames:
@@ -176,16 +184,12 @@ def _iter_config_files(context: ScanContext) -> Iterator[tuple[Path, Path]]:
 
 
 def _read_text(path: Path) -> Optional[str]:
+    from .file_cache import read_text_cached
+
     try:
-        raw = path.read_bytes()
+        return read_text_cached(path)
     except OSError as e:
         _LOGGER.debug("Unreadable %s: %s", path, e)
-        return None
-    if b"\x00" in raw[:8192]:
-        return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
         return None
 
 
