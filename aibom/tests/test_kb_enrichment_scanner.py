@@ -34,11 +34,14 @@ from aibom.models import AIComponentType, DetectionSource, ScanContext
 from aibom.scanners.kb_enrichment_scanner import (
     ALLOWED_CONCEPTS,
     KBEnrichmentScanner,
+    _MatchResult,
     _build_kb_patterns,
+    _emit_suggestive_candidates,
     _extract_class_segment,
     _extract_leaf_class,
     _frameworks_related,
-    _match_observation,
+    _has_suggestive_signal,
+    _match_observation_rich,
     _resolve_kb_path,
 )
 
@@ -85,8 +88,8 @@ class TestFrameworksRelated:
         assert _frameworks_related("openai", "") is True
 
 
-class TestMatchObservation:
-    """Unit tests for _match_observation with a fake kb_by_id."""
+class TestMatchObservationRich:
+    """Unit tests for _match_observation_rich with a fake kb_by_id."""
 
     @pytest.fixture()
     def sample_kb(self) -> dict[str, dict[str, Any]]:
@@ -109,33 +112,38 @@ class TestMatchObservation:
         }
 
     def test_tier1_exact(self, sample_kb: dict):
-        result = _match_observation("crewai.Agent", sample_kb, {"crewai"})
-        assert result is not None
-        assert result["concept"] == "agent"
+        result = _match_observation_rich("crewai.Agent", sample_kb, {"crewai"})
+        assert result.is_confirmed
+        assert result.entry is not None
+        assert result.entry["concept"] == "agent"
 
     def test_tier2_suffix(self, sample_kb: dict):
-        result = _match_observation(
+        result = _match_observation_rich(
             "ChatOpenAI",
             {"langchain_openai.ChatOpenAI": sample_kb["langchain_openai.ChatOpenAI"]},
             {"langchain_openai"},
         )
-        assert result is not None
-        assert result["concept"] == "model"
+        assert result.is_confirmed
+        assert result.entry is not None
+        assert result.entry["concept"] == "model"
 
     def test_tier3_class_segment(self, sample_kb: dict):
-        result = _match_observation(
+        result = _match_observation_rich(
             "langchain_community.vectorstores.FAISS.from_texts",
             sample_kb,
             {"langchain_community"},
         )
-        assert result is not None
-        assert result["concept"] == "datastore"
+        assert result.is_confirmed
+        assert result.entry is not None
+        assert result.entry["concept"] == "datastore"
 
     def test_no_match(self, sample_kb: dict):
-        result = _match_observation("totally.Unknown", sample_kb, set())
-        assert result is None
+        result = _match_observation_rich("totally.Unknown", sample_kb, set())
+        assert not result.is_confirmed
+        assert not result.is_partial
 
-    def test_tier3_rejects_unrelated_framework(self):
+    def test_partial_match_framework_mismatch(self):
+        """Leaf class matches KB but import module differs — MAYBE path."""
         kb = {
             "langchain_community.llms.openai.OpenAI": {
                 "id": "langchain_community.llms.openai.OpenAI",
@@ -143,8 +151,37 @@ class TestMatchObservation:
                 "framework": "langchain_community",
             },
         }
-        result = _match_observation("openai.OpenAI", kb, {"openai"})
-        assert result is None
+        result = _match_observation_rich("models.OpenAI", kb, {"models"})
+        assert result.is_partial
+        assert result.partial_kb_id == "langchain_community.llms.openai.OpenAI"
+        assert result.partial_kb_framework == "langchain_community"
+        assert result.obs_module == "models"
+
+    def test_partial_match_wrapper_library(self):
+        """Wrapper class that matches KB leaf via class segment extraction."""
+        kb = {
+            "langchain_openai.ChatOpenAI": {
+                "id": "langchain_openai.ChatOpenAI",
+                "concept": "model",
+                "framework": "langchain_openai",
+            },
+        }
+        result = _match_observation_rich(
+            "models.llm.openai.ChatOpenAI.invoke", kb, set(),
+        )
+        assert result.is_partial
+        assert "ChatOpenAI" in (result.partial_kb_id or "")
+
+    def test_confirmed_when_framework_matches(self):
+        kb = {
+            "langchain_openai.ChatOpenAI": {
+                "id": "langchain_openai.ChatOpenAI",
+                "concept": "model",
+                "framework": "langchain_openai",
+            },
+        }
+        result = _match_observation_rich("langchain_openai.ChatOpenAI", kb, {"langchain_openai"})
+        assert result.is_confirmed
 
     def test_tier3_lowercase_short_name_skipped(self):
         kb = {
@@ -154,12 +191,10 @@ class TestMatchObservation:
                 "framework": "crewai",
             },
         }
-        result = _match_observation(
+        result = _match_observation_rich(
             "openai.OpenAI.chat.completions.create", kb, {"openai"}
         )
-        # "create" is lowercase, but class segment "OpenAI" is uppercase.
-        # However, the framework check should reject because openai != crewai.
-        assert result is None
+        assert not result.is_confirmed
 
 
 def _kb_available() -> bool:
@@ -417,6 +452,107 @@ class TestKBEnrichmentScannerIntegration:
         comps, _ = KBEnrichmentScanner().scan(ctx)
         files = {c.file_path for c in comps}
         assert len(files) == 2
+
+
+class TestHasSuggestiveSignal:
+    """Unit tests for _has_suggestive_signal."""
+
+    def test_ai_dir_models(self, tmp_path: Path):
+        f = tmp_path / "models" / "llm.py"
+        f.parent.mkdir()
+        f.write_text("class MyLLM: pass")
+        assert _has_suggestive_signal(f, "class MyLLM: pass")
+
+    def test_ai_dir_agents(self, tmp_path: Path):
+        f = tmp_path / "agents" / "main.py"
+        f.parent.mkdir()
+        f.write_text("pass")
+        assert _has_suggestive_signal(f, "pass")
+
+    def test_import_has_openai(self, tmp_path: Path):
+        f = tmp_path / "utils" / "helper.py"
+        f.parent.mkdir()
+        source = "from internal.openai_wrapper import get_client\n"
+        f.write_text(source)
+        assert _has_suggestive_signal(f, source)
+
+    def test_no_signal_plain_util(self, tmp_path: Path):
+        f = tmp_path / "utils" / "strings.py"
+        f.parent.mkdir()
+        source = "import os\ndef strip(s): return s.strip()\n"
+        f.write_text(source)
+        assert not _has_suggestive_signal(f, source)
+
+    def test_no_signal_test_file(self, tmp_path: Path):
+        f = tmp_path / "tests" / "test_foo.py"
+        f.parent.mkdir()
+        source = "import pytest\ndef test_x(): pass\n"
+        f.write_text(source)
+        assert not _has_suggestive_signal(f, source)
+
+
+class TestEmitSuggestiveCandidates:
+    """Unit tests for _emit_suggestive_candidates."""
+
+    def test_emits_for_indicative_class(self, tmp_path: Path):
+        f = tmp_path / "models" / "chat.py"
+        f.parent.mkdir()
+        source = "client = OpenAIModel(api_key='x')\n"
+        f.write_text(source)
+        candidates = _emit_suggestive_candidates(f, source)
+        assert len(candidates) == 1
+        assert candidates[0].needs_agentic is True
+        assert candidates[0].confidence == 0.2
+        assert "suggestive_signal" in candidates[0].metadata
+
+    def test_skips_generic_class(self, tmp_path: Path):
+        f = tmp_path / "models" / "data.py"
+        f.parent.mkdir()
+        source = "obj = Dict(key='val')\n"
+        f.write_text(source)
+        candidates = _emit_suggestive_candidates(f, source)
+        assert len(candidates) == 0
+
+    def test_skips_non_indicative_class(self, tmp_path: Path):
+        f = tmp_path / "models" / "user.py"
+        f.parent.mkdir()
+        source = "user = UserProfile(name='x')\n"
+        f.write_text(source)
+        candidates = _emit_suggestive_candidates(f, source)
+        assert len(candidates) == 0
+
+    def test_multiple_candidates(self, tmp_path: Path):
+        f = tmp_path / "agents" / "multi.py"
+        f.parent.mkdir()
+        source = (
+            "llm = ChatModel()\n"
+            "emb = EmbeddingClient()\n"
+        )
+        f.write_text(source)
+        candidates = _emit_suggestive_candidates(f, source)
+        assert len(candidates) == 2
+
+
+@pytest.mark.skipif(not _kb_available(), reason="No KB DuckDB installed")
+class TestPartialMatchIntegration:
+    """Integration test: wrapper code emits agentic candidates via Gate 3 MAYBE."""
+
+    def test_wrapper_emits_agentic_candidate(self, tmp_path: Path):
+        wrapper_dir = tmp_path / "models" / "llm"
+        wrapper_dir.mkdir(parents=True)
+        (wrapper_dir / "__init__.py").write_text("")
+        (wrapper_dir / "openai_wrapper.py").write_text(
+            "from models.llm.base import BaseLLM\n"
+            "class ChatOpenAI:\n"
+            "    pass\n"
+            "llm = ChatOpenAI()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        agentic = [c for c in comps if c.needs_agentic]
+        assert len(agentic) >= 1
+        hints = " ".join(c.agentic_hint for c in agentic)
+        assert "wrapper" in hints.lower() or "trace" in hints.lower()
 
 
 class TestKBEnrichmentScannerNoKB:

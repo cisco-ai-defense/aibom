@@ -28,6 +28,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
+from .file_cache import read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ def _server_metadata(server: dict[str, Any]) -> dict[str, Any]:
 
 def _parse_config_file(path: Path) -> tuple[Optional[dict[str, Any]], bool]:
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = read_text_cached(path)
         data = json.loads(text)
     except (OSError, json.JSONDecodeError):
         return None, False
@@ -183,7 +184,7 @@ def _first_match_line(pattern: re.Pattern[str], text: str) -> Optional[int]:
 
 def _components_from_python(path: Path) -> list[AIComponent]:
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = read_text_cached(path)
     except OSError:
         return []
     fp = str(path.resolve())
@@ -327,18 +328,25 @@ class McpDetector(BaseScanner):
     def scan(
         self, context: ScanContext
     ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
-        spec = _load_exclude_spec(context.exclude_patterns)
         components: list[AIComponent] = []
         config_paths_seen: set[str] = set()
 
-        for raw in context.paths:
-            root = Path(raw).expanduser()
-            for file_path in _iter_files_under(root, spec):
-                if _is_mcp_config_path(file_path):
-                    config_paths_seen.add(str(file_path.resolve()))
-                    components.extend(_components_from_config(file_path))
-                elif file_path.suffix == ".py":
-                    components.extend(_components_from_python(file_path))
+        idx = context.file_index()
+        if idx:
+            all_files = [e.path for entries in idx.values() for e in entries]
+        else:
+            spec = _load_exclude_spec(context.exclude_patterns)
+            all_files = []
+            for raw in context.paths:
+                root = Path(raw).expanduser()
+                all_files.extend(_iter_files_under(root, spec))
+
+        for file_path in all_files:
+            if _is_mcp_config_path(file_path):
+                config_paths_seen.add(str(file_path.resolve()))
+                components.extend(_components_from_config(file_path))
+            elif file_path.suffix == ".py":
+                components.extend(_components_from_python(file_path))
 
         if config_paths_seen:
             _run_optional_yara_on_configs(sorted(config_paths_seen))

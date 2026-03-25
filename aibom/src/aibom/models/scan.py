@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
@@ -127,6 +128,8 @@ class SourceResult(BaseModel):
 class ScanContext(BaseModel):
     """Input context for a scan run."""
 
+    model_config = {"arbitrary_types_allowed": True}
+
     paths: list[str]
     exclude_patterns: list[str] = Field(default_factory=list)
     output_format: str = "json"
@@ -136,6 +139,69 @@ class ScanContext(BaseModel):
     llm_config: Optional[dict[str, Any]] = None
     fail_on: Optional[Severity] = None
     min_severity: Severity = Severity.INFO
+    ai_package_set: Optional[frozenset[str]] = None
+
+    _file_index: Optional[dict[str, list["_IndexedFile"]]] = None
+
+    def file_index(self) -> dict[str, list["_IndexedFile"]]:
+        """Shared file listing built once and reused by all scanners.
+
+        Returns a dict keyed by file extension (e.g. ``".py"``, ``".yaml"``),
+        with values being lists of ``_IndexedFile(path, root)`` tuples.
+        Files matching exclude patterns or skip segments are pre-filtered.
+        """
+        if self._file_index is not None:
+            return self._file_index
+
+        from pathlib import Path
+        from pathspec import PathSpec
+
+        spec: Optional[PathSpec] = None
+        if self.exclude_patterns:
+            spec = PathSpec.from_lines("gitwildmatch", self.exclude_patterns)
+
+        from ..utils.path_filter import should_skip_dir
+
+        idx: dict[str, list[_IndexedFile]] = {}
+
+        for scan_root in self.paths:
+            root = Path(scan_root)
+            if not root.exists():
+                continue
+            if root.is_file():
+                ext = root.suffix.lower()
+                idx.setdefault(ext, []).append(_IndexedFile(root, root.parent))
+                continue
+            base = root.resolve()
+            for dirpath_s, dirnames, filenames in os.walk(base):
+                dirpath = Path(dirpath_s)
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not should_skip_dir(d)
+                ]
+                for fn in filenames:
+                    fpath = dirpath / fn
+                    if spec:
+                        try:
+                            rel = fpath.relative_to(base).as_posix()
+                            if spec.match_file(rel):
+                                continue
+                        except ValueError:
+                            pass
+                    ext = fpath.suffix.lower()
+                    idx.setdefault(ext, []).append(_IndexedFile(fpath, base))
+
+        self._file_index = idx
+        return idx
+
+
+class _IndexedFile:
+    """Lightweight container for a file path and its scan root."""
+    __slots__ = ("path", "root")
+
+    def __init__(self, path: "Any", root: "Any") -> None:
+        self.path = path
+        self.root = root
 
 
 class ScanResult(BaseModel):

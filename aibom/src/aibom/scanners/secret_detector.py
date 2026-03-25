@@ -33,6 +33,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource, Severity
 from .base import BaseScanner
+from .file_cache import read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -140,8 +141,9 @@ AI_KEY_PATTERNS: list[AIKeyPattern] = [
 ]
 
 
+from ..utils.path_filter import should_skip_dir
+
 _SKIP_NAME_SUFFIXES = (".pyc", ".lock", ".min.js")
-_SKIP_DIR_NAMES = frozenset({"node_modules", ".git"})
 
 
 def _slugify_type(label: str) -> str:
@@ -151,7 +153,7 @@ def _slugify_type(label: str) -> str:
 
 def _path_should_skip(rel_posix: str, name: str) -> bool:
     parts = rel_posix.split("/")
-    if any(p in _SKIP_DIR_NAMES for p in parts):
+    if any(should_skip_dir(p) for p in parts):
         return True
     low = name.lower()
     if low.endswith(_SKIP_NAME_SUFFIXES):
@@ -176,6 +178,19 @@ def _is_excluded(abs_file: Path, root: Path, spec: Optional[PathSpec]) -> bool:
 
 
 def _iter_scan_files(context: ScanContext) -> Iterator[tuple[Path, Path]]:
+    idx = context.file_index()
+    if idx:
+        for entries in idx.values():
+            for entry in entries:
+                try:
+                    rel = entry.path.relative_to(entry.root).as_posix()
+                except ValueError:
+                    rel = entry.path.name
+                if _path_should_skip(rel, entry.path.name):
+                    continue
+                yield entry.path, entry.root
+        return
+
     spec = _load_exclude_spec(context)
     for root_str in context.paths:
         root = Path(root_str).resolve()
@@ -194,7 +209,7 @@ def _iter_scan_files(context: ScanContext) -> Iterator[tuple[Path, Path]]:
             dirnames[:] = [
                 d
                 for d in dirnames
-                if d not in _SKIP_DIR_NAMES
+                if not should_skip_dir(d)
                 and not _path_should_skip(
                     "/".join(filter(None, [rel_root, d])), d
                 )
@@ -211,15 +226,11 @@ def _iter_scan_files(context: ScanContext) -> Iterator[tuple[Path, Path]]:
 
 def _read_text_lines(path: Path) -> Optional[list[str]]:
     try:
-        raw = path.read_bytes()
+        text = read_text_cached(path)
     except OSError as e:
         _LOGGER.debug("Unreadable file %s: %s", path, e)
         return None
-    if b"\x00" in raw[:8192]:
-        return None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
+    if "\x00" in text[:8192]:
         return None
     return text.splitlines()
 

@@ -182,7 +182,7 @@ def build_workflow_index(python_files: List[Path]) -> WorkflowIndex:
         try:
             source = Path(file_path)
             text = source.read_text(encoding="utf-8")
-            tree = ast.parse(text)
+            tree = ast.parse(text, filename=str(file_path))
         except Exception as exc:  # pragma: no cover - parsing best-effort
             _LOGGER.debug("Skipping %s during workflow index build: %s", file_path, exc)
             continue

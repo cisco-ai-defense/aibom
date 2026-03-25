@@ -29,12 +29,11 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
+from .file_cache import read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
-_SKIP_DIR_NAMES = frozenset(
-    {"node_modules", ".git", ".venv", "venv", "__pycache__", ".tox"}
-)
+from ..utils.path_filter import should_skip_dir
 
 _AWS_AI_RESOURCES: frozenset[str] = frozenset(
     {
@@ -282,10 +281,17 @@ def _path_has_skip_segment(path: Path, root: Path) -> bool:
         rel = path.relative_to(root)
     except ValueError:
         return False
-    return any(p in _SKIP_DIR_NAMES for p in rel.parts[:-1])
+    return any(should_skip_dir(p) for p in rel.parts[:-1])
 
 
 def _iter_target_files(context: ScanContext) -> Iterator[tuple[Path, Path]]:
+    idx = context.file_index()
+    if idx:
+        for entries in idx.values():
+            for entry in entries:
+                yield entry.path, entry.root
+        return
+
     spec = _build_pathspec(context.exclude_patterns)
     for scan_root in context.paths:
         root = Path(scan_root)
@@ -1046,7 +1052,7 @@ def _process_file(path: Path) -> list[AIComponent]:
     name_lower = path.name.lower()
 
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
+        content = read_text_cached(path)
     except OSError as e:
         _LOGGER.debug("skip unreadable %s: %s", path, e)
         return []

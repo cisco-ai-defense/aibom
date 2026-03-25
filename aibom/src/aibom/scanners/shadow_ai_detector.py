@@ -25,6 +25,7 @@ from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
 from .dependency_scanner import AI_PACKAGES, DependencyScanner, _iter_scan_paths
+from .file_cache import read_text_cached
 
 _LANGCHAIN = frozenset({
     "langchain", "langchain-core", "langchain-community", "langchain-openai",
@@ -224,12 +225,12 @@ def _regex_dynamic_hits(
 
 def _collect_py_imports(path: Path) -> list[tuple[int, str, str]]:
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = read_text_cached(path)
     except OSError:
         return []
     lines = raw.splitlines()
     try:
-        tree = ast.parse(raw)
+        tree = ast.parse(raw, filename=str(path))
     except SyntaxError:
         tree = None
     hits: list[tuple[int, str, str]] = []

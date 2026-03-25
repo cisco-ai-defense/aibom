@@ -65,5 +65,30 @@ class TestWorkflowAnalyzer(unittest.TestCase):
             self.assertIn("value", agent.get("parameters", []))
 
 
+    def test_syntax_error_handled_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bad = Path(tmp_dir) / "broken.py"
+            bad.write_text("def foo(:\n    pass\n", encoding="utf-8")
+            index = build_workflow_index([bad])
+            assert index.get_workflow_context(str(bad), 1) == []
+
+    def test_multi_file_index(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            a = Path(tmp_dir) / "a.py"
+            a.write_text("def caller():\n    callee()\n", encoding="utf-8")
+            b = Path(tmp_dir) / "b.py"
+            b.write_text("def callee():\n    return 42\n", encoding="utf-8")
+            index = build_workflow_index([a, b])
+            ctx_a = index.get_workflow_context(str(a), 1)
+            assert isinstance(ctx_a, list)
+
+    def test_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            empty = Path(tmp_dir) / "empty.py"
+            empty.write_text("", encoding="utf-8")
+            index = build_workflow_index([empty])
+            assert index.get_workflow_context(str(empty), 1) == []
+
+
 if __name__ == "__main__":
     unittest.main()

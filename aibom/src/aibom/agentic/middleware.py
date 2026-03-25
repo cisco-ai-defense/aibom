@@ -142,7 +142,18 @@ class AIBOMScannerMiddleware:
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any] | None:
         """Best-effort extraction of JSON from agent text output."""
+        import re as _re
+
         text = text.strip()
+
+        for fence in _re.finditer(r"```(?:json)?\s*\n(.*?)```", text, _re.DOTALL):
+            block = fence.group(1).strip()
+            if block.startswith("{"):
+                try:
+                    return json.loads(block)
+                except json.JSONDecodeError:
+                    continue
+
         start = text.find("{")
         if start == -1:
             _LOGGER.warning("Agent output contains no JSON object")

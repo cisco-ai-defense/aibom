@@ -114,6 +114,16 @@ def build_catalog(
 
     count = con.execute("SELECT COUNT(*) FROM component_catalog").fetchone()[0]
     print(f"Catalog built with {count} entries.")
+
+    con.execute(
+        """
+        CREATE TABLE component_catalog_last_seg AS
+        SELECT id, split_part(id, '.', -1) AS last_seg
+        FROM component_catalog;
+        """
+    )
+    print("Built component_catalog_last_seg token table.")
+
     con.close()
 
     digest = _sha256(output_path)
