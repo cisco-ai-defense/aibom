@@ -196,6 +196,34 @@ class TestCommentSkipping:
         assert comps[0].metadata["env"] == "NEW_KEY"
 
 
+class TestGoEnvVarExtraction:
+    def test_os_getenv(self, tmp_path: Path) -> None:
+        (tmp_path / "main.go").write_text(
+            'package main\n'
+            'import "os"\n'
+            'func main() {\n'
+            '    model := os.Getenv("LLM_MODEL")\n'
+            '}\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        assert len(comps) == 1
+        assert comps[0].metadata["env"] == "LLM_MODEL"
+
+
+class TestJavaEnvVarExtraction:
+    def test_system_getenv(self, tmp_path: Path) -> None:
+        (tmp_path / "App.java").write_text(
+            'public class App {\n'
+            '    String model = System.getenv("OPENAI_MODEL");\n'
+            '}\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        assert len(comps) == 1
+        assert comps[0].metadata["env"] == "OPENAI_MODEL"
+
+
 class TestUnsupportedLanguage:
     def test_txt_file_skipped(self, tmp_path: Path) -> None:
         (tmp_path / "notes.txt").write_text(

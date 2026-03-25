@@ -25,12 +25,107 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
 _LOGGER = logging.getLogger(__name__)
+
+import contextvars
+
+_batch_tool_stats: contextvars.ContextVar[dict[str, dict[str, Any]]] = (
+    contextvars.ContextVar("_batch_tool_stats")
+)
+
+_allowed_search_roots: list[str] = []
+
+
+def set_allowed_search_roots(paths: list[str]) -> None:
+    """Restrict all tool search operations to these directories."""
+    _allowed_search_roots.clear()
+    _allowed_search_roots.extend(paths)
+
+
+def _clamp_paths(requested: list[str]) -> list[str]:
+    """Return only those paths that fall under an allowed search root.
+
+    If no roots are configured, returns *requested* unchanged (backward compat).
+    """
+    if not _allowed_search_roots:
+        return requested
+    clamped: list[str] = []
+    for p in requested:
+        rp = str(Path(p).resolve())
+        for root in _allowed_search_roots:
+            if rp == root or rp.startswith(root + "/"):
+                clamped.append(p)
+                break
+    if not clamped:
+        return list(_allowed_search_roots)
+    return clamped
+
+
+def _reset_tool_stats() -> None:
+    _batch_tool_stats.set({})
+
+
+def get_tool_stats() -> dict[str, dict[str, Any]]:
+    try:
+        return dict(_batch_tool_stats.get())
+    except LookupError:
+        return {}
+
+
+def _get_stats_dict() -> dict[str, dict[str, Any]]:
+    try:
+        return _batch_tool_stats.get()
+    except LookupError:
+        d: dict[str, dict[str, Any]] = {}
+        _batch_tool_stats.set(d)
+        return d
+
+
+def _track_tool(name: str):
+    """Decorator that logs and tracks timing for each tool invocation."""
+    def decorator(fn):
+        def wrapper(*args, **kwargs):
+            _LOGGER.info("Tool call: %s (args=%s)", name, _summarize_args(args, kwargs))
+            t0 = time.monotonic()
+            try:
+                result = fn(*args, **kwargs)
+                elapsed = time.monotonic() - t0
+                _LOGGER.info("Tool done: %s — %.2fs", name, elapsed)
+                stats = _get_stats_dict()
+                entry = stats.setdefault(name, {"calls": 0, "total_s": 0.0, "errors": 0})
+                entry["calls"] += 1
+                entry["total_s"] += elapsed
+                return result
+            except Exception as exc:
+                elapsed = time.monotonic() - t0
+                _LOGGER.warning("Tool error: %s — %.2fs — %s", name, elapsed, exc)
+                stats = _get_stats_dict()
+                entry = stats.setdefault(name, {"calls": 0, "total_s": 0.0, "errors": 0})
+                entry["calls"] += 1
+                entry["total_s"] += elapsed
+                entry["errors"] += 1
+                raise
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+    return decorator
+
+
+def _summarize_args(args: tuple, kwargs: dict) -> str:
+    parts = []
+    for a in args:
+        s = str(a)
+        parts.append(s[:80] + "…" if len(s) > 80 else s)
+    for k, v in kwargs.items():
+        s = str(v)
+        parts.append(f"{k}={s[:60]}…" if len(s) > 60 else f"{k}={s}")
+    return ", ".join(parts) or "(none)"
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +185,7 @@ _ENV_CONFIG_GLOBS = (
 )
 
 
+@_track_tool("scan_directory")
 def scan_directory_impl(path: str) -> str:
     """Run all registered scanners on *path* and return JSON summary."""
     from ..models import ScanContext
@@ -128,8 +224,10 @@ def scan_directory_impl(path: str) -> str:
     return json.dumps(result, indent=2)
 
 
+@_track_tool("resolve_env_var")
 def resolve_env_var_impl(var_name: str, search_paths: list[str]) -> str:
     """Search for *var_name* definitions in env files and configs."""
+    search_paths = _clamp_paths(search_paths)
     import yaml
 
     found: list[dict[str, Any]] = []
@@ -199,6 +297,7 @@ def _search_yaml_for_key(
             _search_yaml_for_key(item, key, file_path, found, f"{prefix}[{i}]")
 
 
+@_track_tool("lookup_model")
 def lookup_model_impl(identifier: str) -> str:
     """Query model registries for metadata about *identifier*."""
     from ..scanners.model_detector import _registry_lookup
@@ -226,6 +325,7 @@ def lookup_model_impl(identifier: str) -> str:
     return json.dumps(result)
 
 
+@_track_tool("analyze_imports")
 def analyze_imports_impl(file_path: str) -> str:
     """Run LibCST deep import analysis on a single Python file."""
     from ..cst_parser import parse_source_code
@@ -264,6 +364,7 @@ def analyze_imports_impl(file_path: str) -> str:
     })
 
 
+@_track_tool("trace_data_flow")
 def trace_data_flow_impl(symbol: str, file_path: str) -> str:
     """Trace a variable through assignments to resolve its concrete value."""
     p = Path(file_path)
@@ -311,10 +412,12 @@ def trace_data_flow_impl(symbol: str, file_path: str) -> str:
     })
 
 
+@_track_tool("search_codebase")
 def search_codebase_impl(
     pattern: str, search_paths: list[str], literal: bool = False
 ) -> str:
     """Search across directories for a regex or literal pattern."""
+    search_paths = _clamp_paths(search_paths)
     if literal:
         regex = re.compile(re.escape(pattern), re.IGNORECASE)
     else:
@@ -371,19 +474,14 @@ def build_tools() -> list[Any]:
 
     This function is called lazily only when ``--agent-model`` is specified,
     so the ``langchain_core`` import happens only when needed.
+
+    ``scan_directory`` is intentionally excluded: the deterministic scan has
+    already run and its results are pre-fed in the prompt.  Re-scanning is
+    redundant and expensive (~3-4 s per call).
     """
     from langchain_core.tools import StructuredTool
 
     return [
-        StructuredTool.from_function(
-            name="scan_directory",
-            description=(
-                "Run all AIBOM deterministic scanners on a directory. "
-                "Returns detected AI components and relationships as JSON."
-            ),
-            func=scan_directory_impl,
-            args_schema=ScanDirectoryArgs,
-        ),
         StructuredTool.from_function(
             name="resolve_env_var",
             description=(
@@ -429,7 +527,8 @@ def build_tools() -> list[Any]:
             description=(
                 "Search across all input directories for a regex or literal "
                 "pattern. Returns matching file paths, line numbers, and "
-                "context snippets."
+                "context snippets. Use sparingly — only when other tools "
+                "cannot answer your question."
             ),
             func=search_codebase_impl,
             args_schema=SearchCodebaseArgs,

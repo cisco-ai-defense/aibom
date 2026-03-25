@@ -28,6 +28,8 @@ import yaml
 from pathspec import PathSpec
 from platformdirs import user_cache_dir
 
+from .file_cache import read_text_cached
+
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
@@ -542,26 +544,40 @@ def _is_plausible_model_id(s: str) -> bool:
     return True
 
 
+_registry_cache: dict[str, dict[str, Any] | None] = {}
+_SENTINEL = object()
+
+
 def _registry_lookup(model_id: str) -> Optional[dict[str, Any]]:
     key = model_id.strip()
+    cached = _registry_cache.get(key, _SENTINEL)
+    if cached is not _SENTINEL:
+        return dict(cached) if cached is not None else None
 
     # Tier 1: LiteLLM commercial API catalog
     live = _get_live_registry()
     hit = live.get(key.lower())
     if hit:
-        return dict(hit)
+        result = dict(hit)
+        _registry_cache[key] = result
+        return result
 
     # Tier 2 (offline): builtin regex patterns
     for pat, meta in _COMPILED_REGISTRY:
         if pat.search(key):
-            return dict(meta)
+            result = dict(meta)
+            _registry_cache[key] = result
+            return result
 
     # Tier 3: HuggingFace Hub for org/model-name slugs
     if _is_hf_model_id(key):
         hf = _query_hf_hub(key)
         if hf:
-            return dict(hf)
+            result = dict(hf)
+            _registry_cache[key] = result
+            return result
 
+    _registry_cache[key] = None
     return None
 
 
@@ -572,6 +588,17 @@ def _build_pathspec(patterns: list[str]) -> Optional[PathSpec]:
 
 
 def _iter_files(context: ScanContext) -> Iterator[tuple[Path, str]]:
+    idx = context.file_index()
+    if idx:
+        for entries in idx.values():
+            for entry in entries:
+                try:
+                    rel = entry.path.relative_to(entry.root).as_posix()
+                except ValueError:
+                    rel = entry.path.as_posix()
+                yield entry.path, rel
+        return
+
     spec = _build_pathspec(context.exclude_patterns)
     for scan_root in context.paths:
         root = Path(scan_root)
@@ -765,7 +792,7 @@ class ModelDetector(BaseScanner):
             suffix = fpath.suffix.lower()
             name_lower = fpath.name.lower()
             try:
-                text = fpath.read_text(encoding="utf-8", errors="replace")
+                text = read_text_cached(fpath)
             except OSError:
                 continue
 

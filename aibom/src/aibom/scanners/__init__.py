@@ -14,7 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .base import BaseScanner, scanner_registry, run_scanners
+from .base import BaseScanner, scanner_registry, scanner_timings, run_scanners
 from .config_scanner import ConfigScanner
 from .deployment_detector import DeploymentDetector
 from .dependency_scanner import DependencyScanner
@@ -59,5 +59,6 @@ __all__ = [
     "Vulnerability",
     "run_scanners",
     "scanner_registry",
+    "scanner_timings",
     "vuln_provider_registry",
 ]

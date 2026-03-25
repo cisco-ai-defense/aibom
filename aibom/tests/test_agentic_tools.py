@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from aibom.agentic.tools import (
+    _allowed_search_roots,
     analyze_imports_impl,
     lookup_model_impl,
     resolve_env_var_impl,
@@ -31,6 +32,14 @@ from aibom.agentic.tools import (
     search_codebase_impl,
     trace_data_flow_impl,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_search_roots():
+    """Reset module-level search roots so earlier test files don't pollute."""
+    _allowed_search_roots.clear()
+    yield
+    _allowed_search_roots.clear()
 
 
 class TestScanDirectory:

@@ -27,6 +27,8 @@ carry the workload.
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,6 +44,7 @@ from ..models import (
 )
 from ..structures import CodeAnalysisResult
 from .base import BaseScanner
+from .file_cache import read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -173,6 +176,44 @@ _STATIC_PROMPT_PATTERNS: frozenset[str] = frozenset({
     "PromptTemplate", "ChatPromptTemplate",
     "FewShotPromptTemplate", "FewShotChatMessagePromptTemplate",
 })
+
+@dataclass(frozen=True, slots=True)
+class _MatchResult:
+    """Outcome of matching an observation against the KB."""
+
+    entry: dict[str, Any] | None = None
+    partial_kb_id: str | None = None
+    partial_kb_framework: str | None = None
+    obs_module: str = ""
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.entry is not None and self.partial_kb_id is None
+
+    @property
+    def is_partial(self) -> bool:
+        return self.entry is None and self.partial_kb_id is not None
+
+
+_AI_SUGGESTIVE_DIR_SEGMENTS: frozenset[str] = frozenset({
+    "models", "agents", "tools", "prompts", "embeddings", "llm",
+    "inference", "ai", "ml", "vectorstores", "vector_stores",
+    "retrievers", "memory", "chains", "chatbots",
+})
+
+_AI_SUGGESTIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({
+    "llm", "openai", "anthropic", "embedding", "vector", "agent",
+    "model", "inference", "chat", "completion", "bedrock", "vertex",
+    "huggingface", "transformers", "torch", "tensorflow", "keras",
+    "ollama", "cohere", "mistral", "gemini",
+})
+
+_AI_INDICATIVE_CLASS_RE: re.Pattern[str] = re.compile(
+    r"(LLM|Model|Agent|Embedding|Vector|Chain|Tool|Prompt|Memory|Chat|"
+    r"Retriever|Completion|Inference|Tokenizer)",
+    re.IGNORECASE,
+)
+
 
 _GENERIC_CLASS_NAMES: frozenset[str] = frozenset({
     "ABC", "Any", "Dict", "List", "Optional", "Tuple", "Set", "Type",
@@ -368,16 +409,63 @@ class KBEnrichmentScanner(BaseScanner):
 
             kb_patterns = _build_kb_patterns(db)
             kb_fw_prefixes = _build_kb_framework_prefixes(db)
+            kb_fw_names = _build_kb_framework_names(db)
 
-            for py_file in _find_python_files(context):
+            if context.ai_package_set:
+                combined = set(kb_fw_names)
+                for pkg in context.ai_package_set:
+                    combined.add(pkg)
+                    combined.add(pkg.replace("-", "_"))
+                filter_set = frozenset(combined)
+            else:
+                filter_set = kb_fw_names
+
+            all_py_files = _find_python_files(context)
+            tier1_files: list[tuple[Path, str]] = []
+            suggestive_files: list[tuple[Path, str]] = []
+
+            for py_file in all_py_files:
                 try:
-                    source = py_file.read_text(encoding="utf-8")
+                    source = read_text_cached(py_file)
+                except Exception:  # noqa: BLE001
+                    continue
+                if _file_has_kb_framework_import(source, filter_set):
+                    tier1_files.append((py_file, source))
+                elif _has_suggestive_signal(py_file, source):
+                    suggestive_files.append((py_file, source))
+
+            _LOGGER.debug(
+                "KB enrichment: %d Tier 1 (framework import), "
+                "%d suggestive (wrapper), %d skipped of %d total",
+                len(tier1_files), len(suggestive_files),
+                len(all_py_files) - len(tier1_files) - len(suggestive_files),
+                len(all_py_files),
+            )
+
+            parsed_results: list[CodeAnalysisResult] = []
+            all_symbols: set[str] = set()
+            all_files = tier1_files + suggestive_files
+            for py_file, source in all_files:
+                try:
                     result = parse_source_code(str(py_file), source)
-                    components.extend(
-                        _process_file(result, db, kb_patterns, kb_fw_prefixes)
-                    )
+                    parsed_results.append(result)
+                    _collect_symbols(result, all_symbols)
                 except Exception:  # noqa: BLE001
                     _LOGGER.debug("KB enrichment: failed to parse %s", py_file, exc_info=True)
+
+            kb_entries = _batch_kb_lookup(db, all_symbols) if all_symbols else {}
+
+            for result in parsed_results:
+                components.extend(
+                    _process_file_with_cache(
+                        result, kb_entries, kb_patterns, kb_fw_prefixes,
+                    )
+                )
+
+            for py_file, source in suggestive_files:
+                components.extend(
+                    _emit_suggestive_candidates(py_file, source)
+                )
 
         return components, []
 
@@ -387,7 +475,175 @@ class KBEnrichmentScanner(BaseScanner):
 # ---------------------------------------------------------------------------
 
 
+def _build_kb_framework_names(db: CatalogDB) -> frozenset[str]:
+    """Query the KB for the full set of framework package names.
+
+    Returns both the raw framework values (``langchain_community``) **and**
+    their root prefixes (``langchain``), giving us a complete allowlist
+    derived from the KB — no hardcoded guessing.
+    """
+    try:
+        rows = db._connection.execute(  # noqa: SLF001
+            "SELECT DISTINCT framework FROM component_catalog WHERE framework IS NOT NULL"
+        ).fetchall()
+        names: set[str] = set()
+        for (fw,) in rows:
+            if fw:
+                names.add(fw)
+                names.add(fw.split("_")[0].split("-")[0])
+        if names:
+            return frozenset(names)
+    except Exception:  # noqa: BLE001
+        pass
+    return frozenset()
+
+
+_AMBIGUOUS_TOP_LEVEL = frozenset({
+    "google", "aws", "azure", "microsoft", "com", "org", "io", "ai",
+})
+
+
+def _import_matches_framework(dotted_path: str, kb_frameworks: frozenset[str]) -> bool:
+    """Check if a dotted import path matches any known framework.
+
+    Strategy:
+    - Single-segment (``torch``): direct check + root-prefix check.
+    - Multi-dot (``google.cloud.aiplatform``): build progressive underscore
+      joins (``google_cloud``, ``google_cloud_aiplatform``) and check each.
+      The bare first segment is only accepted if it is NOT in
+      ``_AMBIGUOUS_TOP_LEVEL`` — so ``langchain.agents`` matches (first
+      segment ``langchain`` is specific) but ``google.protobuf`` does not
+      (``google`` is ambiguous without deeper context).
+    """
+    segments = dotted_path.split(".")
+
+    if len(segments) == 1:
+        pkg = segments[0]
+        if pkg in kb_frameworks:
+            return True
+        root = pkg.split("_")[0].split("-")[0]
+        return root in kb_frameworks
+
+    first = segments[0]
+    if first not in _AMBIGUOUS_TOP_LEVEL and first in kb_frameworks:
+        return True
+
+    accumulated = ""
+    for i, seg in enumerate(segments):
+        accumulated = f"{accumulated}_{seg}" if accumulated else seg
+        if i == 0:
+            continue
+        if accumulated in kb_frameworks:
+            return True
+
+    return False
+
+
+def _file_has_kb_framework_import(
+    source: str, kb_frameworks: frozenset[str],
+) -> bool:
+    """Return True if *source* contains an ``import`` or ``from`` statement
+    referencing any framework known to the KB.
+
+    This is a cheap structural check — it only looks at lines that start with
+    ``import `` or ``from `` (after stripping whitespace) and checks the full
+    dotted import path progressively against the framework set.
+    """
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("from "):
+            parts = stripped.split(None, 2)
+            if len(parts) >= 2:
+                if _import_matches_framework(parts[1], kb_frameworks):
+                    return True
+        elif stripped.startswith("import "):
+            parts = stripped.split(None, 2)
+            if len(parts) >= 2:
+                for mod in parts[1].split(","):
+                    dotted = mod.strip().split(" ")[0]
+                    if _import_matches_framework(dotted, kb_frameworks):
+                        return True
+    return False
+
+
+def _has_suggestive_signal(py_file: Path, source: str) -> bool:
+    """Return True if the file has AI-suggestive directory path or import path.
+
+    This is the bypass for wrapper libraries that don't directly import known
+    frameworks but live in directories or import modules whose names suggest
+    AI involvement (e.g., ``models/llm/openai.py``).
+    """
+    parts = py_file.parts
+    for part in parts:
+        if part.lower() in _AI_SUGGESTIVE_DIR_SEGMENTS:
+            return True
+
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(("from ", "import ")):
+            lower = stripped.lower()
+            for seg in _AI_SUGGESTIVE_IMPORT_SEGMENTS:
+                if seg in lower:
+                    return True
+    return False
+
+
+def _emit_suggestive_candidates(
+    py_file: Path, source: str,
+) -> list[AIComponent]:
+    """Emit low-confidence agentic candidates for AI-indicative class names.
+
+    Only fires for files that passed the suggestive-signal check but failed
+    the framework import check.  The agent will trace the wrapper chain.
+    """
+    candidates: list[AIComponent] = []
+    seen_lines: set[int] = set()
+    for i, line in enumerate(source.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        assign_match = re.match(
+            r"(\w+)\s*=\s*([A-Z]\w+)\s*\(", stripped,
+        )
+        if not assign_match:
+            continue
+        _target, class_name = assign_match.group(1), assign_match.group(2)
+        if class_name in _GENERIC_CLASS_NAMES:
+            continue
+        if not _AI_INDICATIVE_CLASS_RE.search(class_name):
+            continue
+        if i in seen_lines:
+            continue
+        seen_lines.add(i)
+        candidates.append(
+            AIComponent(
+                name=class_name,
+                component_type=AIComponentType.MODEL,
+                file_path=str(py_file),
+                line_number=i,
+                framework="",
+                detection_source=DetectionSource.KB_ENRICHMENT,
+                confidence=0.2,
+                needs_agentic=True,
+                agentic_hint=(
+                    f"Class '{class_name}' in suggestive path "
+                    f"'{py_file.parent.name}/' has AI-indicative name. "
+                    f"Agent should read this file and trace imports to confirm."
+                ),
+                metadata={
+                    "suggestive_signal": True,
+                    "parent_dir": py_file.parent.name,
+                },
+            )
+        )
+    return candidates
+
+
 def _find_python_files(context: ScanContext) -> list[Path]:
+    idx = context.file_index()
+    if idx:
+        return [e.path for e in idx.get(".py", [])]
+
     files: list[Path] = []
     for p in context.paths:
         path = Path(p)
@@ -396,6 +652,247 @@ def _find_python_files(context: ScanContext) -> list[Path]:
         elif path.is_dir():
             files.extend(sorted(path.rglob("*.py")))
     return files
+
+
+def _collect_symbols(result: CodeAnalysisResult, symbols: set[str]) -> None:
+    """Gather all symbols from a parsed file result into the shared set."""
+    variable_map: dict[str, str] = {}
+    for assignment in result.assignments:
+        if assignment.target_qualified_name and assignment.call.qualified_name:
+            variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
+
+    for assignment in result.assignments:
+        name = _resolve_chain(assignment.call.qualified_name, variable_map)
+        symbols.add(name)
+    for dec in result.decorators:
+        name = dec.decorator_qualified_name
+        if dec.instance_variable and dec.instance_variable in variable_map:
+            base = variable_map[dec.instance_variable]
+            attr = name.split(".", 1)[-1] if "." in name else name
+            name = f"{base}.{attr}"
+        name = _resolve_chain(name, variable_map)
+        symbols.add(name)
+    for ctx in result.context_managers:
+        if ctx.context_expr_qualified_name:
+            symbols.add(_resolve_chain(ctx.context_expr_qualified_name, variable_map))
+
+
+def _batch_kb_lookup(
+    db: CatalogDB, symbols: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Query DuckDB for symbols via the token-based hash-join index.
+
+    Returns a filtered ``kb_by_id`` dict containing only entries whose concept
+    is in :data:`ALLOWED_CONCEPTS`.
+    """
+    query_suffixes: set[str] = set(symbols)
+    for s in symbols:
+        if "." in s:
+            query_suffixes.add(s.rsplit(".", 1)[-1])
+            cls = _extract_class_segment(s)
+            if cls:
+                query_suffixes.add(cls)
+
+    matched = db.find_components_by_suffixes(list(query_suffixes))
+
+    kb_by_id: dict[str, dict[str, Any]] = {}
+    for entry in matched:
+        concept = (entry.get("concept") or "").lower()
+        if concept not in ALLOWED_CONCEPTS:
+            continue
+        eid = entry["id"]
+        if eid not in kb_by_id:
+            kb_by_id[eid] = entry
+
+    return kb_by_id
+
+
+def _process_file_with_cache(
+    result: CodeAnalysisResult,
+    kb_by_id: dict[str, dict[str, Any]],
+    kb_patterns: dict[AIComponentType, frozenset[str]] | None = None,
+    kb_fw_prefixes: frozenset[str] | None = None,
+) -> list[AIComponent]:
+    """Match one file using pre-fetched KB entries (no per-file DB query)."""
+    variable_map: dict[str, str] = {}
+    for assignment in result.assignments:
+        if assignment.target_qualified_name and assignment.call.qualified_name:
+            variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
+
+    observations: list[dict[str, Any]] = []
+    components: list[AIComponent] = []
+    seen: set[tuple[str, int]] = set()
+
+    for assignment in result.assignments:
+        name = _resolve_chain(assignment.call.qualified_name, variable_map)
+        observations.append(
+            _obs(name, result.file_path, assignment.line_number, "assignment",
+                 args=assignment.call.arguments,
+                 assigned_target=assignment.target_qualified_name)
+        )
+
+    for dec in result.decorators:
+        name = dec.decorator_qualified_name
+        if dec.instance_variable and dec.instance_variable in variable_map:
+            base = variable_map[dec.instance_variable]
+            attr = name.split(".", 1)[-1] if "." in name else name
+            name = f"{base}.{attr}"
+        name = _resolve_chain(name, variable_map)
+        observations.append(
+            _obs(name, result.file_path, dec.line_number, "decorator",
+                 decorated=dec.decorated_function_name)
+        )
+
+    for ctx in result.context_managers:
+        if not ctx.context_expr_qualified_name:
+            continue
+        name = _resolve_chain(ctx.context_expr_qualified_name, variable_map)
+        observations.append(
+            _obs(name, result.file_path, ctx.line_number, "context_manager")
+        )
+
+    imports = getattr(result, "imports", []) or []
+
+    fw_prefixes = kb_fw_prefixes or _AGENT_FRAMEWORK_PREFIXES
+    pat = kb_patterns or {}
+    _call_pattern_map: list[tuple[frozenset[str], frozenset[str], AIComponentType]] = [
+        (pat.get(AIComponentType.AGENT, _AGENT_CREATION_PATTERNS), fw_prefixes, AIComponentType.AGENT),
+        (pat.get(AIComponentType.TOOL, _STATIC_TOOL_PATTERNS), fw_prefixes, AIComponentType.TOOL),
+        (pat.get(AIComponentType.MEMORY, _STATIC_MEMORY_PATTERNS), fw_prefixes, AIComponentType.MEMORY),
+        (pat.get(AIComponentType.PROMPT, _STATIC_PROMPT_PATTERNS), fw_prefixes, AIComponentType.PROMPT),
+    ]
+
+    for call_obs in result.calls:
+        qn = _resolve_chain(call_obs.qualified_name, variable_map)
+        for patterns, fw_pref, comp_type in _call_pattern_map:
+            if _is_known_call(qn, imports, patterns, fw_pref):
+                key = (result.file_path, call_obs.line_number)
+                if key not in seen:
+                    short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+                    components.append(
+                        AIComponent(
+                            name=short,
+                            component_type=comp_type,
+                            file_path=result.file_path,
+                            line_number=call_obs.line_number,
+                            framework=qn.split(".")[0] if "." in qn else "",
+                            detection_source=DetectionSource.CODE_ANALYSIS,
+                            metadata={"call_pattern": qn},
+                        )
+                    )
+                    seen.add(key)
+                break
+
+    for assignment in result.assignments:
+        qn = _resolve_chain(assignment.call.qualified_name, variable_map)
+        for patterns, fw_pref, comp_type in _call_pattern_map:
+            if _is_known_call(qn, imports, patterns, fw_pref):
+                key = (result.file_path, assignment.line_number)
+                if key not in seen:
+                    target = assignment.target_qualified_name or qn
+                    short = target.rsplit(".", 1)[-1] if "." in target else target
+                    components.append(
+                        AIComponent(
+                            name=short,
+                            component_type=comp_type,
+                            file_path=result.file_path,
+                            line_number=assignment.line_number,
+                            framework=qn.split(".")[0] if "." in qn else "",
+                            detection_source=DetectionSource.CODE_ANALYSIS,
+                            metadata={"call_pattern": qn, "assigned_to": target},
+                        )
+                    )
+                    seen.add(key)
+                break
+
+    suffix_idx = _build_suffix_index(kb_by_id)
+    imported_frameworks = _extract_frameworks_from_imports(imports)
+
+    for obs_data in observations:
+        key = (obs_data["file"], obs_data["line"])
+        if key in seen:
+            continue
+
+        match = _match_observation_rich(
+            obs_data["name"], kb_by_id, imported_frameworks, suffix_idx,
+        )
+
+        if match.is_confirmed:
+            kb_entry = match.entry
+            assert kb_entry is not None  # noqa: S101
+            concept = kb_entry["concept"].lower()
+            comp_type = _CONCEPT_TO_TYPE.get(concept)
+            if not comp_type:
+                continue
+            comp_type = _refine_type_from_kb_id(kb_entry["id"], comp_type)
+            if comp_type is None:
+                continue
+
+            meta: dict[str, Any] = {"kb_id": kb_entry["id"]}
+            if obs_data.get("assigned_target"):
+                meta["assigned_target"] = obs_data["assigned_target"]
+            if obs_data.get("decorated"):
+                meta["decorated_function"] = obs_data["decorated"]
+            if obs_data.get("args"):
+                meta["arguments"] = obs_data["args"]
+
+            display_name = obs_data["name"]
+            if obs_data.get("type") == "decorator" and obs_data.get("decorated"):
+                display_name = obs_data["decorated"]
+
+            components.append(
+                AIComponent(
+                    name=display_name,
+                    component_type=comp_type,
+                    file_path=obs_data["file"],
+                    line_number=obs_data["line"],
+                    framework=kb_entry.get("framework", ""),
+                    detection_source=DetectionSource.KB_ENRICHMENT,
+                    kb_concept=concept,
+                    kb_label=kb_entry.get("label", ""),
+                    metadata=meta,
+                )
+            )
+            seen.add(key)
+
+        elif match.is_partial:
+            if match.obs_module in imported_frameworks:
+                continue
+            class_seg = _extract_class_segment(obs_data["name"])
+            display_name = class_seg or obs_data["name"]
+            if obs_data.get("type") == "decorator" and obs_data.get("decorated"):
+                display_name = obs_data["decorated"]
+            hint = (
+                f"Class '{display_name}' matches KB entry '{match.partial_kb_id}' "
+                f"but import module '{match.obs_module}' differs from KB "
+                f"framework '{match.partial_kb_framework}'. "
+                f"Agent should trace the wrapper chain to confirm."
+            )
+            meta_partial: dict[str, Any] = {
+                "partial_kb_id": match.partial_kb_id,
+                "obs_module": match.obs_module,
+            }
+            if obs_data.get("assigned_target"):
+                meta_partial["assigned_target"] = obs_data["assigned_target"]
+            if obs_data.get("args"):
+                meta_partial["arguments"] = obs_data["args"]
+            components.append(
+                AIComponent(
+                    name=display_name,
+                    component_type=AIComponentType.MODEL,
+                    file_path=obs_data["file"],
+                    line_number=obs_data["line"],
+                    framework=match.obs_module,
+                    detection_source=DetectionSource.KB_ENRICHMENT,
+                    confidence=0.3,
+                    needs_agentic=True,
+                    agentic_hint=hint,
+                    metadata=meta_partial,
+                )
+            )
+            seen.add(key)
+
+    return components
 
 
 def _process_file(
@@ -523,6 +1020,7 @@ def _process_file(
         if eid not in kb_by_id:
             kb_by_id[eid] = entry
 
+    suffix_idx = _build_suffix_index(kb_by_id)
     imported_frameworks = _extract_frameworks_from_imports(imports)
 
     for obs_data in observations:
@@ -530,41 +1028,74 @@ def _process_file(
         if key in seen:
             continue
 
-        kb_entry = _match_observation(obs_data["name"], kb_by_id, imported_frameworks)
-        if not kb_entry:
-            continue
+        match = _match_observation_rich(obs_data["name"], kb_by_id, imported_frameworks, suffix_idx)
 
-        concept = kb_entry["concept"].lower()
-        comp_type = _CONCEPT_TO_TYPE.get(concept)
-        if not comp_type:
-            continue
+        if match.is_confirmed:
+            kb_entry = match.entry
+            assert kb_entry is not None  # noqa: S101
+            concept = kb_entry["concept"].lower()
+            comp_type = _CONCEPT_TO_TYPE.get(concept)
+            if not comp_type:
+                continue
+            comp_type = _refine_type_from_kb_id(kb_entry["id"], comp_type)
+            if comp_type is None:
+                continue
 
-        comp_type = _refine_type_from_kb_id(kb_entry["id"], comp_type)
-        if comp_type is None:
-            continue
+            seen.add(key)
 
-        seen.add(key)
+            display_name = obs_data["name"]
+            if obs_data["type"] == "decorator" and obs_data.get("decorated"):
+                display_name = obs_data["decorated"]
 
-        display_name = obs_data["name"]
-        if obs_data["type"] == "decorator" and obs_data.get("decorated"):
-            display_name = obs_data["decorated"]
-
-        components.append(
-            AIComponent(
-                name=display_name,
-                component_type=comp_type,
-                file_path=obs_data["file"],
-                line_number=obs_data["line"],
-                framework=kb_entry.get("framework", ""),
-                detection_source=DetectionSource.KB_ENRICHMENT,
-                kb_concept=concept,
-                kb_label=kb_entry.get("label", ""),
-                metadata={
-                    "kb_id": kb_entry["id"],
-                    "observation_type": obs_data["type"],
-                },
+            components.append(
+                AIComponent(
+                    name=display_name,
+                    component_type=comp_type,
+                    file_path=obs_data["file"],
+                    line_number=obs_data["line"],
+                    framework=kb_entry.get("framework", ""),
+                    detection_source=DetectionSource.KB_ENRICHMENT,
+                    kb_concept=concept,
+                    kb_label=kb_entry.get("label", ""),
+                    metadata={
+                        "kb_id": kb_entry["id"],
+                        "observation_type": obs_data["type"],
+                    },
+                )
             )
-        )
+
+        elif match.is_partial:
+            if match.obs_module in imported_frameworks:
+                continue
+            class_seg = _extract_class_segment(obs_data["name"])
+            display_name = class_seg or obs_data["name"]
+            if obs_data["type"] == "decorator" and obs_data.get("decorated"):
+                display_name = obs_data["decorated"]
+            hint = (
+                f"Class '{display_name}' matches KB entry '{match.partial_kb_id}' "
+                f"but import module '{match.obs_module}' differs from KB "
+                f"framework '{match.partial_kb_framework}'. "
+                f"Agent should trace the wrapper chain to confirm."
+            )
+            components.append(
+                AIComponent(
+                    name=display_name,
+                    component_type=AIComponentType.MODEL,
+                    file_path=obs_data["file"],
+                    line_number=obs_data["line"],
+                    framework=match.obs_module,
+                    detection_source=DetectionSource.KB_ENRICHMENT,
+                    confidence=0.3,
+                    needs_agentic=True,
+                    agentic_hint=hint,
+                    metadata={
+                        "partial_kb_id": match.partial_kb_id,
+                        "obs_module": match.obs_module,
+                        "observation_type": obs_data["type"],
+                    },
+                )
+            )
+            seen.add(key)
 
     return components
 
@@ -599,62 +1130,112 @@ def _resolve_chain(name: str, variable_map: dict[str, str]) -> str:
     return name
 
 
-def _match_observation(
+def _build_suffix_index(
+    kb_by_id: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build a suffix→entries index to avoid O(n) scans in _match_observation.
+
+    Keys are each dot-delimited suffix of the KB id.  E.g. for
+    ``langchain_community.vectorstores.faiss.FAISS`` we index entries under
+    ``FAISS``, ``faiss.FAISS``, ``vectorstores.faiss.FAISS``, etc.
+    """
+    idx: dict[str, list[dict[str, Any]]] = {}
+    for kb_id, entry in kb_by_id.items():
+        parts = kb_id.split(".")
+        for i in range(1, len(parts) + 1):
+            suffix = ".".join(parts[-i:])
+            idx.setdefault(suffix, []).append(entry)
+    return idx
+
+
+def _match_observation_rich(
     obs_name: str,
     kb_by_id: dict[str, dict[str, Any]],
     imported_frameworks: set[str],
-) -> Optional[dict[str, Any]]:
-    """Return the best KB entry for *obs_name*, or ``None``.
+    suffix_index: dict[str, list[dict[str, Any]]] | None = None,
+) -> _MatchResult:
+    """Match an observation against the KB, returning confirmed, partial, or empty.
 
-    Tier 1: exact match on KB id.
-    Tier 2: suffix match on full qualified name.
-    Tier 3: suffix match on the SHORT class/function name (last dot-segment),
-            disambiguated by imported frameworks.  This handles the common case
-            where a wrapper package (``langchain_openai``) re-exports from an
-            implementation package (``langchain_community``).
+    Tier 1: exact match on KB id → confirmed.
+    Tier 2: suffix match on full qualified name, framework-related → confirmed.
+    Tier 3: suffix match on SHORT class name, framework-related → confirmed.
+    Partial: leaf class exists in KB suffix index but framework guard rejected.
+    Empty: no KB overlap at all.
     """
-    # Tier 1 -- exact
     if obs_name in kb_by_id:
-        return kb_by_id[obs_name]
+        return _MatchResult(entry=kb_by_id[obs_name])
 
     obs_module = obs_name.split(".")[0] if "." in obs_name else ""
 
-    # Tier 2 -- full qualified suffix, validated against framework family.
-    # Without this check ``openai.OpenAI`` would match
-    # ``langchain_community.llms.openai.OpenAI`` via the coincidental
-    # ``.openai.OpenAI`` submodule path.
+    if suffix_index is not None:
+        all_candidates = suffix_index.get(obs_name, [])
+        fw_candidates = [
+            e for e in all_candidates
+            if not obs_module or _frameworks_related(obs_module, e.get("framework", ""))
+        ]
+        if fw_candidates:
+            return _MatchResult(entry=_pick_best(fw_candidates, imported_frameworks, obs_module))
+
+        if all_candidates and obs_module:
+            best = _pick_best(all_candidates, imported_frameworks, obs_module)
+            return _MatchResult(
+                partial_kb_id=best.get("id", ""),
+                partial_kb_framework=best.get("framework", ""),
+                obs_module=obs_module,
+            )
+
+        class_name = _extract_class_segment(obs_name)
+        if class_name:
+            all_cls_candidates = suffix_index.get(class_name, [])
+            if all_cls_candidates:
+                best = _pick_best(all_cls_candidates, imported_frameworks, obs_module)
+                if not obs_module or _frameworks_related(obs_module, best.get("framework", "")):
+                    return _MatchResult(entry=best)
+                return _MatchResult(
+                    partial_kb_id=best.get("id", ""),
+                    partial_kb_framework=best.get("framework", ""),
+                    obs_module=obs_module,
+                )
+        return _MatchResult()
+
     candidates: list[dict[str, Any]] = []
+    all_suffix_candidates: list[dict[str, Any]] = []
     for kb_id, entry in kb_by_id.items():
         if kb_id.endswith("." + obs_name):
+            all_suffix_candidates.append(entry)
             if not obs_module or _frameworks_related(obs_module, entry.get("framework", "")):
                 candidates.append(entry)
 
     if candidates:
-        return _pick_best(candidates, imported_frameworks, obs_module)
+        return _MatchResult(entry=_pick_best(candidates, imported_frameworks, obs_module))
+    if all_suffix_candidates and obs_module:
+        best = _pick_best(all_suffix_candidates, imported_frameworks, obs_module)
+        return _MatchResult(
+            partial_kb_id=best.get("id", ""),
+            partial_kb_framework=best.get("framework", ""),
+            obs_module=obs_module,
+        )
 
-    # Tier 3 -- short-name suffix using the nearest class-like (uppercase)
-    # segment from the observation name.  This handles wrapper re-exports
-    # (``langchain_openai.ChatOpenAI`` → KB has ``langchain_community.*.ChatOpenAI``)
-    # and factory calls (``FAISS.from_texts`` → class segment ``FAISS``).
     class_name = _extract_class_segment(obs_name)
     if not class_name:
-        return None
+        return _MatchResult()
 
+    all_cls: list[dict[str, Any]] = []
     for kb_id, entry in kb_by_id.items():
         if kb_id.endswith("." + class_name):
-            candidates.append(entry)
+            all_cls.append(entry)
 
-    if not candidates:
-        return None
+    if not all_cls:
+        return _MatchResult()
 
-    # Tier 3 is the loosest match; require the best candidate's framework to
-    # share a package-family prefix with the observation's module so that
-    # ``openai.OpenAI.chat.completions.create`` doesn't match a
-    # ``langchain_community`` entry just because both have an ``OpenAI`` class.
-    best = _pick_best(candidates, imported_frameworks, obs_module)
-    if obs_module and not _frameworks_related(obs_module, best.get("framework", "")):
-        return None
-    return best
+    best = _pick_best(all_cls, imported_frameworks, obs_module)
+    if not obs_module or _frameworks_related(obs_module, best.get("framework", "")):
+        return _MatchResult(entry=best)
+    return _MatchResult(
+        partial_kb_id=best.get("id", ""),
+        partial_kb_framework=best.get("framework", ""),
+        obs_module=obs_module,
+    )
 
 
 def _extract_class_segment(obs_name: str) -> Optional[str]:
@@ -701,7 +1282,8 @@ def _pick_best(
     """From a set of KB candidates, prefer the one whose framework matches best.
 
     Priority: framework matches the observation's module prefix > framework is
-    imported > first candidate.
+    imported > deterministic fallback (prefer entries where path override agrees
+    with KB concept).
     """
     if len(candidates) == 1:
         return candidates[0]
@@ -719,4 +1301,17 @@ def _pick_best(
         if fw in imported_frameworks or fw_top in imported_frameworks:
             return c
 
+    def _path_override_score(c: dict[str, Any]) -> tuple[int, str]:
+        kid = c.get("id", "")
+        concept = c.get("concept", "")
+        concept_type = _CONCEPT_TO_TYPE.get(concept)
+        if concept_type:
+            refined = _refine_type_from_kb_id(kid, concept_type)
+            if refined is None:
+                return (2, kid)
+            if refined != concept_type:
+                return (1, kid)
+        return (0, kid)
+
+    candidates.sort(key=_path_override_score)
     return candidates[0]
