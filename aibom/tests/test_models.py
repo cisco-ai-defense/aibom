@@ -54,6 +54,7 @@ _EXPECTED_AI_COMPONENT_TYPES: dict[str, str] = {
     "DATA_VERSIONING": "data_versioning",
     "ML_PIPELINE": "ml_pipeline",
     "SKILL": "skill",
+    "OBSERVABILITY": "observability",
     "SECRET": "secret",
     "DEPENDENCY": "dependency",
     "OTHER": "other",

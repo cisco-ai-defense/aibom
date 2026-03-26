@@ -226,6 +226,7 @@ def _build_scan_result(
         "dataset": AIComponentType.DATASET,
         "prompt": AIComponentType.PROMPT,
         "guardrail": AIComponentType.GUARDRAIL,
+        "observability": AIComponentType.OBSERVABILITY,
         "memory": AIComponentType.MEMORY,
         "retriever": AIComponentType.RETRIEVER,
     }
@@ -909,6 +910,11 @@ def analyze(
         "--agentic-batch-size",
         help="Max components per agentic LLM invocation (default 5).",
     ),
+    agentic_concurrency: int = typer.Option(
+        1,
+        "--agentic-concurrency",
+        help="Max parallel agentic LLM batches (default 1, sequential).",
+    ),
     agentic_fast_model: Optional[str] = typer.Option(
         None,
         "--agentic-fast-model",
@@ -1303,6 +1309,7 @@ def analyze(
                 strict=strict,
                 agentic_scope=agentic_scope,
                 agentic_batch_size=agentic_batch_size,
+                agentic_concurrency=agentic_concurrency,
                 agentic_fast_model=agentic_fast_model,
             )
             with console.status(f"[cyan]Scanning {source} (v2 pipeline)"):

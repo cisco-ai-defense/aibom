@@ -95,6 +95,27 @@ AI_PACKAGES: dict[str, set[str]] = {
         "semantic-kernel",
         "promptflow",
         "deepeval",
+        # Observability
+        "traceloop-sdk",
+        "openllmetry",
+        "freeplay",
+        "langsmith",
+        "langfuse",
+        "arize-phoenix",
+        "opik",
+        "helicone",
+        "tracia",
+        "opentelemetry-instrumentation-openai",
+        "opentelemetry-instrumentation-langchain",
+        # Guardrails
+        "nemoguardrails",
+        "guardrails-ai",
+        "llm-guard",
+        "lakera-guard",
+        "rebuff",
+        "cisco-aidefense-sdk",
+        # MCP clients
+        "mcp-client",
     },
     "npm": {
         "openai",
@@ -113,6 +134,8 @@ AI_PACKAGES: dict[str, set[str]] = {
         "@pinecone-database/pinecone",
         "weaviate-ts-client",
         "@qdrant/js-client-rest",
+        "langsmith",
+        "langfuse",
     },
     "go": {
         "github.com/sashabaranov/go-openai",
@@ -939,7 +962,7 @@ class DependencyScanner(BaseScanner):
     def scan(
         self, context: ScanContext
     ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
-        components: list[AIComponent] = []
+        seen: dict[str, AIComponent] = {}
         for path in _iter_scan_paths(context):
             key = path.name.lower()
             if key not in _MANIFEST_PARSERS and not key.endswith(".csproj"):
@@ -948,20 +971,26 @@ class DependencyScanner(BaseScanner):
                 if not _is_ai(ecosystem, name):
                     continue
                 disp = _display_name(ecosystem, name)
+                dedup_key = disp.lower()
+                if dedup_key in seen:
+                    prev = seen[dedup_key]
+                    if not prev.sdk_version and pinned_ver:
+                        prev.sdk_version = pinned_ver
+                        prev.metadata["version_spec"] = raw_spec
+                    continue
                 meta = {
                     "ecosystem": ecosystem,
                     "version_spec": raw_spec,
                     "manifest": path.name,
                 }
-                components.append(
-                    AIComponent(
-                        name=disp,
-                        component_type=AIComponentType.DEPENDENCY,
-                        file_path=str(path.resolve()),
-                        line_number=line_no,
-                        sdk_version=pinned_ver,
-                        detection_source=DetectionSource.DEPENDENCY_MANIFEST,
-                        metadata=meta,
-                    ),
+                comp = AIComponent(
+                    name=disp,
+                    component_type=AIComponentType.DEPENDENCY,
+                    file_path=str(path.resolve()),
+                    line_number=line_no,
+                    sdk_version=pinned_ver,
+                    detection_source=DetectionSource.DEPENDENCY_MANIFEST,
+                    metadata=meta,
                 )
-        return components, []
+                seen[dedup_key] = comp
+        return list(seen.values()), []

@@ -105,6 +105,17 @@ def has_mcp_imports(text: str) -> bool:
     return bool(_MCP_IMPORT_RE.search(text))
 
 
+_CACHE_IMPORT_RE = re.compile(
+    r"(?:^|\n)\s*(?:from|import)\s+"
+    r"(?:redis|memcache|pymemcache|cachetools|diskcache|aiocache)\b",
+    re.MULTILINE,
+)
+
+
+def has_cache_imports(text: str) -> bool:
+    return bool(_CACHE_IMPORT_RE.search(text))
+
+
 def has_any_ai_imports(text: str) -> bool:
     return (
         has_ml_imports(text)

@@ -70,6 +70,111 @@ class PipelineResult:
     total_elapsed_s: float = 0.0
 
 
+def _service_dir(file_path: str, scan_paths: list[str] | None = None) -> str:
+    """Extract a logical service/directory key from a file path.
+
+    Walks up from the file until it finds a directory that contains a
+    manifest (pyproject.toml, go.mod, package.json, Cargo.toml) or is
+    two levels deep from a scan root.  Falls back to the immediate parent.
+    """
+    from pathlib import Path
+
+    p = Path(file_path)
+    for ancestor in p.parents:
+        for marker in ("pyproject.toml", "go.mod", "package.json", "Cargo.toml"):
+            if (ancestor / marker).exists():
+                return str(ancestor)
+    return str(p.parent)
+
+
+def _consolidation_key(c: "AIComponent") -> tuple[str, str]:
+    """Key for grouping duplicate components.
+
+    Groups by (canonical_name, component_type) across the entire scan —
+    repo-level dedup.  ``model_name`` is preferred over ``name`` when
+    present so that different framework wrappers for the same model collapse.
+    """
+    canonical = (c.model_name or c.name).lower().strip()
+    return (canonical, c.component_type.value)
+
+
+_TEST_PATH_SEGMENTS: frozenset[str] = frozenset({
+    "tests", "test", "__tests__", "spec", "testing", "testdata",
+    "test_data", "fixtures",
+})
+
+
+def _is_test_file(file_path: str) -> bool:
+    """Return True when the file lives under a test directory."""
+    from pathlib import Path
+    parts = Path(file_path).parts
+    return any(seg in _TEST_PATH_SEGMENTS for seg in parts)
+
+
+def _consolidate_components(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Merge per-file-reference components into per-logical-asset components.
+
+    Groups by (canonical_name, component_type) across the entire repo.
+    The highest-confidence occurrence is kept; all others become entries
+    in ``metadata["evidence"]`` with file, line, and service fields.
+    Components where **every** occurrence is in a test file are tagged
+    ``metadata["test_only"] = True``.
+    """
+    from collections import OrderedDict
+
+    groups: OrderedDict[tuple, list["AIComponent"]] = OrderedDict()
+    for c in components:
+        key = _consolidation_key(c)
+        groups.setdefault(key, []).append(c)
+
+    result: list["AIComponent"] = []
+    for _key, group in groups.items():
+        if len(group) == 1:
+            c = group[0]
+            if _is_test_file(c.file_path):
+                merged_meta = dict(c.metadata)
+                merged_meta["test_only"] = True
+                c = c.model_copy(update={"metadata": merged_meta})
+            result.append(c)
+            continue
+
+        best = max(group, key=lambda c: (c.confidence, -c.line_number))
+        evidence = []
+        all_test = True
+        for c in group:
+            is_test = _is_test_file(c.file_path)
+            if not is_test:
+                all_test = False
+            if c is not best:
+                evidence.append({
+                    "file": c.file_path,
+                    "line": c.line_number,
+                    "service": _service_dir(c.file_path),
+                    "test_only": is_test,
+                })
+
+        if not _is_test_file(best.file_path):
+            all_test = False
+
+        merged_meta = dict(best.metadata)
+        merged_meta["evidence"] = evidence
+        merged_meta["consolidated_count"] = len(group)
+        if all_test:
+            merged_meta["test_only"] = True
+
+        needs = any(c.needs_agentic for c in group)
+
+        merged = best.model_copy(update={
+            "metadata": merged_meta,
+            "needs_agentic": needs,
+        })
+        result.append(merged)
+
+    return result
+
+
 class ScanPipeline:
     """Four-stage v2 scan pipeline wired into a single ``run()`` call."""
 
@@ -87,6 +192,7 @@ class ScanPipeline:
         exclude_patterns: list[str] | None = None,
         agentic_scope: str = "candidates",
         agentic_batch_size: int = 5,
+        agentic_concurrency: int = 1,
         agentic_fast_model: str | None = None,
     ) -> None:
         self.scan_paths = scan_paths
@@ -100,6 +206,7 @@ class ScanPipeline:
         self.exclude_patterns = exclude_patterns or []
         self.agentic_scope = agentic_scope
         self.agentic_batch_size = agentic_batch_size
+        self.agentic_concurrency = agentic_concurrency
         self.agentic_fast_model = agentic_fast_model
 
     def run(self) -> PipelineResult:
@@ -310,6 +417,7 @@ class ScanPipeline:
                 scan_paths=self.scan_paths,
                 llm_config=self.llm_config,
                 batch_size=self.agentic_batch_size,
+                max_concurrent=self.agentic_concurrency,
                 fast_model=self.agentic_fast_model,
             )
             relationships = relationships + agentic_rels
@@ -327,13 +435,23 @@ class ScanPipeline:
         return components, relationships, []
 
     # ------------------------------------------------------------------
-    # Stage 4: Assemble — apply strict filtering, count agentic candidates
+    # Stage 4: Assemble — consolidate, filter, count
     # ------------------------------------------------------------------
 
     def _stage_assemble(
         self, components: list[AIComponent]
     ) -> tuple[list[AIComponent], int]:
         _LOGGER.info("Stage 4/4 — assembling results")
+
+        before = len(components)
+        components = _consolidate_components(components)
+        after = len(components)
+        if before != after:
+            _LOGGER.info(
+                "Consolidation: %d → %d components (-%d duplicates)",
+                before, after, before - after,
+            )
+
         agentic_count = sum(1 for c in components if c.needs_agentic)
 
         if self.strict:

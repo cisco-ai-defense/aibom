@@ -70,8 +70,14 @@ agentic = [
     "langchain>=1.2.11",
     "langchain-core>=1.2.18",
 ]
+cloud = [
+    "boto3>=1.35.0",
+    "google-cloud-aiplatform>=1.74.0",
+    "azure-identity>=1.19.0",
+    "azure-mgmt-cognitiveservices>=13.6.0",
+]
 all = [
-    "cisco-aibom[analysis,security,agentic]",
+    "cisco-aibom[analysis,security,agentic,cloud]",
 ]
 
 [tool.pytest.ini_options]
