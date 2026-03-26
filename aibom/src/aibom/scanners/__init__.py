@@ -15,7 +15,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .base import BaseScanner, scanner_registry, scanner_timings, run_scanners
+from .cicd_scanner import CICDScanner
+from .cloud_scanner import CloudScanner
 from .config_scanner import ConfigScanner
+from .container_scanner import ContainerScanner
 from .deployment_detector import DeploymentDetector
 from .dependency_scanner import DependencyScanner
 from .env_var_resolver import EnvVarResolver
@@ -23,6 +26,7 @@ from .kb_enrichment_scanner import KBEnrichmentScanner
 from .mcp_detector import McpDetector
 from .ml_lifecycle_detector import MLLifecycleDetector
 from .model_detector import ModelDetector
+from .model_file_scanner import ModelFileScanner
 from .multi_language_scanner import MultiLanguageScanner
 from .secret_detector import SecretDetector
 from .shadow_ai_detector import ShadowAIDetector
@@ -36,11 +40,15 @@ from .vuln_scanner import (
     Vulnerability,
     vuln_provider_registry,
 )
+from .workflow_scanner import WorkflowScanner
 
 __all__ = [
     "BaseScanner",
     "BaseVulnProvider",
+    "CICDScanner",
+    "CloudScanner",
     "ConfigScanner",
+    "ContainerScanner",
     "DeploymentDetector",
     "DependencyScanner",
     "EnvVarResolver",
@@ -49,6 +57,7 @@ __all__ = [
     "McpDetector",
     "MLLifecycleDetector",
     "ModelDetector",
+    "ModelFileScanner",
     "MultiLanguageScanner",
     "OsvProvider",
     "PackageRef",
@@ -57,6 +66,7 @@ __all__ = [
     "SkillDetector",
     "VulnScanner",
     "Vulnerability",
+    "WorkflowScanner",
     "run_scanners",
     "scanner_registry",
     "scanner_timings",

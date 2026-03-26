@@ -52,22 +52,37 @@ class AIBOMScannerMiddleware:
     def extract_findings(
         self, agent_output: str
     ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
-        """Parse the agent's JSON output into AIBOM model objects."""
+        """Parse the agent's JSON string output into AIBOM model objects."""
         data = self._parse_json(agent_output)
         if data is None:
             return [], [], []
+        return self.extract_findings_from_dict(data)
 
+    def extract_findings_from_dict(
+        self, data: dict[str, Any]
+    ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+        """Extract findings from an already-parsed dict."""
         components = self._extract_new_components(data)
         enrichments = self._extract_enrichments(data)
         relationships = self._extract_relationships(data)
         risk_flags = self._extract_risk_flags(data)
-
         return components + enrichments, relationships, risk_flags
 
     def apply_enrichments(
         self,
         existing: list[AIComponent],
         agent_output: str,
+    ) -> list[AIComponent]:
+        """Merge enrichments from a JSON string."""
+        data = self._parse_json(agent_output)
+        if data is None:
+            return list(existing)
+        return self.apply_enrichments_from_dict(existing, data)
+
+    def apply_enrichments_from_dict(
+        self,
+        existing: list[AIComponent],
+        data: dict[str, Any],
     ) -> list[AIComponent]:
         """Merge enrichments, removals, and reclassifications into *existing*.
 
@@ -78,9 +93,6 @@ class AIBOMScannerMiddleware:
 
         Returns a new list.  Components not referenced are passed through.
         """
-        data = self._parse_json(agent_output)
-        if data is None:
-            return list(existing)
 
         remove_ids: set[str] = set()
         for item in data.get("remove_components", []):
@@ -118,7 +130,10 @@ class AIBOMScannerMiddleware:
             if new_type_str:
                 try:
                     new_type = AIComponentType(new_type_str)
-                    comp = comp.model_copy(update={"component_type": new_type})
+                    comp = comp.model_copy(update={
+                        "component_type": new_type,
+                        "needs_agentic": False,
+                    })
                 except ValueError:
                     _LOGGER.warning(
                         "Invalid reclassify type '%s' for %s",
@@ -129,7 +144,13 @@ class AIBOMScannerMiddleware:
             if upd is not None:
                 merged_meta = dict(comp.metadata)
                 merged_meta.update(upd.pop("metadata", {}))
-                comp = comp.model_copy(update={**upd, "metadata": merged_meta})
+                comp = comp.model_copy(update={
+                    **upd,
+                    "metadata": merged_meta,
+                    "needs_agentic": False,
+                })
+            elif comp.needs_agentic:
+                comp = comp.model_copy(update={"needs_agentic": False})
 
             result.append(comp)
 
@@ -141,31 +162,18 @@ class AIBOMScannerMiddleware:
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any] | None:
-        """Best-effort extraction of JSON from agent text output."""
-        import re as _re
-
+        """Parse the agent's final message as JSON."""
         text = text.strip()
-
-        for fence in _re.finditer(r"```(?:json)?\s*\n(.*?)```", text, _re.DOTALL):
-            block = fence.group(1).strip()
-            if block.startswith("{"):
-                try:
-                    return json.loads(block)
-                except json.JSONDecodeError:
-                    continue
-
-        start = text.find("{")
-        if start == -1:
-            _LOGGER.warning("Agent output contains no JSON object")
-            return None
-        end = text.rfind("}")
-        if end == -1 or end <= start:
-            _LOGGER.warning("Agent output contains malformed JSON")
+        if not text:
+            _LOGGER.warning("Agent returned empty output")
             return None
         try:
-            return json.loads(text[start : end + 1])
+            return json.loads(text)
         except json.JSONDecodeError:
-            _LOGGER.warning("Failed to parse agent JSON output")
+            _LOGGER.warning(
+                "Failed to parse agent JSON output — first 300 chars: %s",
+                text[:300],
+            )
             return None
 
     @staticmethod

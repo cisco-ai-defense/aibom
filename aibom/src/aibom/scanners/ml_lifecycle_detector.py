@@ -312,6 +312,29 @@ _CONCEPT_PATTERNS: list[ConceptPattern] = [
         ],
         "ML workflow orchestration",
     ),
+    ConceptPattern(
+        AIComponentType.TRAINING_RUN,
+        [
+            (re.compile(r"""boto3\.client\s*\(\s*["']sagemaker["']\s*\)"""), "aws-sagemaker"),
+            (re.compile(r"""\bcreate_training_job\s*\("""), "aws-sagemaker"),
+            (re.compile(r"""\bcreate_endpoint\s*\("""), "aws-sagemaker"),
+            (re.compile(r"""\bSageMaker(?:Estimator|Processor|Pipeline)\s*\("""), "aws-sagemaker"),
+            (re.compile(r"""\bHuggingFace(?:Processor|Model|Estimator)\s*\("""), "aws-sagemaker"),
+            (re.compile(r"""\bCustomJob\s*\("""), "gcp-vertex-ai"),
+            (re.compile(r"""\baiplatform\.(?:init|CustomJob|AutoMLTabularTrainingJob)\s*\("""), "gcp-vertex-ai"),
+            (re.compile(r"""\bcommand_job\s*=\s*command\s*\(""", re.IGNORECASE), "azure-ml"),
+            (re.compile(r"""\bml_client\.(?:jobs\.create_or_update|compute\.begin_create_or_update)\s*\("""), "azure-ml"),
+        ],
+        [
+            ("from sagemaker import", "aws-sagemaker"),
+            ("import sagemaker", "aws-sagemaker"),
+            ("from sagemaker.huggingface import", "aws-sagemaker"),
+            ("from google.cloud import aiplatform", "gcp-vertex-ai"),
+            ("from azure.ai.ml import command", "azure-ml"),
+            ("from azure.ai.ml import MLClient", "azure-ml"),
+        ],
+        "Cloud ML training job (SageMaker / Vertex AI / Azure ML)",
+    ),
 ]
 
 _YAML_DATA_SECTION_RE = re.compile(r"^\s*data:\s*(?:#.*)?$")
@@ -364,6 +387,10 @@ _AMBIGUOUS_TRAINING_FW = frozenset({
     "keras/pytorch", "pytorch/tensorflow", "pytorch",
 })
 
+_CLOUD_ML_FW = frozenset({
+    "aws-sagemaker", "gcp-vertex-ai", "azure-ml",
+})
+
 _AMBIGUOUS_DATASET_FW = frozenset({
     "pandas", "cloud-storage", "azure-blob",
 })
@@ -382,6 +409,8 @@ def _concept_confidence(
         return (0.75, False, "")
 
     if concept == AIComponentType.TRAINING_RUN:
+        if framework in _CLOUD_ML_FW:
+            return (0.9, False, "")
         if file_has_ml:
             return (0.9, False, "")
         return (0.3, True, f".fit()/{framework} without ML imports in file")
@@ -410,6 +439,16 @@ def _concept_confidence(
         return (0.5, True, "pipeline pattern without AI/ML imports")
 
     return (0.85, False, "")
+
+
+_OPENAPI_MARKER_RE = re.compile(
+    r'^\s*(?:openapi|swagger)\s*:', re.MULTILINE,
+)
+
+
+def _is_openapi_spec(text: str) -> bool:
+    """Return True when the YAML text appears to be an OpenAPI/Swagger spec."""
+    return bool(_OPENAPI_MARKER_RE.search(text[:2000]))
 
 
 class MLLifecycleDetector(BaseScanner):
@@ -502,13 +541,15 @@ class MLLifecycleDetector(BaseScanner):
                         )
                         break
 
+            is_openapi_spec = is_yaml and _is_openapi_spec(text)
+
             scan_lines = text.splitlines()
             for line_no, line in enumerate(scan_lines, start=1):
                 stripped = line.strip()
 
                 if is_yaml and _YAML_DATA_SECTION_RE.match(line):
                     is_k8s_manifest = _K8S_DATA_SECTION_RE.search(text) is not None
-                    if not is_k8s_manifest:
+                    if not is_k8s_manifest and not is_openapi_spec:
                         uri = _extract_uri_from_line(line)
                         add(
                             _emit(
