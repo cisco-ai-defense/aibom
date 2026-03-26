@@ -23,11 +23,12 @@ they test the helper functions and mock the external dependencies.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aibom.agentic.agent import _build_context_message, _extract_final_message
+from aibom.agentic.agent import _build_context_message, _extract_structured_response
 from aibom.models import AIComponent, AIComponentType, ComponentRelationship
 
 
@@ -130,20 +131,25 @@ class TestBuildContextMessage:
         assert "code_context" not in data["enrich_these"][0]
 
 
-class TestExtractFinalMessage:
-    def test_extracts_from_message_objects(self):
-        mock_msg = MagicMock()
-        mock_msg.content = "final answer"
-        result = {"messages": [MagicMock(), mock_msg]}
-        assert _extract_final_message(result) == "final answer"
+class TestExtractStructuredResponse:
+    def test_prefers_structured_response(self):
+        result = {
+            "structured_response": {"enriched_components": [], "new_components": []},
+            "messages": [MagicMock()],
+        }
+        data = _extract_structured_response(result)
+        assert data == {"enriched_components": [], "new_components": []}
 
-    def test_extracts_from_dict_messages(self):
-        result = {"messages": [{"content": "hello"}, {"content": "final"}]}
-        assert _extract_final_message(result) == "final"
+    def test_falls_back_to_json_message(self):
+        mock_msg = MagicMock()
+        mock_msg.content = '{"enriched_components": []}'
+        result = {"messages": [mock_msg]}
+        data = _extract_structured_response(result)
+        assert data == {"enriched_components": []}
 
     def test_returns_none_for_empty(self):
-        assert _extract_final_message({"messages": []}) is None
-        assert _extract_final_message({}) is None
+        assert _extract_structured_response({"messages": []}) is None
+        assert _extract_structured_response({}) is None
 
 
 class TestLazyImport:
@@ -277,6 +283,7 @@ class TestRunAgenticEnrichment:
             deterministic_relationships=[],
             scan_paths=["/tmp"],
             batch_size=5,
+            max_concurrent=3,
         )
         assert mock_agent.ainvoke.call_count == 3  # 5 + 5 + 2, parallel
 
@@ -381,3 +388,113 @@ class TestToolStats:
         assert "my_tool" in stats
         assert stats["my_tool"]["calls"] == 1
         assert stats["my_tool"]["errors"] == 0
+
+
+class TestLocalityAwareBatching:
+    """Locality-aware batching groups co-located components."""
+
+    def test_groups_by_directory(self):
+        from aibom.agentic.agent import _locality_aware_batches
+
+        comps = [
+            AIComponent(name="a", component_type=AIComponentType.MODEL, file_path="/repo/dir1/a.py", line_number=1),
+            AIComponent(name="b", component_type=AIComponentType.MODEL, file_path="/repo/dir1/b.py", line_number=2),
+            AIComponent(name="c", component_type=AIComponentType.MODEL, file_path="/repo/dir2/c.py", line_number=1),
+            AIComponent(name="d", component_type=AIComponentType.MODEL, file_path="/repo/dir2/d.py", line_number=2),
+        ]
+        batches = _locality_aware_batches(comps, batch_size=3)
+        assert len(batches) == 2
+        dirs_b0 = {str(Path(c.file_path).parent) for c in batches[0]}
+        assert len(dirs_b0) <= 2
+
+    def test_single_dir_stays_together(self):
+        from aibom.agentic.agent import _locality_aware_batches
+
+        comps = [
+            AIComponent(name=f"m{i}", component_type=AIComponentType.MODEL, file_path=f"/repo/pkg/{i}.py", line_number=i)
+            for i in range(4)
+        ]
+        batches = _locality_aware_batches(comps, batch_size=5)
+        assert len(batches) == 1
+        assert len(batches[0]) == 4
+
+    def test_respects_batch_size(self):
+        from aibom.agentic.agent import _locality_aware_batches
+
+        comps = [
+            AIComponent(name=f"m{i}", component_type=AIComponentType.MODEL, file_path=f"/repo/pkg/{i}.py", line_number=i)
+            for i in range(7)
+        ]
+        batches = _locality_aware_batches(comps, batch_size=3)
+        assert all(len(b) <= 3 for b in batches)
+        assert sum(len(b) for b in batches) == 7
+
+
+class TestAgenticResultCache:
+    """Content-hash result cache for agentic enrichment."""
+
+    def test_cache_miss_then_hit(self, tmp_path):
+        from aibom.agentic.agent import _AgenticResultCache, _component_cache_key
+
+        cache = _AgenticResultCache(tmp_path / "cache")
+        comp = AIComponent(
+            name="gpt-4o", component_type=AIComponentType.MODEL,
+            file_path="a.py", line_number=1, model_name="gpt-4o",
+        )
+        key = _component_cache_key(comp)
+        assert cache.get(key) is None
+
+        cache.put(key, {"enriched_components": [], "new_components": []})
+        assert cache.get(key) is not None
+
+    def test_partition_splits_cached_and_uncached(self, tmp_path):
+        from aibom.agentic.agent import _AgenticResultCache, _component_cache_key
+
+        cache = _AgenticResultCache(tmp_path / "cache")
+        c1 = AIComponent(name="a", component_type=AIComponentType.MODEL, file_path="a.py", line_number=1, model_name="gpt-4o")
+        c2 = AIComponent(name="b", component_type=AIComponentType.MODEL, file_path="b.py", line_number=1, model_name="gpt-5")
+        cache.put(_component_cache_key(c1), {"enriched_components": []})
+
+        cached, uncached = cache.partition([c1, c2])
+        assert len(cached) == 1
+        assert cached[0].name == "a"
+        assert len(uncached) == 1
+        assert uncached[0].name == "b"
+
+    def test_disk_persistence(self, tmp_path):
+        from aibom.agentic.agent import _AgenticResultCache, _component_cache_key
+
+        cache_dir = tmp_path / "cache"
+        cache1 = _AgenticResultCache(cache_dir)
+        comp = AIComponent(name="x", component_type=AIComponentType.MODEL, file_path="x.py", line_number=1)
+        key = _component_cache_key(comp)
+        cache1.put(key, {"enriched_components": [], "test": True})
+
+        cache2 = _AgenticResultCache(cache_dir)
+        assert cache2.get(key) is not None
+        assert cache2.get(key)["test"] is True
+
+
+class TestSubAgentGrouping:
+    """Sub-agent dispatch groups components by scan root."""
+
+    def test_groups_by_scan_root(self):
+        from aibom.agentic.agent import _group_by_top_dir
+
+        comps = [
+            AIComponent(name="a", component_type=AIComponentType.MODEL, file_path="/repo1/src/a.py", line_number=1),
+            AIComponent(name="b", component_type=AIComponentType.MODEL, file_path="/repo1/src/b.py", line_number=2),
+            AIComponent(name="c", component_type=AIComponentType.MODEL, file_path="/repo2/lib/c.py", line_number=1),
+        ]
+        groups = _group_by_top_dir(comps, scan_paths=["/repo1", "/repo2"])
+        assert len(groups) == 2
+
+    def test_single_root_single_group(self):
+        from aibom.agentic.agent import _group_by_top_dir
+
+        comps = [
+            AIComponent(name=f"m{i}", component_type=AIComponentType.MODEL, file_path=f"/repo/d{i}/f.py", line_number=i)
+            for i in range(5)
+        ]
+        groups = _group_by_top_dir(comps, scan_paths=["/repo"])
+        assert len(groups) == 1

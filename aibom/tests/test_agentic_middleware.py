@@ -284,10 +284,14 @@ class TestReclassifyComponents:
 
 
 class TestParseJson:
-    def test_extracts_json_from_surrounding_text(self, mw):
-        text = 'Here is the result:\n{"key": "value"}\nDone.'
+    def test_parses_pure_json(self, mw):
+        text = '{"key": "value"}'
         result = mw._parse_json(text)
         assert result == {"key": "value"}
+
+    def test_rejects_json_with_surrounding_text(self, mw):
+        text = 'Here is the result:\n{"key": "value"}\nDone.'
+        assert mw._parse_json(text) is None
 
     def test_returns_none_for_no_json(self, mw):
         assert mw._parse_json("no json here") is None

@@ -232,14 +232,19 @@ class ScanResult(BaseModel):
     def summary(self) -> dict[str, Any]:
         components = self.all_components
         by_type: dict[str, int] = {}
+        test_only_count = 0
         for c in components:
+            if c.metadata.get("test_only"):
+                test_only_count += 1
+                continue
             if not c.needs_agentic:
                 by_type[c.component_type.value] = by_type.get(c.component_type.value, 0) + 1
         agentic = [c for c in components if c.needs_agentic]
         return {
             "total_sources": len(self.sources),
-            "total_components": len(components) - len(agentic),
+            "total_components": len(components) - len(agentic) - test_only_count,
             "agentic_candidates": len(agentic),
+            "test_only_components": test_only_count,
             "component_types": by_type,
             "total_relationships": len(self.all_relationships),
             "risk_score": self.risk.score,

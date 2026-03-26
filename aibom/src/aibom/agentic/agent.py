@@ -30,6 +30,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from pydantic import BaseModel, Field
+
 from ..models import (
     AIComponent,
     ComponentRelationship,
@@ -41,6 +43,57 @@ from ..models import (
 )
 from .middleware import AIBOMScannerMiddleware
 from .prompts import AIBOM_AGENT_SYSTEM_PROMPT
+
+
+class _EnrichedComponent(BaseModel):
+    instance_id: str = ""
+    updates: dict[str, Any] = Field(default_factory=dict)
+
+
+class _NewComponent(BaseModel):
+    name: str = ""
+    component_type: str = "other"
+    file_path: str = ""
+    line_number: int = 0
+    framework: str = ""
+    model_name: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class _RemoveComponent(BaseModel):
+    instance_id: str = ""
+    reason: str = ""
+
+
+class _ReclassifyComponent(BaseModel):
+    instance_id: str = ""
+    new_type: str = ""
+    reason: str = ""
+
+
+class _Relationship(BaseModel):
+    source_name: str = ""
+    target_name: str = ""
+    relationship_type: str = ""
+
+
+class _RiskFinding(BaseModel):
+    flag: str = ""
+    description: str = ""
+    file_path: str = ""
+    line_number: int = 0
+    severity: str = "info"
+
+
+class AgentResponse(BaseModel):
+    """Structured output schema for the AIBOM agent."""
+
+    enriched_components: list[_EnrichedComponent] = Field(default_factory=list)
+    new_components: list[_NewComponent] = Field(default_factory=list)
+    remove_components: list[_RemoveComponent] = Field(default_factory=list)
+    reclassify_components: list[_ReclassifyComponent] = Field(default_factory=list)
+    new_relationships: list[_Relationship] = Field(default_factory=list)
+    risk_findings: list[_RiskFinding] = Field(default_factory=list)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -134,6 +187,7 @@ def create_aibom_agent(
         model=model,
         tools=tools,
         system_prompt=system_prompt or AIBOM_AGENT_SYSTEM_PROMPT,
+        response_format=AgentResponse,
         name="aibom-scanner",
     )
     return agent
@@ -146,9 +200,9 @@ _DEFAULT_BATCH_SIZE = 5
 # infinite loops, NOT a workload budget.
 _RECURSION_LIMIT = 1000
 
-_MAX_CONCURRENT_BATCHES = 1
-
 _SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
+
+_SUB_AGENT_THRESHOLD = 50
 
 
 def _classify_candidates(
@@ -179,6 +233,133 @@ def _classify_candidates(
     return simple, complex_
 
 
+def _locality_aware_batches(
+    components: list[AIComponent],
+    batch_size: int,
+) -> list[list[AIComponent]]:
+    """Group components by parent directory, then split into batches.
+
+    Co-located components share imports and context, so batching them
+    together lets the agent reason about a directory as a unit and
+    reduces redundant file reads.
+    """
+    from collections import defaultdict
+
+    by_dir: dict[str, list[AIComponent]] = defaultdict(list)
+    for c in components:
+        parent = str(Path(c.file_path).parent) if c.file_path else "__unknown__"
+        by_dir[parent].append(c)
+
+    batches: list[list[AIComponent]] = []
+    current: list[AIComponent] = []
+    for _dir_key in sorted(by_dir):
+        group = by_dir[_dir_key]
+        for comp in group:
+            current.append(comp)
+            if len(current) >= batch_size:
+                batches.append(current)
+                current = []
+    if current:
+        batches.append(current)
+    return batches
+
+
+import hashlib as _hashlib
+
+
+def _component_cache_key(c: AIComponent) -> str:
+    """Derive a content-based cache key for a component."""
+    parts = [
+        c.file_path or "",
+        str(c.line_number),
+        c.name,
+        c.component_type.value,
+        c.model_name or "",
+    ]
+    if c.file_path and c.line_number:
+        snippet = _read_code_window(c.file_path, c.line_number)
+        if snippet:
+            parts.append(snippet)
+    raw = "|".join(parts)
+    return _hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+class _AgenticResultCache:
+    """In-process + optional on-disk cache for agentic batch results.
+
+    Keyed by content hash of each component so unchanged code across
+    re-runs skips the LLM entirely.
+    """
+
+    def __init__(self, cache_dir: Path | None = None) -> None:
+        self._mem: dict[str, dict[str, Any]] = {}
+        self._disk_dir = cache_dir
+        if cache_dir:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self._load_disk()
+
+    def _load_disk(self) -> None:
+        if not self._disk_dir:
+            return
+        for p in self._disk_dir.glob("*.json"):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                self._mem[p.stem] = data
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        return self._mem.get(key)
+
+    def put(self, key: str, value: dict[str, Any]) -> None:
+        self._mem[key] = value
+        if self._disk_dir:
+            try:
+                (self._disk_dir / f"{key}.json").write_text(
+                    json.dumps(value, default=str), encoding="utf-8",
+                )
+            except OSError:
+                pass
+
+    def partition(
+        self, components: list[AIComponent],
+    ) -> tuple[list[AIComponent], list[AIComponent]]:
+        """Split components into cached (hit) and uncached (miss)."""
+        cached: list[AIComponent] = []
+        uncached: list[AIComponent] = []
+        for c in components:
+            key = _component_cache_key(c)
+            if self.get(key) is not None:
+                cached.append(c)
+            else:
+                uncached.append(c)
+        return cached, uncached
+
+    def apply_cached(
+        self,
+        components: list[AIComponent],
+        middleware: AIBOMScannerMiddleware,
+    ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+        """Apply cached agentic results to components."""
+        enriched: list[AIComponent] = []
+        all_new: list[AIComponent] = []
+        all_rels: list[ComponentRelationship] = []
+        all_flags: list[RiskFlag] = []
+        for c in components:
+            key = _component_cache_key(c)
+            data = self.get(key)
+            if data:
+                new, rels, flags = middleware.extract_findings_from_dict(data)
+                enriched_batch = middleware.apply_enrichments_from_dict([c], data)
+                enriched.extend(enriched_batch)
+                all_new.extend(new)
+                all_rels.extend(rels)
+                all_flags.extend(flags)
+            else:
+                enriched.append(c)
+        return enriched, all_new, all_rels, all_flags
+
+
 def _run_batch(
     agent: Any,
     middleware: AIBOMScannerMiddleware,
@@ -203,6 +384,7 @@ def _run_batch(
     )
     t0 = time.monotonic()
 
+    result = None
     try:
         result = agent.invoke(
             {"messages": [{"role": "user", "content": summary}]},
@@ -215,7 +397,18 @@ def _run_batch(
             "Batch %d failed after %.1fs: %s | tool_stats=%s",
             batch_num, elapsed, exc, json.dumps(stats),
         )
-        return batch, [], [], []
+        if result is not None:
+            data = _extract_structured_response(result)
+            if data:
+                _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
+                new_c, new_r, rf = middleware.extract_findings_from_dict(data)
+                enriched = middleware.apply_enrichments_from_dict(batch, data)
+                return enriched, new_c, new_r, rf
+        enriched = [
+            c.model_copy(update={"needs_agentic": False, "agentic_hint": "batch_recursion_limit"})
+            for c in batch
+        ]
+        return enriched, [], [], []
 
     elapsed = time.monotonic() - t0
     stats = get_tool_stats()
@@ -228,13 +421,13 @@ def _run_batch(
         json.dumps(stats),
     )
 
-    final_message = _extract_final_message(result)
-    if not final_message:
+    data = _extract_structured_response(result)
+    if not data:
         _LOGGER.warning("Batch %d returned no usable output", batch_num)
         return batch, [], [], []
 
-    new_components, new_rels, risk_flags = middleware.extract_findings(final_message)
-    enriched = middleware.apply_enrichments(batch, final_message)
+    new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
+    enriched = middleware.apply_enrichments_from_dict(batch, data)
     return enriched, new_components, new_rels, risk_flags
 
 
@@ -262,6 +455,7 @@ async def _run_batch_async(
     )
     t0 = time.monotonic()
 
+    result = None
     try:
         result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": summary}]},
@@ -274,7 +468,18 @@ async def _run_batch_async(
             "Batch %d failed after %.1fs: %s | tool_stats=%s",
             batch_num, elapsed, exc, json.dumps(stats),
         )
-        return batch, [], [], []
+        if result is not None:
+            data = _extract_structured_response(result)
+            if data:
+                _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
+                new_c, new_r, rf = middleware.extract_findings_from_dict(data)
+                enriched = middleware.apply_enrichments_from_dict(batch, data)
+                return enriched, new_c, new_r, rf
+        enriched = [
+            c.model_copy(update={"needs_agentic": False, "agentic_hint": "batch_recursion_limit"})
+            for c in batch
+        ]
+        return enriched, [], [], []
 
     elapsed = time.monotonic() - t0
     stats = get_tool_stats()
@@ -287,13 +492,13 @@ async def _run_batch_async(
         json.dumps(stats),
     )
 
-    final_message = _extract_final_message(result)
-    if not final_message:
+    data = _extract_structured_response(result)
+    if not data:
         _LOGGER.warning("Batch %d returned no usable output", batch_num)
         return batch, [], [], []
 
-    new_components, new_rels, risk_flags = middleware.extract_findings(final_message)
-    enriched = middleware.apply_enrichments(batch, final_message)
+    new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
+    enriched = middleware.apply_enrichments_from_dict(batch, data)
     return enriched, new_components, new_rels, risk_flags
 
 
@@ -304,7 +509,7 @@ async def _run_batches_parallel(
     relationships: list[ComponentRelationship],
     scan_paths: list[str],
     all_components: list[AIComponent] | None = None,
-    max_concurrent: int = _MAX_CONCURRENT_BATCHES,
+    max_concurrent: int = 1,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Run batches concurrently, capped at *max_concurrent* simultaneous LLM conversations."""
     sem = asyncio.Semaphore(max_concurrent)
@@ -340,6 +545,124 @@ async def _run_batches_parallel(
     return all_enriched, all_new, all_rels, all_flags
 
 
+def _default_agentic_cache_dir() -> Path | None:
+    """Return the default on-disk cache directory, or None if unavailable."""
+    try:
+        d = Path.home() / ".cache" / "cisco-aibom" / "agentic"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except OSError:
+        return None
+
+
+def _run_tier(
+    agent: Any,
+    middleware: AIBOMScannerMiddleware,
+    components: list[AIComponent],
+    relationships: list[ComponentRelationship],
+    scan_paths: list[str],
+    batch_size: int,
+    max_concurrent: int,
+    all_components: list[AIComponent] | None,
+    cache: _AgenticResultCache | None,
+) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    """Execute a single tier (simple or complex) with caching and parallel batches."""
+    tier_enriched: list[AIComponent] = []
+    tier_new: list[AIComponent] = []
+    tier_rels: list[ComponentRelationship] = []
+    tier_flags: list[RiskFlag] = []
+
+    to_send = components
+    if cache:
+        cached_comps, to_send = cache.partition(components)
+        if cached_comps:
+            _LOGGER.info(
+                "Cache hit for %d/%d components — skipping LLM",
+                len(cached_comps), len(components),
+            )
+            e, n, r, f = cache.apply_cached(cached_comps, middleware)
+            tier_enriched.extend(e)
+            tier_new.extend(n)
+            tier_rels.extend(r)
+            tier_flags.extend(f)
+
+    if not to_send:
+        return tier_enriched, tier_new, tier_rels, tier_flags
+
+    batches = _locality_aware_batches(to_send, batch_size)
+    _LOGGER.info(
+        "%d components → %d locality-aware batches (concurrency=%d)",
+        len(to_send), len(batches), max_concurrent,
+    )
+
+    if max_concurrent > 1 and len(batches) > 1:
+        enriched, new, rels, flags = asyncio.run(
+            _run_batches_parallel(
+                agent, middleware, batches,
+                relationships, scan_paths,
+                all_components=all_components,
+                max_concurrent=max_concurrent,
+            )
+        )
+    else:
+        enriched: list[AIComponent] = []
+        new: list[AIComponent] = []
+        rels: list[ComponentRelationship] = []
+        flags: list[RiskFlag] = []
+        for idx, batch in enumerate(batches, 1):
+            e, n, r, f = _run_batch(
+                agent, middleware, batch,
+                relationships, scan_paths,
+                idx, len(batches),
+                all_components=all_components,
+            )
+            enriched.extend(e)
+            new.extend(n)
+            rels.extend(r)
+            flags.extend(f)
+
+    if cache:
+        for batch in batches:
+            for c in batch:
+                key = _component_cache_key(c)
+                cache.put(key, {
+                    "enriched_components": [],
+                    "new_components": [],
+                    "remove_components": [],
+                    "reclassify_components": [],
+                    "new_relationships": [],
+                    "risk_findings": [],
+                })
+
+    tier_enriched.extend(enriched)
+    tier_new.extend(new)
+    tier_rels.extend(rels)
+    tier_flags.extend(flags)
+    return tier_enriched, tier_new, tier_rels, tier_flags
+
+
+def _group_by_top_dir(
+    components: list[AIComponent],
+    scan_paths: list[str],
+) -> dict[str, list[AIComponent]]:
+    """Group components by their nearest scan root for sub-agent dispatch."""
+    from collections import defaultdict
+
+    resolved_roots = [str(Path(p).resolve()) for p in scan_paths]
+    groups: dict[str, list[AIComponent]] = defaultdict(list)
+
+    for c in components:
+        fp = str(Path(c.file_path).resolve()) if c.file_path else ""
+        matched_root = "__default__"
+        for root in resolved_roots:
+            if fp.startswith(root):
+                matched_root = root
+                break
+        groups[matched_root].append(c)
+
+    return dict(groups)
+
+
 def run_agentic_enrichment(
     model_string: str,
     deterministic_components: list[AIComponent],
@@ -347,9 +670,16 @@ def run_agentic_enrichment(
     scan_paths: list[str],
     llm_config: dict[str, Any] | None = None,
     batch_size: int = _DEFAULT_BATCH_SIZE,
+    max_concurrent: int = 1,
     fast_model: str | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
-    """Run the full agentic enrichment pipeline with batching and tiered models.
+    """Run the full agentic enrichment pipeline.
+
+    Features:
+      - Locality-aware batching (groups co-located components)
+      - Configurable parallel batches via *max_concurrent*
+      - Content-hash result caching across re-runs
+      - Sub-agent dispatch for large repos (>50 candidates per scan root)
 
     Parameters
     ----------
@@ -365,6 +695,8 @@ def run_agentic_enrichment(
         LLM connection config (api_key, api_base, etc.).
     batch_size:
         Max components per agent invocation (default 5).
+    max_concurrent:
+        Max parallel agentic LLM batches (default 1 = sequential).
     fast_model:
         Optional cheaper/faster model for simple confirmations.
         Falls back to ``model_string`` if not provided.
@@ -380,18 +712,21 @@ def run_agentic_enrichment(
     simple, complex_ = _classify_candidates(deterministic_components)
 
     _LOGGER.info(
-        "Running agentic enrichment with %s (%d simple, %d complex, %d relationships)",
+        "Running agentic enrichment with %s (%d simple, %d complex, %d relationships, concurrency=%d)",
         model_string,
         len(simple),
         len(complex_),
         len(deterministic_relationships),
+        max_concurrent,
     )
+
+    cache = _AgenticResultCache(_default_agentic_cache_dir())
+    middleware = AIBOMScannerMiddleware()
 
     all_enriched: list[AIComponent] = []
     all_new: list[AIComponent] = []
     all_rels: list[ComponentRelationship] = []
     all_flags: list[RiskFlag] = []
-    middleware = AIBOMScannerMiddleware()
 
     tier_model = fast_model or model_string
     if simple:
@@ -400,69 +735,59 @@ def run_agentic_enrichment(
             len(simple), tier_model,
         )
         agent = create_aibom_agent(tier_model, llm_config=llm_config)
-        batches = [
-            simple[i : i + batch_size] for i in range(0, len(simple), batch_size)
-        ]
-        if len(batches) > 1:
-            _LOGGER.info("Running %d simple batches in parallel", len(batches))
-            enriched, new, rels, flags = asyncio.run(
-                _run_batches_parallel(
-                    agent, middleware, batches,
-                    deterministic_relationships, scan_paths,
-                    all_components=deterministic_components,
-                )
-            )
-            all_enriched.extend(enriched)
-            all_new.extend(new)
-            all_rels.extend(rels)
-            all_flags.extend(flags)
-        else:
-            for idx, batch in enumerate(batches, 1):
-                enriched, new, rels, flags = _run_batch(
-                    agent, middleware, batch,
-                    deterministic_relationships, scan_paths,
-                    idx, len(batches),
-                    all_components=deterministic_components,
-                )
-                all_enriched.extend(enriched)
-                all_new.extend(new)
-                all_rels.extend(rels)
-                all_flags.extend(flags)
+        e, n, r, f = _run_tier(
+            agent, middleware, simple,
+            deterministic_relationships, scan_paths,
+            batch_size, max_concurrent, deterministic_components, cache,
+        )
+        all_enriched.extend(e)
+        all_new.extend(n)
+        all_rels.extend(r)
+        all_flags.extend(f)
 
     if complex_:
-        _LOGGER.info(
-            "Tier 2 (complex reasoning): %d candidates via %s",
-            len(complex_), model_string,
+        dir_groups = _group_by_top_dir(complex_, scan_paths)
+        use_sub_agents = (
+            len(dir_groups) > 1
+            and len(complex_) > _SUB_AGENT_THRESHOLD
         )
-        agent = create_aibom_agent(model_string, llm_config=llm_config)
-        batches = [
-            complex_[i : i + batch_size] for i in range(0, len(complex_), batch_size)
-        ]
-        if len(batches) > 1:
-            _LOGGER.info("Running %d complex batches in parallel", len(batches))
-            enriched, new, rels, flags = asyncio.run(
-                _run_batches_parallel(
-                    agent, middleware, batches,
-                    deterministic_relationships, scan_paths,
-                    all_components=deterministic_components,
-                )
+
+        if use_sub_agents:
+            _LOGGER.info(
+                "Sub-agent dispatch: %d directory groups for %d complex candidates",
+                len(dir_groups), len(complex_),
             )
-            all_enriched.extend(enriched)
-            all_new.extend(new)
-            all_rels.extend(rels)
-            all_flags.extend(flags)
-        else:
-            for idx, batch in enumerate(batches, 1):
-                enriched, new, rels, flags = _run_batch(
-                    agent, middleware, batch,
-                    deterministic_relationships, scan_paths,
-                    idx, len(batches),
-                    all_components=deterministic_components,
+            for dir_key, group in sorted(dir_groups.items()):
+                dir_label = Path(dir_key).name if dir_key != "__default__" else "default"
+                _LOGGER.info(
+                    "Sub-agent [%s]: %d candidates via %s",
+                    dir_label, len(group), model_string,
                 )
-                all_enriched.extend(enriched)
-                all_new.extend(new)
-                all_rels.extend(rels)
-                all_flags.extend(flags)
+                agent = create_aibom_agent(model_string, llm_config=llm_config)
+                e, n, r, f = _run_tier(
+                    agent, middleware, group,
+                    deterministic_relationships, scan_paths,
+                    batch_size, max_concurrent, deterministic_components, cache,
+                )
+                all_enriched.extend(e)
+                all_new.extend(n)
+                all_rels.extend(r)
+                all_flags.extend(f)
+        else:
+            _LOGGER.info(
+                "Tier 2 (complex reasoning): %d candidates via %s",
+                len(complex_), model_string,
+            )
+            agent = create_aibom_agent(model_string, llm_config=llm_config)
+            e, n, r, f = _run_tier(
+                agent, middleware, complex_,
+                deterministic_relationships, scan_paths,
+                batch_size, max_concurrent, deterministic_components, cache,
+            )
+            all_enriched.extend(e)
+            all_new.extend(n)
+            all_rels.extend(r)
+            all_flags.extend(f)
 
     all_components = all_enriched + all_new
 
@@ -581,17 +906,43 @@ def _build_context_message(
     )
 
 
-def _extract_final_message(result: Any) -> Optional[str]:
-    """Extract the text content from the agent's final response."""
+def _extract_structured_response(result: Any) -> dict[str, Any] | None:
+    """Extract the structured response from the agent's final state.
+
+    When ``response_format`` is provided, Deep Agents populates
+    ``structured_response`` in the graph state.  Falls back to parsing
+    the last message as JSON if structured output is unavailable.
+    """
+    sr = result.get("structured_response")
+    if sr is not None:
+        if isinstance(sr, BaseModel):
+            return sr.model_dump()
+        if isinstance(sr, dict):
+            return sr
+
     messages = result.get("messages", [])
     if not messages:
         return None
     last = messages[-1]
+    content = ""
     if hasattr(last, "content"):
-        return str(last.content)
-    if isinstance(last, dict):
-        return str(last.get("content", ""))
-    return str(last)
+        content = last.content if isinstance(last.content, str) else str(last.content)
+    elif isinstance(last, dict):
+        content = str(last.get("content", ""))
+    else:
+        content = str(last)
+
+    content = content.strip()
+    if not content:
+        return None
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        _LOGGER.warning(
+            "Failed to parse agent JSON output — first 300 chars: %s",
+            content[:300],
+        )
+        return None
 
 
 _CROSS_REPO_COORDINATOR_PROMPT = """\
@@ -718,12 +1069,7 @@ def run_cross_repo_coordination(
         _LOGGER.warning("Cross-repo coordination failed: %s", exc)
         return [], []
 
-    final = _extract_final_message(result)
-    if not final:
-        return [], []
-
-    middleware = AIBOMScannerMiddleware()
-    data = middleware._parse_json(final)
+    data = _extract_structured_response(result)
     if not data:
         return [], []
 

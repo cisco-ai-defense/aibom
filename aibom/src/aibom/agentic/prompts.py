@@ -84,10 +84,69 @@ You receive two lists:
 - model, agent, tool, prompt, embedding, vector_store, retriever, memory
 - dataset, training_run, hyperparameter, model_artifact
 - experiment_tracker, model_registry, data_versioning, ml_pipeline
-- mcp_server, mcp_client, skill, guardrail, secret, dependency
+- mcp_server, mcp_client, skill, guardrail, observability, secret, dependency
 
 Prompts (PromptTemplate, ChatPromptTemplate, SystemMessage, etc.) are
 first-class AI assets — always keep them.
+
+## Precision rules — avoid false positives
+
+### Prompts
+Do NOT create new prompt components for generic variable names like
+`messages`, `resp`, `content`, `question`, `dialog`, `input`, `output`.
+Only emit a prompt when:
+- It is an explicit prompt template class (PromptTemplate, ChatPromptTemplate)
+- It is a named prompt variable (system_prompt, user_prompt, prompt_template)
+- It contains a template string with placeholders ({variable}, {{ }}, Jinja)
+
+### Secrets
+When you see `client.get("secret/...")` or similar secret-fetching calls,
+use `analyze_imports` to trace whether the client is a vault/secret-manager
+SDK instance (Conjur, HVAC, Azure KeyVault, GCP Secret Manager, AWS
+Secrets Manager). If confirmed, emit as `secret` with the secret path.
+
+### Tools
+Verify that a detected `tool` component is actually callable as a tool by
+an AI agent — not just a utility library. Packages like `more_itertools`,
+`itertools`, `functools`, `collections` are NOT AI tools. Test fixtures
+and mock tools in test files should be flagged for removal.
+
+### MCP Servers
+Look for MCP server patterns beyond standard `from mcp.server import Server`:
+- FastMCP, custom Server subclasses
+- `@server.tool`, `@server.resource`, `@server.prompt` decorators
+- gRPC service definitions that serve AI capabilities
+
+### NOT AI components — remove or reclassify these
+The following are common false positives. Do NOT classify them as AI assets:
+- **API DTOs / request-response models**: Classes like `CreateXxxReqBody`,
+  `UpdateXxxInput`, `ListXxx`, `GetXxx`, `XxxResponse` are HTTP/gRPC
+  endpoint handlers or data transfer objects, not AI components.
+- **CRUD operations**: Database create/read/update/delete wrappers around
+  conversations, messages, or sessions are application logic, not AI memory.
+  Only classify as `memory` when the class manages conversation state
+  *for an LLM* (e.g., ChatHistory that feeds into a prompt, buffer memory
+  that truncates context windows).
+- **gRPC stubs / protobuf definitions**: `*_pb2`, `*_pb2_grpc` files are
+  transport layers, not AI components. The service they front may be an AI
+  asset, but the stub itself is not.
+- **ETL / data pipeline helpers**: Classes that copy data between S3 buckets,
+  manage file paths, or orchestrate batch jobs are infrastructure, not AI
+  assets — unless they directly invoke an AI model or embedding call.
+- **Completion/Query API handlers**: HTTP endpoint handlers that accept a
+  request and forward it to an LLM are application glue. The MODEL behind
+  the handler is the AI asset, not the handler class itself.
+- **Vector store wrappers / ETL jobs**: Classes that copy data TO/FROM a
+  vector store (`CopyVectorDbToS3`, `VectorDbToS3CopyInput`), gRPC stubs
+  for a vector service (`*_pb2`, `*_pb2_grpc`), or batch orchestrators
+  (`BatchDocChunkVectorizer`) are NOT vector_store components. Only the
+  actual store (Weaviate, Pinecone, ChromaDB, etc.) or a direct client
+  class that queries/upserts vectors counts as `vector_store`.
+- **Embedding pipeline jobs**: ETL classes that copy embedding files between
+  environments (`CopyEmbeddingsStagingToProdS3`, `CopyEmbeddingsDevToStagingS3`)
+  or path templates (`S3_STORE_EMBEDDINGS_TEMPLATE`) are data infrastructure,
+  NOT `embedding` components. Only classes that generate or invoke embeddings
+  (OpenAIEmbeddings, SentenceTransformer, HuggingFaceEmbeddings) count.
 
 ## Output format
 
@@ -147,15 +206,20 @@ Return a SINGLE JSON object:
 }
 ```
 
-## Rules
+## ABSOLUTE RULES — VIOLATION CAUSES PARSE FAILURE
 
-- Do NOT hallucinate. Every enrichment must be backed by a tool result or
-  visible in code_context.
-- Prefer concrete values. If you cannot resolve a reference, say so.
-- **CRITICAL**: Your FINAL message MUST contain ONLY the JSON object above
-  (optionally inside a ```json fence). No prose before or after. If you have
-  nothing to report, return the JSON with empty arrays.
-- After outputting JSON, STOP. Do not make additional tool calls.
-- When using search_codebase or resolve_env_var, ONLY pass paths from the
-  `scan_paths` field in the input. NEVER search outside those directories.
+1. Do NOT hallucinate. Every enrichment must be backed by a tool result or
+   visible in code_context.
+2. Prefer concrete values. If you cannot resolve a reference, say so.
+3. When using search_codebase or resolve_env_var, ONLY pass paths from the
+   `scan_paths` field in the input. NEVER search outside those directories.
+4. After you have finished using tools and are ready to respond:
+   - Your FINAL message MUST be **valid JSON and nothing else**.
+   - Do NOT write any explanation, analysis, summary, or commentary.
+   - Do NOT wrap the JSON in markdown fences (no ```json blocks).
+   - Do NOT write "Here is my analysis:" or similar preamble.
+   - The very first character of your final message must be `{`.
+   - The very last character of your final message must be `}`.
+   - If you have nothing to report, return:
+     {"enriched_components":[],"new_components":[],"remove_components":[],"reclassify_components":[],"new_relationships":[],"risk_findings":[]}
 """

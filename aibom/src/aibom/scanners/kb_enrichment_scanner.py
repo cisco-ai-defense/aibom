@@ -209,10 +209,72 @@ _AI_SUGGESTIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({
 })
 
 _AI_INDICATIVE_CLASS_RE: re.Pattern[str] = re.compile(
-    r"(LLM|Model|Agent|Embedding|Vector|Chain|Tool|Prompt|Memory|Chat|"
-    r"Retriever|Completion|Inference|Tokenizer)",
+    r"(LLM|Model|Agent|Embed(?:ding|der)|Vector|Chain|Tool|Prompt|Memory|Chat|"
+    r"Retriever|Completion|Inference|Tokenizer|History|Conversation|ChatBuffer|"
+    r"Guard(?:rail)?|Inspector|Rails|MCPClient|Traceloop)",
     re.IGNORECASE,
 )
+
+
+_CLASS_NAME_TYPE_MAP: list[tuple[re.Pattern[str], AIComponentType]] = [
+    (re.compile(r"Embed(?:ding|der)", re.IGNORECASE), AIComponentType.EMBEDDING),
+    (re.compile(r"Guard(?:rail)?|Inspector|Rails", re.IGNORECASE), AIComponentType.GUARDRAIL),
+    (re.compile(r"MCPClient", re.IGNORECASE), AIComponentType.MCP_CLIENT),
+    (re.compile(r"Traceloop", re.IGNORECASE), AIComponentType.OBSERVABILITY),
+    (re.compile(r"Agent", re.IGNORECASE), AIComponentType.AGENT),
+    (re.compile(r"Tool", re.IGNORECASE), AIComponentType.TOOL),
+    (re.compile(r"Prompt", re.IGNORECASE), AIComponentType.PROMPT),
+    (re.compile(r"Memory|History|Conversation|ChatBuffer", re.IGNORECASE), AIComponentType.MEMORY),
+    (re.compile(r"Retriever", re.IGNORECASE), AIComponentType.RETRIEVER),
+    (re.compile(r"Vector", re.IGNORECASE), AIComponentType.VECTOR_STORE),
+]
+
+_IMPORT_MODULE_TYPE_MAP: dict[str, AIComponentType] = {
+    "traceloop": AIComponentType.OBSERVABILITY,
+    "openllmetry": AIComponentType.OBSERVABILITY,
+    "langsmith": AIComponentType.OBSERVABILITY,
+    "langfuse": AIComponentType.OBSERVABILITY,
+    "arize": AIComponentType.OBSERVABILITY,
+    "phoenix": AIComponentType.OBSERVABILITY,
+    "opik": AIComponentType.OBSERVABILITY,
+    "helicone": AIComponentType.OBSERVABILITY,
+    "freeplay": AIComponentType.OBSERVABILITY,
+    "tracia": AIComponentType.OBSERVABILITY,
+    "llmetry": AIComponentType.OBSERVABILITY,
+    "nemoguardrails": AIComponentType.GUARDRAIL,
+    "guardrails": AIComponentType.GUARDRAIL,
+    "llm_guard": AIComponentType.GUARDRAIL,
+    "lakera_guard": AIComponentType.GUARDRAIL,
+    "rebuff": AIComponentType.GUARDRAIL,
+}
+
+
+_NON_AI_CLASS_SUFFIXES: tuple[str, ...] = (
+    "Response", "Request", "Schema", "Config", "Spec", "Params",
+    "DTO", "DML", "DDL", "Enum", "Type", "Base", "Abstract",
+    "Interface", "Mixin", "Factory", "Builder", "Validator",
+    "Serializer", "Deserializer", "Mapper", "Converter",
+    "Exception", "Error", "Test", "Mock", "Stub", "Fake",
+    "Code", "Status", "Flag",
+)
+
+
+def _is_data_class_name(name: str) -> bool:
+    """Return True when the class name looks like a data/schema class."""
+    return any(name.endswith(s) for s in _NON_AI_CLASS_SUFFIXES)
+
+
+def _infer_type_from_name(name: str) -> AIComponentType:
+    """Infer the component type from a class/import name using pattern matching.
+
+    Returns None if the name looks like a data-class (e.g. ConversationResponse).
+    """
+    if _is_data_class_name(name):
+        return AIComponentType.MODEL  # default — will be filtered by caller
+    for pattern, comp_type in _CLASS_NAME_TYPE_MAP:
+        if pattern.search(name):
+            return comp_type
+    return AIComponentType.MODEL
 
 
 _GENERIC_CLASS_NAMES: frozenset[str] = frozenset({
@@ -221,6 +283,12 @@ _GENERIC_CLASS_NAMES: frozenset[str] = frozenset({
     "Sequence", "Mapping", "MutableMapping", "Annotated", "ClassVar",
     "Protocol", "BaseModel", "Field", "PrivateAttr", "ConfigDict",
     "Awaitable", "AsyncIterator", "Path", "Formatter", "ErrorCode",
+})
+
+_NON_AI_PACKAGES: frozenset[str] = frozenset({
+    "more_itertools", "itertools", "functools", "collections",
+    "dataclasses", "typing_extensions", "pydantic", "attrs",
+    "pytest", "unittest", "mock", "faker",
 })
 
 _DATA_CLASS_SUFFIXES: tuple[str, ...] = (
@@ -462,10 +530,25 @@ class KBEnrichmentScanner(BaseScanner):
                     )
                 )
 
+            for result in parsed_results:
+                components.extend(_detect_tool_schemas(result))
+                components.extend(_detect_prompt_kwargs(result))
+                components.extend(_detect_model_kwargs(result))
+                components.extend(_detect_import_based_assets(result))
+
             for py_file, source in suggestive_files:
                 components.extend(
                     _emit_suggestive_candidates(py_file, source)
                 )
+
+            components.extend(
+                _detect_cache_ai_co_occurrence(tier1_files)
+            )
+
+        components = [
+            c for c in components
+            if c.name.lower().replace("-", "_") not in _NON_AI_PACKAGES
+        ]
 
         return components, []
 
@@ -610,6 +693,8 @@ def _emit_suggestive_candidates(
         _target, class_name = assign_match.group(1), assign_match.group(2)
         if class_name in _GENERIC_CLASS_NAMES:
             continue
+        if _is_data_class_name(class_name):
+            continue
         if not _AI_INDICATIVE_CLASS_RE.search(class_name):
             continue
         if i in seen_lines:
@@ -618,7 +703,7 @@ def _emit_suggestive_candidates(
         candidates.append(
             AIComponent(
                 name=class_name,
-                component_type=AIComponentType.MODEL,
+                component_type=_infer_type_from_name(class_name),
                 file_path=str(py_file),
                 line_number=i,
                 framework="",
@@ -637,6 +722,441 @@ def _emit_suggestive_candidates(
             )
         )
     return candidates
+
+
+def _detect_cache_ai_co_occurrence(
+    tier1_files: list[tuple[Path, str]],
+) -> list[AIComponent]:
+    """Emit agentic candidates when a file imports both an AI framework and a caching library.
+
+    Redis/Memcached alone is not an AI asset, but co-occurring with an AI
+    framework import suggests LLM response caching or conversation memory.
+    """
+    from .import_context import has_cache_imports
+
+    candidates: list[AIComponent] = []
+    seen: set[str] = set()
+    for py_file, source in tier1_files:
+        if not has_cache_imports(source):
+            continue
+        file_key = str(py_file)
+        if file_key in seen:
+            continue
+        seen.add(file_key)
+        cache_lib = "unknown"
+        for lib in ("redis", "memcache", "pymemcache", "cachetools", "diskcache", "aiocache"):
+            if re.search(rf"(?:^|\n)\s*(?:from|import)\s+{lib}\b", source):
+                cache_lib = lib
+                break
+        candidates.append(
+            AIComponent(
+                name=f"{cache_lib} (AI cache co-occurrence)",
+                component_type=AIComponentType.MEMORY,
+                file_path=file_key,
+                line_number=0,
+                framework=cache_lib,
+                detection_source=DetectionSource.CODE_ANALYSIS,
+                confidence=0.4,
+                needs_agentic=True,
+                agentic_hint=(
+                    f"File imports both an AI framework and '{cache_lib}'. "
+                    f"Agent should confirm whether the cache is used for LLM "
+                    f"response caching or conversation memory."
+                ),
+                metadata={"cache_ai_co_occurrence": True, "cache_library": cache_lib},
+            )
+        )
+    return candidates
+
+
+def _detect_import_based_assets(
+    result: "CodeAnalysisResult",
+) -> list[AIComponent]:
+    """Detect AI assets from import statements that match known modules or name patterns.
+
+    Handles: embedder/embedding imports, MCP client imports, guardrail framework
+    imports, and observability framework imports.
+    """
+    from ..structures import CodeAnalysisResult as _CAR  # noqa: F811
+
+    if not isinstance(result, _CAR):
+        return []
+
+    candidates: list[AIComponent] = []
+    seen: set[tuple[str, int]] = set()
+
+    for imp_line in result.imports:
+        imp_lower = imp_line.lower()
+
+        comp_type: AIComponentType | None = None
+        matched_name = ""
+
+        for mod_key, mod_type in _IMPORT_MODULE_TYPE_MAP.items():
+            if mod_key in imp_lower:
+                comp_type = mod_type
+                matched_name = mod_key
+                break
+
+        if comp_type is None:
+            parts = imp_line.split()
+            for part in parts:
+                cleaned = part.strip(",").strip("(").strip(")")
+                if not cleaned or cleaned in ("from", "import", "as"):
+                    continue
+                inferred = _infer_type_from_name(cleaned)
+                if inferred != AIComponentType.MODEL:
+                    comp_type = inferred
+                    matched_name = cleaned
+                    break
+
+        if comp_type is None:
+            continue
+
+        line_no = 0
+        source_lines = []
+        try:
+            from .file_cache import read_text_cached
+            source_lines = read_text_cached(Path(result.file_path)).splitlines()
+        except (OSError, Exception):
+            pass
+        for idx, src_line in enumerate(source_lines, 1):
+            if imp_line.strip() in src_line:
+                line_no = idx
+                break
+
+        dedup = (result.file_path, line_no)
+        if dedup in seen:
+            continue
+        seen.add(dedup)
+
+        candidates.append(
+            AIComponent(
+                name=matched_name,
+                component_type=comp_type,
+                file_path=result.file_path,
+                line_number=line_no,
+                framework="",
+                detection_source=DetectionSource.CODE_ANALYSIS,
+                confidence=0.65,
+                needs_agentic=False,
+                metadata={"import_statement": imp_line.strip()},
+            )
+        )
+
+    return candidates
+
+
+_TOOL_KWARG_NAMES: frozenset[str] = frozenset({
+    "tools", "functions", "tool_choice",
+})
+
+_TOOL_DECORATOR_NAMES: frozenset[str] = frozenset({
+    "tool", "register_tool",
+})
+
+_TOOL_DECORATOR_FRAMEWORKS: frozenset[str] = frozenset({
+    "langchain", "langchain_core", "crewai", "smolagents", "pydantic_ai",
+    "autogen", "deepagents", "llama_index", "agno", "phidata",
+})
+
+_TOOL_CONVERSION_CALLS: frozenset[str] = frozenset({
+    "function_to_schema",
+    "convert_to_openai_tool",
+    "convert_to_openai_function",
+    "format_tool_to_openai_function",
+    "tool_to_function_definition",
+})
+
+_AI_CLIENT_CALLS: frozenset[str] = frozenset({
+    "create", "chat", "completions", "invoke", "ainvoke",
+    "bind_tools", "with_structured_output",
+})
+
+_PROMPT_KWARG_NAMES: frozenset[str] = frozenset({
+    "system_prompt", "system_message", "system", "instructions",
+    "prompt", "template", "messages", "few_shot_examples", "examples",
+})
+
+
+def _detect_tool_schemas(result: "CodeAnalysisResult") -> list[AIComponent]:
+    """Detect tools via structural analysis of calls and decorators.
+
+    Three paths:
+    1. ``tools=``/``functions=`` kwargs on confirmed AI client calls
+    2. ``@tool`` decorators from known AI frameworks
+    3. Tool conversion function calls (``function_to_schema()``, etc.)
+    """
+    from ..structures import CodeAnalysisResult as _CAR  # noqa: F811
+
+    components: list[AIComponent] = []
+    seen: set[tuple[str, int]] = set()
+    imports = getattr(result, "imports", []) or []
+    import_text = "\n".join(imports)
+
+    for call_obs in result.calls:
+        qn = call_obs.qualified_name or ""
+        short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+
+        if short in _AI_CLIENT_CALLS or short in {"create_deep_agent"}:
+            for kwarg_name in _TOOL_KWARG_NAMES:
+                val = call_obs.arguments.get(kwarg_name)
+                if val is None:
+                    continue
+                tool_names = _extract_tool_names_from_arg(val)
+                for tname in tool_names:
+                    key = (result.file_path, call_obs.line_number)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    components.append(
+                        AIComponent(
+                            name=tname,
+                            component_type=AIComponentType.TOOL,
+                            file_path=result.file_path,
+                            line_number=call_obs.line_number,
+                            framework=qn.split(".")[0] if "." in qn else "",
+                            detection_source=DetectionSource.CODE_ANALYSIS,
+                            metadata={"tool_kwarg": kwarg_name, "enclosing_call": qn},
+                        )
+                    )
+
+        if short in _TOOL_CONVERSION_CALLS:
+            arg0 = call_obs.arguments.get("_pos_0", "")
+            tname = _variable_name(arg0) or short
+            key = (result.file_path, call_obs.line_number)
+            if key not in seen:
+                seen.add(key)
+                components.append(
+                    AIComponent(
+                        name=tname,
+                        component_type=AIComponentType.TOOL,
+                        file_path=result.file_path,
+                        line_number=call_obs.line_number,
+                        framework="",
+                        detection_source=DetectionSource.CODE_ANALYSIS,
+                        metadata={"tool_conversion": short},
+                    )
+                )
+
+    for assignment in result.assignments:
+        qn = assignment.call.qualified_name or ""
+        short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+        if short in _TOOL_CONVERSION_CALLS:
+            target = assignment.target_qualified_name or short
+            key = (result.file_path, assignment.line_number)
+            if key not in seen:
+                seen.add(key)
+                components.append(
+                    AIComponent(
+                        name=target.rsplit(".", 1)[-1] if "." in target else target,
+                        component_type=AIComponentType.TOOL,
+                        file_path=result.file_path,
+                        line_number=assignment.line_number,
+                        framework="",
+                        detection_source=DetectionSource.CODE_ANALYSIS,
+                        metadata={"tool_conversion": short, "assigned_to": target},
+                    )
+                )
+
+    for dec in result.decorators:
+        dname = dec.decorator_qualified_name or ""
+        short_dec = dname.rsplit(".", 1)[-1] if "." in dname else dname
+        if short_dec not in _TOOL_DECORATOR_NAMES:
+            continue
+        fw_confirmed = False
+        prefix = dname.split(".")[0].split("_")[0] if "." in dname else ""
+        if prefix in _TOOL_DECORATOR_FRAMEWORKS:
+            fw_confirmed = True
+        else:
+            for imp in imports:
+                for fw in _TOOL_DECORATOR_FRAMEWORKS:
+                    if fw in imp and "tool" in imp:
+                        fw_confirmed = True
+                        break
+                if fw_confirmed:
+                    break
+        if not fw_confirmed:
+            continue
+        key = (result.file_path, dec.line_number)
+        if key not in seen:
+            seen.add(key)
+            components.append(
+                AIComponent(
+                    name=dec.decorated_function_name,
+                    component_type=AIComponentType.TOOL,
+                    file_path=result.file_path,
+                    line_number=dec.line_number,
+                    framework=prefix or "",
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    metadata={"tool_decorator": dname},
+                )
+            )
+
+    return components
+
+
+def _extract_tool_names_from_arg(val: Any) -> list[str]:
+    """Extract tool names from a ``tools=`` kwarg value."""
+    names: list[str] = []
+    if isinstance(val, list):
+        for item in val:
+            n = _variable_name(item)
+            if n:
+                names.append(n)
+            elif isinstance(item, dict) and "name" in item:
+                names.append(str(item["name"]))
+            elif isinstance(item, dict):
+                fn = item.get("function", {})
+                if isinstance(fn, dict) and "name" in fn:
+                    names.append(str(fn["name"]))
+    elif isinstance(val, str):
+        n = _variable_name(val)
+        if n:
+            names.append(n)
+    return names
+
+
+def _variable_name(val: Any) -> str | None:
+    """Extract a variable/attribute name from CST argument sentinel values."""
+    if isinstance(val, str):
+        if val.startswith("VARIABLE:"):
+            return val.removeprefix("VARIABLE:")
+        if val.startswith("ATTRIBUTE:"):
+            return val.removeprefix("ATTRIBUTE:").rsplit(".", 1)[-1]
+    return None
+
+
+_MODEL_KWARG_NAMES: frozenset[str] = frozenset({
+    "model", "model_name", "model_id", "deployment_name", "engine",
+})
+
+_KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset({
+    "ChatOpenAI", "ChatAnthropic", "ChatGoogleGenerativeAI", "AzureChatOpenAI",
+    "OpenAI", "Anthropic", "GenerativeModel", "AnthropicBedrock",
+    "ChatBedrock", "BedrockChat", "ChatVertexAI", "ChatCohere",
+    "ChatMistralAI", "ChatOllama", "ChatLiteLLM", "ChatFireworks",
+    "ChatGroq", "ChatTogether", "VLLMOpenAI", "AzureOpenAI",
+})
+
+
+def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
+    """Extract model names from AI client constructor kwargs via LibCST.
+
+    Catches multi-line constructors that regex misses, e.g.::
+
+        client = AnthropicBedrock(
+            model="anthropic.claude-3-haiku-20240307-v1:0",
+            ...
+        )
+    """
+    from .model_detector import _registry_lookup
+
+    components: list[AIComponent] = []
+    seen: set[tuple[str, int]] = set()
+
+    all_calls = [(c, c.line_number) for c in result.calls]
+    all_calls += [(a.call, a.line_number) for a in result.assignments]
+
+    for call_obs, line in all_calls:
+        qn = call_obs.qualified_name or ""
+        short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+        if short not in _KNOWN_AI_CLIENT_CLASSES:
+            continue
+
+        for kwarg_name in _MODEL_KWARG_NAMES:
+            val = call_obs.arguments.get(kwarg_name)
+            if not isinstance(val, str):
+                continue
+            if val.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
+                continue
+            val = val.strip().strip("'\"")
+            if not val or len(val) < 3:
+                continue
+            key = (result.file_path, line)
+            if key in seen:
+                continue
+            reg = _registry_lookup(val)
+            if reg:
+                seen.add(key)
+                components.append(
+                    AIComponent(
+                        name=val,
+                        component_type=AIComponentType.MODEL,
+                        file_path=result.file_path,
+                        line_number=line,
+                        model_name=val,
+                        framework=short,
+                        detection_source=DetectionSource.CODE_ANALYSIS,
+                        metadata={
+                            "provider": reg.get("provider", ""),
+                            "extracted_from_kwarg": kwarg_name,
+                            "constructor": short,
+                        },
+                    )
+                )
+                break
+    return components
+
+
+def _detect_prompt_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
+    """Detect prompts consumed by confirmed AI framework calls.
+
+    When a confirmed AI call has a prompt-accepting kwarg (``system_prompt=``,
+    ``system=``, ``instructions=``, etc.), the value is an AI prompt asset.
+    """
+    components: list[AIComponent] = []
+    seen: set[tuple[str, int]] = set()
+
+    all_calls = list(result.calls) + [a.call for a in result.assignments]
+    all_lines = [c.line_number for c in result.calls] + [a.line_number for a in result.assignments]
+
+    for call_obs, line in zip(all_calls, all_lines):
+        qn = call_obs.qualified_name or ""
+        short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+
+        for kwarg_name in _PROMPT_KWARG_NAMES:
+            val = call_obs.arguments.get(kwarg_name)
+            if val is None:
+                continue
+            key = (result.file_path, line)
+            if key in seen:
+                continue
+
+            if isinstance(val, str) and not val.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
+                seen.add(key)
+                display = val[:80] + "..." if len(val) > 80 else val
+                components.append(
+                    AIComponent(
+                        name=f"prompt ({kwarg_name})",
+                        component_type=AIComponentType.PROMPT,
+                        file_path=result.file_path,
+                        line_number=line,
+                        text=val,
+                        framework=qn.split(".")[0] if "." in qn else "",
+                        detection_source=DetectionSource.CODE_ANALYSIS,
+                        metadata={"prompt_kwarg": kwarg_name, "enclosing_call": qn},
+                    )
+                )
+            elif isinstance(val, str) and val.startswith("VARIABLE:"):
+                var_name = val.removeprefix("VARIABLE:")
+                seen.add(key)
+                components.append(
+                    AIComponent(
+                        name=var_name,
+                        component_type=AIComponentType.PROMPT,
+                        file_path=result.file_path,
+                        line_number=line,
+                        framework=qn.split(".")[0] if "." in qn else "",
+                        detection_source=DetectionSource.CODE_ANALYSIS,
+                        confidence=0.7,
+                        metadata={
+                            "prompt_kwarg": kwarg_name,
+                            "enclosing_call": qn,
+                            "variable_ref": var_name,
+                        },
+                    )
+                )
+    return components
 
 
 def _find_python_files(context: ScanContext) -> list[Path]:
