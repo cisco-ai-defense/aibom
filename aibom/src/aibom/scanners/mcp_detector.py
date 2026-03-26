@@ -44,6 +44,7 @@ _CONFIG_NAMES = frozenset(
 
 _RE_FROM_MCP_IMPORT = re.compile(r"from\s+mcp\s+import\b")
 _RE_FROM_MCP_SERVER_IMPORT = re.compile(r"from\s+mcp\.server\s+import\b")
+_RE_FROM_FASTMCP_IMPORT = re.compile(r"(?:from\s+fastmcp|import\s+fastmcp)\b")
 _RE_FASTMCP = re.compile(r"\bFastMCP\s*\(")
 _RE_SERVER_CALL = re.compile(r"\bServer\s*\(")
 _RE_MCP_TOOL_DECORATOR = re.compile(
@@ -202,6 +203,11 @@ def _components_from_python(path: Path) -> list[AIComponent]:
                 _line_for_match(text, m_srv_imp.start()),
             )
         )
+    m_fastmcp_imp = _RE_FROM_FASTMCP_IMPORT.search(text)
+    if m_fastmcp_imp:
+        server_hits.append(
+            ("from_fastmcp_import", _line_for_match(text, m_fastmcp_imp.start()))
+        )
     ln = _first_match_line(_RE_FASTMCP, text)
     if ln is not None:
         server_hits.append(("FastMCP", ln))
@@ -226,7 +232,7 @@ def _components_from_python(path: Path) -> list[AIComponent]:
         )
 
     mdec = _RE_MCP_TOOL_DECORATOR.search(text)
-    has_mcp = bool(m_imp or m_srv_imp or _RE_FASTMCP.search(text))
+    has_mcp = bool(m_imp or m_srv_imp or m_fastmcp_imp or _RE_FASTMCP.search(text))
     if mdec:
         if has_mcp:
             out.append(

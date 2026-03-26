@@ -97,7 +97,9 @@ _MODEL_KWARGS = frozenset({
     "model", "model_name", "model_id", "deployment_name",
 })
 _API_KEY_KWARGS = frozenset({
-    "api_key", "openai_api_key",
+    "api_key", "openai_api_key", "anthropic_api_key",
+    "huggingface_api_key", "hf_token", "cohere_api_key",
+    "google_api_key", "replicate_api_token",
 })
 _ENDPOINT_KWARGS = frozenset({
     "base_url", "endpoint", "azure_endpoint", "api_base",
@@ -115,9 +117,66 @@ _MODEL_VAR_NAMES = frozenset({
     "deployment_name", "engine",
 })
 
+_AI_KEY_ENV_RE = re.compile(
+    r"(OPENAI|ANTHROPIC|HUGGING_?FACE|HF_|COHERE|GOOGLE_AI|REPLICATE|"
+    r"MISTRAL|TOGETHER|AZURE_OPENAI|BEDROCK|VERTEX|GROQ|FIREWORKS|"
+    r"ANYSCALE|DEEPINFRA|PERPLEXITY)"
+    r".*(?:KEY|TOKEN|SECRET)\b",
+    re.IGNORECASE,
+)
+
 _ASSIGN_LHS_RE = re.compile(
     r"""(?:^|\n)\s*(?:(?:const|let|var|final)\s+)?"""
     r"""([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*""",
+)
+
+_INFRA_ENV_PREFIXES: tuple[str, ...] = (
+    "TEMPORAL_", "OTEL_", "KAFKA_", "REDIS_", "POSTGRES_", "PG_",
+    "MYSQL_", "MONGO_", "RABBIT", "GRPC_", "HTTP_", "HTTPS_",
+    "LOG_", "DEBUG_", "NODE_", "K8S_", "KUBE_", "DOCKER_",
+    "VAULT_", "CONSUL_", "ETCD_", "JAEGER_", "ZIPKIN_",
+    "DATADOG_", "DD_", "PROMETHEUS_", "GRAFANA_", "ELASTIC_",
+    "SPLUNK_", "SENTRY_", "MY_NODE_", "CLUSTER_", "POD_",
+)
+
+# ---------------------------------------------------------------------------
+# Vault / Secret-manager patterns  (Fix 3: generalized secret fetch)
+#
+# Matches programmatic secret retrieval calls across providers:
+#   - HashiCorp Vault:  client.read("secret/..."), vault_client.read(...)
+#   - Conjur:           conjur_client.get_secret("alias")
+#   - AWS Secrets Mgr:  client.get_secret_value(SecretId="...")
+#   - Azure Key Vault:  client.get_secret("name")
+#   - GCP Secret Mgr:   client.access_secret_version(request=...)
+#   - Generic:          read_secret("name"), get_secret("name")
+# ---------------------------------------------------------------------------
+
+_VAULT_SECRET_CALL_RE = re.compile(
+    r"""(?:"""
+    r"""\.get_secret(?:_value)?\s*\("""       # conjur, Azure KV, generic
+    r"""|\.read_secret\s*\("""                # generic
+    r"""|\.access_secret_version\s*\("""      # GCP Secret Manager
+    r"""|vault[_\.].*\.read\s*\("""           # HashiCorp Vault
+    r"""|secrets_manager.*\.get_secret_value\s*\("""  # AWS explicit
+    r""")""",
+    re.IGNORECASE,
+)
+
+_VAULT_SECRET_STRING_RE = re.compile(
+    r"""["'](secret[/:][\w/.-]+|"""
+    r"""SecretId[=:]\s*[\w/.-]+)["']""",
+)
+
+_VAULT_IMPORT_RE = re.compile(
+    r"""(?:"""
+    r"""from\s+(?:hvac|conjur|azure\.keyvault|google\.cloud\.secretmanager"""
+    r"""|botocore|boto3)"""
+    r"""|import\s+(?:hvac|conjur))""",
+)
+
+_VAULT_STRING_LITERAL_RE = re.compile(
+    r"""["'](?:secret/|conjur/|vault:|arn:aws:secretsmanager:)[\w/.:-]+["']""",
+    re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
@@ -234,7 +293,7 @@ def _classify_assignment(text: str, env_match_start: int) -> str | None:
 def _env_context_to_component_type(ctx: str) -> AIComponentType:
     if ctx in ("model_kwarg", "model_assignment"):
         return AIComponentType.MODEL
-    if ctx == "api_key_kwarg":
+    if ctx in ("api_key_kwarg", "api_key_envname"):
         return AIComponentType.SECRET
     if ctx == "endpoint_kwarg":
         return AIComponentType.DEPENDENCY
@@ -282,7 +341,13 @@ class EnvVarResolver(BaseScanner):
                     ctx = _classify_kwarg(text, match_start)
                     if ctx is None:
                         ctx = _classify_assignment(text, match_start)
+                    if ctx is None and _AI_KEY_ENV_RE.match(env_name):
+                        ctx = "api_key_envname"
                     if ctx is None:
+                        continue
+
+                    env_upper = env_name.upper()
+                    if any(env_upper.startswith(p) for p in _INFRA_ENV_PREFIXES):
                         continue
 
                     dedup_key = (fp_str, env_name, ctx)
@@ -313,4 +378,120 @@ class EnvVarResolver(BaseScanner):
                         },
                     ))
 
+        vault_comps = self._detect_vault_secrets(context, seen)
+        components.extend(vault_comps)
+
         return components, []
+
+    def _detect_vault_secrets(
+        self,
+        context: ScanContext,
+        already_seen: set[tuple[str, str, str]],
+    ) -> list[AIComponent]:
+        """Detect secrets fetched via vault/secret-manager SDKs."""
+        results: list[AIComponent] = []
+        for fpath, _rel in _iter_files(context):
+            suffix = fpath.suffix.lower()
+            if suffix not in (".py", ".go", ".java", ".js", ".ts", ".rb"):
+                continue
+
+            try:
+                text = read_text_cached(fpath)
+            except OSError:
+                continue
+
+            fp_str = str(fpath)
+            has_vault_import = bool(_VAULT_IMPORT_RE.search(text))
+
+            for m in _VAULT_SECRET_CALL_RE.finditer(text):
+                if _is_commented(text, m.start(), suffix):
+                    continue
+                line_no = _line_number(text, m.start())
+                dedup = (fp_str, f"vault_call_L{line_no}", "vault")
+                if dedup in already_seen:
+                    continue
+                already_seen.add(dedup)
+
+                secret_name = ""
+                str_m = _VAULT_SECRET_STRING_RE.search(
+                    text[m.start():m.start() + 200]
+                )
+                if str_m:
+                    secret_name = str_m.group(1)
+
+                conf = 0.8 if has_vault_import else 0.4
+                results.append(AIComponent(
+                    name=secret_name or "vault-secret",
+                    component_type=AIComponentType.SECRET,
+                    file_path=fp_str,
+                    line_number=line_no,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    confidence=conf,
+                    needs_agentic=conf < 0.6,
+                    agentic_hint=(
+                        "Secret fetched via vault/secret-manager SDK; "
+                        "agent should verify the secret path/alias."
+                    ) if conf < 0.6 else "",
+                    metadata={
+                        "secret_source": "vault_sdk",
+                        "secret_path": secret_name,
+                        "has_vault_import": has_vault_import,
+                    },
+                ))
+
+            if has_vault_import and not any(
+                d[0] == fp_str and d[2] == "vault" for d in already_seen
+            ):
+                line_no = _line_number(text, _VAULT_IMPORT_RE.search(text).start())  # type: ignore[union-attr]
+                dedup = (fp_str, "vault_import_hint", "vault")
+                if dedup not in already_seen:
+                    already_seen.add(dedup)
+                    results.append(AIComponent(
+                        name="vault-secret-candidate",
+                        component_type=AIComponentType.SECRET,
+                        file_path=fp_str,
+                        line_number=line_no,
+                        detection_source=DetectionSource.CODE_ANALYSIS,
+                        confidence=0.3,
+                        needs_agentic=True,
+                        agentic_hint=(
+                            "vault_secret_pattern: File imports a vault/secret-manager "
+                            "SDK but no explicit get_secret call was matched. "
+                            "Use analyze_imports to trace secret access patterns."
+                        ),
+                        metadata={
+                            "secret_source": "vault_import_only",
+                            "has_vault_import": True,
+                        },
+                    ))
+
+            for m in _VAULT_STRING_LITERAL_RE.finditer(text):
+                if _is_commented(text, m.start(), suffix):
+                    continue
+                line_no = _line_number(text, m.start())
+                dedup = (fp_str, f"vault_str_L{line_no}", "vault")
+                if dedup in already_seen:
+                    continue
+                already_seen.add(dedup)
+                secret_path = m.group(0).strip("\"'")
+                results.append(AIComponent(
+                    name=secret_path,
+                    component_type=AIComponentType.SECRET,
+                    file_path=fp_str,
+                    line_number=line_no,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    confidence=0.5 if has_vault_import else 0.3,
+                    needs_agentic=True,
+                    agentic_hint=(
+                        "vault_secret_pattern: String literal references a "
+                        "secret path. Use analyze_imports to confirm this is "
+                        "a vault/secret-manager access."
+                    ),
+                    metadata={
+                        "secret_source": "string_literal",
+                        "secret_path": secret_path,
+                        "has_vault_import": has_vault_import,
+                    },
+                ))
+
+        return results

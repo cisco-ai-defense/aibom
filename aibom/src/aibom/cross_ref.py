@@ -26,6 +26,7 @@ from typing import Any
 
 import yaml
 
+from .models.enums import AIComponentType
 from .models.scan import AIComponent
 from .scanners.dependency_scanner import (
     AI_PACKAGES,
@@ -433,7 +434,14 @@ def resolve_components(
                 }
                 meta.update(provenance)
 
-                if c.model_name is None and val:
+                if c.component_type == AIComponentType.VECTOR_STORE:
+                    meta["index_name"] = val
+                    new_c = c.model_copy(update={
+                        "confidence": max(c.confidence, 0.8),
+                        "needs_agentic": False,
+                        "metadata": meta,
+                    })
+                elif c.model_name is None and val:
                     new_c = c.model_copy(update={
                         "model_name": val,
                         "metadata": meta,
