@@ -44,7 +44,7 @@ from ..models import (
 )
 from ..structures import CodeAnalysisResult
 from .base import BaseScanner
-from .file_cache import read_text_cached
+from .file_cache import read_python_source, read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -494,7 +494,7 @@ class KBEnrichmentScanner(BaseScanner):
 
             for py_file in all_py_files:
                 try:
-                    source = read_text_cached(py_file)
+                    source = read_python_source(py_file)
                 except Exception:  # noqa: BLE001
                     continue
                 if _file_has_kb_framework_import(source, filter_set):
@@ -1162,15 +1162,18 @@ def _detect_prompt_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 def _find_python_files(context: ScanContext) -> list[Path]:
     idx = context.file_index()
     if idx:
-        return [e.path for e in idx.get(".py", [])]
+        py = [e.path for e in idx.get(".py", [])]
+        py.extend(e.path for e in idx.get(".ipynb", []))
+        return py
 
     files: list[Path] = []
     for p in context.paths:
         path = Path(p)
-        if path.is_file() and path.suffix == ".py":
+        if path.is_file() and path.suffix in (".py", ".ipynb"):
             files.append(path)
         elif path.is_dir():
             files.extend(sorted(path.rglob("*.py")))
+            files.extend(sorted(path.rglob("*.ipynb")))
     return files
 
 

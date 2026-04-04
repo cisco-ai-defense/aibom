@@ -27,7 +27,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
-from .file_cache import read_text_cached
+from .file_cache import is_python_source, read_python_source, read_text_cached
 from .import_context import has_any_ai_imports, has_data_imports, has_ml_imports
 
 
@@ -405,7 +405,7 @@ def _concept_confidence(
     framework: str,
 ) -> tuple[float, bool, str]:
     """Return (confidence, needs_agentic, hint) based on import context."""
-    if suffix != ".py":
+    if suffix not in (".py", ".ipynb"):
         return (0.75, False, "")
 
     if concept == AIComponentType.TRAINING_RUN:
@@ -482,13 +482,18 @@ class MLLifecycleDetector(BaseScanner):
             name_lower = fpath.name.lower()
 
             try:
-                text = read_text_cached(fpath)
+                text = (
+                    read_python_source(fpath)
+                    if is_python_source(fpath)
+                    else read_text_cached(fpath)
+                )
             except OSError:
                 continue
 
-            file_has_ml = has_ml_imports(text) if suffix == ".py" else False
-            file_has_ai = has_any_ai_imports(text) if suffix == ".py" else False
-            file_has_data = has_data_imports(text) if suffix == ".py" else False
+            is_py = suffix in (".py", ".ipynb")
+            file_has_ml = has_ml_imports(text) if is_py else False
+            file_has_ai = has_any_ai_imports(text) if is_py else False
+            file_has_data = has_data_imports(text) if is_py else False
 
             is_ci = (
                 rel.startswith(".github/workflows/")
@@ -564,7 +569,7 @@ class MLLifecycleDetector(BaseScanner):
                             )
                         )
 
-                if suffix == ".py":
+                if is_py:
                     hp_conf = 0.85 if file_has_ml else 0.35
                     hp_agentic = not file_has_ml
                     for hp_rx, hp_key in _HP_RULES:
@@ -594,7 +599,7 @@ class MLLifecycleDetector(BaseScanner):
                                 seen.add(key)
                                 components.append(comp)
 
-                scan_concepts = suffix == ".py" or is_ci or is_jenkins or is_yaml
+                scan_concepts = is_py or is_ci or is_jenkins or is_yaml
                 if not scan_concepts:
                     continue
 

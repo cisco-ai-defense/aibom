@@ -851,7 +851,7 @@ def _iter_scan_files(context: ScanContext) -> list[tuple[Path, str, str]]:
     if idx:
         out: list[tuple[Path, str, str]] = []
         for ext, entries in idx.items():
-            if ext == ".py":
+            if ext in (".py", ".ipynb"):
                 continue
             lang = _EXTENSION_TO_LANG.get(ext)
             if lang is None:
@@ -871,7 +871,7 @@ def _iter_scan_files(context: ScanContext) -> list[tuple[Path, str, str]]:
         if not root.exists():
             continue
         if root.is_file():
-            if root.suffix.lower() == ".py":
+            if root.suffix.lower() in (".py", ".ipynb"):
                 continue
             lang = _EXTENSION_TO_LANG.get(root.suffix.lower())
             if lang is None:
@@ -885,7 +885,7 @@ def _iter_scan_files(context: ScanContext) -> list[tuple[Path, str, str]]:
         for f in root.rglob("*"):
             if not f.is_file():
                 continue
-            if f.suffix.lower() == ".py":
+            if f.suffix.lower() in (".py", ".ipynb"):
                 continue
             lang = _EXTENSION_TO_LANG.get(f.suffix.lower())
             if lang is None:

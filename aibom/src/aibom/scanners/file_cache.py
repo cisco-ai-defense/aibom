@@ -124,6 +124,49 @@ async def warm_cache_async(
     return loaded
 
 
+_PYTHON_SUFFIXES: frozenset[str] = frozenset({".py", ".ipynb"})
+
+
+def is_python_source(path: Path | str) -> bool:
+    """Return True if *path* is a Python source file or Jupyter notebook."""
+    return Path(path).suffix.lower() in _PYTHON_SUFFIXES
+
+
+def read_python_source(path: Path | str) -> str:
+    """Read Python source from a ``.py`` file or extract code cells from ``.ipynb``.
+
+    For ``.py`` files this is identical to ``read_text_cached``.
+    For ``.ipynb`` files the notebook is parsed and code cells are
+    concatenated into a virtual Python source string.  The result is
+    cached so repeated calls across scanners pay no extra I/O.
+    """
+    p = Path(path)
+    if p.suffix.lower() == ".ipynb":
+        cache_key = f"__notebook_python__:{p}"
+        with _lock:
+            if cache_key in _cache:
+                _hit_count_inc()
+                return _cache[cache_key]
+        from ..notebook_parser import extract_code_from_notebook
+
+        text = extract_code_from_notebook(p)
+        with _lock:
+            _cache[cache_key] = text
+            _miss_count_inc()
+        return text
+    return read_text_cached(p)
+
+
+def _hit_count_inc() -> None:
+    global _hit_count
+    _hit_count += 1
+
+
+def _miss_count_inc() -> None:
+    global _miss_count
+    _miss_count += 1
+
+
 def cache_stats() -> dict[str, int]:
     """Return hit/miss statistics for diagnostics."""
     with _lock:

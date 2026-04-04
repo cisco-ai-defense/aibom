@@ -40,7 +40,6 @@ __all__ = [
     "CrossRepoSummaryArgs",
     "ResolveEnvVarArgs",
     "ResolveIaCRefArgs",
-    "build_cross_repo_tools",
     "cross_repo_summary_tool",
     "resolve_env_var_tool",
     "resolve_iac_ref_tool",
@@ -588,30 +587,3 @@ def cross_repo_summary_tool(scan_paths: list[str]) -> str:
         return json.dumps({"error": str(exc)})
 
 
-def build_cross_repo_tools() -> list:
-    """Return LangChain StructuredTool instances for cross-repo reasoning."""
-    try:
-        from langchain_core.tools import StructuredTool
-    except ImportError:
-        return []
-
-    return [
-        StructuredTool.from_function(
-            func=resolve_env_var_tool,
-            name="resolve_env_var",
-            description="Resolve an environment variable across all scanned repos",
-            args_schema=ResolveEnvVarArgs,
-        ),
-        StructuredTool.from_function(
-            func=resolve_iac_ref_tool,
-            name="resolve_iac_ref",
-            description="Resolve an IaC reference (Terraform var, CFn !Ref, etc.)",
-            args_schema=ResolveIaCRefArgs,
-        ),
-        StructuredTool.from_function(
-            func=cross_repo_summary_tool,
-            name="cross_repo_summary",
-            description="Get a summary of shared env vars and packages across repos",
-            args_schema=CrossRepoSummaryArgs,
-        ),
-    ]

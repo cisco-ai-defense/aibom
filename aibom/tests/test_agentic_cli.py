@@ -87,35 +87,6 @@ class TestAgenticEnrichmentViaCLI:
         assert result.exit_code == 0
         assert mock_create.call_count >= 1
 
-    def test_llm_model_with_legacy_mode_skips_agentic(self, sample_dir, tmp_path):
-        import duckdb
-
-        db_file = tmp_path / "test_catalog.duckdb"
-        con = duckdb.connect(str(db_file))
-        con.execute(
-            "CREATE TABLE component_catalog ("
-            "id TEXT, label TEXT, concept TEXT, framework TEXT, "
-            "sig_name TEXT, type TEXT, catalog_label TEXT)"
-        )
-        con.close()
-
-        out = tmp_path / "report.txt"
-        with patch(
-            "aibom.cli.ensure_local_database", return_value=db_file
-        ):
-            result = runner.invoke(
-                app,
-                [
-                    "analyze", str(sample_dir),
-                    "--output-format", "plaintext",
-                    "--output-file", str(out),
-                    "--legacy-mode",
-                    "--llm-model", "test-model",
-                    "--llm-api-base", "http://localhost:11434",
-                ],
-            )
-        assert result.exit_code == 0
-
     def test_llm_model_help_mentions_agentic(self):
         import re
 

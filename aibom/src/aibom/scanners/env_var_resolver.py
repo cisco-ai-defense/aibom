@@ -34,7 +34,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
-from .file_cache import read_text_cached
+from .file_cache import is_python_source, read_python_source, read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ _RUBY_ENV_PATTERNS = [_RUBY_ENV_BRACKET, _RUBY_ENV_FETCH]
 
 _LANG_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ".py": _PY_ENV_PATTERNS,
+    ".ipynb": _PY_ENV_PATTERNS,
     ".js": _JS_ENV_PATTERNS,
     ".ts": _JS_ENV_PATTERNS,
     ".jsx": _JS_ENV_PATTERNS,
@@ -232,6 +233,7 @@ def _line_number(text: str, pos: int) -> int:
 
 _COMMENT_PREFIXES = {
     ".py": "#",
+    ".ipynb": "#",
     ".rb": "#",
     ".js": "//",
     ".ts": "//",
@@ -324,7 +326,11 @@ class EnvVarResolver(BaseScanner):
                 continue
 
             try:
-                text = read_text_cached(fpath)
+                text = (
+                    read_python_source(fpath)
+                    if is_python_source(fpath)
+                    else read_text_cached(fpath)
+                )
             except OSError:
                 continue
 
@@ -392,11 +398,15 @@ class EnvVarResolver(BaseScanner):
         results: list[AIComponent] = []
         for fpath, _rel in _iter_files(context):
             suffix = fpath.suffix.lower()
-            if suffix not in (".py", ".go", ".java", ".js", ".ts", ".rb"):
+            if suffix not in (".py", ".ipynb", ".go", ".java", ".js", ".ts", ".rb"):
                 continue
 
             try:
-                text = read_text_cached(fpath)
+                text = (
+                    read_python_source(fpath)
+                    if is_python_source(fpath)
+                    else read_text_cached(fpath)
+                )
             except OSError:
                 continue
 

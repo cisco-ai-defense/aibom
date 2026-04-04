@@ -14,7 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import copy
+
 import json
 import logging
 import os
@@ -39,21 +39,12 @@ from rich.tree import Tree
 
 from .report_sender import post_report_with_retries
 from .utils.version import resolve_package_version
-from .categorizer import categorize_symbols
-from .framework_config_parser import parse_project_configs
-from .container_utils import extract_app_from_docker, is_docker_image
-from .cst_parser import parse_source_code
-from .catalog_db import CatalogDB
+from .scanners.container_extractor import extract_source_from_image, is_container_image, VALID_TIERS, validate_tier
 from .custom_catalog import (
     CustomCatalogConfig,
-    discover_custom_catalog,
     load_custom_catalog,
 )
-from .db_loader import ensure_local_database
-from .notebook_parser import extract_code_from_notebook
-from .structures import CodeAnalysisResult
 from .api_handler import start_api_server
-from .workflow_analyzer import build_workflow_index, workflow_identifier
 from .reporters import get_reporter, reporter_registry
 from .models.enums import Severity as SeverityEnum
 from .kb.manager import KBManager, KBError
@@ -66,6 +57,7 @@ app = typer.Typer(
     help="Generate an AI BOM from source code.",
     no_args_is_help=True,
 )
+
 
 ENV_FILE_ENV_VAR = "AIBOM_ENV_FILE"
 
@@ -191,97 +183,29 @@ def _record_analysis_error(
 
 
 @app.callback(invoke_without_command=True)
-def main_callback(ctx: typer.Context) -> None:
-    """Ensure a subcommand is provided when invoking the CLI."""
+def main_callback(
+    ctx: typer.Context,
+    log_level: str = typer.Option(
+        "INFO",
+        "--log-level",
+        envvar="AIBOM_LOG_LEVEL",
+        help="Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
+    ),
+) -> None:
+    """Generate an AI BOM from source code."""
+    numeric_level = getattr(logging, log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        console.print(f"[red]Invalid log level:[/] {log_level}")
+        raise typer.Exit(code=1)
+    logging.basicConfig(level=numeric_level, format="%(levelname)s: %(message)s")
+
     if ctx.invoked_subcommand is None:
         console.print(
-            "[bold red]No subcommand provided.[/] Please use [green]analyze[/], [green]report[/], or [green]kb[/]."
+            "[bold red]No subcommand provided.[/] Please use [green]analyze[/], "
+            "[green]report[/], [green]watch[/], [green]benchmark[/], [green]kb[/], "
+            "[green]cache[/], [green]plugin[/], or [green]diff[/]."
         )
         raise typer.Exit(code=1)
-
-
-def _build_scan_result(
-    all_analysis_outputs: Dict[str, Any],
-    run_metadata: Dict[str, Any],
-    run_errors: List[Dict[str, Any]],
-) -> "ScanResult":
-    """Bridge legacy CategorizationOutput to the v2 ScanResult model."""
-    from .models import (
-        AIComponent as V2Component,
-        AIComponentType,
-        ComponentRelationship as V2Relationship,
-        ScanResult,
-        SourceResult,
-    )
-
-    _TYPE_MAP = {
-        "model": AIComponentType.MODEL,
-        "agent": AIComponentType.AGENT,
-        "tool": AIComponentType.TOOL,
-        "mcp_server": AIComponentType.MCP_SERVER,
-        "mcp_client": AIComponentType.MCP_CLIENT,
-        "embedding": AIComponentType.EMBEDDING,
-        "vector_store": AIComponentType.VECTOR_STORE,
-        "datastore": AIComponentType.VECTOR_STORE,
-        "dataset": AIComponentType.DATASET,
-        "prompt": AIComponentType.PROMPT,
-        "guardrail": AIComponentType.GUARDRAIL,
-        "observability": AIComponentType.OBSERVABILITY,
-        "memory": AIComponentType.MEMORY,
-        "retriever": AIComponentType.RETRIEVER,
-    }
-
-    sources = []
-    for source_path, output in all_analysis_outputs.items():
-        categorized = getattr(output, "components", output)
-        relationships = getattr(output, "relationships", [])
-
-        components: List[V2Component] = []
-        for category, items in categorized.items():
-            comp_type = _TYPE_MAP.get(category, AIComponentType.OTHER)
-            for item in (items or []):
-                components.append(V2Component(
-                    name=item.get("name", "unknown"),
-                    component_type=comp_type,
-                    file_path=item.get("file_path", ""),
-                    line_number=item.get("line_number", 0),
-                    framework=item.get("framework", ""),
-                    model_name=item.get("model_name"),
-                    embedding_model=item.get("embedding_model"),
-                    description=item.get("description"),
-                    text=item.get("text"),
-                    instance_id=item.get("instance_id", ""),
-                    metadata={
-                        k: v for k, v in item.items()
-                        if k not in {
-                            "name", "file_path", "line_number", "framework",
-                            "model_name", "embedding_model", "description",
-                            "text", "instance_id", "category",
-                        }
-                    },
-                ))
-
-        v2_rels: List[V2Relationship] = []
-        for rel in relationships:
-            v2_rels.append(V2Relationship(
-                source_instance_id=getattr(rel, "source_instance_id", ""),
-                target_instance_id=getattr(rel, "target_instance_id", ""),
-                label=getattr(rel, "label", ""),
-                source_name=getattr(rel, "source_name", ""),
-                target_name=getattr(rel, "target_name", ""),
-            ))
-
-        sources.append(SourceResult(
-            path=source_path,
-            components=components,
-            relationships=v2_rels,
-        ))
-
-    return ScanResult(
-        metadata=run_metadata,
-        sources=sources,
-        errors=[e.get("message", str(e)) for e in run_errors],
-    )
 
 
 def _render_component_table(source: str, categorized_components: Dict[str, List[Dict[str, Any]]]) -> None:
@@ -412,114 +336,6 @@ def _display_analysis_summary(all_analysis_outputs: Dict[str, Any], max_examples
         console.print()  # spacing
 
 
-def _find_python_files(path: Path) -> List[Path]:
-    """Finds all .py and .ipynb files in a given path (file or directory)."""
-    if path.is_file() and path.suffix in (".py", ".ipynb"):
-        return [path]
-    if path.is_dir():
-        py_files = list(path.rglob("*.py"))
-        nb_files = list(path.rglob("*.ipynb"))
-        return py_files + nb_files
-    return []
-
-
-def _generate_plaintext_report(all_analysis_outputs, output_file: Path):
-    """Generate plaintext report format."""
-    report_lines = ["--- AI BOM Analysis Report ---"]
-    grand_total = 0
-    for source, output in all_analysis_outputs.items():
-        categorized_components = getattr(output, "components", output)
-        report_lines.append(f"\n\n--- Results for source: {source} ---")
-        total_components = 0
-        for category, components in categorized_components.items():
-            if components:
-                total_components += len(components)
-                report_lines.append(f"\n[+] Found {len(components)} {category.upper()}:")
-                for comp in components:
-                    report_lines.append(f"  - Name: {comp['name']}")
-                    if 'text' in comp:
-                        prompt_text = json.dumps(comp['text'], indent=4)
-                        report_lines.append(f"    Text: {prompt_text}")
-                    if 'model_name' in comp:
-                        report_lines.append(f"    Model: {comp['model_name']}")
-                    if 'embedding_model' in comp:
-                        report_lines.append(f"    Embedding Model: {comp['embedding_model']}")
-                    report_lines.append(f"    Source: {comp['file_path']}:{comp['line_number']}")
-                    workflows = comp.get('workflows')
-                    if workflows:
-                        report_lines.append("    Workflows:")
-                        for wf in workflows:
-                            workflow_name = wf.get('function', 'unknown')
-                            wf_file = wf.get('file_path', '')
-                            wf_line = wf.get('line', '')
-                            distance = wf.get('distance', 0)
-                            report_lines.append(
-                                f"      - {workflow_name} (distance {distance}) [{wf_file}:{wf_line}]"
-                            )
-
-        if total_components == 0:
-            report_lines.append("No known AI components were found in this source.")
-        relationships = getattr(output, "relationships", [])
-        if relationships:
-            report_lines.append(f"\n[+] Derived Relationships ({len(relationships)}):")
-            for rel in relationships:
-                report_lines.append(
-                    f"  - {rel.source_name} [{rel.source_category}] {rel.label} {rel.target_name} [{rel.target_category}]"
-                )
-        grand_total += total_components
-
-    if grand_total == 0:
-        report_lines.append("\nNo known AI components were found in any of the specified sources.")
-    else:
-        report_lines.append(f"\n--- End of Report: Found {grand_total} total components across all sources. ---")
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("\n".join(report_lines))
-    logging.info(f"Plaintext report written to {output_file}")
-
-
-def _convert_to_container_path(file_path: str, temp_dir: str) -> str:
-    """Convert host temporary directory path to container path."""
-    if not temp_dir or temp_dir not in file_path:
-        return file_path
-    
-    # Convert temp_dir/app/... -> /app/...
-    if "/app/" in file_path:
-        # Find the /app/ part and everything after it
-        app_index = file_path.find("/app/")
-        return file_path[app_index:]
-    
-    # For other paths, try to extract meaningful container path
-    # Remove the temp directory prefix
-    relative_path = file_path.replace(temp_dir, "")
-    if relative_path.startswith("/"):
-        relative_path = relative_path[1:]
-    
-    # If it looks like site-packages content, map to container path
-    if "site-packages" in relative_path:
-        # Extract the part after site-packages-X/
-        parts = relative_path.split("/")
-        if len(parts) > 1 and parts[0].startswith("site-packages"):
-            return "/" + "/".join(parts[1:])
-    
-    # Default: assume it's in /app
-    return "/app/" + relative_path if relative_path else "/app"
-
-
-def _convert_paths_in_output(analysis_output, temp_dir: str):
-    """Convert all file paths in components from host paths to container paths."""
-    if not temp_dir:
-        return analysis_output
-    
-    categorized_components = getattr(analysis_output, "components", analysis_output)
-    for category, components in categorized_components.items():
-        for component in components:
-            if "file_path" in component:
-                component["file_path"] = _convert_to_container_path(component["file_path"], temp_dir)
-    
-    return analysis_output
-
-
 def _map_source_kind(kind: Optional[str]) -> str:
     """Map internal source kind strings to the API enum expected by the backend."""
     normalized = (kind or "").replace("_", "-").lower()
@@ -571,149 +387,6 @@ def _build_submission_payload(
         "sources": sources_payload,
         "report": report,
     }
-
-
-def _generate_json_report(
-    all_analysis_outputs,
-    output_file: Path,
-    metadata: Optional[Dict[str, Any]] = None,
-    source_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
-    run_errors: Optional[List[Dict[str, Any]]] = None,
-):
-    """Generate JSON report format."""
-    metadata = metadata or {}
-    source_summaries = source_summaries or {}
-    total_sources = len(source_summaries) if source_summaries else len(all_analysis_outputs)
-    report = {
-        "aibom_analysis": {
-            "metadata": metadata,
-            "sources": {},
-            "summary": {
-                "total_sources": total_sources,
-                "total_components": 0,
-                "categories": {},
-                "total_relationships": 0,
-                "total_workflows": 0,
-            },
-            "errors": run_errors or [],
-        }
-    }
-    
-    category_totals = {}
-    grand_total = 0
-    grand_relationships = 0
-    grand_workflows = 0
-    
-    for source, output in all_analysis_outputs.items():
-        categorized_components = getattr(output, "components", output)
-        source_data = {
-            "components": {},
-            "total_components": 0,
-            "workflows": [],
-            "total_workflows": 0,
-        }
-        workflow_catalog: Dict[str, Dict[str, Any]] = {}
-
-        source_total = 0
-        for category, components in categorized_components.items():
-            if not components:
-                continue
-            source_total += len(components)
-            category_totals[category] = category_totals.get(category, 0) + len(components)
-
-            category_components: List[Dict[str, Any]] = []
-            for component in components:
-                component_copy = copy.deepcopy(component)
-                workflows = component_copy.get("workflows") or []
-                if workflows:
-                    enriched_workflows: List[Dict[str, Any]] = []
-                    for workflow in workflows:
-                        wf_copy = copy.deepcopy(workflow)
-                        wf_id = workflow_identifier(
-                            wf_copy.get("function"),
-                            wf_copy.get("file_path"),
-                            wf_copy.get("line"),
-                        )
-                        wf_copy["id"] = wf_id
-                        enriched_workflows.append(wf_copy)
-
-                        existing = workflow_catalog.get(wf_id)
-                        wf_distance = wf_copy.get("distance", 0)
-                        if not existing:
-                            workflow_catalog[wf_id] = {
-                                "id": wf_id,
-                                "function": wf_copy.get("function"),
-                                "file_path": wf_copy.get("file_path"),
-                                "line": wf_copy.get("line"),
-                                "distance": wf_distance,
-                            }
-                        else:
-                            existing["distance"] = min(existing.get("distance", wf_distance), wf_distance)
-                    component_copy["workflows"] = enriched_workflows
-                category_components.append(component_copy)
-            source_data["components"][category] = category_components
-
-        source_data["total_components"] = source_total
-        source_data["workflows"] = list(workflow_catalog.values())
-        source_data["total_workflows"] = len(workflow_catalog)
-        grand_workflows += len(workflow_catalog)
-        relationships = getattr(output, "relationships", [])
-        if relationships:
-            source_data["relationships"] = [rel.to_dict() for rel in relationships]
-            grand_relationships += len(relationships)
-        summary_payload = source_summaries.get(source, {})
-        source_data["summary"] = {
-            "status": summary_payload.get("status", "completed"),
-            "status_detail": summary_payload.get("status_detail"),
-            "source_kind": summary_payload.get("source_kind"),
-            "assets_discovered": summary_payload.get("assets_discovered", source_total),
-            "branches_scanned": summary_payload.get("branches_scanned"),
-            "last_generated_at": summary_payload.get("last_generated_at"),
-        }
-        if summary_payload.get("errors"):
-            source_data["summary"]["errors"] = summary_payload["errors"]
-        report["aibom_analysis"]["sources"][source] = source_data
-        grand_total += source_total
-    
-    # Ensure sources that failed prior to component extraction are still represented.
-    for missing_source, summary_payload in source_summaries.items():
-        if missing_source in report["aibom_analysis"]["sources"]:
-            continue
-        placeholder = {
-            "components": {},
-            "total_components": summary_payload.get("assets_discovered", 0),
-            "workflows": [],
-            "total_workflows": 0,
-            "summary": {
-                "status": summary_payload.get("status", "failed"),
-                "status_detail": summary_payload.get("status_detail"),
-                "source_kind": summary_payload.get("source_kind"),
-                "assets_discovered": summary_payload.get("assets_discovered", 0),
-                "branches_scanned": summary_payload.get("branches_scanned"),
-                "last_generated_at": summary_payload.get("last_generated_at"),
-            },
-        }
-        if summary_payload.get("errors"):
-            placeholder["summary"]["errors"] = summary_payload["errors"]
-        report["aibom_analysis"]["sources"][missing_source] = placeholder
-
-    report["aibom_analysis"]["summary"]["total_components"] = grand_total
-    report["aibom_analysis"]["summary"]["total_relationships"] = grand_relationships
-    report["aibom_analysis"]["summary"]["categories"] = category_totals
-    report["aibom_analysis"]["summary"]["total_workflows"] = grand_workflows
-    status_counts: Dict[str, int] = {}
-    for info in source_summaries.values():
-        status = info.get("status", "completed")
-        status_counts[status] = status_counts.get(status, 0) + 1
-    if status_counts:
-        report["aibom_analysis"]["summary"]["status_counts"] = status_counts
-    if metadata.get("status"):
-        report["aibom_analysis"]["summary"]["status"] = metadata["status"]
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(report, f, indent=2)
-    logging.info(f"JSON report written to {output_file}")
-    return report
 
 
 def _render_json_report_console(report: Dict[str, Any]) -> None:
@@ -825,34 +498,44 @@ def analyze(
         help="Verify TLS certificates when POSTing the report.",
         envvar="AIBOM_POST_VERIFY_TLS",
     ),
-    log_level: str = typer.Option(
-        "INFO",
-        "--log-level",
-        help="Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
-    ),
     llm_model: Optional[str] = typer.Option(
         None,
         "--llm-model",
+        envvar="AIBOM_LLM_MODEL",
         help=(
-            "LLM model name (e.g. gpt-4o, claude-sonnet-4-20250514).  "
-            "In v2 mode this enables agentic enrichment after the "
-            "deterministic scan (requires 'cisco-aibom[agentic]')."
+            "LLM model name (e.g. gpt-4o, us.anthropic.claude-sonnet-4-20250514-v1:0).  "
+            "Enables agentic enrichment after the deterministic scan "
+            "(requires 'cisco-aibom[agentic]').  The legacy 'provider/model' "
+            "prefix is still accepted for backward compatibility."
+        ),
+    ),
+    llm_provider: Optional[str] = typer.Option(
+        None,
+        "--llm-provider",
+        envvar="AIBOM_LLM_PROVIDER",
+        help=(
+            "LLM provider name for LangChain (e.g. bedrock, openai, anthropic, "
+            "azure_openai, google_genai, ollama).  If not set, inferred from "
+            "the model name or a 'provider/' prefix in --llm-model."
         ),
     ),
     llm_api_key: Optional[str] = typer.Option(
         None,
         "--llm-api-key",
-        help="LLM API key. May be optional for local LLM",
+        envvar="AIBOM_LLM_API_KEY",
+        help="LLM API key. May be optional for local LLM or AWS Bedrock.",
     ),
     llm_api_base: Optional[str] = typer.Option(
         None,
         "--llm-api-base",
-        help="LLM API base URL",
+        envvar="AIBOM_LLM_API_BASE",
+        help="LLM API base URL.",
     ),
     llm_api_version: Optional[str] = typer.Option(
         None,
         "--llm-api-version",
-        help="LLM API version (for Azure OpenAI or some providers). May be optional for local LLM",
+        envvar="AIBOM_LLM_API_VERSION",
+        help="LLM API version (for Azure OpenAI). May be optional for other providers.",
     ),
     show_summary: bool = typer.Option(
         True,
@@ -880,6 +563,11 @@ def analyze(
             "Exit with non-zero code if risk severity meets or exceeds this "
             "threshold: critical, high, medium, low."
         ),
+    ),
+    policy: Optional[str] = typer.Option(
+        None,
+        "--policy",
+        help="Path to a YAML policy file. When set, violations are printed and the process exits with code 1 if the policy does not pass.",
     ),
     min_severity: str = typer.Option(
         "info",
@@ -922,6 +610,20 @@ def analyze(
             "Cheaper/faster LLM for simple confirmations (model lookups, "
             "dependency checks). Falls back to --llm-model if not set."
         ),
+    ),
+    agentic_timeout: int = typer.Option(
+        120,
+        "--agentic-timeout",
+        help="Wall-clock timeout (seconds) per agentic LLM batch (default 120).",
+    ),
+    container_tier: str = typer.Option(
+        "auto",
+        "--container-extraction-tier",
+        help=(
+            "Force a specific container extraction tier instead of auto-detection. "
+            f"Choices: {', '.join(VALID_TIERS)}."
+        ),
+        callback=lambda v: validate_tier(v),
     ),
     cache_dir: Optional[Path] = typer.Option(
         None,
@@ -1009,31 +711,29 @@ def analyze(
             "Higher values speed up org-scale scans but require more memory."
         ),
     ),
-    legacy_mode: bool = typer.Option(
+    incremental: bool = typer.Option(
         False,
-        "--legacy-mode",
+        "--incremental",
         help=(
-            "Use the v1 KB-symbol-matching pipeline instead of the v2 "
-            "targeted detectors.  Intended for backward compatibility only."
+            "Skip scanning git repos whose HEAD has not changed since "
+            "the last cached scan.  Cache is stored under "
+            "~/.cache/cisco-aibom/org-cache/."
+        ),
+    ),
+    compliance: Optional[str] = typer.Option(
+        None,
+        "--compliance",
+        help=(
+            "Advisory compliance evaluation after scan: eu-ai-act, "
+            "owasp-agentic, nist-ai-rmf, or all (does not change exit code)."
         ),
     ),
 ):
     """Analyzes a Python codebase to generate an AI BOM."""
-    # Configure logging
-    numeric_level = getattr(logging, log_level.upper(), None)
-    if not isinstance(numeric_level, int):
-        logging.error(f"Invalid log level: {log_level}")
-        raise typer.Exit(code=1)
-    
-    # Remove existing handlers and configure root logger
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    logging.basicConfig(level=numeric_level, format='%(levelname)s: %(message)s')
-
     # Validate output format
     if output_format not in _VALID_OUTPUT_FORMATS:
         valid = ", ".join(sorted(_VALID_OUTPUT_FORMATS))
-        logging.error(f"Invalid output format '{output_format}'. Must be one of: {valid}")
+        console.print(f"[red]Invalid output format[/] '{output_format}'. Must be one of: {valid}")
         raise typer.Exit(code=1)
 
     if agentic_scope not in ("candidates", "all"):
@@ -1041,6 +741,16 @@ def analyze(
             f"Invalid --agentic-scope '{agentic_scope}'. Must be: candidates, all"
         )
         raise typer.Exit(code=1)
+
+    if compliance is not None:
+        allowed_cf = frozenset({"eu-ai-act", "owasp-agentic", "nist-ai-rmf", "all"})
+        if compliance.strip().lower() not in allowed_cf:
+            logging.error(
+                "Invalid --compliance %r. Must be one of: %s",
+                compliance,
+                ", ".join(sorted(allowed_cf)),
+            )
+            raise typer.Exit(code=1)
 
     # Validate severity options
     fail_on_severity: Optional[SeverityEnum] = None
@@ -1060,6 +770,7 @@ def analyze(
     if llm_model:
         llm_config = {
             "model": llm_model,
+            "provider": llm_provider,
             "api_key": llm_api_key,
             "api_base": llm_api_base,
             "api_version": llm_api_version,
@@ -1133,10 +844,14 @@ def analyze(
         from .repo_triage import RepoTriager
 
         triage_llm_cfg = {"model": llm_model}
-        if llm_base:
-            triage_llm_cfg["api_base"] = llm_base
-        if llm_key:
-            triage_llm_cfg["api_key"] = llm_key
+        if llm_provider:
+            triage_llm_cfg["provider"] = llm_provider
+        if llm_api_base:
+            triage_llm_cfg["api_base"] = llm_api_base
+        if llm_api_key:
+            triage_llm_cfg["api_key"] = llm_api_key
+        if llm_api_version:
+            triage_llm_cfg["api_version"] = llm_api_version
 
         triager = RepoTriager(llm_config=triage_llm_cfg)
         triage_results = triager.triage_repos(sources_to_process)
@@ -1186,14 +901,6 @@ def analyze(
         "output_format": output_format,
         "sources_requested": len(sources_to_process),
     }
-    db_path: Optional[Path] = None
-    if legacy_mode:
-        try:
-            db_path = ensure_local_database(console=console)
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[bold red]Knowledge base error:[/] {exc}")
-            raise typer.Exit(code=1)
-
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
         explicit_config = load_custom_catalog(Path(custom_catalog))
@@ -1218,7 +925,7 @@ def analyze(
                 continue
             is_container = False
         else:
-            is_container = is_docker_image(source)
+            is_container = is_container_image(source)
             path_to_analyze = Path(source)
 
         source_summary = {
@@ -1238,10 +945,9 @@ def analyze(
 
         if is_container:
             logging.info(f"Source '{source}' detected as a container image.")
-            temp_dir = tempfile.mkdtemp(prefix="aibom_")
-            extract_info = extract_app_from_docker(source, temp_dir)
-            if "error" in extract_info:
-                message = f"Error extracting from Docker image: {extract_info['error']}"
+            extraction = extract_source_from_image(source, llm_config=llm_config, tier=container_tier)
+            if extraction.error or extraction.extracted_dir is None:
+                message = f"Error extracting from container image: {extraction.error or 'unknown'}"
                 logging.error(message)
                 _record_analysis_error(
                     run_errors,
@@ -1250,10 +956,9 @@ def analyze(
                     message,
                     severity="fatal",
                 )
-                if temp_dir:
-                    shutil.rmtree(temp_dir)
                 continue
-            path_to_analyze = Path(extract_info.get("extracted_to", temp_dir))
+            temp_dir = str(extraction.extracted_dir)
+            path_to_analyze = extraction.extracted_dir
 
         if is_container:
             source_summary["source_path"] = "/app" if path_to_analyze.name == "app" else str(path_to_analyze)
@@ -1276,209 +981,151 @@ def analyze(
                 shutil.rmtree(temp_dir)
             continue
 
-        # -----------------------------------------------------------------
-        # v2 path: four-stage pipeline (scan → cross-ref → agentic → assemble)
-        # -----------------------------------------------------------------
-        if not legacy_mode:
-            from .scan_pipeline import ScanPipeline
+        from .scan_pipeline import ScanPipeline
 
-            scan_path = str(path_to_analyze)
+        scan_path = str(path_to_analyze)
 
-            _scan_cache_hit = False
-            if cache_dir:
-                from .scan_cache import cache_key, load_cached, save_cached
+        if incremental and not is_container and (path_to_analyze / ".git").exists():
+            from .incremental import OrgCache
 
-                _ck = cache_key([scan_path])
-                cached = load_cached(cache_dir, _ck)
-                if cached:
-                    _scan_cache_hit = True
-                    console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
-                    all_analysis_outputs[source] = cached
-                    if temp_dir:
-                        shutil.rmtree(temp_dir)
-                    continue
-
-            pipeline = ScanPipeline(
-                scan_paths=[scan_path],
-                output_format=output_format,
-                output_file=str(output_file) if output_file else None,
-                llm_config=llm_config,
-                kb_path=str(db_path) if db_path else None,
-                fail_on=fail_on_severity,
-                min_severity=severity_filter,
-                strict=strict,
-                agentic_scope=agentic_scope,
-                agentic_batch_size=agentic_batch_size,
-                agentic_concurrency=agentic_concurrency,
-                agentic_fast_model=agentic_fast_model,
-            )
-            with console.status(f"[cyan]Scanning {source} (v2 pipeline)"):
-                result = pipeline.run()
-
-            if llm_config and result.agentic_risk_flags:
+            org_cache = OrgCache()
+            cached_sr = org_cache.get_cached(str(path_to_analyze.resolve()))
+            if cached_sr is not None:
                 console.print(
-                    f"  [magenta]Agentic enrichment added "
-                    f"{len(result.agentic_risk_flags)} risk flags[/]"
+                    f"[green]Org cache hit[/] for {source} "
+                    f"(~/.cache/cisco-aibom/org-cache)"
                 )
+                merged_components: list = []
+                merged_rels: list = []
+                for s in cached_sr.sources:
+                    merged_components.extend(s.components)
+                    merged_rels.extend(s.relationships)
+                all_analysis_outputs[source] = {
+                    "_v2": True,
+                    "components": merged_components,
+                    "relationships": merged_rels,
+                    "_agentic_risk_flags": [],
+                    "_agentic_candidate_count": 0,
+                }
+                source_summary["assets_discovered"] = len(merged_components)
+                source_summary["last_generated_at"] = _utcnow_iso()
+                if source_summary["status"] == "in_progress":
+                    source_summary["status"] = "completed"
+                if temp_dir:
+                    shutil.rmtree(temp_dir)
+                continue
 
-            if result.external_deps:
-                escaping = [d for d in result.external_deps if d.escapes_root]
-                if escaping:
-                    lines = [
-                        f"[yellow bold]{len(escaping)} dependency(ies) reference "
-                        f"repos not included in this scan:[/]\n"
-                    ]
-                    for d in escaping[:10]:
-                        label = d.name or d.url_or_path
-                        lines.append(
-                            f"  • [bold]{label}[/] ({d.dep_type}) "
-                            f"from {Path(d.source_file).name}"
-                        )
-                    if len(escaping) > 10:
-                        lines.append(f"  … and {len(escaping) - 10} more")
+        _scan_cache_hit = False
+        if cache_dir:
+            from .scan_cache import cache_key, load_cached, save_cached
+
+            _ck = cache_key([scan_path])
+            cached = load_cached(cache_dir, _ck)
+            if cached:
+                _scan_cache_hit = True
+                console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
+                all_analysis_outputs[source] = cached
+                if temp_dir:
+                    shutil.rmtree(temp_dir)
+                continue
+
+        pipeline = ScanPipeline(
+            scan_paths=[scan_path],
+            output_format=output_format,
+            output_file=str(output_file) if output_file else None,
+            llm_config=llm_config,
+            fail_on=fail_on_severity,
+            min_severity=severity_filter,
+            strict=strict,
+            agentic_scope=agentic_scope,
+            agentic_batch_size=agentic_batch_size,
+            agentic_concurrency=agentic_concurrency,
+            agentic_fast_model=agentic_fast_model,
+            agentic_timeout=agentic_timeout,
+        )
+        with console.status(f"[cyan]Scanning {source}"):
+            result = pipeline.run()
+
+        if llm_config and result.agentic_risk_flags:
+            console.print(
+                f"  [magenta]Agentic enrichment added "
+                f"{len(result.agentic_risk_flags)} risk flags[/]"
+            )
+
+        if result.external_deps:
+            escaping = [d for d in result.external_deps if d.escapes_root]
+            if escaping:
+                lines = [
+                    f"[yellow bold]{len(escaping)} dependency(ies) reference "
+                    f"repos not included in this scan:[/]\n"
+                ]
+                for d in escaping[:10]:
+                    label = d.name or d.url_or_path
                     lines.append(
-                        "\n[dim]Include these repos in your scan for "
-                        "better cross-reference resolution.[/]"
+                        f"  • [bold]{label}[/] ({d.dep_type}) "
+                        f"from {Path(d.source_file).name}"
                     )
-                    console.print(Panel(
-                        "\n".join(lines),
-                        title="[bold]Missing Repositories[/]",
-                        border_style="yellow",
-                    ))
+                if len(escaping) > 10:
+                    lines.append(f"  … and {len(escaping) - 10} more")
+                lines.append(
+                    "\n[dim]Include these repos in your scan for "
+                    "better cross-reference resolution.[/]"
+                )
+                console.print(Panel(
+                    "\n".join(lines),
+                    title="[bold]Missing Repositories[/]",
+                    border_style="yellow",
+                ))
 
-            if timing and result.timings:
-                _print_timing_table(console, result)
+        if timing and result.timings:
+            _print_timing_table(console, result)
 
-            output_data: dict[str, Any] = {
+        output_data: dict[str, Any] = {
+            "_v2": True,
+            "components": result.components,
+            "relationships": result.relationships,
+            "_agentic_risk_flags": result.agentic_risk_flags,
+            "_agentic_candidate_count": result.agentic_candidate_count,
+        }
+        all_analysis_outputs[source] = output_data
+
+        if cache_dir and not _scan_cache_hit:
+            from .scan_cache import cache_key, save_cached
+
+            _ck = cache_key([scan_path])
+            _serializable = {
                 "_v2": True,
-                "components": result.components,
-                "relationships": result.relationships,
-                "_agentic_risk_flags": result.agentic_risk_flags,
+                "components": [c.model_dump(mode="json") for c in result.components],
+                "relationships": [r.model_dump(mode="json") for r in result.relationships],
+                "_agentic_risk_flags": [
+                    f.model_dump(mode="json") if hasattr(f, "model_dump") else str(f)
+                    for f in result.agentic_risk_flags
+                ],
                 "_agentic_candidate_count": result.agentic_candidate_count,
             }
-            all_analysis_outputs[source] = output_data
+            save_cached(cache_dir, _ck, _serializable)
 
-            if cache_dir and not _scan_cache_hit:
-                from .scan_cache import cache_key, save_cached
+        if incremental and not is_container and (path_to_analyze / ".git").exists():
+            from .incremental import OrgCache
+            from .models import ScanResult, SourceResult
 
-                _ck = cache_key([scan_path])
-                _serializable = {
-                    "_v2": True,
-                    "components": [c.model_dump(mode="json") for c in result.components],
-                    "relationships": [r.model_dump(mode="json") for r in result.relationships],
-                    "_agentic_risk_flags": [
-                        f.model_dump(mode="json") if hasattr(f, "model_dump") else str(f)
-                        for f in result.agentic_risk_flags
+            org_cache = OrgCache()
+            org_cache.store(
+                str(path_to_analyze.resolve()),
+                ScanResult(
+                    metadata=run_metadata,
+                    sources=[
+                        SourceResult(
+                            path=scan_path,
+                            components=result.components,
+                            relationships=result.relationships,
+                        )
                     ],
-                    "_agentic_candidate_count": result.agentic_candidate_count,
-                }
-                save_cached(cache_dir, _ck, _serializable)
-
-            source_summary["assets_discovered"] = len(result.components)
-            source_summary["last_generated_at"] = _utcnow_iso()
-            if source_summary["status"] == "in_progress":
-                source_summary["status"] = "completed"
-
-            if temp_dir:
-                shutil.rmtree(temp_dir)
-            continue
-
-        # -----------------------------------------------------------------
-        # Legacy path: KB-driven symbol matching (v1)
-        # -----------------------------------------------------------------
-        python_files = _find_python_files(path_to_analyze)
-        if not python_files:
-            logging.warning("No Python files found to analyze in this source.")
-            source_summary["status"] = "skipped"
-            source_summary["status_detail"] = "no_python_files"
-            if temp_dir:
-                shutil.rmtree(temp_dir)
-            continue
-
-        py_count = sum(1 for f in python_files if f.suffix == ".py")
-        nb_count = sum(1 for f in python_files if f.suffix == ".ipynb")
-        logging.info(f"Found {py_count} Python file(s) and {nb_count} notebook(s) to analyze...")
-
-        analysis_results: List[CodeAnalysisResult] = []
-
-        config_root = path_to_analyze if path_to_analyze.is_dir() else path_to_analyze.parent
-        config_results = parse_project_configs(config_root)
-        analysis_results.extend(config_results)
-
-        with Progress(
-            SpinnerColumn(),
-            "[progress.description]{task.description}",
-            TimeElapsedColumn(),
-            transient=True,
-        ) as progress:
-            task_id = progress.add_task(f"[cyan]Parsing {source}", total=len(python_files))
-            for py_file in python_files:
-                try:
-                    if py_file.suffix == ".ipynb":
-                        source_code = extract_code_from_notebook(py_file)
-                        if not source_code.strip():
-                            continue
-                    else:
-                        with open(py_file, "r", encoding="utf-8") as f:
-                            source_code = f.read()
-                    result = parse_source_code(str(py_file), source_code)
-                    analysis_results.append(result)
-                except Exception as e:
-                    logging.warning(f"Could not parse {py_file}. Error: {e}")
-                    _record_analysis_error(
-                        run_errors,
-                        source_summary,
-                        source,
-                        f"Could not parse {py_file}: {e}",
-                        file_path=str(py_file),
-                    )
-                finally:
-                    progress.advance(task_id)
-
-        workflow_index = None
-        try:
-            with console.status(f"[green]Building workflow index for {source}"):
-                workflow_index = build_workflow_index(python_files)
-        except Exception as workflow_error:
-            logging.debug(f"Failed to build workflow index: {workflow_error}")
-
-        config_root = path_to_analyze if path_to_analyze.is_dir() else path_to_analyze.parent
-        source_custom: Optional[CustomCatalogConfig] = explicit_config
-        if source_custom is None:
-            discovered = discover_custom_catalog(config_root)
-            source_custom = load_custom_catalog(discovered) if discovered else None
-
-        with CatalogDB(db_path) as connector:
-            if source_custom and not source_custom.is_empty:
-                connector.add_custom_entries(
-                    [comp.to_catalog_dict() for comp in source_custom.components]
-                )
-                if source_custom.excludes:
-                    connector.add_excludes(source_custom.excludes)
-                n_comp = len(source_custom.components)
-                n_base = len(source_custom.base_class_rules)
-                n_excl = len(source_custom.excludes)
-                n_rel = len(source_custom.custom_relationships)
-                console.print(
-                    f"[dim]Custom catalog: {n_comp} component(s), {n_base} base-class rule(s), "
-                    f"{n_excl} exclude(s), {n_rel} custom relationship(s)[/]"
-                )
-
-            analysis_output = categorize_symbols(
-                analysis_results,
-                connector,
-                llm_config,
-                workflow_index,
-                custom_config=source_custom,
+                    errors=[],
+                ),
             )
 
-        if is_container and temp_dir:
-            analysis_output = _convert_paths_in_output(analysis_output, temp_dir)
-
-        all_analysis_outputs[source] = analysis_output
-        categorized_components = getattr(analysis_output, "components", analysis_output)
-        total_components = sum(len(items or []) for items in categorized_components.values())
-        source_summary["assets_discovered"] = total_components
+        source_summary["assets_discovered"] = len(result.components)
         source_summary["last_generated_at"] = _utcnow_iso()
         if source_summary["status"] == "in_progress":
             source_summary["status"] = "completed"
@@ -1538,107 +1185,141 @@ def analyze(
     report_data = None
     reporter = get_reporter(output_format)
 
-    has_v2_output = any(
-        isinstance(o, dict) and o.get("_v2")
-        for o in all_analysis_outputs.values()
+    from .models import (
+        AIComponent as V2Component,
+        AIComponentType,
+        ComponentRelationship as V2Relationship,
+        ScanResult,
+        SourceResult,
+    )
+    from .risk import RiskScorer
+
+    v2_sources = []
+    for source_path, output in all_analysis_outputs.items():
+        if isinstance(output, dict) and output.get("_v2"):
+            v2_sources.append(SourceResult(
+                path=source_path,
+                components=output["components"],
+                relationships=output["relationships"],
+            ))
+    scan_result = ScanResult(
+        metadata=run_metadata,
+        sources=v2_sources,
+        errors=[e.get("message", str(e)) for e in run_errors],
     )
 
-    if has_v2_output or (reporter and output_format not in ("json", "plaintext")):
-        from .models import (
-            AIComponent as V2Component,
-            AIComponentType,
-            ComponentRelationship as V2Relationship,
-            ScanResult,
-            SourceResult,
-        )
-        from .risk import RiskScorer
+    scorer = RiskScorer()
+    scan_result.risk = scorer.score(scan_result)
 
-        if has_v2_output:
-            v2_sources = []
-            for source_path, output in all_analysis_outputs.items():
-                if isinstance(output, dict) and output.get("_v2"):
-                    v2_sources.append(SourceResult(
-                        path=source_path,
-                        components=output["components"],
-                        relationships=output["relationships"],
-                    ))
-                else:
-                    legacy_sr = _build_scan_result(
-                        {source_path: output}, run_metadata, [],
-                    )
-                    v2_sources.extend(legacy_sr.sources)
-            scan_result = ScanResult(
-                metadata=run_metadata,
-                sources=v2_sources,
-                errors=[e.get("message", str(e)) for e in run_errors],
+    for output in all_analysis_outputs.values():
+        if isinstance(output, dict):
+            for rf in output.get("_agentic_risk_flags", []):
+                scan_result.risk.add_flag(rf)
+
+    if compliance:
+        from .compliance import ComplianceFramework, evaluate_compliance, parse_compliance_cli_value
+
+        parsed = parse_compliance_cli_value(compliance)
+        frameworks = list(ComplianceFramework) if parsed == "all" else [parsed]
+        for fw in frameworks:
+            report = evaluate_compliance(scan_result, fw)
+            ctable = Table(
+                title=f"Compliance — {fw.value}",
+                box=box.MINIMAL_DOUBLE_HEAD,
+                header_style="bold cyan",
             )
-        else:
-            scan_result = _build_scan_result(
-                all_analysis_outputs, run_metadata, run_errors,
+            ctable.add_column("ID", style="dim")
+            ctable.add_column("Requirement")
+            ctable.add_column("Status")
+            ctable.add_column("Detail")
+            for row in report.results:
+                st = row.status
+                st_style = "green" if st == "pass" else "yellow" if st == "not_applicable" else "red"
+                ctable.add_row(
+                    row.requirement_id,
+                    row.title,
+                    f"[{st_style}]{st}[/{st_style}]",
+                    row.message,
+                )
+            console.print(ctable)
+            summ = report.summary
+            sum_table = Table(box=box.SIMPLE, title=f"Summary — {fw.value}")
+            sum_table.add_column("Metric")
+            sum_table.add_column("Value", justify="right")
+            sum_table.add_row("Total requirements", str(summ["total_requirements"]))
+            sum_table.add_row("Passed", str(summ["passed"]))
+            sum_table.add_row("Failed", str(summ["failed"]))
+            sum_table.add_row("Not applicable", str(summ["not_applicable"]))
+            sum_table.add_row("Coverage %", f"{summ['coverage_pct']:.1f}")
+            console.print(sum_table)
+
+    if policy:
+        from .policy import evaluate_policy, load_policy
+
+        pol = load_policy(Path(policy))
+        pr = evaluate_policy(pol, scan_result)
+        if pr.violations:
+            vtable = Table(
+                "Rule",
+                "Severity",
+                "Message",
+                title="Policy violations",
+                header_style="bold red",
+                box=box.MINIMAL_DOUBLE_HEAD,
             )
+            for v in pr.violations:
+                extra = ""
+                if v.component_name:
+                    extra = f" ({v.component_name})"
+                if v.file_path:
+                    extra += f" @ {v.file_path}"
+                vtable.add_row(
+                    v.rule,
+                    v.severity.value,
+                    v.message + extra,
+                )
+            console.print(vtable)
+        if not pr.passed:
+            console.print("[bold red]Policy check failed.[/]")
+            raise typer.Exit(code=1)
 
-        scorer = RiskScorer()
-        scan_result.risk = scorer.score(scan_result)
+    if not reporter:
+        reporter = get_reporter(output_format)
 
-        for output in all_analysis_outputs.values():
-            if isinstance(output, dict):
-                for rf in output.get("_agentic_risk_flags", []):
-                    scan_result.risk.add_flag(rf)
-
-        if not reporter:
-            reporter = get_reporter(output_format)
-
-        if reporter:
-            if validate:
-                errors = reporter.validate(scan_result)
-                if errors:
-                    for err in errors:
-                        console.print(f"[yellow]Validation: {err}[/]")
-                else:
-                    console.print("[green]Validation passed.[/]")
-
-            if output_file:
-                import io
-                buf = io.StringIO()
-                reporter.render(scan_result, buf)
-                output_file.write_text(buf.getvalue(), encoding="utf-8")
-                console.print(f"[green]Report written to {output_file}[/]")
+    if reporter:
+        if validate:
+            errors = reporter.validate(scan_result)
+            if errors:
+                for err in errors:
+                    console.print(f"[yellow]Validation: {err}[/]")
             else:
-                import sys
-                reporter.render(scan_result, sys.stdout)
-        elif output_format == "json":
+                console.print("[green]Validation passed.[/]")
+
+        if output_file:
             import io
-            json_rep = get_reporter("json")
-            if json_rep and output_file:
-                buf = io.StringIO()
-                json_rep.render(scan_result, buf)
-                output_file.write_text(buf.getvalue(), encoding="utf-8")
-                console.print(f"[green]Report written to {output_file}[/]")
-        elif output_format == "plaintext":
-            plaintext_rep = get_reporter("plaintext")
-            if plaintext_rep and output_file:
-                import io
-                buf = io.StringIO()
-                plaintext_rep.render(scan_result, buf)
-                output_file.write_text(buf.getvalue(), encoding="utf-8")
-                console.print(f"[green]Report written to {output_file}[/]")
+            buf = io.StringIO()
+            reporter.render(scan_result, buf)
+            output_file.write_text(buf.getvalue(), encoding="utf-8")
+            console.print(f"[green]Report written to {output_file}[/]")
+        else:
+            import sys
+            reporter.render(scan_result, sys.stdout)
 
-        if fail_on_severity and scorer.should_fail(scan_result.risk, fail_on_severity):
-            console.print(
-                f"[bold red]Risk threshold exceeded: {scan_result.risk.severity.value} "
-                f">= {fail_on_severity.value}[/]"
-            )
-            raise typer.Exit(code=2)
-
-    elif output_format == "json":
-        report_data = _generate_json_report(
-            all_analysis_outputs,
-            output_file,
-            metadata=run_metadata,
-            source_summaries=source_outcomes,
-            run_errors=run_errors,
+    if fail_on_severity and scorer.should_fail(scan_result.risk, fail_on_severity):
+        console.print(
+            f"[bold red]Risk threshold exceeded: {scan_result.risk.severity.value} "
+            f">= {fail_on_severity.value}[/]"
         )
-        if post_url:
+        raise typer.Exit(code=2)
+
+    if post_url and output_format == "json":
+        import io as _io
+
+        json_rep = get_reporter("json")
+        if json_rep:
+            buf = _io.StringIO()
+            json_rep.render(scan_result, buf)
+            report_data = json.loads(buf.getvalue())
             try:
                 submission_payload = _build_submission_payload(report_data, source_outcomes)
                 logging.info("Sending report")
@@ -1653,14 +1334,13 @@ def analyze(
             except Exception as exc:  # noqa: BLE001
                 logging.error("Failed to POST report: %s", exc)
                 raise typer.Exit(code=1)
-    elif output_format == "api":
+
+    if output_format == "api":
         logging.info("--- Starting API Server ---")
         component_map = {
             source: getattr(output, "components", output) for source, output in all_analysis_outputs.items()
         }
         start_api_server(component_map)
-    else:  # plaintext
-        _generate_plaintext_report(all_analysis_outputs, output_file)
 
     for cm in clone_managers:
         cm.__exit__(None, None, None)
@@ -1688,6 +1368,120 @@ def analyze(
     if show_summary:
         _display_analysis_summary(all_analysis_outputs)
 
+
+@app.command("watch")
+def watch_command(
+    sources: List[str] = typer.Argument(
+        ...,
+        help="Source directories or files to poll and re-scan (v2 pipeline).",
+    ),
+    interval: float = typer.Option(
+        2.0,
+        "--interval",
+        help="Seconds between filesystem polls.",
+    ),
+    debounce: float = typer.Option(
+        0.5,
+        "--debounce",
+        help="Seconds to wait after a change before re-scanning (coalesces rapid edits).",
+    ),
+) -> None:
+    """Poll paths for changes and re-run the v2 scan, printing component deltas."""
+    resolved = [str(Path(s).resolve()) for s in sources]
+    for p in resolved:
+        if not Path(p).exists():
+            console.print(f"[red]Path not found:[/] {p}")
+            raise typer.Exit(code=1)
+
+    from .scan_pipeline import ScanPipeline
+    from .watch import watch_loop
+
+    def scan_fn() -> object:
+        pipeline = ScanPipeline(scan_paths=resolved, output_format="json")
+        return pipeline.run()
+
+    try:
+        watch_loop(
+            sources,
+            scan_fn,
+            console=console,
+            interval=interval,
+            debounce=debounce,
+        )
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped.[/]")
+
+
+benchmark_app = typer.Typer(
+    help="Compare scan output against ground-truth YAML.",
+    no_args_is_help=True,
+)
+app.add_typer(benchmark_app, name="benchmark")
+
+
+@benchmark_app.command("run")
+def benchmark_run(
+    gt: Path = typer.Option(
+        ...,
+        "--gt",
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Ground-truth YAML file.",
+    ),
+    scan: Path = typer.Option(
+        ...,
+        "--scan",
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Scan report JSON (ScanResult or legacy aibom_analysis wrapper).",
+    ),
+    strict_names: bool = typer.Option(
+        False,
+        "--strict-names",
+        help="Match listed names (case-insensitive) when GT provides names.",
+    ),
+    fmt: str = typer.Option(
+        "table",
+        "--format",
+        help="Output: table, json, or csv.",
+    ),
+) -> None:
+    from pydantic import ValidationError
+
+    from .benchmark import benchmark_scan, load_ground_truth, render_benchmark_result
+    from .diff import load_scan_result_json
+
+    try:
+        ground = load_ground_truth(gt)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Failed to load ground truth:[/] {exc}")
+        raise typer.Exit(code=1)
+
+    try:
+        scan_result = load_scan_result_json(scan)
+    except json.JSONDecodeError as exc:
+        console.print(f"[red]Invalid JSON:[/] {exc}")
+        raise typer.Exit(code=1)
+    except ValidationError as exc:
+        console.print(f"[red]Invalid scan report:[/] {exc}")
+        raise typer.Exit(code=1)
+    except OSError as exc:
+        console.print(f"[red]Failed to read scan:[/] {exc}")
+        raise typer.Exit(code=1)
+
+    allowed = {"table", "json", "csv"}
+    if fmt.lower() not in allowed:
+        console.print(f"[red]Invalid --format {fmt!r}.[/] Use: {', '.join(sorted(allowed))}")
+        raise typer.Exit(code=1)
+
+    result = benchmark_scan(ground, scan_result, strict_names=strict_names)
+    render_benchmark_result(result, fmt.lower(), console=console)
+
+
 kb_app = typer.Typer(help="Manage the AIBOM knowledge base.", no_args_is_help=True)
 app.add_typer(kb_app, name="kb")
 
@@ -1707,12 +1501,28 @@ def cache_clear(
         "--cache-dir",
         help="Directory where cached scan results are stored.",
     ),
+    include_agentic: bool = typer.Option(
+        True,
+        "--include-agentic/--no-agentic",
+        help="Also clear the agentic enrichment result cache.",
+    ),
 ) -> None:
-    """Remove all cached scan results."""
+    """Remove all cached scan results (and optionally agentic results)."""
+    import shutil
+
     from .scan_cache import clear_cache as _clear
 
     removed = _clear(cache_dir)
     console.print(f"[green]Removed {removed} cached scan result(s) from {cache_dir}[/]")
+
+    if include_agentic:
+        agentic_dir = Path.home() / ".cache" / "cisco-aibom" / "agentic"
+        if agentic_dir.exists():
+            count = sum(1 for _ in agentic_dir.glob("*.json"))
+            shutil.rmtree(agentic_dir)
+            console.print(f"[green]Removed {count} agentic cache file(s) from {agentic_dir}[/]")
+        else:
+            console.print("[dim]No agentic cache to clear.[/]")
 
 
 @cache_app.command("list")
@@ -1748,6 +1558,72 @@ def cache_list(
 
 plugin_app = typer.Typer(help="Discover and manage AIBOM plugins.", no_args_is_help=True)
 app.add_typer(plugin_app, name="plugin")
+
+def _diff_impl(old_report: Path, new_report: Path, fmt: str) -> None:
+    allowed = {"table", "json", "markdown"}
+    if fmt.lower() not in allowed:
+        console.print(
+            f"[red]Invalid --format {fmt!r}.[/] "
+            "Use: table, json, markdown.",
+        )
+        raise typer.Exit(code=1)
+    from pydantic import ValidationError
+
+    from .diff import diff_scan_results, load_scan_result_json, render_diff
+
+    try:
+        old_sr = load_scan_result_json(old_report)
+        new_sr = load_scan_result_json(new_report)
+    except json.JSONDecodeError as exc:
+        console.print(f"[red]Invalid JSON:[/] {exc}")
+        raise typer.Exit(code=1)
+    except ValidationError as exc:
+        console.print(f"[red]Invalid report structure:[/] {exc}")
+        raise typer.Exit(code=1)
+    except OSError as exc:
+        console.print(f"[red]Failed to read report:[/] {exc}")
+        raise typer.Exit(code=1)
+
+    result = diff_scan_results(old_sr, new_sr)
+    try:
+        render_diff(result, fmt, console)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+
+
+diff_app = typer.Typer(
+    help="Compare two AIBOM JSON scan reports.",
+    no_args_is_help=True,
+)
+app.add_typer(diff_app, name="diff")
+
+
+@diff_app.command("run")
+def diff_run(
+    old_report: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        help="Path to the older JSON report.",
+    ),
+    new_report: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        help="Path to the newer JSON report.",
+    ),
+    fmt: str = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        help="Output format: table, json, or markdown.",
+    ),
+) -> None:
+    """Compare reports; use when you need ``--format`` after the report paths (Typer quirk)."""
+    _diff_impl(old_report, new_report, fmt)
 
 
 @plugin_app.command("list")

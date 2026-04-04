@@ -39,6 +39,7 @@ from .cross_ref import (
     resolve_components,
 )
 from .models import ScanContext
+from .models.enums import AIComponentType
 from .models.scan import AIComponent, ComponentRelationship
 from .scanners import run_scanners
 from .scanners.file_cache import cache_stats, clear_cache
@@ -175,6 +176,122 @@ def _consolidate_components(
     return result
 
 
+def _vector_store_technology(c: "AIComponent") -> str | None:
+    if c.component_type != AIComponentType.VECTOR_STORE:
+        return None
+    name_l = (c.model_name or c.name or "").lower()
+    if "weaviate" in name_l:
+        return "weaviate"
+    if "pinecone" in name_l:
+        return "pinecone"
+    if "chroma" in name_l:
+        return "chromadb"
+    if "milvus" in name_l:
+        return "milvus"
+    if "qdrant" in name_l:
+        return "qdrant"
+    if "faiss" in name_l:
+        return "faiss"
+    if "pgvector" in name_l:
+        return "pgvector"
+    if "redis" in name_l:
+        return "redis"
+    return None
+
+
+def _consolidate_vector_stores(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    from collections import OrderedDict
+
+    tech_groups: OrderedDict[str, list["AIComponent"]] = OrderedDict()
+    rest: list["AIComponent"] = []
+
+    for c in components:
+        tech = _vector_store_technology(c)
+        if tech is None:
+            rest.append(c)
+        else:
+            tech_groups.setdefault(tech, []).append(c)
+
+    merged: list["AIComponent"] = list(rest)
+
+    for tech, group in tech_groups.items():
+        if len(group) == 1:
+            c = group[0]
+            meta = dict(c.metadata)
+            meta["store_technology"] = tech
+            merged.append(c.model_copy(update={"metadata": meta}))
+            continue
+
+        best = max(group, key=lambda c: (c.confidence, -c.line_number))
+        seen: set[tuple[str, int]] = set()
+        evidence: list[dict[str, Any]] = []
+
+        def _add_evidence_entry(
+            file_path: str,
+            line_number: int,
+            *,
+            test_only: bool | None = None,
+        ) -> None:
+            if test_only is None:
+                test_only = _is_test_file(file_path)
+            key = (file_path, line_number)
+            if key in seen:
+                return
+            seen.add(key)
+            evidence.append({
+                "file": file_path,
+                "line": line_number,
+                "service": _service_dir(file_path),
+                "test_only": test_only,
+            })
+
+        def _merge_prior_evidence(meta: dict[str, Any]) -> None:
+            for ev in meta.get("evidence") or []:
+                if not isinstance(ev, dict):
+                    continue
+                fp = str(ev.get("file", ""))
+                ln = int(ev.get("line", 0) or 0)
+                t = ev.get("test_only")
+                if isinstance(t, bool):
+                    _add_evidence_entry(fp, ln, test_only=t)
+                else:
+                    _add_evidence_entry(fp, ln)
+
+        _merge_prior_evidence(dict(best.metadata))
+
+        for c in group:
+            if c is best:
+                continue
+            _add_evidence_entry(c.file_path, c.line_number)
+            _merge_prior_evidence(dict(c.metadata))
+
+        best_key = (best.file_path, best.line_number)
+        merged_evidence = [
+            ev for ev in evidence
+            if (str(ev.get("file", "")), int(ev.get("line", 0) or 0)) != best_key
+        ]
+
+        merged_meta = dict(best.metadata)
+        merged_meta["evidence"] = merged_evidence
+        merged_meta["consolidated_count"] = len(group)
+        merged_meta["store_technology"] = tech
+
+        all_test = all(_is_test_file(c.file_path) for c in group)
+        if all_test:
+            merged_meta["test_only"] = True
+
+        needs = any(c.needs_agentic for c in group)
+
+        merged.append(best.model_copy(update={
+            "metadata": merged_meta,
+            "needs_agentic": needs,
+        }))
+
+    return merged
+
+
 class ScanPipeline:
     """Four-stage v2 scan pipeline wired into a single ``run()`` call."""
 
@@ -194,6 +311,7 @@ class ScanPipeline:
         agentic_batch_size: int = 5,
         agentic_concurrency: int = 1,
         agentic_fast_model: str | None = None,
+        agentic_timeout: int = 120,
     ) -> None:
         self.scan_paths = scan_paths
         self.output_format = output_format
@@ -208,6 +326,7 @@ class ScanPipeline:
         self.agentic_batch_size = agentic_batch_size
         self.agentic_concurrency = agentic_concurrency
         self.agentic_fast_model = agentic_fast_model
+        self.agentic_timeout = agentic_timeout
 
     def run(self) -> PipelineResult:
         clear_cache()
@@ -419,6 +538,7 @@ class ScanPipeline:
                 batch_size=self.agentic_batch_size,
                 max_concurrent=self.agentic_concurrency,
                 fast_model=self.agentic_fast_model,
+                timeout_s=self.agentic_timeout,
             )
             relationships = relationships + agentic_rels
 
@@ -450,6 +570,15 @@ class ScanPipeline:
             _LOGGER.info(
                 "Consolidation: %d → %d components (-%d duplicates)",
                 before, after, before - after,
+            )
+
+        before_vs = len(components)
+        components = _consolidate_vector_stores(components)
+        after_vs = len(components)
+        if before_vs != after_vs:
+            _LOGGER.info(
+                "Vector store dedup: %d → %d components (-%d)",
+                before_vs, after_vs, before_vs - after_vs,
             )
 
         agentic_count = sum(1 for c in components if c.needs_agentic)

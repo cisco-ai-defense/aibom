@@ -1,0 +1,33 @@
+# docker-compose.yml — local dev/testing for cisco-aibom Docker images.
+# NOT for production. Images are NOT pushed from here.
+#
+# Usage:
+#   docker compose build              # build both variants
+#   docker compose run base analyze /workspace -o json
+#   docker compose run agentic analyze /workspace --llm-model anthropic/claude-sonnet-4-20250514
+
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ${SCAN_DIR:-.}:/workspace:ro
+    working_dir: /workspace
+
+  agentic:
+    build:
+      context: .
+      dockerfile: Dockerfile.agentic
+    volumes:
+      - ${SCAN_DIR:-.}:/workspace:ro
+    working_dir: /workspace
+    environment:
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AWS_DEFAULT_REGION
+      - AZURE_OPENAI_API_KEY
+      - AZURE_OPENAI_ENDPOINT
