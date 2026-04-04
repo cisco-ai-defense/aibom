@@ -4,41 +4,54 @@
 [![Cisco AI Defense](https://img.shields.io/badge/Cisco-AI%20Defense-049fd9?logo=cisco&logoColor=white)](https://www.cisco.com/site/us/en/products/security/ai-defense/index.html)
 [![AI Security and Safety Framework](https://img.shields.io/badge/AI%20Security-Framework-orange)](https://learn-cloudsecurity.cisco.com/ai-security-framework)
 
-The AI BOM tool scans codebases and container images to inventory AI framework components (models, agents, tools, prompts, and more). It currently parses Python source code, resolves fully qualified symbols, and matches them against a DuckDB catalog to produce an AI bill of materials (AI BOM). Optional LLM enrichment extracts model names, and a workflow pass annotates components with call-path context.
+Cisco AI BOM scans codebases, container images, and cloud environments to produce an AI Bill of Materials — a structured inventory of models, agents, tools, MCP servers/clients, datasets, prompts, guardrails, secrets, and other AI assets used in your software. It supports Python, JavaScript/TypeScript, Java, Go, Rust, Ruby, C#, and PHP, with deterministic detection, cross-reference resolution, and optional LLM-powered agentic enrichment.
 
 ## Table of Contents
 
 - [Features](#features)
 - [Repository Layout](#repository-layout)
 - [Installation](#installation)
-- [Knowledge Base Configuration](#knowledge-base-configuration)
-- [Usage](#usage)
-- [Custom Catalog](#custom-catalog)
-- [Testing](#testing)
+- [Quick Start](#quick-start)
+- [Commands](#commands)
+- [Agentic Enrichment](#agentic-enrichment)
+- [Container Scanning](#container-scanning)
+- [Cross-Repo and Org Scanning](#cross-repo-and-org-scanning)
 - [Output Formats](#output-formats)
-- [API Mode](#api-mode)
-- [Technical Details](#technical-details)
+- [Custom Catalog](#custom-catalog)
+- [Policy Engine](#policy-engine)
+- [Knowledge Base](#knowledge-base)
+- [Environment Variables](#environment-variables)
+- [Docker](#docker)
+- [Testing](#testing)
+- [Further Reading](#further-reading)
 - [Troubleshooting](#troubleshooting)
 
 ## Features
 
-- **Static Python analysis:** Uses `libcst` to capture assignments, decorators, type annotations, context managers, class definitions, and inline annotations.
-- **Container image scanning:** Extracts `/app` from Docker images when available, otherwise scans `site-packages`.
-- **DuckDB catalog matching:** Maps fully qualified symbols to curated component categories.
-- **Custom catalog:** Users can register custom AI components, base-class detection rules, exclude patterns, relationship hints, and custom relationship types via a `.aibom.yaml` configuration file.
-- **Inline annotations:** Tag classes and functions directly in source code with `# aibom: concept=...` comments for instant recognition.
-- **Base class detection:** Automatically categorize classes that inherit from specified base classes.
-- **Workflow context:** Builds a lightweight call graph to show which workflows reach each component.
-- **Derived relationships:** Infers `USES_TOOL`, `USES_LLM`, `USES_MEMORY`, `USES_RETRIEVER`, `USES_EMBEDDING`, and user-defined relationship links from component arguments.
-- **Optional LLM enrichment:** Uses `litellm` to extract model/embedding names from code snippets.
-- **Multiple outputs:** Plaintext, JSON, or a FastAPI API server.
-- **Report submission:** Optional POST of the JSON report with retries.
+- **Multi-language analysis** — Python (LibCST), JavaScript/TypeScript, Java, Go, Rust, Ruby, C#, PHP (tree-sitter).
+- **21 built-in scanners** — model detection, dependency analysis, secret detection, vulnerability scanning (OSV.dev), MCP server/client detection, ML lifecycle detection, cloud resource scanning, CI/CD pipeline analysis, deployment detection, container scanning, data-file scanning, environment variable resolution, KB enrichment, and more.
+- **24 AI component types** — `model`, `agent`, `tool`, `mcp_server`, `mcp_client`, `embedding`, `vector_store`, `dataset`, `prompt`, `guardrail`, `memory`, `retriever`, `training_run`, `hyperparameter`, `model_artifact`, `experiment_tracker`, `model_registry`, `data_versioning`, `ml_pipeline`, `skill`, `observability`, `secret`, `dependency`, `other`.
+- **Three-tier detection** — Tier 1 (deterministic high-confidence), Tier 2 (cross-reference resolution), Tier 3 (agentic LLM reasoning).
+- **10 output formats** — Plaintext, JSON, CycloneDX, SARIF, SPDX, HTML dashboard, Markdown, CSV, JUnit, and a live API server.
+- **Container image scanning** — Extract and analyze application source code from Docker, Podman, nerdctl, Buildah, Skopeo, Crane, or Undock images, with Anchore Syft for SBOM metadata.
+- **Cross-repo and org-level scanning** — Scan multiple local repos, GitHub orgs, GitLab groups, or Bitbucket projects, with incremental caching.
+- **Agentic enrichment** — Optional LLM pass (via Deep Agents + LangChain) to resolve ambiguous detections, extract model names, and classify uncertain components.
+- **Policy engine** — YAML-driven pass/fail gates for CI/CD integration (max-risk, required fields, blocked/required component types).
+- **Compliance checks** — EU AI Act, OWASP Agentic Top 10, NIST AI RMF advisory mappings.
+- **Watch mode** — Real-time file-system monitoring with debounced re-scan and delta reporting.
+- **Diff command** — Compare two AIBOM JSON snapshots side-by-side.
+- **Benchmark command** — Measure precision/recall/F1 against a labelled ground-truth file.
+- **Secret detection** — Integrated Yelp `detect-secrets` for hardcoded API keys, tokens, and credentials.
+- **Vulnerability scanning** — OSV.dev API lookups for known CVEs in detected dependencies.
+- **Plugin system** — Extend with custom scanners and reporters via Python entry points.
+- **Custom catalog** — Register custom AI components, base-class rules, excludes, and relationships via `.aibom.yaml`.
+- **Knowledge base** — Curated DuckDB catalog of AI framework symbols with download, verification, and versioned updates.
 
 ## Repository Layout
 
 ```
 aibom/   # Python analyzer package + CLI
-docs/    # API documentation
+docs/    # Documentation (CLI reference, guides, API docs)
 ```
 
 ## Installation
@@ -46,332 +59,351 @@ docs/    # API documentation
 ### Prerequisites
 
 - Python 3.11+
-- uv (Python package manager, recommended)
-- Docker (optional, for container image analysis)
-- LLM provider API key (optional, for model extraction)
+- [uv](https://github.com/astral-sh/uv) (Python package manager)
+- Docker / Podman (optional, for container image analysis)
+- LLM provider credentials (optional, for agentic enrichment)
 
-### Installing as a CLI tool
+### Install from PyPI
 
 ```bash
-# Install uv
+# Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
-# or: brew install uv
 
+# Core CLI
 uv tool install --python 3.13 cisco-aibom
 
-# Verify installation
+# With agentic enrichment (OpenAI / Azure OpenAI)
+uv tool install --python 3.13 "cisco-aibom[agentic,llm-openai]"
+
+# With agentic enrichment (AWS Bedrock)
+uv tool install --python 3.13 "cisco-aibom[agentic,llm-aws]"
+
+# Everything
+uv tool install --python 3.13 "cisco-aibom[all]"
+
+# Verify
 cisco-aibom --help
 ```
 
-Alternatively, install from source:
+### Install from source
 
 ```bash
 uv tool install --python 3.13 --from git+https://github.com/cisco-ai-defense/aibom cisco-aibom
-
-# Verify installation
-cisco-aibom --help
 ```
 
-### Installing for local development
+### Local development
 
 ```bash
 git clone https://github.com/cisco-ai-defense/aibom.git
 cd aibom/aibom
 
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# or: brew install uv
-
 uv sync
+source .venv/bin/activate
 
-# Activate virtual environment
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
-
-# Verify installation
 cisco-aibom --help
 ```
 
-When working from source, you can also run the CLI with `uv run cisco-aibom ...` or `uv run python -m aibom ...`.
+When working from source, you can also use `uv run cisco-aibom ...` or `uv run python -m aibom ...`.
 
-## Knowledge Base Configuration
+### Optional extras
 
-The analyzer uses a local DuckDB catalog described by `manifest.json`.
-The DuckDB file is a prebuilt, versioned knowledge-catalog artifact of AI frameworks. It is used as a read-only lookup dataset, with checksum verification for compatibility and integrity.
-For users running the packaged CLI (for example via `uv tool install` or `pip`), the packaged manifest provides a default checksum and default catalog location (`~/.aibom/catalogs/aibom_catalog-<version>.duckdb`). You can still override with `AIBOM_DB_PATH` and `AIBOM_DB_SHA256`.
-When running from source, execute from the `aibom/` directory or set `AIBOM_MANIFEST_PATH` to point at `aibom/src/aibom/manifest.json`.
+| Extra | Installs | Purpose |
+|-------|----------|---------|
+| `agentic` | Deep Agents, LangChain | LLM-powered agentic enrichment |
+| `llm-openai` | `langchain-openai` | OpenAI / Azure OpenAI provider |
+| `llm-aws` | `langchain-aws` | AWS Bedrock provider |
+| `analysis` | `detect-secrets`, `tree-sitter` | Secret detection, multi-language parsing |
+| `security` | `cisco-ai-mcp-scanner`, `cisco-ai-skill-scanner` | Cisco security tool integration |
+| `cloud` | `boto3`, `google-cloud-aiplatform`, `azure-*` | Cloud resource scanning |
+| `all` | All of the above | Full feature set |
 
-### Download the DuckDB artifact from GitHub Releases
+## Quick Start
 
 ```bash
-# Set this to the release tag that matches your catalog artifact (example: 0.5.1)
-VERSION="<version>"
-mkdir -p "${HOME}/.aibom/catalogs"
+# Scan a local project
+cisco-aibom analyze /path/to/project -o json -O report.json
 
-# Option 1: GitHub CLI
+# Scan a container image
+cisco-aibom analyze my-app:latest -o json -O report.json
+
+# Scan with agentic enrichment
+cisco-aibom analyze /path/to/project -o json -O report.json \
+  --llm-model gpt-4o --llm-provider openai --llm-api-key $OPENAI_API_KEY
+
+# Scan multiple repos under a directory
+cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json
+
+# HTML dashboard
+cisco-aibom analyze /path/to/project -o html -O dashboard.html
+
+# Policy gate for CI
+cisco-aibom analyze /path/to/project -o json -O report.json --policy policy.yaml
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `analyze` | Scan source code, container images, or repos and produce an AI BOM. |
+| `report` | Render a previously generated JSON report with Rich formatting. |
+| `watch` | Poll directories for changes and re-scan with delta reporting. |
+| `diff run` | Compare two AIBOM JSON reports side-by-side. |
+| `benchmark run` | Measure precision/recall/F1 against ground-truth YAML. |
+| `kb download` | Download the latest knowledge base. |
+| `kb check` | Check if a newer KB version is available. |
+| `kb info` | Display info about the locally installed KB. |
+| `kb verify` | Verify KB integrity (SHA-256 checksum). |
+| `kb request` | Request a KB build for a specific SDK version. |
+| `cache clear` | Remove cached scan results and agentic cache. |
+| `cache list` | List cached scan entries. |
+| `plugin list` | List discovered plugins (entry points, MCP servers). |
+
+See [docs/CLI_REFERENCE.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CLI_REFERENCE.md) for complete option details.
+
+### Global options
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--log-level` | `AIBOM_LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default `INFO`). |
+
+## Agentic Enrichment
+
+When `--llm-model` is supplied (requires `cisco-aibom[agentic]`), the CLI runs a second pass using LLM-powered agents to:
+
+- Resolve ambiguous component classifications
+- Extract model names from code context
+- Confirm or remove false positives from deterministic detection
+- Discover components missed by static analysis
+
+```bash
+# OpenAI
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-4o --llm-provider openai --llm-api-key $OPENAI_API_KEY
+
+# Azure OpenAI
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-4o --llm-provider azure_openai \
+  --llm-api-base https://my-endpoint.openai.azure.com \
+  --llm-api-key $AZURE_OPENAI_API_KEY --llm-api-version 2024-12-01-preview
+
+# AWS Bedrock
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model us.anthropic.claude-sonnet-4-20250514-v1:0 --llm-provider bedrock
+
+# Local Ollama
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gemma3:12b --llm-provider ollama \
+  --llm-api-base http://localhost:11434
+```
+
+All LLM options can also be set via environment variables or a `.env` file. See [docs/AGENTIC_MODE.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md) for the full guide.
+
+### Agentic tuning
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--agentic-scope` | `candidates` | `candidates` (only ambiguous items) or `all` (every component). |
+| `--agentic-batch-size` | `5` | Max components per LLM invocation. |
+| `--agentic-concurrency` | `1` | Max parallel LLM batches. |
+| `--agentic-timeout` | `120` | Wall-clock seconds per batch before timeout. |
+| `--agentic-fast-model` | — | Cheaper model for simple confirmations. |
+
+## Container Scanning
+
+The CLI auto-detects container image references and extracts application source code for analysis.
+
+```bash
+# Auto-detect extraction method
+cisco-aibom analyze my-app:latest -o json -O report.json
+
+# Force a specific extraction tier
+cisco-aibom analyze my-app:latest -o json -O report.json --container-extraction-tier podman
+```
+
+Supported tiers: `auto`, `syft`, `docker`, `podman`, `nerdctl`, `buildah`, `crane`, `skopeo`, `tarball`.
+
+See [docs/CONTAINER_SCANNING.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CONTAINER_SCANNING.md) for details.
+
+## Cross-Repo and Org Scanning
+
+```bash
+# Discover and scan all git repos under a directory
+cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json
+
+# Scan a GitHub org (requires GITHUB_TOKEN)
+cisco-aibom analyze --github-org my-org --platform-token $GITHUB_TOKEN -o json -O report.json
+
+# Scan a GitLab group
+cisco-aibom analyze --gitlab-group my-group --platform-token $GITLAB_TOKEN -o json -O report.json
+
+# Scan repos from a file (JSON array or newline-delimited)
+cisco-aibom analyze --repos-file repos.txt -o json -O report.json
+
+# Incremental scan (skip repos with unchanged HEAD)
+cisco-aibom analyze /path/to/repos --discover-repos --incremental -o json -O report.json
+
+# Limit and filter
+cisco-aibom analyze --github-org my-org --platform-token $GITHUB_TOKEN \
+  --max-repos 50 --repo-filter "ml-" --parallel-repos 4 -o json -O report.json
+```
+
+## Output Formats
+
+| Format | Flag | Description |
+|--------|------|-------------|
+| Plaintext | `-o plaintext` | Human-readable text report. |
+| JSON | `-o json` | Structured JSON with full component details. |
+| CycloneDX | `-o cyclonedx` | CycloneDX 1.6 BOM (ML-BOM profile). |
+| SARIF | `-o sarif` | SARIF v2.1.0 for IDE/CI integration. |
+| SPDX | `-o spdx` | SPDX 3.0 with AI and Dataset profiles. |
+| HTML | `-o html` | Interactive dashboard with dependency graph and risk heatmap. |
+| Markdown | `-o markdown` | Markdown table report. |
+| CSV | `-o csv` | Flat CSV for spreadsheet analysis. |
+| JUnit | `-o junit` | JUnit XML for CI test result reporting. |
+| API | `-o api` | Live FastAPI server at `http://127.0.0.1:8000`. |
+
+All file-based formats require `--output-file` / `-O`.
+
+## Custom Catalog
+
+The built-in DuckDB catalog covers popular AI frameworks, but you can extend it with a `.aibom.yaml` configuration file for custom components, base-class detection rules, exclude patterns, and relationship hints.
+
+```yaml
+# .aibom.yaml
+components:
+  - id: MyLLMWrapper
+    concept: model
+    label: My Custom LLM
+    framework: internal
+
+base_classes:
+  - class: BaseTool
+    concept: tool
+
+excludes:
+  - some_noisy_helper_function
+
+relationship_hints:
+  tool_arguments:
+    - custom_tools
+```
+
+Place `.aibom.yaml` in your project root (auto-discovered) or pass `--custom-catalog /path/to/.aibom.yaml`.
+
+Supported keys: `components`, `base_classes`, `excludes`, `relationship_hints`, `custom_relationships`. See the full reference in [aibom/examples/.aibom.yaml](https://github.com/cisco-ai-defense/aibom/blob/main/aibom/examples/.aibom.yaml).
+
+### Inline annotations
+
+Tag classes and functions directly in source code:
+
+```python
+# aibom: concept=guardrail framework=internal
+class SafetyFilter:
+    ...
+
+class MyRouter:  # aibom: concept=router
+    ...
+```
+
+## Policy Engine
+
+Define pass/fail gates in a YAML policy file for CI/CD integration:
+
+```yaml
+# policy.yaml
+max_risk_score: 70
+required_fields:
+  - model_name
+blocked_types:
+  - secret
+required_types:
+  - guardrail
+rules:
+  - name: no-hardcoded-keys
+    field: metadata.secret_type
+    operator: not_exists
+```
+
+```bash
+cisco-aibom analyze ./my-app -o json -O report.json --policy policy.yaml
+# Exit code 1 if policy fails
+```
+
+## Knowledge Base
+
+The analyzer uses a versioned DuckDB catalog of AI framework symbols.
+
+```bash
+# Download the latest KB
+cisco-aibom kb download
+
+# Check for updates
+cisco-aibom kb check
+
+# Verify integrity
+cisco-aibom kb verify
+
+# View info
+cisco-aibom kb info
+```
+
+Manual download from GitHub Releases:
+
+```bash
+VERSION="0.5.1"
+mkdir -p "${HOME}/.aibom/catalogs"
 gh release download "${VERSION}" \
   --repo cisco-ai-defense/aibom \
   --pattern "aibom_catalog-${VERSION}.duckdb" \
   --dir "${HOME}/.aibom/catalogs"
 
-# Option 2: direct download URL
-curl -fL \
-  -o "${HOME}/.aibom/catalogs/aibom_catalog-${VERSION}.duckdb" \
-  "https://github.com/cisco-ai-defense/aibom/releases/download/${VERSION}/aibom_catalog-${VERSION}.duckdb"
-```
-
-### Provide the DuckDB path to the analyzer
-
-```bash
 export AIBOM_DB_PATH="${HOME}/.aibom/catalogs/aibom_catalog-${VERSION}.duckdb"
-
-# Set only if your file is different from the manifest default (for example,
-# custom path/version) or if you see a checksum mismatch error:
-# export AIBOM_DB_SHA256="<sha256-of-${AIBOM_DB_PATH}>"
 ```
 
-Compute SHA-256 when needed:
+## Environment Variables
+
+All CLI options with an `envvar` binding can be set via environment variables or a `.env` file. The CLI auto-loads `.env` from the current directory, or you can specify a custom path with `AIBOM_ENV_FILE`.
+
+| Variable | CLI Option | Description |
+|----------|-----------|-------------|
+| `AIBOM_LOG_LEVEL` | `--log-level` | Logging level (default `INFO`). |
+| `AIBOM_LLM_MODEL` | `--llm-model` | LLM model name. |
+| `AIBOM_LLM_PROVIDER` | `--llm-provider` | LangChain provider (`openai`, `azure_openai`, `bedrock`, `ollama`, etc.). |
+| `AIBOM_LLM_API_KEY` | `--llm-api-key` | LLM API key. |
+| `AIBOM_LLM_API_BASE` | `--llm-api-base` | LLM API base URL. |
+| `AIBOM_LLM_API_VERSION` | `--llm-api-version` | API version (Azure OpenAI). |
+| `AIBOM_POST_URL` | `--post-url` | HTTP endpoint to POST the report to. |
+| `AI_DEFENSE_API_KEY` | `--ai-defense-api-key` | Cisco AI Defense API key. |
+| `AIBOM_GITHUB_ORG` | `--github-org` | GitHub org for repo discovery. |
+| `AIBOM_GITLAB_GROUP` | `--gitlab-group` | GitLab group for repo discovery. |
+| `AIBOM_BITBUCKET_PROJECT` | `--bitbucket-project` | Bitbucket project for repo discovery. |
+| `AIBOM_PLATFORM_TOKEN` | `--platform-token` | Auth token for GitHub/GitLab/Bitbucket. |
+| `AIBOM_DB_PATH` | — | Override path to the DuckDB catalog file. |
+| `AIBOM_DB_SHA256` | — | Expected SHA-256 checksum for the catalog. |
+| `AIBOM_MANIFEST_PATH` | — | Override path to `manifest.json`. |
+| `AIBOM_ENV_FILE` | — | Path to a custom `.env` file. |
+
+## Docker
+
+Two Dockerfiles are provided:
+
+| Image | Dockerfile | Extras | Size |
+|-------|-----------|--------|------|
+| `cisco-aibom` | `Dockerfile` | `analysis`, `security` | ~200 MB |
+| `cisco-aibom-agentic` | `Dockerfile.agentic` | All (`analysis`, `security`, `agentic`, `cloud`) | ~800 MB |
 
 ```bash
-# macOS
-shasum -a 256 "${AIBOM_DB_PATH}"
+cd aibom
 
-# Linux
-sha256sum "${AIBOM_DB_PATH}"
+# Build the deterministic image
+docker build -t cisco-aibom .
+
+# Build the full agentic image
+docker build -f Dockerfile.agentic -t cisco-aibom-agentic .
+
+# Run
+docker run --rm -v /path/to/project:/workspace cisco-aibom analyze /workspace -o json -O /workspace/report.json
 ```
-
-Use only the hash value (first column) as `AIBOM_DB_SHA256`.
-
-Override settings with environment variables:
-
-- `AIBOM_DB_PATH`: local DuckDB file path
-- `AIBOM_DB_SHA256`: SHA-256 checksum for the DuckDB file
-
-`AIBOM_DB_PATH` may be absolute or relative. Relative env-var values are resolved from the current working directory; relative `duckdb_file` values in `manifest.json` are resolved from the manifest directory.
-
-## Usage
-
-### Analyze sources
-
-```bash
-# Local directory (JSON output)
-cisco-aibom analyze /path/to/project --output-format json --output-file report.json
-
-# Container image (JSON output)
-cisco-aibom analyze langchain-app:latest --output-format json --output-file report.json
-
-# Multiple images from a JSON list
-cisco-aibom analyze --images-file images.json --output-format plaintext --output-file report.txt
-```
-
-`--output-file` is required for `plaintext` and `json` output formats.
-
-### Render a JSON report
-
-```bash
-cisco-aibom report report.json --raw-json
-```
-
-### Optional LLM enrichment
-
-```bash
-cisco-aibom analyze /path/to/project \
-  --output-format json \
-  --output-file report.json \
-  --llm-model gpt-3.5-turbo \
-  --llm-api-base https://api.openai.com/v1 \
-  --llm-api-key $OPENAI_API_KEY
-```
-
-Local LLM example:
-
-```bash
-cisco-aibom analyze /path/to/project \
-  --output-format json \
-  --output-file report.json \
-  --llm-model ollama_chat/gemma3:12b \
-  --llm-api-base http://localhost:11434
-```
-
-### Optional report submission
-
-```bash
-cisco-aibom analyze /path/to/project \
-  --output-format json \
-  --output-file report.json \
-  --post-url https://api.security.cisco.com/api/ai-defense/v1/aibom/analysis \
-  --ai-defense-api-key $AI_DEFENSE_API_KEY
-```
-
-You can also set `AIBOM_POST_URL` instead of `--post-url` and `AI_DEFENSE_API_KEY` instead of `--ai-defense-api-key`.
-
-The API key is sent as the `x-cisco-ai-defense-tenant-api-key` header. Use the same path in every region:
-`/api/ai-defense/v1/aibom/analysis`.
-
-Choose the base domain for your Cisco AI Defense organization's region:
-
-- US: `https://api.security.cisco.com/api/ai-defense/v1/aibom/analysis`
-- APJ: `https://api.apj.security.cisco.com/api/ai-defense/v1/aibom/analysis`
-- EU: `https://api.eu.security.cisco.com/api/ai-defense/v1/aibom/analysis`
-- UAE: `https://api.uae.security.cisco.com/api/ai-defense/v1/aibom/analysis`
-
-## Custom Catalog
-
-The built-in DuckDB catalog covers popular AI frameworks (LangChain, LangGraph, CrewAI, PyTorch, scikit-learn, etc.), but many teams build custom wrappers, internal tools, or use niche libraries that the catalog does not know about. The **custom catalog** lets you teach the analyzer about these components using three complementary mechanisms:
-
-1. **Configuration file** (`.aibom.yaml`) -- register components, base-class rules, excludes, and relationships declaratively.
-2. **Inline annotations** (`# aibom: concept=...`) -- tag individual classes and functions directly in source code.
-3. **Base class detection** -- automatically categorize any class that inherits from a specified base class.
-
-### Using a configuration file
-
-Place a `.aibom.yaml` (or `.aibom.yml` / `.aibom.json`) in your project root. The analyzer auto-discovers it, or you can point to it explicitly:
-
-```bash
-# Auto-discovery (looks for .aibom.yaml/.yml/.json in the source directory)
-cisco-aibom analyze /path/to/project --output-format json --output-file report.json
-
-# Explicit path
-cisco-aibom analyze /path/to/project \
-  --custom-catalog /path/to/.aibom.yaml \
-  --output-format json \
-  --output-file report.json
-```
-
-### Configuration file reference
-
-A complete `.aibom.yaml` example (also available at `aibom/examples/.aibom.yaml`):
-
-```yaml
-# ─── Custom Components ───────────────────────────────────────────────
-# Register symbols the built-in catalog does not know about.
-# 'id' can be a short class/function name (e.g. MyLLMWrapper) or a
-# fully qualified name (e.g. myproject.llm.MyLLMWrapper).
-# Short names are matched via suffix matching, so 'MyLLMWrapper' will
-# match any qualified name ending in 'MyLLMWrapper'.
-components:
-  - id: MyLLMWrapper
-    concept: model                   # model | agent | tool | memory | ...
-    label: My Custom LLM             # human-readable label (optional)
-    framework: internal              # framework name (default: "custom")
-    metadata:                        # arbitrary key-value pairs (optional)
-      owner: ml-team
-      version: "2.1"
-
-  - id: myproject.tools.SearchTool
-    concept: tool
-
-  - id: SafetyFilter
-    concept: guardrail               # custom categories are allowed
-
-  - id: RequestRouter
-    concept: router
-
-# ─── Base Class Detection ────────────────────────────────────────────
-# Any class that inherits from a listed base is auto-categorized.
-base_classes:
-  - class: BaseTool
-    concept: tool
-  - class: mylib.BaseAgent
-    concept: agent
-  - class: BaseGuardrail
-    concept: guardrail
-
-# ─── Exclude Patterns ────────────────────────────────────────────────
-# Suppress false positives. Entries whose IDs end with (or equal) these
-# strings are filtered out of analysis results.
-excludes:
-  - langchain.deprecated.OldAgent
-  - some_noisy_helper_function
-
-# ─── Extended Relationship Hints ─────────────────────────────────────
-# Add argument names that the relationship engine should inspect.
-# These are additive -- they extend the built-in hints, not replace them.
-relationship_hints:
-  tool_arguments:        # extends: tool, tools, skills, abilities
-    - custom_tools
-    - plugins
-  llm_arguments:         # extends: llm, language_model, chat_model, model
-    - language_model
-  memory_arguments:      # extends: memory, checkpointer, store, saver, ...
-    - state_store
-  retriever_arguments:   # extends: retriever, retrievers, search, ...
-    - doc_search
-  embedding_arguments:   # extends: embedding, embeddings, embed, ...
-    - vectorizer
-
-# ─── Custom Relationship Types ───────────────────────────────────────
-# Define entirely new relationship labels with source/target constraints
-# and the argument names that trigger them.
-custom_relationships:
-  - label: ROUTES_TO
-    source_categories: [router]
-    target_categories: [agent]
-    argument_hints: [routes, destinations]
-
-  - label: GUARDS
-    source_categories: [guardrail]
-    target_categories: [model, agent]
-    argument_hints: [guarded_by, guard]
-```
-
-### Inline annotations
-
-Tag classes or functions directly in your source code. The comment must appear on the line immediately above the definition or as a trailing comment on the definition line:
-
-```python
-# aibom: concept=guardrail framework=internal
-class SafetyFilter:
-    """Custom content-safety guardrail."""
-
-    def check(self, text: str) -> bool:
-        ...
-
-
-# aibom: concept=tool label=WebSearch
-def search_web(query: str) -> list:
-    """Search the web and return results."""
-    ...
-
-
-class MyRouter:  # aibom: concept=router
-    """Routes requests to the appropriate agent."""
-    ...
-```
-
-Supported keys in the annotation: `concept` (required), `framework` (optional, default `"custom"`), `label` (optional).
-
-### Base class detection
-
-When `base_classes` rules are defined in `.aibom.yaml`, the analyzer inspects every class definition in the scanned code. If a class inherits (directly) from a listed base, it is auto-categorized without needing an explicit `components` entry or inline annotation:
-
-```yaml
-# .aibom.yaml
-base_classes:
-  - class: BaseTool
-    concept: tool
-```
-
-```python
-# my_tools.py -- these are automatically detected as "tool" components
-class SearchTool(BaseTool):
-    ...
-
-class CalculatorTool(BaseTool):
-    ...
-```
-
-### Precedence
-
-When the same symbol is detected by multiple mechanisms, the following precedence applies (highest first):
-
-1. **Inline annotation** (`# aibom: concept=...`)
-2. **Base class rule** (from `.aibom.yaml` `base_classes`)
-3. **Custom component entry** (from `.aibom.yaml` `components`)
-4. **Supplemental catalog** (built-in LangGraph/CrewAI entries)
-5. **DuckDB catalog** (prebuilt knowledge base)
-
-Exclude patterns override all of the above -- a matching exclude always removes the component from results.
 
 ## Testing
 
@@ -380,123 +412,20 @@ cd aibom
 uv run pytest tests -v
 ```
 
-## Output Formats
+## Further Reading
 
-### Plaintext output
-
-```text
---- AI BOM Analysis Report ---
-
---- Results for source: langchain-app:latest ---
-
-[+] Found 4 MODEL:
-  - Name: langchain_community.llms.openai.OpenAI
-    Model: gpt-3.5-turbo-instruct
-    Source: /app/comprehensive_langchain_app.py:32
-...
---- End of Report: Found 42 total components across all sources. ---
-```
-
-### JSON output
-
-```json
-{
-  "aibom_analysis": {
-    "metadata": {
-      "run_id": "...",
-      "analyzer_version": "<analyzer-version>",
-      "started_at": "2025-01-01T00:00:00Z",
-      "completed_at": "2025-01-01T00:00:10Z"
-    },
-    "sources": {
-      "langchain-app:latest": {
-        "components": {
-          "model": [
-            {
-              "name": "langchain_community.llms.openai.OpenAI",
-              "file_path": "/app/app.py",
-              "line_number": 32,
-              "category": "model",
-              "model_name": "gpt-3.5-turbo",
-              "workflows": []
-            }
-          ]
-        },
-        "relationships": [
-          {
-            "source_instance_id": "...",
-            "target_instance_id": "...",
-            "label": "USES_LLM",
-            "source_name": "...",
-            "target_name": "...",
-            "source_category": "agent",
-            "target_category": "model"
-          }
-        ],
-        "workflows": [
-          {
-            "id": "...",
-            "function": "module.flow",
-            "file_path": "/app/app.py",
-            "line": 10,
-            "distance": 0
-          }
-        ],
-        "total_components": 42,
-        "total_workflows": 7,
-        "summary": {
-          "status": "completed",
-          "source_kind": "container"
-        }
-      }
-    },
-    "summary": {
-      "total_sources": 1,
-      "total_components": 42,
-      "total_relationships": 3,
-      "total_workflows": 7,
-      "categories": {
-        "model": 4,
-        "tool": 8
-      }
-    },
-    "errors": []
-  }
-}
-```
-
-## API Mode
-
-`--output-format api` starts a FastAPI server that serves the analyzed components:
-
-```bash
-cisco-aibom analyze /path/to/project --output-format api
-```
-
-Endpoints:
-
-- `GET /api/components`
-- `GET /api/components/types`
-- `GET /api/components/{id}`
-- `GET /health`
-
-See `docs/API_SERVER_README.md` for detailed API usage.
-
-## Technical Details
-
-- **Parsing:** `libcst` extracts fully qualified names for calls, decorators, type annotations, context managers, class definitions (with base classes), and `# aibom:` inline annotations.
-- **Catalog matching:** Symbols are matched against the DuckDB `component_catalog` table using suffix matching on their fully qualified IDs. Custom entries from `.aibom.yaml` are merged into this lookup.
-- **Custom catalog:** The `custom_catalog` module loads `.aibom.yaml`/`.yml`/`.json` files and provides component entries, base-class rules, exclude patterns, extended relationship hints, and custom relationship types to the categorizer.
-- **Inline annotations:** The CST parser extracts `# aibom: concept=...` comments on class and function definitions, which the categorizer uses to create components without requiring catalog entries.
-- **Base class detection:** The CST parser captures base classes for every `class` statement. The categorizer matches these against base-class rules from the custom catalog configuration.
-- **Workflow analysis:** The AST-based workflow analyzer associates components with the functions that call into them.
-- **Relationships:** Agent arguments are inspected for tool/LLM/memory/retriever/embedding references to derive `USES_TOOL`, `USES_LLM`, `USES_MEMORY`, `USES_RETRIEVER`, and `USES_EMBEDDING` links. User-defined relationship types from `.aibom.yaml` `custom_relationships` are also derived.
-- **LLM enrichment:** `litellm` is used only when `--llm-model` is supplied.
+- [CLI Reference](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CLI_REFERENCE.md) — Complete command and option reference.
+- [Agentic Mode Guide](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md) — LLM enrichment setup, providers, and tuning.
+- [Container Scanning Guide](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CONTAINER_SCANNING.md) — Extraction tiers, Syft, and runtime support.
+- [API Server](https://github.com/cisco-ai-defense/aibom/blob/main/docs/API_SERVER_README.md) — FastAPI endpoint details for `--output-format api`.
+- [Technical Overview](https://github.com/cisco-ai-defense/aibom/blob/main/aibom/docs/TECHNICAL_OVERVIEW.md) — Architecture, pipeline stages, and scanner design.
 
 ## Troubleshooting
 
-- **DuckDB catalog errors:** Ensure the catalog file exists at `AIBOM_DB_PATH` (or `duckdb_file` in manifest) and that `AIBOM_DB_SHA256` (or `duckdb_sha256` in manifest) matches the file checksum. When running from source, execute from `aibom/` or set `AIBOM_MANIFEST_PATH`.
-- **Docker issues:** Container analysis requires a working Docker CLI and daemon.
-- **LLM configuration errors:** `--llm-api-base` is required whenever `--llm-model` is set.
-- **API server questions:** Use `docs/API_SERVER_README.md` for API mode behavior and endpoint details.
-- **Missing output files:** `--output-file` is mandatory for `plaintext` and `json` formats.
+- **DuckDB catalog errors:** Run `cisco-aibom kb download` to fetch the latest catalog, or set `AIBOM_DB_PATH` to point at an existing file. Use `cisco-aibom kb verify` to check integrity.
+- **Container extraction fails:** Ensure Docker or an alternative runtime is installed and running. Use `--container-extraction-tier` to force a specific tool. See [docs/CONTAINER_SCANNING.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CONTAINER_SCANNING.md).
+- **Agentic mode not activating:** Install the agentic extra (`uv tool install "cisco-aibom[agentic,llm-openai]"`) and supply `--llm-model`. See [docs/AGENTIC_MODE.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md).
+- **LLM provider errors:** Ensure `--llm-provider` matches the installed LangChain integration package. For Azure OpenAI, `--llm-api-version` is required.
+- **Slow scans on large repos:** Use `--timing` to identify bottlenecks. Consider `--strict` to skip agentic candidates, or `--agentic-scope candidates` (default) to only send ambiguous items.
+- **Missing output files:** `--output-file` / `-O` is required for all file-based formats.
+- **Report submission:** Set `AIBOM_POST_URL` and `AI_DEFENSE_API_KEY`. Regional endpoints: US (`api.security.cisco.com`), APJ (`api.apj.security.cisco.com`), EU (`api.eu.security.cisco.com`), UAE (`api.uae.security.cisco.com`).

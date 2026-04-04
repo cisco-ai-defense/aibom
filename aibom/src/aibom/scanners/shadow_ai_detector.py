@@ -25,7 +25,7 @@ from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
 from .dependency_scanner import AI_PACKAGES, DependencyScanner, _iter_scan_paths
-from .file_cache import read_text_cached
+from .file_cache import is_python_source, read_python_source, read_text_cached
 
 _LANGCHAIN = frozenset({
     "langchain", "langchain-core", "langchain-community", "langchain-openai",
@@ -225,7 +225,7 @@ def _regex_dynamic_hits(
 
 def _collect_py_imports(path: Path) -> list[tuple[int, str, str]]:
     try:
-        raw = read_text_cached(path)
+        raw = read_python_source(path)
     except OSError:
         return []
     lines = raw.splitlines()
@@ -269,7 +269,7 @@ class ShadowAIDetector(BaseScanner):
         findings: list[AIComponent] = []
         seen: set[tuple[str, str]] = set()
         for path in _iter_scan_paths(context):
-            if path.suffix != ".py":
+            if not is_python_source(path):
                 continue
             for lineno, mod_spec, snippet in _collect_py_imports(path):
                 pkgs = _satisfying_pypi_packages(mod_spec)

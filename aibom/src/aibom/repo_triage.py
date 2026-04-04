@@ -145,11 +145,14 @@ class RepoTriager:
         results: list[TriageResult] = []
 
         try:
-            from litellm import completion
+            from .llm_factory import build_chat_model
         except ImportError:
-            _LOGGER.warning("litellm not available; falling back to needs-clone for all")
+            _LOGGER.warning(
+                "Agentic triage requires 'cisco-aibom[agentic]'; "
+                "falling back to needs-clone for all"
+            )
             return [
-                TriageResult(rp, "needs-clone", "litellm unavailable", "deterministic")
+                TriageResult(rp, "needs-clone", "agentic extras unavailable", "deterministic")
                 for rp in repo_paths
             ]
 
@@ -169,14 +172,25 @@ class RepoTriager:
         )
 
         try:
-            resp = completion(
-                messages=[
-                    {"role": "system", "content": _TRIAGE_SYSTEM_PROMPT},
-                    {"role": "user", "content": batch_prompt},
-                ],
-                **self.llm_config,
+            cfg = dict(self.llm_config) if self.llm_config else {}
+            model_string = cfg.get("model", "gpt-4o-mini")
+
+            model = build_chat_model(
+                model_string,
+                provider=cfg.get("provider"),
+                api_key=cfg.get("api_key"),
+                api_base=cfg.get("api_base"),
+                api_version=cfg.get("api_version"),
             )
-            raw = resp.choices[0].message.content.strip()
+
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            messages = [
+                SystemMessage(content=_TRIAGE_SYSTEM_PROMPT),
+                HumanMessage(content=batch_prompt),
+            ]
+            resp = model.invoke(messages)
+            raw = resp.content.strip()  # type: ignore[union-attr]
             start = raw.find("[")
             end = raw.rfind("]")
             if start >= 0 and end > start:

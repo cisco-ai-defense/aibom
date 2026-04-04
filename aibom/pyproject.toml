@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cisco-aibom"
-version = "0.5.2"
+version = "0.5.1"
 description = "A tool to generate an AI BOM from source code."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -20,7 +20,6 @@ dependencies = [
     "libcst>=1.0.0",
     "duckdb>=1.0.0",
     "typer>=0.9.0",
-    "litellm==1.80.16",
     "pandas>=2.0.0",
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
@@ -70,6 +69,12 @@ agentic = [
     "langchain>=1.2.11",
     "langchain-core>=1.2.18",
 ]
+llm-openai = [
+    "langchain-openai>=0.3.0",
+]
+llm-aws = [
+    "langchain-aws>=0.2.0",
+]
 cloud = [
     "boto3>=1.35.0",
     "google-cloud-aiplatform>=1.74.0",
@@ -77,7 +82,7 @@ cloud = [
     "azure-mgmt-cognitiveservices>=13.6.0",
 ]
 all = [
-    "cisco-aibom[analysis,security,agentic,cloud]",
+    "cisco-aibom[analysis,security,agentic,llm-openai,llm-aws,cloud]",
 ]
 
 [tool.pytest.ini_options]
@@ -140,7 +145,6 @@ strict_equality = true
 
 [[tool.mypy.overrides]]
 module = [
-    "litellm",
     "deepagents",
     "deepagents.*",
     "langchain",

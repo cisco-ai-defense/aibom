@@ -67,7 +67,7 @@ You receive two lists:
 2. **Model verification**: For each model name in `enrich_these`, call
    `lookup_model` ONCE. You may batch multiple names in your first round.
 3. **Env var resolution**: For any component whose metadata contains
-   `env` or `env_var_ref`, or whose model_name looks like an env var, call
+   `env` or `env_context`, or whose model_name looks like an env var, call
    `resolve_env_var` ONCE.
 4. **Classification review**: Using the code_context, verify each component's
    type is correct. Reclassify or flag false positives.
