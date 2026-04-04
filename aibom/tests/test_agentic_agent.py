@@ -32,6 +32,13 @@ from aibom.agentic.agent import _build_context_message, _extract_structured_resp
 from aibom.models import AIComponent, AIComponentType, ComponentRelationship
 
 
+@pytest.fixture(autouse=True)
+def _isolate_agentic_cache():
+    """Prevent on-disk agentic cache from leaking between tests."""
+    with patch("aibom.agentic.agent._default_agentic_cache_dir", return_value=None):
+        yield
+
+
 class TestBuildContextMessage:
     def test_includes_components_and_paths(self):
         comps = [

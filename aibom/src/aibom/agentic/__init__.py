@@ -28,6 +28,7 @@ __all__ = [
     "AIBOMScannerMiddleware",
     "create_aibom_agent",
     "run_agentic_enrichment",
+    "resolve_container_layout",
     "AgenticEnrichmentError",
 ]
 
@@ -42,6 +43,13 @@ def create_aibom_agent(model_string: str, **kwargs):  # type: ignore[no-untyped-
 def run_agentic_enrichment(*args, **kwargs):  # type: ignore[no-untyped-def]
     """Lazy re-export — actual import happens on first call."""
     from .agent import run_agentic_enrichment as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def resolve_container_layout(*args, **kwargs):  # type: ignore[no-untyped-def]
+    """Lazy re-export — actual import happens on first call."""
+    from .agent import resolve_container_layout as _impl
 
     return _impl(*args, **kwargs)
 

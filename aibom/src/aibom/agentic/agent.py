@@ -102,8 +102,8 @@ class AgenticEnrichmentError(Exception):
     """Raised when the agentic enrichment pipeline fails."""
 
 
-def _configure_rate_limiter(init_kwargs: dict[str, Any]) -> None:
-    """Attach a client-side rate limiter to the LLM unless one is already set.
+def _build_rate_limiter() -> Any:
+    """Return a client-side rate limiter for LLM calls.
 
     ``rate_limiter`` is a first-class field on LangChain's ``BaseChatModel``,
     so it works for *every* provider (Bedrock, OpenAI, Anthropic, Azure,
@@ -111,14 +111,13 @@ def _configure_rate_limiter(init_kwargs: dict[str, Any]) -> None:
     throttles outgoing requests so the provider never sees a burst — preventing
     rate-limit errors rather than recovering from them after the fact.
     """
-    if "rate_limiter" not in init_kwargs:
-        from langchain_core.rate_limiters import InMemoryRateLimiter
+    from langchain_core.rate_limiters import InMemoryRateLimiter
 
-        init_kwargs["rate_limiter"] = InMemoryRateLimiter(
-            requests_per_second=1.0,
-            check_every_n_seconds=0.1,
-            max_bucket_size=10,
-        )
+    return InMemoryRateLimiter(
+        requests_per_second=1.0,
+        check_every_n_seconds=0.1,
+        max_bucket_size=10,
+    )
 
 
 def create_aibom_agent(
@@ -146,43 +145,26 @@ def create_aibom_agent(
     A compiled LangGraph ``CompiledStateGraph`` ready for ``.invoke()``.
     """
     from deepagents import create_deep_agent
-    from langchain.chat_models import init_chat_model
 
+    from ..llm_factory import build_chat_model
     from .tools import build_tools
 
-    init_kwargs: dict[str, Any] = {}
-
-    model_id = model_string
-    provider_prefix = ""
-    if "/" in model_string:
-        provider_prefix, _, model_id = model_string.partition("/")
-        init_kwargs.setdefault("model_provider", provider_prefix)
-
-    if llm_config:
-        if llm_config.get("api_key"):
-            init_kwargs["api_key"] = llm_config["api_key"]
-        if llm_config.get("api_base"):
-            if provider_prefix == "azure_openai":
-                init_kwargs["azure_endpoint"] = llm_config["api_base"]
-            else:
-                init_kwargs["base_url"] = llm_config["api_base"]
-        if llm_config.get("api_version") and provider_prefix == "azure_openai":
-            init_kwargs["api_version"] = llm_config["api_version"]
-
-    _configure_rate_limiter(init_kwargs)
+    cfg = llm_config or {}
+    rate_limiter = _build_rate_limiter()
 
     try:
-        model = init_chat_model(model_id, **init_kwargs)
+        model = build_chat_model(
+            model_string,
+            provider=cfg.get("provider"),
+            api_key=cfg.get("api_key"),
+            api_base=cfg.get("api_base"),
+            api_version=cfg.get("api_version"),
+            rate_limiter=rate_limiter,
+        )
     except ImportError as exc:
         raise ImportError(str(exc)) from exc
     tools = build_tools()
 
-    # NOTE: LangGraph's recommended proactive approach (RemainingSteps in
-    # the graph state) cannot be used here because Deep Agents merges all
-    # middleware state schemas into Input/Output schemas where managed
-    # channels are forbidden.  We rely on the reactive approach instead:
-    # _RECURSION_LIMIT=1000 (safety net) + GraphRecursionError catch in
-    # _run_batch / _run_batch_async.
     agent = create_deep_agent(
         model=model,
         tools=tools,
@@ -199,6 +181,9 @@ _DEFAULT_BATCH_SIZE = 5
 # Set explicitly so the intent is clear: this is a safety net against
 # infinite loops, NOT a workload budget.
 _RECURSION_LIMIT = 1000
+
+_DEFAULT_AGENTIC_TIMEOUT_S = 120
+_DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 
 _SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
 
@@ -221,8 +206,8 @@ def _classify_candidates(
         is_simple = (
             c.component_type.value in _SIMPLE_CANDIDATE_TYPES
             and c.model_name
-            and not c.metadata.get("env_var_ref")
             and not c.metadata.get("env")
+            and not c.metadata.get("env_context")
             and not c.metadata.get("partial_kb_id")
             and not c.metadata.get("suggestive_signal")
         )
@@ -360,6 +345,21 @@ class _AgenticResultCache:
         return enriched, all_new, all_rels, all_flags
 
 
+def _degraded_batch_components(
+    batch: list[AIComponent],
+    *,
+    hint: str,
+) -> list[AIComponent]:
+    return [
+        c.model_copy(update={"needs_agentic": False, "agentic_hint": hint})
+        for c in batch
+    ]
+
+
+def _circuit_breaker_skipped_batch(batch: list[AIComponent]) -> list[AIComponent]:
+    return _degraded_batch_components(batch, hint="circuit_breaker_tripped")
+
+
 def _run_batch(
     agent: Any,
     middleware: AIBOMScannerMiddleware,
@@ -369,7 +369,9 @@ def _run_batch(
     batch_num: int,
     total_batches: int,
     all_components: list[AIComponent] | None = None,
-) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    *,
+    timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
+) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag], bool]:
     """Invoke the agent on a single batch and return parsed results."""
     from .tools import _reset_tool_stats, get_tool_stats
 
@@ -385,11 +387,29 @@ def _run_batch(
     t0 = time.monotonic()
 
     result = None
-    try:
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": summary}]},
-            config={"recursion_limit": _RECURSION_LIMIT},
+
+    async def _invoke_timed() -> Any:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: agent.invoke(
+                    {"messages": [{"role": "user", "content": summary}]},
+                    config={"recursion_limit": _RECURSION_LIMIT},
+                ),
+            ),
+            timeout=timeout_s,
         )
+
+    try:
+        result = asyncio.run(_invoke_timed())
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - t0
+        stats = get_tool_stats()
+        _LOGGER.warning(
+            "Batch %d timed out after %.1fs | tool_stats=%s",
+            batch_num, elapsed, json.dumps(stats),
+        )
+        enriched = _degraded_batch_components(batch, hint="batch_timeout")
+        return enriched, [], [], [], True
     except Exception as exc:
         elapsed = time.monotonic() - t0
         stats = get_tool_stats()
@@ -403,12 +423,9 @@ def _run_batch(
                 _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
                 new_c, new_r, rf = middleware.extract_findings_from_dict(data)
                 enriched = middleware.apply_enrichments_from_dict(batch, data)
-                return enriched, new_c, new_r, rf
-        enriched = [
-            c.model_copy(update={"needs_agentic": False, "agentic_hint": "batch_recursion_limit"})
-            for c in batch
-        ]
-        return enriched, [], [], []
+                return enriched, new_c, new_r, rf, False
+        enriched = _degraded_batch_components(batch, hint="batch_recursion_limit")
+        return enriched, [], [], [], True
 
     elapsed = time.monotonic() - t0
     stats = get_tool_stats()
@@ -424,11 +441,11 @@ def _run_batch(
     data = _extract_structured_response(result)
     if not data:
         _LOGGER.warning("Batch %d returned no usable output", batch_num)
-        return batch, [], [], []
+        return batch, [], [], [], True
 
     new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
     enriched = middleware.apply_enrichments_from_dict(batch, data)
-    return enriched, new_components, new_rels, risk_flags
+    return enriched, new_components, new_rels, risk_flags, False
 
 
 async def _run_batch_async(
@@ -440,7 +457,9 @@ async def _run_batch_async(
     batch_num: int,
     total_batches: int,
     all_components: list[AIComponent] | None = None,
-) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    *,
+    timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
+) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag], bool]:
     """Async version of _run_batch using agent.ainvoke()."""
     from .tools import _reset_tool_stats, get_tool_stats
 
@@ -457,10 +476,22 @@ async def _run_batch_async(
 
     result = None
     try:
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": summary}]},
-            config={"recursion_limit": _RECURSION_LIMIT},
+        result = await asyncio.wait_for(
+            agent.ainvoke(
+                {"messages": [{"role": "user", "content": summary}]},
+                config={"recursion_limit": _RECURSION_LIMIT},
+            ),
+            timeout=timeout_s,
         )
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - t0
+        stats = get_tool_stats()
+        _LOGGER.warning(
+            "Batch %d timed out after %.1fs | tool_stats=%s",
+            batch_num, elapsed, json.dumps(stats),
+        )
+        enriched = _degraded_batch_components(batch, hint="batch_timeout")
+        return enriched, [], [], [], True
     except Exception as exc:
         elapsed = time.monotonic() - t0
         stats = get_tool_stats()
@@ -474,12 +505,9 @@ async def _run_batch_async(
                 _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
                 new_c, new_r, rf = middleware.extract_findings_from_dict(data)
                 enriched = middleware.apply_enrichments_from_dict(batch, data)
-                return enriched, new_c, new_r, rf
-        enriched = [
-            c.model_copy(update={"needs_agentic": False, "agentic_hint": "batch_recursion_limit"})
-            for c in batch
-        ]
-        return enriched, [], [], []
+                return enriched, new_c, new_r, rf, False
+        enriched = _degraded_batch_components(batch, hint="batch_recursion_limit")
+        return enriched, [], [], [], True
 
     elapsed = time.monotonic() - t0
     stats = get_tool_stats()
@@ -495,11 +523,11 @@ async def _run_batch_async(
     data = _extract_structured_response(result)
     if not data:
         _LOGGER.warning("Batch %d returned no usable output", batch_num)
-        return batch, [], [], []
+        return batch, [], [], [], True
 
     new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
     enriched = middleware.apply_enrichments_from_dict(batch, data)
-    return enriched, new_components, new_rels, risk_flags
+    return enriched, new_components, new_rels, risk_flags, False
 
 
 async def _run_batches_parallel(
@@ -510,37 +538,57 @@ async def _run_batches_parallel(
     scan_paths: list[str],
     all_components: list[AIComponent] | None = None,
     max_concurrent: int = 1,
+    *,
+    timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
+    max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
-    """Run batches concurrently, capped at *max_concurrent* simultaneous LLM conversations."""
-    sem = asyncio.Semaphore(max_concurrent)
+    """Run locality-aware batches (ordered) with a circuit breaker.
 
-    async def _guarded(batch: list[AIComponent], idx: int) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
-        async with sem:
-            return await _run_batch_async(
-                agent, middleware, batch,
-                relationships, scan_paths,
-                idx, len(batches),
-                all_components=all_components,
-            )
-
-    tasks = [_guarded(batch, idx) for idx, batch in enumerate(batches, 1)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    Batches are processed sequentially so consecutive failures are defined in
+    a stable order.  *max_concurrent* is accepted for API compatibility with
+    the CLI but does not enable overlapping invocations here.
+    """
+    del max_concurrent
 
     all_enriched: list[AIComponent] = []
     all_new: list[AIComponent] = []
     all_rels: list[ComponentRelationship] = []
     all_flags: list[RiskFlag] = []
+    consecutive_failures = 0
 
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            _LOGGER.warning("Parallel batch %d raised: %s", i + 1, r)
-            all_enriched.extend(batches[i])
+    for idx, batch in enumerate(batches, 1):
+        if consecutive_failures >= max_consecutive_failures:
+            _LOGGER.warning(
+                "Agentic circuit breaker: skipping batches %d–%d after "
+                "%d consecutive failures",
+                idx, len(batches), max_consecutive_failures,
+            )
+            for b in batches[idx - 1:]:
+                all_enriched.extend(_circuit_breaker_skipped_batch(b))
+            break
+
+        try:
+            enriched, new, rels, flags, batch_failed = await _run_batch_async(
+                agent, middleware, batch,
+                relationships, scan_paths,
+                idx, len(batches),
+                all_components=all_components,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:
+            _LOGGER.warning("Parallel batch %d raised: %s", idx, exc)
+            all_enriched.extend(batch)
+            consecutive_failures += 1
             continue
-        enriched, new, rels, flags = r
+
         all_enriched.extend(enriched)
         all_new.extend(new)
         all_rels.extend(rels)
         all_flags.extend(flags)
+        if batch_failed:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
 
     return all_enriched, all_new, all_rels, all_flags
 
@@ -565,6 +613,9 @@ def _run_tier(
     max_concurrent: int,
     all_components: list[AIComponent] | None,
     cache: _AgenticResultCache | None,
+    *,
+    timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
+    max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Execute a single tier (simple or complex) with caching and parallel batches."""
     tier_enriched: list[AIComponent] = []
@@ -602,6 +653,8 @@ def _run_tier(
                 relationships, scan_paths,
                 all_components=all_components,
                 max_concurrent=max_concurrent,
+                timeout_s=timeout_s,
+                max_consecutive_failures=max_consecutive_failures,
             )
         )
     else:
@@ -609,17 +662,32 @@ def _run_tier(
         new: list[AIComponent] = []
         rels: list[ComponentRelationship] = []
         flags: list[RiskFlag] = []
+        consecutive_failures = 0
         for idx, batch in enumerate(batches, 1):
-            e, n, r, f = _run_batch(
+            if consecutive_failures >= max_consecutive_failures:
+                _LOGGER.warning(
+                    "Agentic circuit breaker: skipping batches %d–%d after "
+                    "%d consecutive failures",
+                    idx, len(batches), max_consecutive_failures,
+                )
+                for b in batches[idx - 1:]:
+                    enriched.extend(_circuit_breaker_skipped_batch(b))
+                break
+            e, n, r, f, batch_failed = _run_batch(
                 agent, middleware, batch,
                 relationships, scan_paths,
                 idx, len(batches),
                 all_components=all_components,
+                timeout_s=timeout_s,
             )
             enriched.extend(e)
             new.extend(n)
             rels.extend(r)
             flags.extend(f)
+            if batch_failed:
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
 
     if cache:
         for batch in batches:
@@ -672,6 +740,8 @@ def run_agentic_enrichment(
     batch_size: int = _DEFAULT_BATCH_SIZE,
     max_concurrent: int = 1,
     fast_model: str | None = None,
+    timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
+    max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Run the full agentic enrichment pipeline.
 
@@ -739,6 +809,8 @@ def run_agentic_enrichment(
             agent, middleware, simple,
             deterministic_relationships, scan_paths,
             batch_size, max_concurrent, deterministic_components, cache,
+            timeout_s=timeout_s,
+            max_consecutive_failures=max_consecutive_failures,
         )
         all_enriched.extend(e)
         all_new.extend(n)
@@ -768,6 +840,8 @@ def run_agentic_enrichment(
                     agent, middleware, group,
                     deterministic_relationships, scan_paths,
                     batch_size, max_concurrent, deterministic_components, cache,
+                    timeout_s=timeout_s,
+                    max_consecutive_failures=max_consecutive_failures,
                 )
                 all_enriched.extend(e)
                 all_new.extend(n)
@@ -783,6 +857,8 @@ def run_agentic_enrichment(
                 agent, middleware, complex_,
                 deterministic_relationships, scan_paths,
                 batch_size, max_concurrent, deterministic_components, cache,
+                timeout_s=timeout_s,
+                max_consecutive_failures=max_consecutive_failures,
             )
             all_enriched.extend(e)
             all_new.extend(n)
@@ -1107,3 +1183,149 @@ def run_cross_repo_coordination(
         len(rels), len(flags),
     )
     return rels, flags
+
+
+# ---------------------------------------------------------------------------
+# Container layout resolution (agentic)
+# ---------------------------------------------------------------------------
+
+class _SelectedDirectory(BaseModel):
+    path: str = ""
+    reason: str = ""
+
+
+class ContainerLayoutResponse(BaseModel):
+    """Structured output for container app directory identification."""
+
+    selected_directories: list[_SelectedDirectory] = Field(default_factory=list)
+    excluded_directories: list[_SelectedDirectory] = Field(default_factory=list)
+    reasoning: str = ""
+
+
+_CONTAINER_LAYOUT_PROMPT = """\
+You are a container image analyst for Cisco AI Defense.
+
+You will receive:
+- The image config (WORKDIR, ENTRYPOINT, CMD, ENV vars)
+- A list of candidate directories that MAY contain application source code
+- A file listing from the image filesystem
+
+Your task: determine which candidate directories contain **application source code**
+(Python, JavaScript, TypeScript, Java, Go, Rust, etc.) as opposed to:
+- Infrastructure / deployment config (Helm values, Terraform, CI scripts)
+- Vendored dependencies or generated code
+- Documentation or test-only artifacts
+- System files or package manager caches
+
+Return ONLY directories that contain code the developer wrote for this application.
+Be conservative — it is better to include a borderline directory than to miss real app code.
+
+Guidelines:
+- WORKDIR is the strongest signal — it almost always contains app code
+- ENTRYPOINT/CMD target directories are strong signals
+- Directories with requirements.txt, pyproject.toml, package.json, go.mod alongside
+  source files are strong signals
+- Directories named "tests", "docs", "scripts", "deploy", "helm", "terraform",
+  "k8s", ".github" are usually NOT app code (but "tests" alongside app code is fine
+  to include if the main app dir is the parent)
+"""
+
+
+def resolve_container_layout(
+    model_string: str,
+    image_config: dict[str, Any],
+    candidate_dirs: list[str],
+    file_listing: list[str],
+    *,
+    llm_config: dict[str, Any] | None = None,
+    timeout_s: int = 60,
+) -> list[str]:
+    """Use an LLM to pick application directories from candidates.
+
+    Parameters
+    ----------
+    model_string:
+        Model identifier for ``init_chat_model``.
+    image_config:
+        Dict with ``workdir``, ``entrypoint``, ``cmd``, ``env``.
+    candidate_dirs:
+        Directories identified by deterministic heuristics.
+    file_listing:
+        Subset of the image file listing (capped for token budget).
+    llm_config:
+        Optional API keys / endpoints.
+    timeout_s:
+        Max seconds to wait for the LLM.
+
+    Returns
+    -------
+    Filtered list of directories the LLM considers application code.
+    Falls back to *candidate_dirs* on any failure.
+    """
+    from deepagents import create_deep_agent
+
+    from ..llm_factory import build_chat_model
+
+    cfg = llm_config or {}
+
+    try:
+        model = build_chat_model(
+            model_string,
+            provider=cfg.get("provider"),
+            api_key=cfg.get("api_key"),
+            api_base=cfg.get("api_base"),
+            api_version=cfg.get("api_version"),
+            rate_limiter=_build_rate_limiter(),
+        )
+    except Exception:
+        _LOGGER.warning("Failed to init LLM for container layout, using all candidates", exc_info=True)
+        return candidate_dirs
+
+    agent = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt=_CONTAINER_LAYOUT_PROMPT,
+        response_format=ContainerLayoutResponse,
+        name="aibom-container-layout",
+    )
+
+    file_sample = file_listing[:2000]
+    user_message = json.dumps({
+        "image_config": image_config,
+        "candidate_directories": candidate_dirs,
+        "file_listing_sample": file_sample,
+    }, indent=2)
+
+    try:
+        result = asyncio.run(
+            asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: agent.invoke(
+                        {"messages": [{"role": "user", "content": user_message}]},
+                        config={"recursion_limit": 25},
+                    ),
+                ),
+                timeout=timeout_s,
+            )
+        )
+    except Exception:
+        _LOGGER.warning("Container layout agent failed, using all candidates", exc_info=True)
+        return candidate_dirs
+
+    parsed = _extract_structured_response(result)
+    if not parsed:
+        _LOGGER.warning("Container layout agent returned unparseable response")
+        return candidate_dirs
+
+    selected = [d.get("path", "") for d in parsed.get("selected_directories", [])]
+    selected = [d for d in selected if d]
+
+    if not selected:
+        _LOGGER.info("Container layout agent selected no directories, using all candidates")
+        return candidate_dirs
+
+    _LOGGER.info(
+        "Container layout agent selected %d of %d dirs: %s",
+        len(selected), len(candidate_dirs), selected,
+    )
+    return selected

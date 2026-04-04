@@ -478,7 +478,6 @@ dependencies = [
     { name = "httpx" },
     { name = "jinja2" },
     { name = "libcst" },
-    { name = "litellm" },
     { name = "pandas" },
     { name = "pathspec" },
     { name = "platformdirs" },
@@ -505,7 +504,9 @@ all = [
     { name = "detect-secrets" },
     { name = "google-cloud-aiplatform" },
     { name = "langchain" },
+    { name = "langchain-aws" },
     { name = "langchain-core" },
+    { name = "langchain-openai" },
     { name = "tree-sitter" },
     { name = "tree-sitter-languages" },
 ]
@@ -519,6 +520,12 @@ cloud = [
     { name = "azure-mgmt-cognitiveservices" },
     { name = "boto3" },
     { name = "google-cloud-aiplatform" },
+]
+llm-aws = [
+    { name = "langchain-aws" },
+]
+llm-openai = [
+    { name = "langchain-openai" },
 ]
 security = [
     { name = "cisco-ai-mcp-scanner" },
@@ -550,7 +557,7 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'cloud'", specifier = ">=1.35.0" },
     { name = "cisco-ai-mcp-scanner", marker = "extra == 'security'", specifier = ">=4.3.0" },
     { name = "cisco-ai-skill-scanner", marker = "extra == 'security'", specifier = ">=2.0.0" },
-    { name = "cisco-aibom", extras = ["analysis", "security", "agentic", "cloud"], marker = "extra == 'all'" },
+    { name = "cisco-aibom", extras = ["analysis", "security", "agentic", "llm-openai", "llm-aws", "cloud"], marker = "extra == 'all'" },
     { name = "cyclonedx-python-lib", specifier = ">=9.0.0" },
     { name = "deepagents", marker = "extra == 'agentic'", specifier = ">=0.4.12" },
     { name = "detect-secrets", marker = "extra == 'analysis'", specifier = ">=1.5.0" },
@@ -560,9 +567,10 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.0" },
     { name = "langchain", marker = "extra == 'agentic'", specifier = ">=1.2.11" },
+    { name = "langchain-aws", marker = "extra == 'llm-aws'", specifier = ">=0.2.0" },
     { name = "langchain-core", marker = "extra == 'agentic'", specifier = ">=1.2.18" },
+    { name = "langchain-openai", marker = "extra == 'llm-openai'", specifier = ">=0.3.0" },
     { name = "libcst", specifier = ">=1.0.0" },
-    { name = "litellm", specifier = ">=1.77.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "pathspec", specifier = ">=0.12.0" },
     { name = "platformdirs", specifier = ">=4.0.0" },
@@ -576,7 +584,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.9.0" },
     { name = "uvicorn", specifier = ">=0.24.0" },
 ]
-provides-extras = ["test", "analysis", "security", "agentic", "cloud", "all"]
+provides-extras = ["test", "analysis", "security", "agentic", "llm-openai", "llm-aws", "cloud", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1698,6 +1706,21 @@ wheels = [
 ]
 
 [[package]]
+name = "langchain-aws"
+version = "1.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "boto3" },
+    { name = "langchain-core" },
+    { name = "numpy" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/13/1a/6b7824b4d88ae89a90ef50995529522ce2c3bea416d0c7868bdec82f33ea/langchain_aws-1.4.1.tar.gz", hash = "sha256:9b91efc224b4d9a44120a4dea65f57097c75adcdba906dcea13357ffa93b0559", size = 489886, upload-time = "2026-03-20T04:55:11.285Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/67/7d/63a2c27b907db716f5d3076b6e0df1f9c4cbddf0d4f82cd5bd39e656baa5/langchain_aws-1.4.1-py3-none-any.whl", hash = "sha256:42faf88d646966155da006be61d8beb8e35decd4d610cf86728ef17a19be0a23", size = 196845, upload-time = "2026-03-20T04:55:09.997Z" },
+]
+
+[[package]]
 name = "langchain-core"
 version = "1.2.20"
 source = { registry = "https://pypi.org/simple" }
@@ -1729,6 +1752,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/14/63/e7d148f903cebfef50109da71378f411166f068d66f79b9e16a62dbacf41/langchain_google_genai-4.2.1.tar.gz", hash = "sha256:7f44487a0337535897e3bba9a1d6605d722629e034f757ffa8755af0aa85daa8", size = 278288, upload-time = "2026-02-19T19:29:19.416Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/7e/46c5973bd8b10a5c4c8a77136cf536e658796380a17c740246074901b038/langchain_google_genai-4.2.1-py3-none-any.whl", hash = "sha256:a7735289cf94ca3a684d830e09196aac8f6e75e647e3a0a1c3c9dc534ceb985e", size = 66500, upload-time = "2026-02-19T19:29:18.002Z" },
+]
+
+[[package]]
+name = "langchain-openai"
+version = "1.1.11"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core" },
+    { name = "openai" },
+    { name = "tiktoken" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/40/cd/439be2b8deb8bd0d4c470c7c7f66698a84d823e583c3d36a322483cb7cab/langchain_openai-1.1.11.tar.gz", hash = "sha256:44b003a2960d1f6699f23721196b3b97d0c420d2e04444950869213214b7a06a", size = 1088560, upload-time = "2026-03-09T23:02:36.894Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f0/0f/e4cb42848c25f65969adfb500a06dea1a541831604250fd0d8aa6e54fef5/langchain_openai-1.1.11-py3-none-any.whl", hash = "sha256:a03596221405d38d6852fb865467cb0d9ff9e79f335905eb6a576e8c4874ac71", size = 87694, upload-time = "2026-03-09T23:02:35.651Z" },
 ]
 
 [[package]]
@@ -2416,7 +2453,7 @@ wheels = [
 
 [[package]]
 name = "openai"
-version = "2.15.0"
+version = "2.30.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -2428,9 +2465,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/94/f4/4690ecb5d70023ce6bfcfeabfe717020f654bde59a775058ec6ac4692463/openai-2.15.0.tar.gz", hash = "sha256:42eb8cbb407d84770633f31bf727d4ffb4138711c670565a41663d9439174fba", size = 627383, upload-time = "2026-01-09T22:10:08.603Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/88/15/52580c8fbc16d0675d516e8749806eda679b16de1e4434ea06fb6feaa610/openai-2.30.0.tar.gz", hash = "sha256:92f7661c990bda4b22a941806c83eabe4896c3094465030dd882a71abe80c885", size = 676084, upload-time = "2026-03-25T22:08:59.96Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b5/df/c306f7375d42bafb379934c2df4c2fa3964656c8c782bac75ee10c102818/openai-2.15.0-py3-none-any.whl", hash = "sha256:6ae23b932cd7230f7244e52954daa6602716d6b9bf235401a107af731baea6c3", size = 1067879, upload-time = "2026-01-09T22:10:06.446Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/9e/5bfa2270f902d5b92ab7d41ce0475b8630572e71e349b2a4996d14bdda93/openai-2.30.0-py3-none-any.whl", hash = "sha256:9a5ae616888eb2748ec5e0c5b955a51592e0b201a11f4262db920f2a78c5231d", size = 1146656, upload-time = "2026-03-25T22:08:58.2Z" },
 ]
 
 [[package]]

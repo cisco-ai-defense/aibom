@@ -1,0 +1,374 @@
+# CLI Reference
+
+Complete reference for the `cisco-aibom` command-line interface.
+
+## Global Options
+
+These options apply to all commands.
+
+| Option | Env Var | Default | Description |
+|--------|---------|---------|-------------|
+| `--log-level` | `AIBOM_LOG_LEVEL` | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `--help` | — | — | Show help and exit. |
+
+## `cisco-aibom analyze`
+
+Scan source code, container images, or repositories to produce an AI Bill of Materials.
+
+```bash
+cisco-aibom analyze [OPTIONS] [SOURCES]...
+```
+
+### Positional Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `SOURCES` | One or more source directories, file paths, or container image references to analyze. |
+
+### Source Options
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--images-file`, `-f` | — | Path to a JSON file containing a list of container images to scan. |
+| `--repos-file` | — | File listing repo paths or git URLs (JSON array or newline-delimited). |
+| `--discover-repos` | — | Treat each positional source as a parent directory and discover git repos underneath. |
+| `--github-org` | `AIBOM_GITHUB_ORG` | Discover and scan repos from a GitHub org or user. |
+| `--gitlab-group` | `AIBOM_GITLAB_GROUP` | Discover and scan repos from a GitLab group. |
+| `--bitbucket-project` | `AIBOM_BITBUCKET_PROJECT` | Discover and scan repos from a Bitbucket workspace/project. |
+| `--platform-token` | `AIBOM_PLATFORM_TOKEN` | Auth token for GitHub/GitLab/Bitbucket API access. |
+| `--repo-filter` | — | Filter discovered repos by name substring. |
+| `--repo-topic` | — | Filter discovered repos by topic/tag. |
+| `--max-repos` | — | Max repos when using discovery (sorted by last push, most recent first). |
+| `--parallel-repos` | — | Number of repositories to scan in parallel (default `1`). |
+| `--incremental` | — | Skip repos whose HEAD is unchanged since last cached scan. |
+
+### Output Options
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--output-format`, `-o` | — | Output format: `plaintext`, `json`, `api`, `cyclonedx`, `sarif`, `spdx`, `html`, `markdown`, `csv`, `junit` (default `plaintext`). |
+| `--output-file`, `-O` | — | Path to write the report (required for file-based formats). |
+| `--validate` | — | Validate output against the format's schema and report errors. |
+| `--show-summary` / `--no-show-summary` | — | Display a Rich summary table after analysis (default on). |
+| `--timing` | — | Print per-stage and per-scanner timing breakdown. |
+
+### Report Submission
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--post-url` | `AIBOM_POST_URL` | HTTP endpoint to POST the JSON report to. |
+| `--ai-defense-api-key` | `AI_DEFENSE_API_KEY` | API key for Cisco AI Defense endpoints (sent as `x-cisco-ai-defense-tenant-api-key`). |
+| `--post-timeout` | `AIBOM_POST_TIMEOUT` | Timeout in seconds for POSTing the report (default `30`). |
+| `--post-verify-tls` / `--no-post-verify-tls` | `AIBOM_POST_VERIFY_TLS` | Verify TLS certificates when POSTing (default on). |
+
+### LLM / Agentic Options
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--llm-model` | `AIBOM_LLM_MODEL` | LLM model name (e.g. `gpt-4o`, `us.anthropic.claude-sonnet-4-20250514-v1:0`). Enables agentic enrichment (requires `cisco-aibom[agentic]`). |
+| `--llm-provider` | `AIBOM_LLM_PROVIDER` | LangChain provider name: `openai`, `azure_openai`, `bedrock`, `anthropic`, `google_genai`, `ollama`, etc. Inferred from the model name if not set. |
+| `--llm-api-key` | `AIBOM_LLM_API_KEY` | LLM API key. Optional for local LLMs and AWS Bedrock. |
+| `--llm-api-base` | `AIBOM_LLM_API_BASE` | LLM API base URL. |
+| `--llm-api-version` | `AIBOM_LLM_API_VERSION` | LLM API version (required for Azure OpenAI). |
+| `--agentic-scope` | — | `candidates` (only ambiguous items, default) or `all` (every component). |
+| `--agentic-batch-size` | — | Max components per LLM invocation (default `5`). |
+| `--agentic-concurrency` | — | Max parallel agentic LLM batches (default `1`). |
+| `--agentic-fast-model` | — | Cheaper/faster model for simple confirmations (Tier 1 candidates). |
+| `--agentic-timeout` | — | Wall-clock timeout in seconds per agentic batch (default `120`). |
+
+### Analysis Options
+
+| Option | Description |
+|--------|-------------|
+| `--custom-catalog` | Path to a custom catalog file (`.aibom.yaml`/`.yml`/`.json`). Auto-discovered from the source directory if not set. |
+| `--container-extraction-tier` | Force a container extraction tier: `auto`, `syft`, `docker`, `podman`, `nerdctl`, `buildah`, `crane`, `skopeo`, `tarball` (default `auto`). |
+| `--severity` | Minimum severity of findings to include (default `info`). |
+| `--strict` | Only emit high-confidence detections; suppress items needing agentic reasoning. |
+| `--fail-on` | Exit non-zero if risk severity meets or exceeds: `critical`, `high`, `medium`, `low`. |
+| `--policy` | Path to a YAML policy file. Exits `1` if the policy does not pass. |
+| `--compliance` | Advisory compliance mapping: `eu-ai-act`, `owasp-agentic`, `nist-ai-rmf`, or `all`. |
+| `--cache-dir` | Directory for caching scan results keyed by `repo@commit_sha`. |
+
+### Examples
+
+```bash
+# Basic scan with JSON output
+cisco-aibom analyze ./my-app -o json -O report.json
+
+# Container image scan
+cisco-aibom analyze my-app:latest -o json -O report.json
+
+# HTML dashboard
+cisco-aibom analyze ./my-app -o html -O dashboard.html
+
+# CycloneDX BOM
+cisco-aibom analyze ./my-app -o cyclonedx -O bom.json
+
+# With agentic enrichment
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-4o --llm-provider openai --llm-api-key $OPENAI_API_KEY
+
+# Multi-repo scan with discovery
+cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json
+
+# GitHub org scan
+cisco-aibom analyze --github-org my-org --platform-token $GITHUB_TOKEN \
+  --max-repos 50 --parallel-repos 4 -o json -O report.json
+
+# Policy gate in CI
+cisco-aibom analyze ./my-app -o json -O report.json --policy policy.yaml --fail-on high
+
+# Timing breakdown
+cisco-aibom analyze ./my-app -o json -O report.json --timing
+
+# Strict mode (deterministic only)
+cisco-aibom analyze ./my-app -o json -O report.json --strict
+
+# Compliance check
+cisco-aibom analyze ./my-app -o json -O report.json --compliance eu-ai-act
+```
+
+---
+
+## `cisco-aibom report`
+
+Render a previously generated JSON report using Rich formatting.
+
+```bash
+cisco-aibom report [OPTIONS] REPORT_FILE
+```
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `REPORT_FILE` | Path to a JSON report file. |
+| `--raw-json` | Display the raw JSON with syntax highlighting before the summary. |
+
+### Example
+
+```bash
+cisco-aibom report report.json
+cisco-aibom report report.json --raw-json
+```
+
+---
+
+## `cisco-aibom watch`
+
+Poll directories for file-system changes and re-run the scan pipeline, printing component deltas.
+
+```bash
+cisco-aibom watch [OPTIONS] SOURCES...
+```
+
+| Argument / Option | Default | Description |
+|-------------------|---------|-------------|
+| `SOURCES` | — | Source directories or files to poll and re-scan. |
+| `--interval` | `2.0` | Seconds between file-system polls. |
+| `--debounce` | `0.5` | Seconds to wait after a change before re-scanning. |
+
+### Example
+
+```bash
+cisco-aibom watch ./my-app --interval 5 --debounce 1
+```
+
+---
+
+## `cisco-aibom diff run`
+
+Compare two AIBOM JSON scan reports and display added, removed, and changed components.
+
+```bash
+cisco-aibom diff run [OPTIONS] OLD_REPORT NEW_REPORT
+```
+
+| Argument / Option | Default | Description |
+|-------------------|---------|-------------|
+| `OLD_REPORT` | — | Path to the older JSON report. |
+| `NEW_REPORT` | — | Path to the newer JSON report. |
+| `--format`, `-f` | `table` | Output format: `table`, `json`, or `markdown`. |
+
+### Example
+
+```bash
+cisco-aibom diff run report-v1.json report-v2.json
+cisco-aibom diff run report-v1.json report-v2.json --format json
+```
+
+---
+
+## `cisco-aibom benchmark run`
+
+Compare scan output against a ground-truth YAML file to measure detection accuracy.
+
+```bash
+cisco-aibom benchmark run [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--gt` | Path to ground-truth YAML file (required). |
+| `--scan` | Path to scan report JSON (required). |
+| `--strict-names` | Match listed names (case-insensitive) when the ground-truth provides names. |
+| `--format` | Output format: `table` (default), `json`, or `csv`. |
+
+### Example
+
+```bash
+cisco-aibom benchmark run --gt ground-truth.yaml --scan report.json
+cisco-aibom benchmark run --gt ground-truth.yaml --scan report.json --format json
+```
+
+### Ground-truth YAML format
+
+```yaml
+components:
+  - type: model
+    count: 3
+    names:
+      - gpt-4o
+      - text-embedding-ada-002
+      - gemma-2b
+  - type: agent
+    count: 2
+  - type: tool
+    count: 5
+```
+
+---
+
+## `cisco-aibom kb`
+
+Manage the AIBOM knowledge base (DuckDB catalog).
+
+### `kb download`
+
+```bash
+cisco-aibom kb download [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--version`, `-v` | Specific KB version to download (latest if omitted). |
+| `--url` | Override the manifest URL. |
+
+### `kb check`
+
+Check if a newer KB version is available.
+
+```bash
+cisco-aibom kb check
+```
+
+### `kb info`
+
+Display information about the locally installed KB.
+
+```bash
+cisco-aibom kb info
+```
+
+### `kb verify`
+
+Verify the integrity of the locally installed KB (SHA-256 checksum).
+
+```bash
+cisco-aibom kb verify
+```
+
+### `kb request`
+
+Request a KB build for a specific SDK version.
+
+```bash
+cisco-aibom kb request [OPTIONS]
+```
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--sdk` | — | SDK name, e.g. `langchain`, `openai` (required). |
+| `--version`, `-v` | — | SDK version to request (required). |
+| `--language`, `-l` | — | Programming language (default `python`). |
+| `--api-key` | `CISCO_AI_DEFENSE_API_KEY` | Cisco AI Defense API key. |
+| `--api-base` | `CISCO_AI_DEFENSE_API_BASE` | Cisco AI Defense API base URL. |
+
+### `kb request-status`
+
+```bash
+cisco-aibom kb request-status REQUEST_ID [OPTIONS]
+```
+
+### `kb list-requests`
+
+```bash
+cisco-aibom kb list-requests [OPTIONS]
+```
+
+---
+
+## `cisco-aibom cache`
+
+Manage the scan result cache.
+
+### `cache clear`
+
+Remove all cached scan results and (optionally) the agentic enrichment cache.
+
+```bash
+cisco-aibom cache clear [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--cache-dir` | `~/.aibom/cache` | Directory where cached scan results are stored. |
+| `--include-agentic` / `--no-agentic` | Include | Also clear the agentic enrichment cache at `~/.cache/cisco-aibom/agentic/`. |
+
+### `cache list`
+
+List all cached scan result entries.
+
+```bash
+cisco-aibom cache list [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--cache-dir` | `~/.aibom/cache` | Directory where cached scan results are stored. |
+
+---
+
+## `cisco-aibom plugin list`
+
+List all discovered plugins (entry points, MCP servers, plugin manifests).
+
+```bash
+cisco-aibom plugin list
+```
+
+---
+
+## Environment Variable Summary
+
+| Variable | Description |
+|----------|-------------|
+| `AIBOM_ENV_FILE` | Path to a `.env` file to load. Falls back to `./.env` if present. |
+| `AIBOM_LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
+| `AIBOM_LLM_MODEL` | LLM model name for agentic enrichment. |
+| `AIBOM_LLM_PROVIDER` | LangChain provider name. |
+| `AIBOM_LLM_API_KEY` | LLM API key. |
+| `AIBOM_LLM_API_BASE` | LLM API base URL. |
+| `AIBOM_LLM_API_VERSION` | LLM API version (Azure OpenAI). |
+| `AIBOM_POST_URL` | HTTP endpoint to POST the JSON report to. |
+| `AIBOM_POST_TIMEOUT` | POST timeout in seconds. |
+| `AIBOM_POST_VERIFY_TLS` | Verify TLS for report POST (`true`/`false`). |
+| `AI_DEFENSE_API_KEY` | Cisco AI Defense tenant API key. |
+| `AIBOM_GITHUB_ORG` | GitHub org/user for repo discovery. |
+| `AIBOM_GITLAB_GROUP` | GitLab group for repo discovery. |
+| `AIBOM_BITBUCKET_PROJECT` | Bitbucket workspace/project for repo discovery. |
+| `AIBOM_PLATFORM_TOKEN` | Auth token for GitHub/GitLab/Bitbucket APIs. |
+| `AIBOM_DB_PATH` | Override path to the DuckDB catalog file. |
+| `AIBOM_DB_SHA256` | Expected SHA-256 checksum for the DuckDB catalog. |
+| `AIBOM_MANIFEST_PATH` | Override path to `manifest.json`. |
+| `CISCO_AI_DEFENSE_API_KEY` | API key for KB request commands. |
+| `CISCO_AI_DEFENSE_API_BASE` | API base URL for KB request commands. |
+| `AZURE_SUBSCRIPTION_ID` | Azure subscription ID for cloud scanning. |

@@ -28,7 +28,7 @@ from pathspec import PathSpec
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
-from .file_cache import read_text_cached
+from .file_cache import is_python_source, read_python_source, read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -185,7 +185,7 @@ def _first_match_line(pattern: re.Pattern[str], text: str) -> Optional[int]:
 
 def _components_from_python(path: Path) -> list[AIComponent]:
     try:
-        text = read_text_cached(path)
+        text = read_python_source(path)
     except OSError:
         return []
     fp = str(path.resolve())
@@ -351,7 +351,7 @@ class McpDetector(BaseScanner):
             if _is_mcp_config_path(file_path):
                 config_paths_seen.add(str(file_path.resolve()))
                 components.extend(_components_from_config(file_path))
-            elif file_path.suffix == ".py":
+            elif is_python_source(file_path):
                 components.extend(_components_from_python(file_path))
 
         if config_paths_seen:

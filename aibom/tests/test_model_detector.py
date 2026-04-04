@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aibom.scanners.model_detector import ModelDetector, _litellm_alias_keys, _registry_cache
+from aibom.scanners.model_detector import ModelDetector, _model_alias_keys, _registry_cache
 
 from .conftest import run_scanner
 
@@ -22,8 +22,8 @@ def _clear_registry_cache():
     _registry_cache.clear()
 
 
-class TestLiteLLMAliasKeys:
-    """Unit tests for _litellm_alias_keys normalization."""
+class TestModelAliasKeys:
+    """Unit tests for _model_alias_keys normalization."""
 
     @pytest.mark.parametrize(
         "raw_id, expected_aliases",
@@ -76,7 +76,7 @@ class TestLiteLLMAliasKeys:
         ],
     )
     def test_alias_generation(self, raw_id: str, expected_aliases: list[str]) -> None:
-        result = _litellm_alias_keys(raw_id)
+        result = _model_alias_keys(raw_id)
         for alias in expected_aliases:
             assert alias in result, f"{alias!r} not in {result}"
 
@@ -147,7 +147,7 @@ class TestModelDetector:
         )
         assert comps == []
 
-    def test_litellm_catalog_used_when_available(self, tmp_path: Path) -> None:
+    def test_model_catalog_used_when_available(self, tmp_path: Path) -> None:
         fake_registry = {
             "brand-new-model-2026": {
                 "provider": "newco",
@@ -231,7 +231,7 @@ class TestModelDetector:
         assert comps[0].metadata["registry_source"] == "none"
 
     def test_bedrock_arn_resolves_via_alias(self, tmp_path: Path) -> None:
-        meta = {"provider": "bedrock", "family": "claude-3-5-sonnet", "deprecated": False, "source": "litellm"}
+        meta = {"provider": "bedrock", "family": "claude-3-5-sonnet", "deprecated": False, "source": "model_catalog"}
         fake_registry = {
             "anthropic.claude-3-5-sonnet-20241022-v2:0": meta,
             "claude-3-5-sonnet-20241022-v2:0": meta,
@@ -246,10 +246,10 @@ class TestModelDetector:
             )
         assert len(comps) == 1
         assert comps[0].confidence == 1.0
-        assert comps[0].metadata["registry_source"] == "litellm"
+        assert comps[0].metadata["registry_source"] == "model_catalog"
 
     def test_shorthand_resolves_via_alias(self, tmp_path: Path) -> None:
-        meta = {"provider": "anthropic", "family": "claude-3-5-sonnet", "deprecated": False, "source": "litellm"}
+        meta = {"provider": "anthropic", "family": "claude-3-5-sonnet", "deprecated": False, "source": "model_catalog"}
         fake_registry = {
             "claude-3-5-sonnet-20241022": meta,
             "claude-3-5-sonnet": meta,
@@ -262,10 +262,10 @@ class TestModelDetector:
             )
         assert len(comps) == 1
         assert comps[0].confidence == 1.0
-        assert comps[0].metadata["registry_source"] == "litellm"
+        assert comps[0].metadata["registry_source"] == "model_catalog"
 
     def test_azure_prefixed_model_resolves(self, tmp_path: Path) -> None:
-        meta = {"provider": "azure", "family": "gpt-4o", "deprecated": False, "source": "litellm"}
+        meta = {"provider": "azure", "family": "gpt-4o", "deprecated": False, "source": "model_catalog"}
         fake_registry = {
             "azure/gpt-4o-2024-08-06": meta,
             "gpt-4o-2024-08-06": meta,

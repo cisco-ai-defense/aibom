@@ -1,73 +1,198 @@
-# AI BOM - Technical Overview
+# AI BOM — Technical Overview
 
 ## 1. High-Level Architecture
 
 | Layer | Responsibilities |
-| --- | --- |
-| **CLI (Typer + Rich)** | Provides `analyze` and `report` commands, loads `.env` (or `AIBOM_ENV_FILE`), validates options, configures logging, and renders Rich summaries. |
-| **Config + Manifest** | Loads `manifest.json` from `AIBOM_MANIFEST_PATH`, packaged defaults, then current-working-directory fallback; environment overrides support DB path/SHA and post URL. |
+|-------|------------------|
+| **CLI (Typer + Rich)** | Provides `analyze`, `report`, `watch`, `diff`, `benchmark`, `kb`, `cache`, and `plugin` commands. Loads `.env` configuration, validates options, configures logging, and renders Rich summaries. |
+| **Config + Manifest** | Loads `manifest.json` from `AIBOM_MANIFEST_PATH`, packaged defaults, or CWD fallback. Environment overrides for DB path, SHA, and post URL. |
 | **Knowledge Base Loader** | Resolves a local DuckDB catalog path (from env or manifest), verifies SHA-256, and returns the validated file path. |
-| **Source Resolver** | Distinguishes local paths vs Docker images; for images, runs a container and extracts `/app` or `site-packages` into a temp workspace. |
-| **Parser (LibCST)** | Extracts assignments, decorators, standalone calls, type annotations, context managers, imports, class definitions (with base classes), `# aibom:` inline annotations, and raw code snippets. |
-| **Custom Catalog** | Loads `.aibom.yaml`/`.yml`/`.json` user configuration: custom component entries, base-class rules, exclude patterns, extended relationship hints, and custom relationship types. |
-| **Workflow Index (AST)** | Builds a best-effort call graph with function boundaries and callsite metadata for workflow context. |
-| **Categorizer + Relationships** | Matches parsed symbols to catalog entries (DuckDB + custom), processes inline annotations and base-class rules, assigns categories, optionally enriches model/tool details via LLM, and derives built-in and user-defined relationship links. |
-| **Reporting + API** | Emits plaintext or JSON reports, or starts the FastAPI API server; optional POST of JSON with retries. |
+| **Source Resolver** | Distinguishes local paths, container images, and remote repos. For images, runs tiered container extraction (Docker/Podman/nerdctl/Buildah/Skopeo/Crane/tarball). For remote repos, clones via platform adapters (GitHub/GitLab/Bitbucket). |
+| **Scan Pipeline** | Four-stage orchestrator: Scan → Cross-Ref → Agentic → Assemble. Runs all registered scanners, resolves env-var references, optionally enriches via LLM, and applies filtering. |
+| **Scanners (21 built-in)** | Pluggable scanner registry with `__init_subclass__` auto-registration. Each scanner implements `scan(ctx) → (components, relationships)`. Covers models, dependencies, secrets, vulnerabilities, MCP, ML lifecycle, cloud, CI/CD, deployments, containers, data files, config, skills, workflows, and more. |
+| **Cross-Reference Index** | Builds env-var and package indexes across all scanned files. Resolves env-var references to concrete values (model names, API keys, endpoints) by correlating source code with `.env`, `docker-compose.yaml`, Helm values, and Terraform files. |
+| **Agentic Layer** | Optional LLM-powered enrichment via Deep Agents + LangChain. Three-tier classification (simple/complex candidates), locality-aware batching, sub-agent dispatch, structured output parsing, content-hash caching, and circuit breaker. |
+| **Policy Engine** | YAML-driven pass/fail gates: max risk score, required/blocked component types, required fields, and custom rules. |
+| **Reporters (10 formats)** | Pluggable reporter registry. Built-in: Plaintext, JSON, CycloneDX (1.6), SARIF (2.1.0), SPDX (3.0), HTML dashboard, Markdown, CSV, JUnit. Plus live FastAPI API server. |
+| **Custom Catalog** | Loads `.aibom.yaml`/`.yml`/`.json`: custom component entries, base-class rules, exclude patterns, relationship hints, and custom relationship types. |
 
 ## 2. Execution Flow
 
-1. **Startup** - Load `.env` (from `AIBOM_ENV_FILE` or local defaults), parse CLI args, validate output/LLM options, and apply manifest config for DuckDB path/checksum defaults.  
-2. **Knowledge Base** - Call `ensure_local_database()` to resolve and verify the local DuckDB catalog with SHA-256 validation.  
-3. **Custom Catalog** - Load `.aibom.yaml`/`.yml`/`.json` (from `--custom-catalog` or auto-discovered in the source directory). Merge custom component entries into the catalog, register exclude patterns, and pass base-class rules, relationship hints, and custom relationship types to the categorizer.
-4. **Source Acquisition** - For each source: detect Docker vs local path, extract `/app` or `site-packages` for images, and list `.py` files.
-5. **Parsing** - Run the LibCST visitor per file to collect assignments, decorators, type annotations, context managers, imports, class definitions (with base classes), and `# aibom:` inline annotations; parse errors are logged as warnings.
-6. **Workflow Index** - Build an AST-based call graph for the source files to provide workflow context (distance, callsite, arguments).
-7. **Categorization** - Query the catalog by suffix (DuckDB + custom entries, minus excludes), keep exact symbol matches, assign categories, process inline annotations and base-class rules, attach workflow context, and derive built-in and user-defined relationships. Optional LLM enrichment can add tool descriptions and model names.
-8. **Reporting** - Convert container temp paths to container-style paths, build per-source summaries and run metadata, and emit plaintext or JSON reports.
-9. **Publishing / API** - Optionally POST the JSON report with retries, or start the in-memory API server (`--output-format api`).
-10. **Console Summary** - Render Rich summaries and workflow examples when `--show-summary` is enabled.
+1. **Startup** — Load `.env` (from `AIBOM_ENV_FILE` or local defaults), parse CLI args, validate options, configure logging.
+2. **Knowledge Base** — Call `ensure_local_database()` to resolve and verify the DuckDB catalog with SHA-256 validation.
+3. **Custom Catalog** — Load `.aibom.yaml` (from `--custom-catalog` or auto-discovered). Merge custom entries, register excludes, pass base-class rules and relationship hints.
+4. **Source Acquisition** — For each source: detect container image vs local path vs remote repo. Extract container images via the tiered extractor. Clone remote repos via platform adapters.
+5. **Scan Pipeline Stage 1: Scan** — Run all registered scanners against the source files. Each scanner produces components and relationships. File I/O uses async caching for performance.
+6. **Scan Pipeline Stage 2: Cross-Ref** — Build env-var and package indexes. Resolve env-var references (`os.getenv("MODEL_NAME")`) to concrete values by correlating across files, `.env`, docker-compose, Helm, and Terraform.
+7. **Scan Pipeline Stage 3: Agentic** — If `--llm-model` is set, classify components into simple/complex candidates. Run locality-aware batched LLM enrichment. Apply structured output (enrichments, new components, removals, risk findings). Cache results by content hash.
+8. **Scan Pipeline Stage 4: Assemble** — Apply `--strict` filtering (drop `needs_agentic` items), collect counts and timing, build the final `PipelineResult`.
+9. **Reporting** — Route `PipelineResult` to the selected reporter. Convert container temp paths to container-style paths. Build per-source summaries and run metadata.
+10. **Post-Processing** — Optionally POST the JSON report with retries, run policy checks, display compliance advisories, render Rich console summary.
 
-## 3. Key Modules
+## 3. Scanner Architecture
 
-| Module | Notes |
-| --- | --- |
-| `src/aibom/cli.py` | CLI entrypoint; orchestrates analysis, loads `.env`, resolves manifest settings, loads custom catalog, and renders outputs. |
-| `src/aibom/cst_parser.py` | LibCST-based parser for assignments, decorators, annotations, context managers, imports, class definitions (with base classes), `# aibom:` inline annotations, and raw code. |
-| `src/aibom/custom_catalog.py` | Loads and validates `.aibom.yaml`/`.yml`/`.json` user configuration files. Parses custom component entries, base-class detection rules, exclude patterns, extended relationship hints, and custom relationship types. Also provides `parse_inline_annotation()` for `# aibom:` comment parsing. |
-| `src/aibom/workflow_analyzer.py` | AST-based function index and call graph for workflow context enrichment. |
-| `src/aibom/categorizer.py` | Maps observations to catalog entries (DuckDB + supplemental + custom), processes inline annotations and base-class rules, attaches workflows, and derives built-in and user-defined relationships. |
-| `src/aibom/catalog_db.py` | DuckDB access layer for catalog lookup; supports custom entry merging and exclude filtering. |
-| `src/aibom/db_loader.py` | Manifest/env path resolution and SHA verification of the local catalog. |
-| `src/aibom/report_sender.py` | POSTs JSON report payloads with retry/backoff. |
-| `src/aibom/api_handler.py` | Converts results to a DataFrame and starts the FastAPI API server. |
-| `src/aibom/api/server.py` | FastAPI endpoints for component browsing and health checks. |
-| `tests/…` | Coverage for parsing, categorization, workflow indexing, custom catalog loading, and report generation. |
+Scanners use a registry pattern with `__init_subclass__` auto-registration:
 
-## 4. Workflow Index Essentials
+```
+BaseScanner
+├── ModelDetector          — AI model usage (registry lookup, import context)
+├── DependencyScanner      — Package manifests (requirements.txt, package.json, go.mod, etc.)
+├── SecretDetector         — Hardcoded API keys, tokens (via detect-secrets)
+├── VulnScanner            — CVE lookups via OSV.dev API
+├── McpDetector            — MCP server/client usage patterns
+├── SkillDetector          — AI skill definitions and registrations
+├── MLLifecycleDetector    — Training runs, datasets, hyperparameters, model artifacts
+├── CloudScanner           — AWS/GCP/Azure AI service resource references
+├── CICDScanner            — CI/CD pipeline AI asset references
+├── DeploymentDetector     — IaC deployment patterns (Terraform, CloudFormation, Helm, K8s)
+├── ContainerScanner       — Dockerfile/Containerfile AI base image detection
+├── DataFileScanner        — Model files (.safetensors, .gguf, .onnx) and dataset files (.parquet, .arrow)
+├── ModelFileScanner       — Model artifact files on disk
+├── ConfigScanner          — Framework config files (LangGraph JSON, pyproject.toml AI sections)
+├── MultiLanguageScanner   — JS/TS, Java, Go, Rust, Ruby, C#, PHP (via tree-sitter)
+├── EnvVarResolver         — Environment variable extraction from source code
+├── KBEnrichmentScanner    — DuckDB knowledge base symbol matching and enrichment
+├── WorkflowScanner        — Workflow/call-graph context attachment
+├── WorkspaceDepScanner    — Monorepo local path dependency detection
+├── ShadowAIDetector       — Shadow AI / unmanaged AI usage patterns
+└── (Plugin scanners via entry point: aibom.scanners)
+```
 
-1. **AST Function Indexing** - Records function/method boundaries, qualified names, decorators, class context, and parameter lists.  
-2. **Call Edge Recording** - Captures best-effort call relationships within a file, storing callsite line numbers and serialized argument strings.  
-3. **Reverse Graph Traversal** - `get_workflow_context` walks callers breadth-first (default depth 4, max 10 entries) and returns `workflow_id`, `distance`, and call metadata.  
-4. **Reporting** - Workflow context is attached to components and also summarized per source in the JSON report.
+Each scanner receives a `ScanContext` with paths, config, and shared state. Scanners run in registration order. The file cache (`file_cache.py`) provides async-compatible read caching to avoid redundant I/O across scanners.
 
-## 5. Knowledge Base (DuckDB) Strategy
+## 4. Key Modules
 
-* Manifest keys: `duckdb_sha256` and `duckdb_file`, with env overrides (`AIBOM_DB_PATH`, `AIBOM_DB_SHA256`).  
-* `duckdb_file` is resolved relative to `manifest.json` when the value is not absolute.  
-* Catalog lookup uses `id LIKE %suffix` for parsed symbols; final matches are exact string matches against the parsed qualified names.  
-* User-defined custom entries from `.aibom.yaml` are merged into the in-memory catalog with lowest precedence (DuckDB > supplemental > custom). Exclude patterns filter out matching entries from all sources.  
+| Module | Purpose |
+|--------|---------|
+| `cli.py` | CLI entry point — orchestrates analysis, loads config, renders outputs. |
+| `scan_pipeline.py` | Four-stage pipeline orchestrator (Scan → Cross-Ref → Agentic → Assemble). |
+| `scanners/__init__.py` | Scanner registry and `run_scanners()` dispatcher. |
+| `scanners/base.py` | `BaseScanner` abstract class with `__init_subclass__` auto-registration. |
+| `cross_ref.py` | Env-var and package index builder, component resolver, external repo dep detection. |
+| `cst_parser.py` | LibCST-based Python parser for assignments, decorators, annotations, imports, class definitions, and inline annotations. |
+| `scanners/multi_language_scanner.py` | Tree-sitter-based parser for JS/TS, Java, Go, Rust, Ruby, C#, PHP. |
+| `custom_catalog.py` | `.aibom.yaml` loader — custom entries, base-class rules, excludes, relationship hints. |
+| `catalog_db.py` | DuckDB access layer for catalog lookup with custom entry merging. |
+| `db_loader.py` | Manifest/env path resolution and SHA-256 verification. |
+| `agentic/agent.py` | Agentic enrichment core — candidate classification, locality-aware batching, sub-agent dispatch, circuit breaker, content-hash caching. |
+| `agentic/tools.py` | LangChain tools for file reading, import analysis, and code search. |
+| `agentic/middleware.py` | Structured output parser — extracts enrichments, new components, removals, risk findings from LLM JSON responses. |
+| `agentic/prompts.py` | System prompts for the agentic enrichment agent. |
+| `llm_factory.py` | Centralized `build_chat_model()` — provider resolution, parameter mapping for OpenAI/Azure/Bedrock/Ollama/etc. |
+| `llm_client.py` | Lightweight LLM client for semantic parsing (model name extraction). |
+| `scanners/container_extractor.py` | Tiered container source extraction (Docker/Podman/nerdctl/Buildah/Skopeo/Crane/tarball). |
+| `scanners/model_detector.py` | Model detection via LiteLLM catalog, HuggingFace Hub, and import context. |
+| `scanners/dependency_scanner.py` | Multi-format dependency parsing (pip, npm, Maven, Go, Rust, Ruby, C#, PHP). |
+| `scanners/secret_detector.py` | Secret detection via Yelp `detect-secrets` integration. |
+| `scanners/vuln_scanner.py` | Vulnerability scanning via OSV.dev API. |
+| `scanners/env_var_resolver.py` | Multi-language env-var extraction (Python, JS/TS, Go, Java, Ruby, C#, Rust, PHP). |
+| `scanners/deployment_detector.py` | IaC detection (Terraform, CloudFormation, Azure ARM/Bicep, Helm, K8s manifests). |
+| `policy.py` | YAML policy engine — pass/fail gates for CI/CD. |
+| `compliance.py` | EU AI Act, OWASP Agentic, NIST AI RMF compliance mappings. |
+| `diff.py` | Two-report diff engine (added/removed/changed components). |
+| `benchmark.py` | Precision/recall/F1 benchmarking against ground-truth YAML. |
+| `watch.py` | File-system polling + debounced re-scan with delta reporting. |
+| `risk.py` | Risk scoring and severity classification. |
+| `reporters/*.py` | Output format implementations (10 built-in + plugin entry point). |
+| `plugins.py` | Plugin discovery via Python entry points (`aibom.scanners`, `aibom.reporters`). |
+| `platform_adapters.py` | GitHub/GitLab/Bitbucket API adapters for repo discovery. |
+| `multi_repo.py` | Multi-repo scan orchestration with parallel execution. |
+| `incremental.py` | Commit-SHA keyed scan caching for incremental org scans. |
+| `repo_triage.py` | Agentic repository triage — LLM-assisted repo prioritization. |
+| `report_sender.py` | POST JSON reports with retry/backoff. |
+| `workflow_analyzer.py` | AST-based function index and call graph for workflow context. |
+| `models/enums.py` | `AIComponentType` (24 types), `Severity`, `Confidence` enums. |
+| `models/scan.py` | `AIComponent`, `ComponentRelationship`, `RiskFlag`, `ScanContext`, `ScanResult` dataclasses. |
 
-## 6. Report Submission
+## 5. Component Types
 
-* `--post-url` triggers a POST of the JSON report; `AIBOM_POST_URL`, `AIBOM_POST_TIMEOUT`, and `AIBOM_POST_VERIFY_TLS` mirror CLI options.  
-* Payload includes `run_id`, `analyzer_version`, `submitted_at`, `source_kind`, `sources`, and the report body.  
-* Requests use `x-cisco-ai-defense-tenant-api-key` when `--ai-defense-api-key`/`AI_DEFENSE_API_KEY` is set, with retry/backoff for 429/5xx.  
+The analyzer recognizes 24 AI component types:
 
-## 7. Outputs
+| Type | Description |
+|------|-------------|
+| `model` | AI/ML models (LLMs, embeddings, classifiers). |
+| `agent` | Autonomous AI agents. |
+| `tool` | Tools available to agents. |
+| `mcp_server` | Model Context Protocol servers. |
+| `mcp_client` | Model Context Protocol clients. |
+| `embedding` | Embedding models and services. |
+| `vector_store` | Vector databases and stores. |
+| `dataset` | Datasets used in ML pipelines. |
+| `prompt` | Prompt templates and chains. |
+| `guardrail` | Safety and content filters. |
+| `memory` | Agent memory and state stores. |
+| `retriever` | RAG retrievers and search components. |
+| `training_run` | Model training/finetuning invocations. |
+| `hyperparameter` | ML hyperparameter configurations. |
+| `model_artifact` | Serialized model files. |
+| `experiment_tracker` | Experiment tracking (MLflow, W&B, etc.). |
+| `model_registry` | Model registries and catalogs. |
+| `data_versioning` | Dataset versioning tools (DVC, etc.). |
+| `ml_pipeline` | ML pipeline orchestrators. |
+| `skill` | AI skills and capabilities. |
+| `observability` | AI observability tools (LangSmith, Langfuse, etc.). |
+| `secret` | Hardcoded API keys, tokens, credentials. |
+| `dependency` | AI framework dependencies from package manifests. |
+| `other` | Unclassified AI-related components. |
 
-| Output | Description |
-| --- | --- |
-| Plaintext | Report file listing detected components and their workflow context. |
-| JSON | `aibom_analysis` with metadata, per-source components, workflow summaries, relationships, and errors. |
-| API | FastAPI server that serves component data (`/api/components`, `/health`). |
-| Report Command | `cisco-aibom report` renders JSON summaries and optionally the raw JSON. |
+## 6. Output Formats
+
+| Format | Reporter | Standard |
+|--------|----------|----------|
+| Plaintext | `plaintext_reporter.py` | — |
+| JSON | `json_reporter.py` | AIBOM JSON schema |
+| CycloneDX | `cyclonedx_reporter.py` | CycloneDX 1.6 (ML-BOM profile) |
+| SARIF | `sarif_reporter.py` | SARIF v2.1.0 |
+| SPDX | `spdx_reporter.py` | SPDX 3.0 (AI + Dataset profiles) |
+| HTML | `html_reporter.py` | Interactive dashboard |
+| Markdown | `markdown_reporter.py` | GitHub-flavored Markdown |
+| CSV | `csv_reporter.py` | Flat CSV |
+| JUnit | `junit_reporter.py` | JUnit XML |
+| API | `api_handler.py` + `api/server.py` | FastAPI REST endpoints |
+
+Reporters use a registry pattern. Custom reporters can be added via the `aibom.reporters` entry point group.
+
+## 7. Agentic Enrichment Architecture
+
+The agentic layer uses Deep Agents (LangChain-based) with structured output:
+
+1. **Candidate classification** — Components are split into "simple" (registry-confirmable: known model/dependency with a model name) and "complex" (ambiguous type, missing model name, multi-file reasoning needed).
+2. **Locality-aware batching** — Components are grouped by parent directory, then split into batches of configurable size. This provides coherent code context per batch.
+3. **Sub-agent dispatch** — When scanning multiple directory groups exceeding a threshold, independent agents are dispatched per group.
+4. **Structured output** — The agent returns JSON with `enriched_components`, `new_components`, `remove_components`, and `risk_findings`.
+5. **Content-hash caching** — Each component's cache key is derived from its file path, line number, name, type, and surrounding code content. Unchanged components reuse cached LLM results.
+6. **Circuit breaker** — After N consecutive batch failures, remaining batches are skipped to prevent runaway costs.
+7. **Timeout** — Per-batch wall-clock timeout with graceful degradation.
+
+## 8. Cross-Reference Resolution
+
+The cross-ref stage builds two indexes:
+
+- **Env-var index** — Maps environment variable names to their values by scanning `.env`, `docker-compose.yaml`, Helm `values.yaml`, Terraform `*.tfvars`, and CI/CD pipeline definitions.
+- **Package index** — Maps package names to installed versions by parsing `requirements.txt`, `poetry.lock`, `package-lock.json`, `go.sum`, etc.
+
+Components referencing env vars (e.g., `os.getenv("MODEL_NAME")`) are resolved to concrete values using the env-var index, with full provenance tracking.
+
+## 9. Knowledge Base Strategy
+
+- Manifest keys: `duckdb_sha256` and `duckdb_file`, with env overrides (`AIBOM_DB_PATH`, `AIBOM_DB_SHA256`).
+- `duckdb_file` is resolved relative to `manifest.json` when not absolute.
+- Catalog lookup uses suffix matching on fully qualified symbol names.
+- The KB is used for enrichment: matching detected symbols against known AI framework components to add category, framework, and metadata.
+- Custom entries from `.aibom.yaml` are merged with lowest precedence (DuckDB > supplemental > custom).
+- KB management via CLI: `kb download`, `kb check`, `kb info`, `kb verify`, `kb request`.
+
+## 10. Report Submission
+
+- `--post-url` triggers a POST of the JSON report. `AIBOM_POST_URL`, `AIBOM_POST_TIMEOUT`, and `AIBOM_POST_VERIFY_TLS` mirror CLI options.
+- Payload includes `run_id`, `analyzer_version`, `submitted_at`, `source_kind`, `sources`, and the report body.
+- Requests use `x-cisco-ai-defense-tenant-api-key` when `--ai-defense-api-key` / `AI_DEFENSE_API_KEY` is set, with retry/backoff for 429/5xx.
+
+## 11. Plugin System
+
+Plugins are discovered via Python entry points:
+
+- `aibom.scanners` — Custom scanner classes (must subclass `BaseScanner`).
+- `aibom.reporters` — Custom reporter classes (must subclass `BaseReporter`).
+
+The `plugin list` command shows all discovered plugins.

@@ -28,7 +28,7 @@ import yaml
 from pathspec import PathSpec
 from platformdirs import user_cache_dir
 
-from .file_cache import read_text_cached
+from .file_cache import is_python_source, read_python_source, read_text_cached
 
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
@@ -36,7 +36,7 @@ from .base import BaseScanner
 
 _LOGGER = logging.getLogger(__name__)
 
-_LITELLM_CATALOG_URL = "https://models.litellm.ai/model_catalog"
+_MODEL_CATALOG_URL = "https://models.litellm.ai/model_catalog"
 _HF_API_URL = "https://huggingface.co/api/models"
 _CACHE_TTL_SECONDS = 86400  # 24 hours
 _CACHE_DIR = Path(user_cache_dir("aibom")) / "model_cache"
@@ -78,11 +78,11 @@ def _save_cached(name: str, models: dict[str, dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tier 1 -- LiteLLM Model Catalog  (commercial API models, 2500+)
+# Tier 1 -- Model Catalog  (commercial API models, 2500+)
 # ---------------------------------------------------------------------------
 
 
-def _fetch_litellm_catalog(
+def _fetch_model_catalog(
     provider: str | None = None,
 ) -> list[dict[str, Any]]:
     import httpx
@@ -92,7 +92,7 @@ def _fetch_litellm_catalog(
         params["provider"] = provider
     try:
         with httpx.Client(timeout=10) as client:
-            resp = client.get(_LITELLM_CATALOG_URL, params=params)
+            resp = client.get(_MODEL_CATALOG_URL, params=params)
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list):
@@ -100,11 +100,11 @@ def _fetch_litellm_catalog(
             if isinstance(data, dict):
                 return data.get("data", data.get("models", []))
     except Exception:
-        _LOGGER.debug("LiteLLM catalog fetch failed", exc_info=True)
+        _LOGGER.debug("Model catalog fetch failed", exc_info=True)
     return []
 
 
-def _provider_from_litellm_id(model_id: str) -> str:
+def _provider_from_model_id(model_id: str) -> str:
     if "/" in model_id:
         return model_id.split("/", 1)[0]
     return "unknown"
@@ -114,8 +114,8 @@ _BEDROCK_VERSION_RE = re.compile(r":[0-9]+$")
 _DATE_SUFFIX_RE = re.compile(r"-\d{4}-?\d{2}-?\d{2}(-v\d+)?$")
 
 
-def _litellm_alias_keys(raw_id: str) -> list[str]:
-    """Generate all normalized lookup keys for a LiteLLM model ID.
+def _model_alias_keys(raw_id: str) -> list[str]:
+    """Generate all normalized lookup keys for a model catalog ID.
 
     Handles: slash-prefixed (azure/gpt-4o), dot-prefixed Bedrock ARNs
     (us.anthropic.claude-3-5-sonnet-20241022-v2:0), fine-tune prefixes
@@ -165,12 +165,12 @@ def _litellm_alias_keys(raw_id: str) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
-def _build_litellm_registry() -> dict[str, dict[str, Any]]:
-    cached = _load_cached("litellm_models.json")
+def _build_model_registry() -> dict[str, dict[str, Any]]:
+    cached = _load_cached("model_catalog.json")
     if cached is not None:
         return cached
 
-    raw = _fetch_litellm_catalog()
+    raw = _fetch_model_catalog()
     if not raw:
         return {}
 
@@ -182,31 +182,31 @@ def _build_litellm_registry() -> dict[str, dict[str, Any]]:
         provider = (
             entry.get("provider")
             or entry.get("litellm_provider")
-            or _provider_from_litellm_id(model_id)
+            or _provider_from_model_id(model_id)
         )
-        aliases = _litellm_alias_keys(model_id)
+        aliases = _model_alias_keys(model_id)
         canonical = aliases[-1] if aliases else model_id.lower()
         meta = {
             "provider": provider.lower(),
             "family": canonical.rsplit("-", 1)[0] if "-" in canonical else canonical,
             "deprecated": entry.get("deprecated", False),
-            "source": "litellm",
+            "source": "model_catalog",
         }
         for alias in aliases:
             if alias not in registry:
                 registry[alias] = meta
-    _save_cached("litellm_models.json", registry)
+    _save_cached("model_catalog.json", registry)
     return registry
 
 
-_litellm_registry: dict[str, dict[str, Any]] | None = None
+_model_registry: dict[str, dict[str, Any]] | None = None
 
 
 def _get_live_registry() -> dict[str, dict[str, Any]]:
-    global _litellm_registry
-    if _litellm_registry is None:
-        _litellm_registry = _build_litellm_registry()
-    return _litellm_registry
+    global _model_registry
+    if _model_registry is None:
+        _model_registry = _build_model_registry()
+    return _model_registry
 
 
 # ---------------------------------------------------------------------------
@@ -792,13 +792,17 @@ class ModelDetector(BaseScanner):
             suffix = fpath.suffix.lower()
             name_lower = fpath.name.lower()
             try:
-                text = read_text_cached(fpath)
+                text = (
+                    read_python_source(fpath)
+                    if is_python_source(fpath)
+                    else read_text_cached(fpath)
+                )
             except OSError:
                 continue
 
             extracted: list[tuple[str, int, str]] = []
 
-            if suffix == ".py":
+            if suffix in (".py", ".ipynb"):
                 for val, ln in _extract_python_models(text):
                     extracted.append((val, ln, "string_literal"))
             elif name_lower == ".env" or fpath.name.endswith(".env"):

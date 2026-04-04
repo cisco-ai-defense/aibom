@@ -19,6 +19,7 @@ from .cicd_scanner import CICDScanner
 from .cloud_scanner import CloudScanner
 from .config_scanner import ConfigScanner
 from .container_scanner import ContainerScanner
+from .data_file_scanner import DataFileScanner
 from .deployment_detector import DeploymentDetector
 from .dependency_scanner import DependencyScanner
 from .env_var_resolver import EnvVarResolver
@@ -41,6 +42,7 @@ from .vuln_scanner import (
     vuln_provider_registry,
 )
 from .workflow_scanner import WorkflowScanner
+from .workspace_dep_scanner import WorkspaceDepScanner
 
 __all__ = [
     "BaseScanner",
@@ -49,6 +51,7 @@ __all__ = [
     "CloudScanner",
     "ConfigScanner",
     "ContainerScanner",
+    "DataFileScanner",
     "DeploymentDetector",
     "DependencyScanner",
     "EnvVarResolver",
@@ -67,6 +70,7 @@ __all__ = [
     "VulnScanner",
     "Vulnerability",
     "WorkflowScanner",
+    "WorkspaceDepScanner",
     "run_scanners",
     "scanner_registry",
     "scanner_timings",

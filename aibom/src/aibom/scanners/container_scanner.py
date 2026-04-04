@@ -86,6 +86,44 @@ class ContainerScanner(BaseScanner):
             except Exception:
                 _LOGGER.warning("Container scan failed for %s", image_ref, exc_info=True)
 
+            if context.config.get("container_source_extraction", True):
+                try:
+                    from .container_extractor import extract_source_from_image
+
+                    extraction = extract_source_from_image(
+                        image_ref,
+                        llm_config=context.config.get("llm_config"),
+                    )
+                    if extraction.extracted_dir:
+                        _LOGGER.info(
+                            "Extracted source from %s to %s (tier=%s, dirs=%s)",
+                            image_ref, extraction.extracted_dir,
+                            extraction.tier_used, extraction.app_dirs,
+                        )
+                        context.config["_extracted_container_dirs"] = context.config.get(
+                            "_extracted_container_dirs", [],
+                        )
+                        context.config["_extracted_container_dirs"].append(
+                            {
+                                "image_ref": image_ref,
+                                "path": str(extraction.extracted_dir),
+                                "app_dirs": extraction.app_dirs,
+                                "tier": extraction.tier_used,
+                                "needs_agentic": extraction.needs_agentic,
+                                "agentic_hint": extraction.agentic_hint,
+                            }
+                        )
+                    elif extraction.error:
+                        _LOGGER.warning(
+                            "Container source extraction failed for %s: %s",
+                            image_ref, extraction.error,
+                        )
+                except Exception:
+                    _LOGGER.warning(
+                        "Container source extraction error for %s",
+                        image_ref, exc_info=True,
+                    )
+
         return components, []
 
 

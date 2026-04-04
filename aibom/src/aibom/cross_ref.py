@@ -473,7 +473,7 @@ def resolve_components(
             reg_hit = _try_registry(mn)
             if reg_hit:
                 reg_meta = dict(new_c.metadata) if new_c.metadata else {}
-                reg_meta["registry_source"] = reg_hit.get("source", "litellm")
+                reg_meta["registry_source"] = reg_hit.get("source", "model_catalog")
                 reg_meta["provider"] = reg_hit.get("provider", "unknown")
                 new_c = new_c.model_copy(update={
                     "confidence": max(new_c.confidence, 0.85),
