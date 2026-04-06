@@ -464,7 +464,9 @@ def _extract_with_crane(
         if probe.returncode != 0:
             runtime = _find_runtime()
             if runtime:
-                tmp_tar = Path(tempfile.mktemp(suffix=".tar"))
+                tmp_fd = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+                tmp_fd.close()
+                tmp_tar = Path(tmp_fd.name)
                 subprocess.run(
                     [runtime.path, "save", "-o", str(tmp_tar), image_ref],
                     capture_output=True, timeout=300, check=True,
@@ -616,7 +618,9 @@ def _run_discovery(
         if tier == "skopeo":
             _require("skopeo", skopeo)
         if skopeo:
-            tmp_tar = Path(tempfile.mktemp(suffix=".tar"))
+            tmp_fd = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+            tmp_fd.close()
+            tmp_tar = Path(tmp_fd.name)
             try:
                 _LOGGER.info("Container discovery: using skopeo copy → tarball")
                 subprocess.run(
@@ -728,7 +732,9 @@ def _run_extraction(
         if tier == "skopeo":
             skopeo = _require("skopeo", skopeo)
         if skopeo:
-            tmp_tar = Path(tempfile.mktemp(suffix=".tar"))
+            tmp_fd = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+            tmp_fd.close()
+            tmp_tar = Path(tmp_fd.name)
             try:
                 _LOGGER.info("Container extraction: skopeo copy → tarball → Python extract")
                 subprocess.run(
@@ -753,7 +759,9 @@ def _run_extraction(
             tar_path = Path(image_ref)
         elif runtime:
             _LOGGER.info("Saving image to tarball for extraction")
-            tmp_tar = Path(tempfile.mktemp(suffix=".tar"))
+            tmp_fd = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+            tmp_fd.close()
+            tmp_tar = Path(tmp_fd.name)
             try:
                 subprocess.run(
                     [runtime.path, "save", "-o", str(tmp_tar), image_ref],
