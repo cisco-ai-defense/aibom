@@ -34,15 +34,20 @@ def _components_by_type(components: Iterable[AIComponent]) -> dict[str, list[dic
 
 def _aibom_payload(result: ScanResult) -> dict[str, Any]:
     base = result.model_dump(mode="json")
-    sources_out: list[dict[str, Any]] = []
+    sources_out: dict[str, dict[str, Any]] = {}
     for src in result.sources:
-        sources_out.append(
-            {
-                "path": src.path,
-                "components": _components_by_type(src.components),
-                "relationships": [r.model_dump(mode="json") for r in src.relationships],
-            }
-        )
+        comps = _components_by_type(src.components)
+        total_components = sum(len(v) for v in comps.values())
+        sources_out[src.path] = {
+            "components": comps,
+            "relationships": [r.model_dump(mode="json") for r in src.relationships],
+            "summary": {
+                "status": "completed",
+                "source_kind": "local-path",
+                "assets_discovered": total_components,
+                "last_generated_at": base["metadata"].get("completed_at"),
+            },
+        }
     return {
         "aibom_analysis": {
             "metadata": base["metadata"],
