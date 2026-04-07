@@ -124,15 +124,14 @@ def load_scan_result_json(path: Path | str) -> ScanResult:
     data = json.loads(raw)
     if "aibom_analysis" in data:
         data = data["aibom_analysis"]
-    sources_raw = data.get("sources", [])
+    sources_raw: dict[str, Any] = data.get("sources", {})
     sources: list[SourceResult] = []
-    for src in sources_raw:
-        path_s = src.get("path", "")
+    for path_s, src in sources_raw.items():
         raw_comps = src.get("components", [])
         flat: list[AIComponent] = []
         if isinstance(raw_comps, dict):
-            for items in raw_comps.values():
-                for item in items:
+            for comp_list in raw_comps.values():
+                for item in comp_list:
                     flat.append(AIComponent.model_validate(item))
         else:
             for item in raw_comps:

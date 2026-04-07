@@ -160,12 +160,13 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
     analysis = data["aibom_analysis"]
     assert analysis["metadata"]["analyzer_version"] == "2.0.0-test"
     assert analysis["metadata"]["run_id"] == "run-test-001"
-    for src in analysis["sources"]:
-        comps = src["components"]
+    for src_path, src_data in analysis["sources"].items():
+        comps = src_data["components"]
         assert set(comps.keys()) == {"model", "agent", "tool"}
         assert len(comps["model"]) == 1
         assert len(comps["agent"]) == 1
         assert len(comps["tool"]) == 1
+        assert "summary" in src_data
 
 
 def test_plaintext_reporter_render(sample_scan_result: ScanResult):
