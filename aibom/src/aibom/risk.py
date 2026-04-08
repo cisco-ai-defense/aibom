@@ -138,7 +138,7 @@ class RiskScorer:
             self._add_flag(risk, "mcp_unknown_server", component)
 
         if (
-            component.component_type == AIComponentType.MODEL
+            component.component_type.is_model_related
             and component.model_name
             and not _is_pinned(component.model_name)
         ):

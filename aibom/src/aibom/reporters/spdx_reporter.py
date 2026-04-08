@@ -30,6 +30,8 @@ CISCO_AIBOM_NS = "https://cisco.com/ns/aibom#"
 _AI_PACKAGE_TYPES: frozenset[AIComponentType] = frozenset(
     {
         AIComponentType.MODEL,
+        AIComponentType.LLM_ENDPOINT,
+        AIComponentType.MODEL_ENDPOINT,
         AIComponentType.EMBEDDING,
         AIComponentType.MODEL_ARTIFACT,
         AIComponentType.TRAINING_RUN,

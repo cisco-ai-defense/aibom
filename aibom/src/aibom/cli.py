@@ -284,6 +284,11 @@ def _render_relationship_table(relationships: List[Any]) -> None:
 def _display_v2_summary(source: str, components: list, relationships: list) -> None:
     """Rich summary for v2 detector output."""
     from collections import Counter
+    from .models import AIComponent as _V2Comp
+    components = [
+        _V2Comp.model_validate(c) if isinstance(c, dict) else c
+        for c in components
+    ]
     panel_title = f"[bold green]Analysis Summary (v2)[/] • {source}"
     console.print(Panel(panel_title, style="green", expand=False))
     if not components:
@@ -858,15 +863,15 @@ def analyze(
 
         deep = [t.repo_path for t in triage_results if t.decision == "deep-scan"]
         clone = [t.repo_path for t in triage_results if t.decision == "needs-clone"]
-        skipped = [t.repo_path for t in triage_results if t.decision == "skip"]
+        skipped = [t for t in triage_results if t.decision == "skip"]
 
         if skipped:
-            console.print(
-                f"  [dim]Repo triage: skipping {len(skipped)} non-AI repo(s)[/]"
-            )
-            for t in triage_results:
-                if t.decision == "skip":
-                    _LOGGER.info("Triage skip: %s — %s (%s)", t.repo_path, t.reason, t.method)
+            for t in skipped:
+                _LOGGER.info(
+                    "Triage would skip %s — %s (%s); keeping because user-provided",
+                    t.repo_path, t.reason, t.method,
+                )
+            clone.extend(t.repo_path for t in skipped)
 
         sources_to_process = deep + clone
 
@@ -965,7 +970,8 @@ def analyze(
             source_summary["source_name"] = str(source)
         else:
             source_summary["source_path"] = str(path_to_analyze.resolve())
-            source_summary["source_name"] = Path(source).name or str(source)
+            from .reporters.json_reporter import _friendly_source_name
+            source_summary["source_name"] = _friendly_source_name(str(path_to_analyze.resolve()))
 
         if not path_to_analyze.exists():
             message = f"Path or image '{source}' not found or could not be processed."
@@ -1192,15 +1198,24 @@ def analyze(
         ScanResult,
         SourceResult,
     )
+    from .models.scan import RiskFlag
     from .risk import RiskScorer
 
     v2_sources = []
     for source_path, output in all_analysis_outputs.items():
         if isinstance(output, dict) and output.get("_v2"):
+            comps = [
+                V2Component.model_validate(c) if isinstance(c, dict) else c
+                for c in output["components"]
+            ]
+            rels = [
+                V2Relationship.model_validate(r) if isinstance(r, dict) else r
+                for r in output["relationships"]
+            ]
             v2_sources.append(SourceResult(
                 path=source_path,
-                components=output["components"],
-                relationships=output["relationships"],
+                components=comps,
+                relationships=rels,
             ))
     scan_result = ScanResult(
         metadata=run_metadata,
@@ -1214,7 +1229,10 @@ def analyze(
     for output in all_analysis_outputs.values():
         if isinstance(output, dict):
             for rf in output.get("_agentic_risk_flags", []):
-                scan_result.risk.add_flag(rf)
+                if isinstance(rf, RiskFlag):
+                    scan_result.risk.add_flag(rf)
+                elif isinstance(rf, dict):
+                    scan_result.risk.add_flag(RiskFlag.model_validate(rf))
 
     if compliance:
         from .compliance import ComplianceFramework, evaluate_compliance, parse_compliance_cli_value

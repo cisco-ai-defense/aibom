@@ -49,7 +49,8 @@ from .file_cache import read_python_source, read_text_cached
 _LOGGER = logging.getLogger(__name__)
 
 ALLOWED_CONCEPTS: frozenset[str] = frozenset(
-    {"agent", "model", "tool", "datastore", "embedding", "prompt", "memory", "retriever"}
+    {"agent", "model", "tool", "datastore", "embedding", "prompt",
+     "memory", "retriever", "knowledge_base", "feature_store"}
 )
 
 _CONCEPT_TO_TYPE: dict[str, AIComponentType] = {
@@ -61,6 +62,8 @@ _CONCEPT_TO_TYPE: dict[str, AIComponentType] = {
     "prompt": AIComponentType.PROMPT,
     "memory": AIComponentType.MEMORY,
     "retriever": AIComponentType.RETRIEVER,
+    "knowledge_base": AIComponentType.KNOWLEDGE_BASE,
+    "feature_store": AIComponentType.FEATURE_STORE,
 }
 
 # KB id path segments that override or suppress the raw concept.
@@ -225,6 +228,8 @@ _CLASS_NAME_TYPE_MAP: list[tuple[re.Pattern[str], AIComponentType]] = [
     (re.compile(r"Tool", re.IGNORECASE), AIComponentType.TOOL),
     (re.compile(r"Prompt", re.IGNORECASE), AIComponentType.PROMPT),
     (re.compile(r"Memory|History|Conversation|ChatBuffer", re.IGNORECASE), AIComponentType.MEMORY),
+    (re.compile(r"KnowledgeBase", re.IGNORECASE), AIComponentType.KNOWLEDGE_BASE),
+    (re.compile(r"FeatureStore", re.IGNORECASE), AIComponentType.FEATURE_STORE),
     (re.compile(r"Retriever", re.IGNORECASE), AIComponentType.RETRIEVER),
     (re.compile(r"Vector", re.IGNORECASE), AIComponentType.VECTOR_STORE),
 ]
@@ -258,23 +263,36 @@ _NON_AI_CLASS_SUFFIXES: tuple[str, ...] = (
     "Code", "Status", "Flag",
 )
 
+_AMBIGUOUS_NAME_TYPES: frozenset[AIComponentType] = frozenset({
+    AIComponentType.EMBEDDING,
+    AIComponentType.MEMORY,
+    AIComponentType.TOOL,
+    AIComponentType.AGENT,
+    AIComponentType.VECTOR_STORE,
+    AIComponentType.RETRIEVER,
+    AIComponentType.PROMPT,
+    AIComponentType.GUARDRAIL,
+})
+
 
 def _is_data_class_name(name: str) -> bool:
     """Return True when the class name looks like a data/schema class."""
     return any(name.endswith(s) for s in _NON_AI_CLASS_SUFFIXES)
 
 
-def _infer_type_from_name(name: str) -> AIComponentType:
+def _infer_type_from_name(name: str) -> tuple[AIComponentType, bool]:
     """Infer the component type from a class/import name using pattern matching.
 
-    Returns None if the name looks like a data-class (e.g. ConversationResponse).
+    Returns ``(type, needs_agentic)`` — ambiguous name-only matches are
+    marked ``needs_agentic=True`` so the LLM can confirm or reject them.
     """
     if _is_data_class_name(name):
-        return AIComponentType.MODEL  # default — will be filtered by caller
+        return AIComponentType.MODEL, False
     for pattern, comp_type in _CLASS_NAME_TYPE_MAP:
         if pattern.search(name):
-            return comp_type
-    return AIComponentType.MODEL
+            ambiguous = comp_type in _AMBIGUOUS_NAME_TYPES
+            return comp_type, ambiguous
+    return AIComponentType.MODEL, False
 
 
 _GENERIC_CLASS_NAMES: frozenset[str] = frozenset({
@@ -700,10 +718,11 @@ def _emit_suggestive_candidates(
         if i in seen_lines:
             continue
         seen_lines.add(i)
+        inferred_type, _name_ambiguous = _infer_type_from_name(class_name)
         candidates.append(
             AIComponent(
                 name=class_name,
-                component_type=_infer_type_from_name(class_name),
+                component_type=inferred_type,
                 file_path=str(py_file),
                 line_number=i,
                 framework="",
@@ -790,6 +809,7 @@ def _detect_import_based_assets(
 
         comp_type: AIComponentType | None = None
         matched_name = ""
+        name_ambiguous = False
 
         for mod_key, mod_type in _IMPORT_MODULE_TYPE_MAP.items():
             if mod_key in imp_lower:
@@ -803,7 +823,7 @@ def _detect_import_based_assets(
                 cleaned = part.strip(",").strip("(").strip(")")
                 if not cleaned or cleaned in ("from", "import", "as"):
                     continue
-                inferred = _infer_type_from_name(cleaned)
+                inferred, name_ambiguous = _infer_type_from_name(cleaned)
                 if inferred != AIComponentType.MODEL:
                     comp_type = inferred
                     matched_name = cleaned
@@ -837,8 +857,12 @@ def _detect_import_based_assets(
                 line_number=line_no,
                 framework="",
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.65,
-                needs_agentic=False,
+                confidence=0.35 if name_ambiguous else 0.65,
+                needs_agentic=name_ambiguous,
+                agentic_hint=(
+                    f"Name-inferred as '{comp_type.value}' from import "
+                    f"'{imp_line.strip()}'; confirm or reclassify."
+                ) if name_ambiguous else "",
                 metadata={"import_statement": imp_line.strip()},
             )
         )
@@ -1030,6 +1054,10 @@ _MODEL_KWARG_NAMES: frozenset[str] = frozenset({
     "model", "model_name", "model_id", "deployment_name", "engine",
 })
 
+_ENDPOINT_KWARG_NAMES: frozenset[str] = frozenset({
+    "base_url", "azure_endpoint", "api_base", "endpoint_url",
+})
+
 _KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset({
     "ChatOpenAI", "ChatAnthropic", "ChatGoogleGenerativeAI", "AzureChatOpenAI",
     "OpenAI", "Anthropic", "GenerativeModel", "AnthropicBedrock",
@@ -1038,16 +1066,22 @@ _KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset({
     "ChatGroq", "ChatTogether", "VLLMOpenAI", "AzureOpenAI",
 })
 
+_BARE_CLIENT_HINTS: dict[str, str] = {
+    "AnthropicBedrock": "Resolve model ID from .messages.create(model=...) calls. Remove if no model ID found.",
+    "BedrockChat": "Resolve model ID from model_id= kwarg or nearby invoke_model calls. Remove if no model ID found.",
+    "ChatBedrock": "Resolve model ID from model_id= kwarg or nearby invoke_model calls. Remove if no model ID found.",
+}
+
 
 def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
-    """Extract model names from AI client constructor kwargs via LibCST.
+    """Extract models, LLM endpoints, and bare clients from AI constructor kwargs via LibCST.
 
-    Catches multi-line constructors that regex misses, e.g.::
-
-        client = AnthropicBedrock(
-            model="anthropic.claude-3-haiku-20240307-v1:0",
-            ...
-        )
+    Classification rules (no dual emission):
+    1. Constructor has ``base_url`` / ``azure_endpoint`` / ``api_base`` / ``endpoint_url``
+       with a concrete URL -> **LLM_ENDPOINT**.
+    2. Constructor has ``model=`` with a registry-known value -> **MODEL**.
+    3. Known client class with neither model nor URL kwargs -> **needs_agentic MODEL**
+       (bare client; prune if agentic layer cannot resolve a model ID).
     """
     from .model_detector import _registry_lookup
 
@@ -1063,6 +1097,39 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
         if short not in _KNOWN_AI_CLIENT_CLASSES:
             continue
 
+        key = (result.file_path, line)
+        if key in seen:
+            continue
+
+        endpoint_url: str | None = None
+        for ek in _ENDPOINT_KWARG_NAMES:
+            raw = call_obs.arguments.get(ek)
+            if isinstance(raw, str) and not raw.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
+                cleaned = raw.strip().strip("'\"")
+                if cleaned.startswith(("http://", "https://")):
+                    endpoint_url = cleaned
+                    break
+
+        if endpoint_url:
+            seen.add(key)
+            components.append(
+                AIComponent(
+                    name=endpoint_url,
+                    component_type=AIComponentType.LLM_ENDPOINT,
+                    file_path=result.file_path,
+                    line_number=line,
+                    framework=short,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    confidence=0.9,
+                    metadata={
+                        "endpoint_url": endpoint_url,
+                        "constructor": short,
+                    },
+                )
+            )
+            continue
+
+        found_model = False
         for kwarg_name in _MODEL_KWARG_NAMES:
             val = call_obs.arguments.get(kwarg_name)
             if not isinstance(val, str):
@@ -1071,9 +1138,6 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                 continue
             val = val.strip().strip("'\"")
             if not val or len(val) < 3:
-                continue
-            key = (result.file_path, line)
-            if key in seen:
                 continue
             reg = _registry_lookup(val)
             if reg:
@@ -1094,7 +1158,29 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                         },
                     )
                 )
+                found_model = True
                 break
+
+        if not found_model and short in _BARE_CLIENT_HINTS:
+            seen.add(key)
+            components.append(
+                AIComponent(
+                    name=short,
+                    component_type=AIComponentType.MODEL,
+                    file_path=result.file_path,
+                    line_number=line,
+                    framework=short,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    confidence=0.3,
+                    needs_agentic=True,
+                    agentic_hint=_BARE_CLIENT_HINTS[short],
+                    metadata={
+                        "detection_method": "bare_provider_client",
+                        "constructor": short,
+                    },
+                )
+            )
+
     return components
 
 

@@ -534,11 +534,38 @@ def _parse_env(
             )
             continue
 
-        if (
-            ku.endswith("_API_BASE")
-            or ku.endswith("_API_VERSION")
+        is_url = value.strip().startswith(("http://", "https://"))
+        is_endpoint_key = (
+            ku.endswith("_ENDPOINT")
+            or ku.endswith("_API_BASE")
             or ku.endswith("_BASE_URL")
-        ):
+        )
+        if is_endpoint_key and is_url:
+            is_custom_served = any(
+                tok in ku for tok in ("SAGEMAKER", "INFERENCE", "SERVING")
+            )
+            ctype = AIComponentType.MODEL_ENDPOINT if is_custom_served else AIComponentType.LLM_ENDPOINT
+            prov = _provider_from_env_key(key)
+            out.append(
+                AIComponent(
+                    name=f"env:{key}",
+                    component_type=ctype,
+                    file_path=str(path.resolve()),
+                    line_number=i,
+                    detection_source=DetectionSource.CONFIG_FILE,
+                    description=f"Endpoint URL from `{key}` (value redacted)",
+                    text=None,
+                    framework=prov or "",
+                    metadata={
+                        "env_var": key,
+                        "redacted": True,
+                        "config_kind": ".env",
+                    },
+                ),
+            )
+            continue
+
+        if is_endpoint_key or ku.endswith("_API_VERSION"):
             prov = _provider_from_env_key(key)
             out.append(
                 AIComponent(

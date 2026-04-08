@@ -152,6 +152,15 @@ def test_get_reporter_unknown_returns_none():
     assert get_reporter("not_a_real_format") is None
 
 
+def test_friendly_source_name():
+    from aibom.reporters.json_reporter import _friendly_source_name
+
+    assert _friendly_source_name("/Users/me/work/github.com/acme-org/my-service") == "acme-org/my-service"
+    assert _friendly_source_name("/Users/me/work/github.com/org/repo") == "org/repo"
+    assert _friendly_source_name("/tmp/sample-ai-app") == "sample-ai-app"
+    assert _friendly_source_name("/proj/src/alpha") == "alpha"
+
+
 def test_json_reporter_render(sample_scan_result: ScanResult):
     buf = StringIO()
     get_reporter("json").render(sample_scan_result, buf)
@@ -160,6 +169,8 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
     analysis = data["aibom_analysis"]
     assert analysis["metadata"]["analyzer_version"] == "2.0.0-test"
     assert analysis["metadata"]["run_id"] == "run-test-001"
+    source_keys = set(analysis["sources"].keys())
+    assert source_keys == {"alpha", "beta"}
     for src_path, src_data in analysis["sources"].items():
         comps = src_data["components"]
         assert set(comps.keys()) == {"model", "agent", "tool"}

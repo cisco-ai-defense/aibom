@@ -69,9 +69,9 @@ class TestEmbeddingImportDetection:
     def test_type_inference_from_class_name(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("OpenAIEmbedder") == AIComponentType.EMBEDDING
-        assert _infer_type_from_name("SentenceTransformersDocumentEmbedding") == AIComponentType.EMBEDDING
-        assert _infer_type_from_name("CustomEmbeddings") == AIComponentType.EMBEDDING
+        assert _infer_type_from_name("OpenAIEmbedder") == (AIComponentType.EMBEDDING, True)
+        assert _infer_type_from_name("SentenceTransformersDocumentEmbedding") == (AIComponentType.EMBEDDING, True)
+        assert _infer_type_from_name("CustomEmbeddings") == (AIComponentType.EMBEDDING, True)
 
     def test_suggestive_candidate_uses_correct_type(self, tmp_path: Path):
         """_emit_suggestive_candidates should infer EMBEDDING, not MODEL."""
@@ -182,9 +182,9 @@ class TestGuardrailDetection:
     def test_guardrail_type_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("LLMRails") == AIComponentType.GUARDRAIL
-        assert _infer_type_from_name("InputGuardrail") == AIComponentType.GUARDRAIL
-        assert _infer_type_from_name("ContentInspector") == AIComponentType.GUARDRAIL
+        assert _infer_type_from_name("LLMRails") == (AIComponentType.GUARDRAIL, True)
+        assert _infer_type_from_name("InputGuardrail") == (AIComponentType.GUARDRAIL, True)
+        assert _infer_type_from_name("ContentInspector") == (AIComponentType.GUARDRAIL, True)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ class TestObservabilityDetection:
     def test_observability_type_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("Traceloop") == AIComponentType.OBSERVABILITY
+        assert _infer_type_from_name("Traceloop") == (AIComponentType.OBSERVABILITY, False)
         # "CustomTracing" and "MetricObserver" are intentionally NOT detected
         # as OBSERVABILITY by class-name alone — observability is detected via
         # import-based patterns to avoid FPs on generic Logger/Observer classes.
@@ -373,34 +373,34 @@ class TestTypeInferenceDefaults:
     def test_generic_llm_class_defaults_to_model(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("ChatCompletion") == AIComponentType.MODEL
-        assert _infer_type_from_name("CustomLLM") == AIComponentType.MODEL
+        assert _infer_type_from_name("ChatCompletion") == (AIComponentType.MODEL, False)
+        assert _infer_type_from_name("CustomLLM") == (AIComponentType.MODEL, False)
 
     def test_agent_type_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("RouterAgent") == AIComponentType.AGENT
+        assert _infer_type_from_name("RouterAgent") == (AIComponentType.AGENT, True)
 
     def test_tool_type_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("SearchTool") == AIComponentType.TOOL
+        assert _infer_type_from_name("SearchTool") == (AIComponentType.TOOL, True)
 
     def test_memory_type_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("ConversationHistory") == AIComponentType.MEMORY
-        assert _infer_type_from_name("ChatBuffer") == AIComponentType.MEMORY
+        assert _infer_type_from_name("ConversationHistory") == (AIComponentType.MEMORY, True)
+        assert _infer_type_from_name("ChatBuffer") == (AIComponentType.MEMORY, True)
 
     def test_retriever_type_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("DocumentRetriever") == AIComponentType.RETRIEVER
+        assert _infer_type_from_name("DocumentRetriever") == (AIComponentType.RETRIEVER, True)
 
     def test_vector_store_type_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("PineconeVectorStore") == AIComponentType.VECTOR_STORE
+        assert _infer_type_from_name("PineconeVectorStore") == (AIComponentType.VECTOR_STORE, True)
 
 
 # ====================================================================
@@ -531,8 +531,8 @@ class TestDataClassSuffixExclusion:
     def test_data_class_name_skips_inference(self):
         from aibom.scanners.kb_enrichment_scanner import _infer_type_from_name
 
-        assert _infer_type_from_name("ConversationResponse") == AIComponentType.MODEL
-        assert _infer_type_from_name("ConversationMemory") == AIComponentType.MEMORY
+        assert _infer_type_from_name("ConversationResponse") == (AIComponentType.MODEL, False)
+        assert _infer_type_from_name("ConversationMemory") == (AIComponentType.MEMORY, True)
 
 
 # ====================================================================

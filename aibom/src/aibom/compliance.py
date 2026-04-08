@@ -68,7 +68,7 @@ def _by_id(components: list[AIComponent]) -> dict[str, AIComponent]:
 
 
 def check_eu_model_transparency(scan: ScanResult, req: ComplianceRequirement) -> ComplianceCheckResult:
-    models = [c for c in scan.all_components if c.component_type == AIComponentType.MODEL]
+    models = [c for c in scan.all_components if c.component_type.is_model_related]
     if not models:
         return ComplianceCheckResult(
             requirement_id=req.id,
@@ -401,7 +401,7 @@ def check_nist_asset_inventory(scan: ScanResult, req: ComplianceRequirement) -> 
 
 
 def check_nist_model_pinned(scan: ScanResult, req: ComplianceRequirement) -> ComplianceCheckResult:
-    models = [c for c in scan.all_components if c.component_type == AIComponentType.MODEL]
+    models = [c for c in scan.all_components if c.component_type.is_model_related]
     if not models:
         return ComplianceCheckResult(
             requirement_id=req.id,
@@ -513,7 +513,7 @@ BUILTIN_REQUIREMENTS: list[ComplianceRequirement] = [
         framework=ComplianceFramework.EU_AI_ACT,
         title="Model transparency",
         description="Every model must have model_name set.",
-        applicable_types=[AIComponentType.MODEL],
+        applicable_types=[AIComponentType.MODEL, AIComponentType.LLM_ENDPOINT, AIComponentType.MODEL_ENDPOINT],
         check_fn_name="check_eu_model_transparency",
     ),
     ComplianceRequirement(
@@ -601,7 +601,7 @@ BUILTIN_REQUIREMENTS: list[ComplianceRequirement] = [
         framework=ComplianceFramework.NIST_AI_RMF,
         title="Model governance",
         description="Models should be pinned (version or registry path).",
-        applicable_types=[AIComponentType.MODEL],
+        applicable_types=[AIComponentType.MODEL, AIComponentType.LLM_ENDPOINT, AIComponentType.MODEL_ENDPOINT],
         check_fn_name="check_nist_model_pinned",
     ),
     ComplianceRequirement(

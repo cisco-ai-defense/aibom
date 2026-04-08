@@ -717,7 +717,7 @@ def _type_breakdown(components: list[AIComponent]) -> list[dict[str, Any]]:
 def _model_inventory_rows(components: list[AIComponent]) -> list[dict[str, Any]]:
     rows = []
     for c in components:
-        if c.component_type != AIComponentType.MODEL:
+        if not c.component_type.is_model_related:
             continue
         rows.append(
             {

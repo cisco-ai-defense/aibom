@@ -25,18 +25,39 @@ class AIComponentType(str, Enum):
     or removing values here, update that prompt to match.
     """
 
+    # Model-related (identity + endpoints)
     MODEL = "model"
+    LLM_ENDPOINT = "llm_endpoint"
+    MODEL_ENDPOINT = "model_endpoint"
+
+    @property
+    def is_model_related(self) -> bool:
+        return self in (
+            AIComponentType.MODEL,
+            AIComponentType.LLM_ENDPOINT,
+            AIComponentType.MODEL_ENDPOINT,
+        )
+
+    # Agentic
     AGENT = "agent"
     TOOL = "tool"
     MCP_SERVER = "mcp_server"
     MCP_CLIENT = "mcp_client"
+    MCP_GATEWAY = "mcp_gateway"
+
+    # Data / retrieval
     EMBEDDING = "embedding"
     VECTOR_STORE = "vector_store"
     DATASET = "dataset"
-    PROMPT = "prompt"
-    GUARDRAIL = "guardrail"
-    MEMORY = "memory"
     RETRIEVER = "retriever"
+    KNOWLEDGE_BASE = "knowledge_base"
+    FEATURE_STORE = "feature_store"
+
+    # Memory / state
+    MEMORY = "memory"
+    PROMPT = "prompt"
+
+    # ML lifecycle
     TRAINING_RUN = "training_run"
     HYPERPARAMETER = "hyperparameter"
     MODEL_ARTIFACT = "model_artifact"
@@ -44,10 +65,15 @@ class AIComponentType(str, Enum):
     MODEL_REGISTRY = "model_registry"
     DATA_VERSIONING = "data_versioning"
     ML_PIPELINE = "ml_pipeline"
+
+    # Operational
+    GUARDRAIL = "guardrail"
     SKILL = "skill"
     OBSERVABILITY = "observability"
     SECRET = "secret"
     DEPENDENCY = "dependency"
+
+    # Catch-all
     OTHER = "other"
 
 
@@ -119,8 +145,14 @@ class RelationshipType(str, Enum):
     USES_DATASET = "USES_DATASET"
     USES_VECTOR_STORE = "USES_VECTOR_STORE"
     USES_MCP_SERVER = "USES_MCP_SERVER"
+    USES_MCP_GATEWAY = "USES_MCP_GATEWAY"
+    USES_KNOWLEDGE_BASE = "USES_KNOWLEDGE_BASE"
+    USES_FEATURE_STORE = "USES_FEATURE_STORE"
+    USES_LLM_ENDPOINT = "USES_LLM_ENDPOINT"
     TRAINS_MODEL = "TRAINS_MODEL"
     LOGS_TO = "LOGS_TO"
     USES_GUARDRAIL = "USES_GUARDRAIL"
     OBSERVES = "OBSERVES"
     CUSTOM = "CUSTOM"
+
+
