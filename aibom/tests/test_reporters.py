@@ -152,11 +152,28 @@ def test_get_reporter_unknown_returns_none():
     assert get_reporter("not_a_real_format") is None
 
 
-def test_friendly_source_name():
+def test_friendly_source_name(tmp_path, monkeypatch):
+    from unittest.mock import patch
     from aibom.reporters.json_reporter import _friendly_source_name
 
-    assert _friendly_source_name("/Users/me/work/github.com/acme-org/my-service") == "acme-org/my-service"
-    assert _friendly_source_name("/Users/me/work/github.com/org/repo") == "org/repo"
+    def _fake_run(cmd, **_kw):
+        class R:
+            returncode = 0
+            stdout = "git@github.com:acme-org/my-service.git\n"
+        return R()
+
+    with patch("aibom.reporters.json_reporter.subprocess.run", side_effect=_fake_run):
+        assert _friendly_source_name(str(tmp_path)) == "acme-org/my-service"
+
+    def _fake_https(cmd, **_kw):
+        class R:
+            returncode = 0
+            stdout = "https://github.com/org/repo.git\n"
+        return R()
+
+    with patch("aibom.reporters.json_reporter.subprocess.run", side_effect=_fake_https):
+        assert _friendly_source_name(str(tmp_path)) == "org/repo"
+
     assert _friendly_source_name("/tmp/sample-ai-app") == "sample-ai-app"
     assert _friendly_source_name("/proj/src/alpha") == "alpha"
 

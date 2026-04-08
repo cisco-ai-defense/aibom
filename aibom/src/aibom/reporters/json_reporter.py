@@ -17,25 +17,40 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
+import subprocess
 from collections.abc import Iterable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import IO, Any
 
 from ..models import AIComponent, ScanResult
 from .base import BaseReporter
 
+_LOGGER = logging.getLogger(__name__)
+
+_REMOTE_ORG_REPO_RE = re.compile(r"[/:]([^/]+)/([^/]+?)(?:\.git)?$")
+
 
 def _friendly_source_name(path: str) -> str:
-    """Derive a short, meaningful source label from a local path or URL.
+    """Derive a short, meaningful source label from a local filesystem path.
 
-    For paths containing ``github.com``, extracts ``org/repo``.
-    Otherwise falls back to the last path component.
+    Tries ``git remote get-url origin`` to extract ``org/repo`` from the
+    actual remote.  Falls back to the last path component.
     """
-    parts = PurePosixPath(path).parts
-    if "github.com" in parts:
-        idx = parts.index("github.com")
-        if idx + 2 < len(parts):
-            return f"{parts[idx + 1]}/{parts[idx + 2]}"
+    resolved = Path(path).resolve()
+    if resolved.is_dir():
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(resolved), "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                m = _REMOTE_ORG_REPO_RE.search(result.stdout.strip())
+                if m:
+                    return f"{m.group(1)}/{m.group(2)}"
+        except Exception:
+            _LOGGER.debug("git remote lookup failed for %s", path)
     return PurePosixPath(path).name or path
 
 

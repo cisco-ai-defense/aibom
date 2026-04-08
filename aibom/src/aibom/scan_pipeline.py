@@ -514,6 +514,8 @@ class ScanPipeline:
     # Stage 3: Agentic enrichment (optional)
     # ------------------------------------------------------------------
 
+    _AGENTIC_CONFIDENCE_THRESHOLD = 0.7
+
     def _stage_agentic(
         self,
         components: list[AIComponent],
@@ -521,6 +523,29 @@ class ScanPipeline:
     ) -> tuple[list[AIComponent], list[ComponentRelationship], list[Any]]:
         if not self.llm_config or not components:
             return components, relationships, []
+
+        promoted = 0
+        components = [
+            (
+                c.model_copy(update={"needs_agentic": True})
+                if not c.needs_agentic
+                and c.confidence < self._AGENTIC_CONFIDENCE_THRESHOLD
+                else c
+            )
+            for c in components
+        ]
+        promoted = sum(
+            1
+            for c in components
+            if c.needs_agentic and c.confidence < self._AGENTIC_CONFIDENCE_THRESHOLD
+        )
+        if promoted:
+            _LOGGER.info(
+                "Auto-promoted %d low-confidence components to agentic review "
+                "(threshold %.2f)",
+                promoted,
+                self._AGENTIC_CONFIDENCE_THRESHOLD,
+            )
 
         candidates = [c for c in components if c.needs_agentic]
         confirmed = [c for c in components if not c.needs_agentic]

@@ -229,22 +229,30 @@ class SymbolVisitor(cst.CSTVisitor):
         return None
 
     def leave_Import(self, original_node: cst.Import) -> None:
-        """Capture import statements."""
+        """Capture import statements with line numbers."""
+        try:
+            line = self.get_metadata(cst.metadata.PositionProvider, original_node).start.line
+        except (KeyError, AttributeError):
+            line = 0
         for alias in original_node.names:
             if isinstance(alias, cst.ImportAlias):
                 import_name = alias.name.value if isinstance(alias.name, cst.Name) else str(alias.name)
                 import_stmt = f"import {import_name}"
                 if alias.asname:
                     import_stmt += f" as {alias.asname.name.value}"
-                self.result.imports.append(import_stmt)
-    
+                self.result.imports.append((line, import_stmt))
+
     def leave_ImportFrom(self, original_node: cst.ImportFrom) -> None:
-        """Capture from...import statements."""
+        """Capture from...import statements with line numbers."""
+        try:
+            line = self.get_metadata(cst.metadata.PositionProvider, original_node).start.line
+        except (KeyError, AttributeError):
+            line = 0
         if original_node.module:
             module_name = self._extract_raw_code(original_node.module)
             if isinstance(original_node.names, cst.ImportStar):
                 import_stmt = f"from {module_name} import *"
-                self.result.imports.append(import_stmt)
+                self.result.imports.append((line, import_stmt))
             elif hasattr(original_node.names, '__iter__'):
                 imported_items = []
                 for alias in original_node.names:
@@ -255,7 +263,7 @@ class SymbolVisitor(cst.CSTVisitor):
                         imported_items.append(item_name)
                 if imported_items:
                     import_stmt = f"from {module_name} import {', '.join(imported_items)}"
-                    self.result.imports.append(import_stmt)
+                    self.result.imports.append((line, import_stmt))
 
     @staticmethod
     def _extract_all_arguments(args) -> Dict[str, Any]:

@@ -48,6 +48,16 @@ from .file_cache import read_python_source, read_text_cached
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _import_strings(imports: list) -> list[str]:
+    """Extract plain import statement strings from a list that may contain
+    ``(line_number, stmt)`` tuples or bare strings."""
+    return [
+        entry[1] if isinstance(entry, tuple) else entry
+        for entry in imports
+    ]
+
+
 ALLOWED_CONCEPTS: frozenset[str] = frozenset(
     {"agent", "model", "tool", "datastore", "embedding", "prompt",
      "memory", "retriever", "knowledge_base", "feature_store"}
@@ -148,7 +158,7 @@ _AGENT_FRAMEWORK_PREFIXES: frozenset[str] = frozenset({
 })
 
 
-def _is_agent_creation_call(qualified_name: str, imports: list[str]) -> bool:
+def _is_agent_creation_call(qualified_name: str, imports: list) -> bool:
     """Return True if *qualified_name* is a known agent creation pattern
     from a recognized framework."""
     short = qualified_name.rsplit(".", 1)[-1] if "." in qualified_name else qualified_name
@@ -157,7 +167,7 @@ def _is_agent_creation_call(qualified_name: str, imports: list[str]) -> bool:
     prefix = qualified_name.split(".")[0].split("_")[0]
     if prefix in _AGENT_FRAMEWORK_PREFIXES:
         return True
-    for imp in imports:
+    for imp in _import_strings(imports):
         parts = imp.split()
         mod = parts[1] if len(parts) > 1 else ""
         mod_prefix = mod.split(".")[0].split("_")[0]
@@ -224,14 +234,14 @@ _CLASS_NAME_TYPE_MAP: list[tuple[re.Pattern[str], AIComponentType]] = [
     (re.compile(r"Guard(?:rail)?|Inspector|Rails", re.IGNORECASE), AIComponentType.GUARDRAIL),
     (re.compile(r"MCPClient", re.IGNORECASE), AIComponentType.MCP_CLIENT),
     (re.compile(r"Traceloop", re.IGNORECASE), AIComponentType.OBSERVABILITY),
-    (re.compile(r"Agent", re.IGNORECASE), AIComponentType.AGENT),
-    (re.compile(r"Tool", re.IGNORECASE), AIComponentType.TOOL),
-    (re.compile(r"Prompt", re.IGNORECASE), AIComponentType.PROMPT),
-    (re.compile(r"Memory|History|Conversation|ChatBuffer", re.IGNORECASE), AIComponentType.MEMORY),
+    (re.compile(r"Agent"), AIComponentType.AGENT),
+    (re.compile(r"Tool"), AIComponentType.TOOL),
+    (re.compile(r"Prompt"), AIComponentType.PROMPT),
+    (re.compile(r"Memory|History|Conversation|ChatBuffer"), AIComponentType.MEMORY),
     (re.compile(r"KnowledgeBase", re.IGNORECASE), AIComponentType.KNOWLEDGE_BASE),
     (re.compile(r"FeatureStore", re.IGNORECASE), AIComponentType.FEATURE_STORE),
     (re.compile(r"Retriever", re.IGNORECASE), AIComponentType.RETRIEVER),
-    (re.compile(r"Vector", re.IGNORECASE), AIComponentType.VECTOR_STORE),
+    (re.compile(r"Vector(?:Store|DB|Database)"), AIComponentType.VECTOR_STORE),
 ]
 
 _IMPORT_MODULE_TYPE_MAP: dict[str, AIComponentType] = {
@@ -394,7 +404,7 @@ def _build_kb_framework_prefixes(db: CatalogDB) -> frozenset[str]:
 
 def _is_known_call(
     qualified_name: str,
-    imports: list[str],
+    imports: list,
     patterns: frozenset[str],
     framework_prefixes: frozenset[str],
 ) -> bool:
@@ -406,7 +416,7 @@ def _is_known_call(
     prefix = qualified_name.split(".")[0].split("_")[0]
     if prefix in framework_prefixes:
         return True
-    for imp in imports:
+    for imp in _import_strings(imports):
         parts = imp.split()
         mod = parts[1] if len(parts) > 1 else ""
         mod_prefix = mod.split(".")[0].split("_")[0]
@@ -436,13 +446,14 @@ def _resolve_kb_path(context: ScanContext) -> Optional[Path]:
     return None
 
 
-def _extract_frameworks_from_imports(imports: list[str]) -> set[str]:
+def _extract_frameworks_from_imports(imports: list[str] | list[tuple[int, str]]) -> set[str]:
     """Derive top-level package names from import statements.
 
     e.g. ``"from langchain_openai import ChatOpenAI"`` → ``{"langchain_openai"}``
     """
     frameworks: set[str] = set()
-    for stmt in imports:
+    for entry in imports:
+        stmt = entry[1] if isinstance(entry, tuple) else entry
         if stmt.startswith("from "):
             module = stmt.split()[1] if len(stmt.split()) > 1 else ""
             top = module.split(".")[0]
@@ -804,7 +815,11 @@ def _detect_import_based_assets(
     candidates: list[AIComponent] = []
     seen: set[tuple[str, int]] = set()
 
-    for imp_line in result.imports:
+    for imp_entry in result.imports:
+        if isinstance(imp_entry, tuple):
+            stored_line, imp_line = imp_entry
+        else:
+            stored_line, imp_line = 0, imp_entry
         imp_lower = imp_line.lower()
 
         comp_type: AIComponentType | None = None
@@ -818,8 +833,13 @@ def _detect_import_based_assets(
                 break
 
         if comp_type is None:
-            parts = imp_line.split()
-            for part in parts:
+            tokens = imp_line.split()
+            try:
+                import_idx = tokens.index("import")
+                symbols = tokens[import_idx + 1:]
+            except ValueError:
+                symbols = tokens
+            for part in symbols:
                 cleaned = part.strip(",").strip("(").strip(")")
                 if not cleaned or cleaned in ("from", "import", "as"):
                     continue
@@ -832,17 +852,7 @@ def _detect_import_based_assets(
         if comp_type is None:
             continue
 
-        line_no = 0
-        source_lines = []
-        try:
-            from .file_cache import read_text_cached
-            source_lines = read_text_cached(Path(result.file_path)).splitlines()
-        except (OSError, Exception):
-            pass
-        for idx, src_line in enumerate(source_lines, 1):
-            if imp_line.strip() in src_line:
-                line_no = idx
-                break
+        line_no = stored_line
 
         dedup = (result.file_path, line_no)
         if dedup in seen:
@@ -914,7 +924,7 @@ def _detect_tool_schemas(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     components: list[AIComponent] = []
     seen: set[tuple[str, int]] = set()
-    imports = getattr(result, "imports", []) or []
+    imports = _import_strings(getattr(result, "imports", []) or [])
     import_text = "\n".join(imports)
 
     for call_obs in result.calls:
@@ -1360,7 +1370,7 @@ def _process_file_with_cache(
             _obs(name, result.file_path, ctx.line_number, "context_manager")
         )
 
-    imports = getattr(result, "imports", []) or []
+    imports = _import_strings(getattr(result, "imports", []) or [])
 
     fw_prefixes = kb_fw_prefixes or _AGENT_FRAMEWORK_PREFIXES
     pat = kb_patterns or {}
@@ -1459,6 +1469,19 @@ def _process_file_with_cache(
                     detection_source=DetectionSource.KB_ENRICHMENT,
                     kb_concept=concept,
                     kb_label=kb_entry.get("label", ""),
+                    needs_agentic=True,
+                    agentic_hint=(
+                        f"KB catalog matched '{display_name}' as "
+                        f"'{concept}' (type={comp_type.value}, "
+                        f"id={kb_entry['id']}). Verify in code_context: "
+                        f"(1) Is this a genuine AI component or a false "
+                        f"positive? (2) Is the assigned type correct — "
+                        f"reclassify if the code does something different "
+                        f"from what the name suggests. (3) Look at nearby "
+                        f"lines for concrete identifiers (model names, "
+                        f"endpoint URLs, class parameters, config values) "
+                        f"and enrich with them."
+                    ),
                     metadata=meta,
                 )
             )
@@ -1553,7 +1576,7 @@ def _process_file(
         )
         symbols.add(name)
 
-    imports = getattr(result, "imports", []) or []
+    imports = _import_strings(getattr(result, "imports", []) or [])
 
     fw_prefixes = kb_fw_prefixes or _AGENT_FRAMEWORK_PREFIXES
     pat = kb_patterns or {}
@@ -1666,6 +1689,19 @@ def _process_file(
                     detection_source=DetectionSource.KB_ENRICHMENT,
                     kb_concept=concept,
                     kb_label=kb_entry.get("label", ""),
+                    needs_agentic=True,
+                    agentic_hint=(
+                        f"KB catalog matched '{display_name}' as "
+                        f"'{concept}' (type={comp_type.value}, "
+                        f"id={kb_entry['id']}). Verify in code_context: "
+                        f"(1) Is this a genuine AI component or a false "
+                        f"positive? (2) Is the assigned type correct — "
+                        f"reclassify if the code does something different "
+                        f"from what the name suggests. (3) Look at nearby "
+                        f"lines for concrete identifiers (model names, "
+                        f"endpoint URLs, class parameters, config values) "
+                        f"and enrich with them."
+                    ),
                     metadata={
                         "kb_id": kb_entry["id"],
                         "observation_type": obs_data["type"],

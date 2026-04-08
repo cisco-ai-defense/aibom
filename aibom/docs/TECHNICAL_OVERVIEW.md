@@ -97,7 +97,7 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `plugins.py` | Plugin discovery via Python entry points (`aibom.scanners`, `aibom.reporters`). |
 | `platform_adapters.py` | GitHub/GitLab/Bitbucket API adapters for repo discovery. |
 | `multi_repo.py` | Multi-repo scan orchestration with parallel execution. |
-| `incremental.py` | Commit-SHA keyed scan caching for incremental org scans. |
+| `incremental.py` | Commit-SHA keyed scan caching (`--skip-unchanged`). |
 | `repo_triage.py` | Agentic repository triage — LLM-assisted repo prioritization. |
 | `report_sender.py` | POST JSON reports with retry/backoff. |
 | `workflow_analyzer.py` | AST-based function index and call graph for workflow context. |

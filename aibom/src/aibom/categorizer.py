@@ -763,7 +763,8 @@ def _build_graph_wiring_indices(
     import_map: Dict[str, Dict[str, str]] = {}
     for result in analysis_results:
         file_imports: Dict[str, str] = {}
-        for imp_str in result.imports:
+        for imp_entry in result.imports:
+            imp_str = imp_entry[1] if isinstance(imp_entry, tuple) else imp_entry
             if imp_str.startswith("from "):
                 parts = imp_str.split()
                 if len(parts) >= 4 and parts[2] == "import":

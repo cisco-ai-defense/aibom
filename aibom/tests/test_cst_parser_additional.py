@@ -18,9 +18,10 @@ def handler():
 """
     result = cst_parser.parse_source_code("file.py", source)
 
-    # Imports captured
-    assert "import os" in result.imports
-    assert "import pkg" in result.imports
+    # Imports captured (tuples of (line_number, import_string))
+    import_strs = [stmt for _, stmt in result.imports]
+    assert "import os" in import_strs
+    assert "import pkg" in import_strs
 
     # Decorator captured
     assert len(result.decorators) == 1

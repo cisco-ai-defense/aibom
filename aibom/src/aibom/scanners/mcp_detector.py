@@ -46,7 +46,9 @@ _RE_FROM_MCP_IMPORT = re.compile(r"from\s+mcp\s+import\b")
 _RE_FROM_MCP_SERVER_IMPORT = re.compile(r"from\s+mcp\.server\s+import\b")
 _RE_FROM_FASTMCP_IMPORT = re.compile(r"(?:from\s+fastmcp|import\s+fastmcp)\b")
 _RE_FASTMCP = re.compile(r"\bFastMCP\s*\(")
+_RE_FASTMCP_NAME = re.compile(r"""\bFastMCP\s*\(\s*["']([^"']+)["']""")
 _RE_SERVER_CALL = re.compile(r"\bServer\s*\(")
+_RE_SERVER_CALL_NAME = re.compile(r"""\bServer\s*\(\s*["']([^"']+)["']""")
 _RE_MCP_TOOL_DECORATOR = re.compile(
     r"@\s*\w+\s*\.\s*(tool|resource|prompt)\s*\(", re.MULTILINE
 )
@@ -191,43 +193,61 @@ def _components_from_python(path: Path) -> list[AIComponent]:
     fp = str(path.resolve())
     out: list[AIComponent] = []
 
-    server_hits: list[tuple[str, int]] = []
+    import_hits: list[tuple[str, int]] = []
+    constructor_hits: list[tuple[str, int]] = []
+    constructor_name: str | None = None
+
     m_imp = _RE_FROM_MCP_IMPORT.search(text)
     if m_imp:
-        server_hits.append(("from_mcp_import", _line_for_match(text, m_imp.start())))
+        import_hits.append(("from_mcp_import", _line_for_match(text, m_imp.start())))
     m_srv_imp = _RE_FROM_MCP_SERVER_IMPORT.search(text)
     if m_srv_imp:
-        server_hits.append(
-            (
-                "from_mcp_server_import",
-                _line_for_match(text, m_srv_imp.start()),
-            )
+        import_hits.append(
+            ("from_mcp_server_import", _line_for_match(text, m_srv_imp.start()))
         )
     m_fastmcp_imp = _RE_FROM_FASTMCP_IMPORT.search(text)
     if m_fastmcp_imp:
-        server_hits.append(
+        import_hits.append(
             ("from_fastmcp_import", _line_for_match(text, m_fastmcp_imp.start()))
         )
-    ln = _first_match_line(_RE_FASTMCP, text)
-    if ln is not None:
-        server_hits.append(("FastMCP", ln))
+
+    m_fastmcp_name = _RE_FASTMCP_NAME.search(text)
+    if m_fastmcp_name:
+        constructor_name = m_fastmcp_name.group(1)
+        constructor_hits.append(
+            ("FastMCP", _line_for_match(text, m_fastmcp_name.start()))
+        )
+    elif _first_match_line(_RE_FASTMCP, text) is not None:
+        constructor_hits.append(("FastMCP", _first_match_line(_RE_FASTMCP, text)))
+
     m_srv_call = _RE_SERVER_CALL.search(text)
     if m_srv_call and (
         _RE_FROM_MCP_SERVER_IMPORT.search(text) or "mcp.server" in text
     ):
-        server_hits.append(("Server", _line_for_match(text, m_srv_call.start())))
+        if not constructor_name:
+            m_srv_name = _RE_SERVER_CALL_NAME.search(text)
+            if m_srv_name:
+                constructor_name = m_srv_name.group(1)
+        constructor_hits.append(("Server", _line_for_match(text, m_srv_call.start())))
+
+    server_hits = constructor_hits or import_hits
     if server_hits:
-        server_hits.sort(key=lambda x: x[1])
-        kinds = [k for k, _ in server_hits]
+        all_kinds = [k for k, _ in import_hits] + [k for k, _ in constructor_hits]
+        if constructor_hits:
+            best_line = constructor_hits[0][1]
+        else:
+            server_hits.sort(key=lambda x: x[1])
+            best_line = server_hits[0][1]
+        server_name = constructor_name or f"{path.stem}_mcp_server"
         out.append(
             AIComponent(
-                name=f"{path.stem}_mcp_server",
+                name=server_name,
                 component_type=AIComponentType.MCP_SERVER,
                 file_path=fp,
-                line_number=server_hits[0][1],
+                line_number=best_line,
                 framework="mcp",
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                metadata={"patterns": kinds},
+                metadata={"patterns": all_kinds},
             )
         )
 

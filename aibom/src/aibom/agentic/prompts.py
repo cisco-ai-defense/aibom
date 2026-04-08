@@ -56,7 +56,21 @@ You receive two lists:
 
 ## Workflow (follow in order, then STOP)
 
-1. **Wrapper tracing (DISCOVERY candidates)**: Some components have an
+1. **KB match verification**: Components with an `agentic_hint` starting
+   with "KB catalog matched" were detected by name-matching against a
+   knowledge base. These are candidates, NOT confirmed assets. For each:
+   - Read the `code_context` carefully to understand what the code actually does
+   - Decide if it is a genuine AI component or a false positive (e.g., a DTO,
+     ETL helper, CRUD wrapper, or unrelated class that happens to share a name)
+   - Verify the `type` is correct. The KB infers type from the class/function
+     name, but the code may do something different — reclassify if needed
+   - Check nearby lines (within code_context) for **concrete identifiers**:
+     model names, endpoint URLs, class constructor parameters, config values,
+     store names, tool definitions — whatever is relevant for the component type
+   - If confirmed: enrich with the concrete values you found
+   - If the type is wrong: `reclassify_components` with the correct type
+   - If false positive: `remove_components` with reason
+2. **Wrapper tracing (DISCOVERY candidates)**: Some components have an
    `agentic_hint` saying "trace the wrapper chain." For these:
    - Read the `code_context` to find what class is instantiated
    - Use `analyze_imports` on the file to trace the wrapper module
@@ -64,20 +78,20 @@ You receive two lists:
      tool, embedding, etc.) or something unrelated?
    - If confirmed: `reclassify_components` with the correct type
    - If false positive: `remove_components` with reason
-2. **Model verification**: For each model name in `enrich_these`, call
+3. **Model verification**: For each model name in `enrich_these`, call
    `lookup_model` ONCE. You may batch multiple names in your first round.
-3. **Env var resolution**: For any component whose metadata contains
+4. **Env var resolution**: For any component whose metadata contains
    `env` or `env_context`, or whose model_name looks like an env var, call
    `resolve_env_var` ONCE.
-4. **Classification review**: Using the code_context, verify each component's
+5. **Classification review**: Using the code_context, verify each component's
    type is correct. Reclassify or flag false positives.
-5. **Relationship discovery**: Using both `enrich_these` AND
+6. **Relationship discovery**: Using both `enrich_these` AND
    `other_detected_components`, identify relationships (agent uses model,
    chain uses tool, service calls embedding, etc.) and report them.
-6. **Gap analysis**: If the code_context reveals AI assets NOT present in
+7. **Gap analysis**: If the code_context reveals AI assets NOT present in
    either list (e.g., a prompt template, an agent class, a tool), add them
    to `new_components`.
-7. **Output your JSON** — then STOP. Do not continue searching.
+8. **Output your JSON** — then STOP. Do not continue searching.
 
 ## Protected asset categories (do NOT prune)
 
@@ -118,6 +132,15 @@ Look for MCP server patterns beyond standard `from mcp.server import Server`:
 - FastMCP, custom Server subclasses
 - `@server.tool`, `@server.resource`, `@server.prompt` decorators
 - gRPC service definitions that serve AI capabilities
+
+### Guardrails
+Do NOT classify config flags, feature toggles, or product references as
+`guardrail`. Boolean flags like `aidefenseEnabled`, `ciscoaidefense`,
+`enable_content_filter`, or product integration toggles are application
+configuration, not guardrail components. Only classify as `guardrail` when:
+- It is a guardrail framework class (NeMoGuardrails, LLMGuard, LakeraGuard)
+- It is a guardrail configuration that defines validation/filtering rules
+- It validates, filters, or moderates AI model inputs or outputs
 
 ### NOT AI components — remove or reclassify these
 The following are common false positives. Do NOT classify them as AI assets:
