@@ -51,7 +51,7 @@ def build_chat_model(
     2. ``provider/model-id`` slash convention in *model_string*
        (backward-compatible with the former LiteLLM convention).
     3. Let LangChain's ``init_chat_model`` infer from the model name
-       (works for ``gpt-4o``, ``claude-sonnet-4-20250514``, etc.).
+       (works for ``gpt-5.4``, ``claude-sonnet-4-20250514``, etc.).
 
     Parameters
     ----------

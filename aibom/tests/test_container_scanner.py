@@ -44,7 +44,7 @@ class TestTierDetection:
 
 
 class TestSyftJsonExtraction:
-    def test_extracts_ai_packages(self):
+    def test_extracts_all_packages_with_hint(self):
         data = {
             "source": {"metadata": {"config": {"Env": []}}},
             "artifacts": [
@@ -58,8 +58,12 @@ class TestSyftJsonExtraction:
         names = {c.name for c in comps}
         assert "torch" in names
         assert "transformers" in names
-        assert "flask" not in names
-        assert "numpy" not in names
+        assert "flask" in names
+        assert "numpy" in names
+        by_name = {c.name: c for c in comps}
+        assert by_name["torch"].metadata["known_ai_package"] is True
+        assert by_name["flask"].metadata["known_ai_package"] is False
+        assert by_name["numpy"].metadata["known_ai_package"] is False
 
     def test_extracts_model_env_vars(self):
         data = {

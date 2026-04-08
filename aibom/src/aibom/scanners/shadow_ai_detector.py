@@ -24,7 +24,7 @@ from typing import Optional
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
-from .dependency_scanner import AI_PACKAGES, DependencyScanner, _iter_scan_paths
+from .dependency_scanner import KNOWN_AI_PACKAGES, DependencyScanner, _iter_scan_paths
 from .file_cache import is_python_source, read_python_source, read_text_cached
 
 _LANGCHAIN = frozenset({
@@ -40,7 +40,7 @@ _LLAMA_INDEX = frozenset({"llama-index", "llama-index-core"})
 
 def _build_module_to_pypi() -> dict[str, frozenset[str]]:
     out: dict[str, frozenset[str]] = {}
-    pypi = AI_PACKAGES["pypi"]
+    pypi = KNOWN_AI_PACKAGES["pypi"]
 
     def add(module: str, pkgs: frozenset[str]) -> None:
         out[module] = pkgs

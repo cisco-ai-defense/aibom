@@ -84,15 +84,19 @@ class TestDependencyScanner:
         names = {c.name for c in comps}
         assert "async-openai" in names
 
-    def test_ignores_non_ai_packages(self, tmp_path: Path) -> None:
+    def test_emits_all_packages_with_known_ai_hint(self, tmp_path: Path) -> None:
         comps, _ = run_scanner(
             DependencyScanner,
             tmp_path,
             {
-                "requirements.txt": "requests>=2.0\n",
+                "requirements.txt": "requests>=2.0\nopenai>=1.0\n",
                 "package.json": json.dumps({"dependencies": {"lodash": "4.17.21"}}),
             },
         )
-        names = {c.name for c in comps}
-        assert "requests" not in names
-        assert "lodash" not in names
+        by_name = {c.name: c for c in comps}
+        assert "requests" in by_name
+        assert "openai" in by_name
+        assert "lodash" in by_name
+        assert by_name["openai"].metadata["known_ai_package"] is True
+        assert by_name["requests"].metadata["known_ai_package"] is False
+        assert by_name["lodash"].metadata["known_ai_package"] is False

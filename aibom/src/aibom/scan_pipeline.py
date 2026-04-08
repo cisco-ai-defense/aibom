@@ -19,7 +19,7 @@
 Stages:
   1. **Scan** — run all registered scanners (Tier 1 + Tier 2 EnvVarResolver).
   2. **Cross-ref** — build env/package index, resolve env-var components.
-  3. **Agentic** — optionally enrich with LLM reasoning (if ``llm_config``).
+  3. **Agentic** — classify all candidates via LLM agent (requires ``llm_config``).
   4. **Assemble** — apply ``--strict`` filtering, collect counts.
 """
 
@@ -329,7 +329,7 @@ class ScanPipeline:
         min_severity: Any | None = None,
         strict: bool = False,
         exclude_patterns: list[str] | None = None,
-        agentic_scope: str = "candidates",
+        agentic_scope: str = "all",
         agentic_batch_size: int = 5,
         agentic_concurrency: int = 1,
         agentic_fast_model: str | None = None,
@@ -511,10 +511,8 @@ class ScanPipeline:
         return resolved, env_idx, pkg_idx, ext_deps
 
     # ------------------------------------------------------------------
-    # Stage 3: Agentic enrichment (optional)
+    # Stage 3: Agentic classification (mandatory)
     # ------------------------------------------------------------------
-
-    _AGENTIC_CONFIDENCE_THRESHOLD = 0.7
 
     def _stage_agentic(
         self,
@@ -524,53 +522,16 @@ class ScanPipeline:
         if not self.llm_config or not components:
             return components, relationships, []
 
-        promoted = 0
-        components = [
-            (
-                c.model_copy(update={"needs_agentic": True})
-                if not c.needs_agentic
-                and c.confidence < self._AGENTIC_CONFIDENCE_THRESHOLD
-                else c
-            )
-            for c in components
-        ]
-        promoted = sum(
-            1
-            for c in components
-            if c.needs_agentic and c.confidence < self._AGENTIC_CONFIDENCE_THRESHOLD
+        _LOGGER.info(
+            "Stage 3/4 — agentic classification (all %d components)",
+            len(components),
         )
-        if promoted:
-            _LOGGER.info(
-                "Auto-promoted %d low-confidence components to agentic review "
-                "(threshold %.2f)",
-                promoted,
-                self._AGENTIC_CONFIDENCE_THRESHOLD,
-            )
-
-        candidates = [c for c in components if c.needs_agentic]
-        confirmed = [c for c in components if not c.needs_agentic]
-
-        if self.agentic_scope == "candidates":
-            to_enrich = candidates
-            _LOGGER.info(
-                "Stage 3/4 — agentic enrichment (%d candidates of %d total)",
-                len(to_enrich), len(components),
-            )
-        else:
-            to_enrich = components
-            _LOGGER.info(
-                "Stage 3/4 — agentic enrichment (all %d components)", len(components),
-            )
-
-        if not to_enrich:
-            _LOGGER.info("Stage 3/4 — no agentic candidates, skipping LLM calls")
-            return components, relationships, []
 
         try:
             from .agentic.agent import run_agentic_enrichment
         except ImportError:
             _LOGGER.warning(
-                "Agentic enrichment requires 'cisco-aibom[agentic]'. Skipping."
+                "Agentic classification requires 'cisco-aibom[agentic]'. Skipping."
             )
             return components, relationships, []
 
@@ -578,7 +539,7 @@ class ScanPipeline:
             model_str = self.llm_config["model"]
             enriched, agentic_rels, agentic_flags = run_agentic_enrichment(
                 model_string=model_str,
-                deterministic_components=to_enrich,
+                deterministic_components=components,
                 deterministic_relationships=relationships,
                 scan_paths=self.scan_paths,
                 llm_config=self.llm_config,
@@ -588,16 +549,10 @@ class ScanPipeline:
                 timeout_s=self.agentic_timeout,
             )
             relationships = relationships + agentic_rels
-
-            if self.agentic_scope == "candidates":
-                components = confirmed + enriched
-            else:
-                components = enriched
-
-            return components, relationships, agentic_flags
+            return enriched, relationships, agentic_flags
 
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Agentic enrichment failed: %s", exc, exc_info=True)
+            _LOGGER.warning("Agentic classification failed: %s", exc, exc_info=True)
 
         return components, relationships, []
 
