@@ -178,6 +178,16 @@ def _classify_env(key: str, value: str) -> AIComponentType:
     return AIComponentType.MODEL
 
 
+_HELM_ENDPOINT_KEY_RE = re.compile(
+    r"(?:endpoint|api_base|api_url|base_url)$", re.IGNORECASE,
+)
+
+
+def _helm_key_is_ai_endpoint(lower_key: str) -> bool:
+    """True when the Helm key name looks like an AI endpoint reference."""
+    return bool(_HELM_ENDPOINT_KEY_RE.search(lower_key))
+
+
 _TRAINING_IMAGE_HINTS: tuple[str, ...] = (
     "huggingface",
     "sagemaker",
@@ -258,7 +268,12 @@ def _emit(
     )
 
 
-def _line_for_needle(content: str, needle: str) -> int:
+def _line_for_needle(content: str, needle: str, key: str = "") -> int:
+    if key:
+        for variant in (f"{key}: {needle}", f"{key}: \"{needle}\"", f"{key}: '{needle}'"):
+            idx = content.find(variant)
+            if idx >= 0:
+                return content.count("\n", 0, idx) + 1
     idx = content.find(needle)
     if idx < 0:
         return 1
@@ -608,9 +623,9 @@ def _walk_helm_values(
     key_path: str = "",
     raw_content: str = "",
 ) -> None:
-    def _resolve_line(needle: str) -> int:
+    def _resolve_line(needle: str, yaml_key: str = "") -> int:
         if raw_content:
-            return _line_for_needle(raw_content, needle)
+            return _line_for_needle(raw_content, needle, key=yaml_key)
         return 1
 
     if isinstance(obj, dict):
@@ -621,14 +636,14 @@ def _walk_helm_values(
             sub = f"{key_path}.{k}" if key_path else k
             if isinstance(v, str):
                 stripped = v.strip()
-                ln = _resolve_line(stripped) if stripped else 1
+                ln = _resolve_line(stripped, yaml_key=k) if stripped else 1
                 if _image_matches_ai(v):
                     out.append(
                         _emit(
                             v[:200],
                             AIComponentType.DEPENDENCY,
                             file_path,
-                            _resolve_line(v[:80]),
+                            _resolve_line(v[:80], yaml_key=k),
                             metadata={"helm_key": sub, "image": v},
                         )
                     )
@@ -642,6 +657,26 @@ def _walk_helm_values(
                             model_name=stripped,
                             metadata={"helm_key": sub},
                             confidence=0.95,
+                        )
+                    )
+                elif (
+                    _helm_key_is_ai_endpoint(lk)
+                    and stripped.startswith(("http://", "https://"))
+                ):
+                    out.append(
+                        _emit(
+                            f"env:{k}",
+                            AIComponentType.LLM_ENDPOINT,
+                            file_path,
+                            ln,
+                            metadata={"helm_key": sub, "endpoint_url": stripped},
+                            confidence=0.5,
+                            needs_agentic=True,
+                            agentic_hint=(
+                                f"Helm key '{k}' ends with an endpoint suffix "
+                                f"and value is a URL. Confirm whether this is "
+                                f"an AI/LLM endpoint or an unrelated service."
+                            ),
                         )
                     )
                 elif _helm_key_suggests_model(sub) and stripped and len(stripped) < 120:

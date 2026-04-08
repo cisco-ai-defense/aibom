@@ -44,9 +44,12 @@ class TestCstParser(unittest.TestCase):
         code = "import os\nfrom sys import argv\nimport pandas as pd"
         result = parse_source_code('test.py', code)
 
-        self.assertIn('import os', result.imports)
-        self.assertIn('from sys import argv', result.imports)
-        self.assertIn('import pandas as pd', result.imports)
+        import_strs = [stmt for _, stmt in result.imports]
+        self.assertIn('import os', import_strs)
+        self.assertIn('from sys import argv', import_strs)
+        self.assertIn('import pandas as pd', import_strs)
+        for line_no, _ in result.imports:
+            self.assertGreater(line_no, 0)
 
     def test_extract_argument_value(self):
         self.assertEqual(_extract_argument_value(cst.SimpleString('"hello"')), 'hello')

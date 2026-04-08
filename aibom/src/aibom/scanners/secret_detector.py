@@ -353,7 +353,13 @@ def _run_gitleaks(source: Path, out: dict[tuple[str, int], AIComponent]) -> None
         except (TypeError, ValueError):
             continue
         stype = _slugify_type(str(rule))
-        abs_path = str(Path(str(file_path)).resolve())
+        fp = Path(str(file_path))
+        if not fp.is_absolute():
+            fp = source / fp
+        resolved = fp.resolve()
+        if not resolved.exists():
+            continue
+        abs_path = str(resolved)
         comp = AIComponent(
             name=stype,
             component_type=AIComponentType.SECRET,
@@ -413,7 +419,13 @@ def _run_trufflehog(source: Path, out: dict[tuple[str, int], AIComponent]) -> No
             ln = int(line_no) if line_no is not None else 1
         except (TypeError, ValueError):
             ln = 1
-        abs_path = str(Path(str(file_path)).resolve())
+        fp = Path(str(file_path))
+        if not fp.is_absolute():
+            fp = source / fp
+        resolved = fp.resolve()
+        if not resolved.exists():
+            continue
+        abs_path = str(resolved)
         comp = AIComponent(
             name=stype,
             component_type=AIComponentType.SECRET,

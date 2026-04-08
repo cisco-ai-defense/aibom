@@ -90,7 +90,7 @@ class CodeAnalysisResult:
     context_managers: List[ContextManagerObservation] = field(default_factory=list)
     class_defs: List[ClassDefObservation] = field(default_factory=list)
     function_annotations: List[FunctionAnnotationObservation] = field(default_factory=list)
-    imports: List[str] = field(default_factory=list)  # Import statements for disambiguation
+    imports: List[tuple[int, str]] = field(default_factory=list)  # (line_number, import_stmt)
 
     def get_all_qualified_names(self) -> Set[str]:
         """Returns a set of all unique qualified names found in the file."""

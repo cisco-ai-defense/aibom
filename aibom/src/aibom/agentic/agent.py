@@ -918,6 +918,8 @@ def _component_to_summary(
         entry["model_name"] = c.model_name
     if c.metadata:
         entry["metadata"] = c.metadata
+    if c.agentic_hint:
+        entry["agentic_hint"] = c.agentic_hint
     if enrich_target:
         entry["ENRICH"] = True
 

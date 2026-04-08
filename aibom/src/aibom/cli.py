@@ -716,9 +716,9 @@ def analyze(
             "Higher values speed up org-scale scans but require more memory."
         ),
     ),
-    incremental: bool = typer.Option(
+    skip_unchanged: bool = typer.Option(
         False,
-        "--incremental",
+        "--skip-unchanged",
         help=(
             "Skip scanning git repos whose HEAD has not changed since "
             "the last cached scan.  Cache is stored under "
@@ -991,7 +991,7 @@ def analyze(
 
         scan_path = str(path_to_analyze)
 
-        if incremental and not is_container and (path_to_analyze / ".git").exists():
+        if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
             from .incremental import OrgCache
 
             org_cache = OrgCache()
@@ -1111,7 +1111,7 @@ def analyze(
             }
             save_cached(cache_dir, _ck, _serializable)
 
-        if incremental and not is_container and (path_to_analyze / ".git").exists():
+        if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
             from .incremental import OrgCache
             from .models import ScanResult, SourceResult
 

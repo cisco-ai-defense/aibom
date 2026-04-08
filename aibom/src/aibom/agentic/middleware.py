@@ -144,6 +144,12 @@ class AIBOMScannerMiddleware:
             if upd is not None:
                 merged_meta = dict(comp.metadata)
                 merged_meta.update(upd.pop("metadata", {}))
+                raw_type = upd.pop("component_type", None)
+                if isinstance(raw_type, str):
+                    try:
+                        upd["component_type"] = AIComponentType(raw_type)
+                    except ValueError:
+                        _LOGGER.warning("Invalid component_type '%s' in enrichment for %s", raw_type, comp.instance_id)
                 comp = comp.model_copy(update={
                     **upd,
                     "metadata": merged_meta,

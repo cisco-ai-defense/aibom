@@ -338,7 +338,10 @@ def analyze_imports_impl(file_path: str) -> str:
     result = parse_source_code(file_path, source)
     return json.dumps({
         "file": file_path,
-        "imports": result.imports,
+        "imports": [
+            entry[1] if isinstance(entry, tuple) else entry
+            for entry in result.imports
+        ],
         "calls": [
             {
                 "name": c.qualified_name,
