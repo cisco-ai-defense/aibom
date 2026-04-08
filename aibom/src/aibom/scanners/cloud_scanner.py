@@ -73,14 +73,22 @@ def _scan_aws() -> list[AIComponent]:
         sm = boto3.client("sagemaker")
         endpoints = sm.list_endpoints(MaxResults=100).get("Endpoints", [])
         for ep in endpoints:
-            name = ep.get("EndpointName", "")
+            ep_name = ep.get("EndpointName", "")
+            model_name = ""
+            try:
+                desc = sm.describe_endpoint(EndpointName=ep_name)
+                variants = desc.get("ProductionVariants", [])
+                if variants:
+                    model_name = variants[0].get("ModelName", "")
+            except Exception:
+                _LOGGER.debug("Cloud scanner: describe_endpoint failed for %s", ep_name)
             components.append(
                 AIComponent(
-                    name=name,
-                    component_type=AIComponentType.MODEL,
+                    name=ep_name,
+                    component_type=AIComponentType.MODEL_ENDPOINT,
                     file_path="aws:sagemaker",
                     line_number=0,
-                    model_name=name,
+                    model_name=model_name or ep_name,
                     framework="sagemaker",
                     detection_source=DetectionSource.API,
                     metadata={
@@ -88,6 +96,7 @@ def _scan_aws() -> list[AIComponent]:
                         "service": "sagemaker",
                         "endpoint_status": ep.get("EndpointStatus", ""),
                         "creation_time": str(ep.get("CreationTime", "")),
+                        "resolved_model": model_name,
                     },
                 )
             )
@@ -134,19 +143,29 @@ def _scan_gcp() -> list[AIComponent]:
         aiplatform.init()
         endpoints = aiplatform.Endpoint.list()
         for ep in endpoints:
+            model_name = ""
+            try:
+                deployed = getattr(ep, "deployed_models", None) or []
+                if deployed:
+                    model_res = getattr(deployed[0], "model", "")
+                    if model_res:
+                        model_name = model_res.rsplit("/", 1)[-1]
+            except Exception:
+                _LOGGER.debug("Cloud scanner: deployed_models lookup failed for %s", ep.display_name)
             components.append(
                 AIComponent(
                     name=ep.display_name,
-                    component_type=AIComponentType.MODEL,
+                    component_type=AIComponentType.MODEL_ENDPOINT,
                     file_path="gcp:vertex_ai",
                     line_number=0,
-                    model_name=ep.display_name,
+                    model_name=model_name or ep.display_name,
                     framework="vertex_ai",
                     detection_source=DetectionSource.API,
                     metadata={
                         "cloud_provider": "gcp",
                         "service": "vertex_ai",
                         "resource_name": ep.resource_name,
+                        "resolved_model": model_name,
                     },
                 )
             )
@@ -178,13 +197,13 @@ def _scan_azure() -> list[AIComponent]:
         accounts = client.accounts.list()
         for acct in accounts:
             if acct.kind and "openai" in acct.kind.lower():
+                endpoint_url = f"https://{acct.name}.openai.azure.com/" if acct.name else ""
                 components.append(
                     AIComponent(
                         name=acct.name or "",
-                        component_type=AIComponentType.MODEL,
+                        component_type=AIComponentType.LLM_ENDPOINT,
                         file_path="azure:cognitive_services",
                         line_number=0,
-                        model_name=acct.name or "",
                         framework="azure_openai",
                         detection_source=DetectionSource.API,
                         metadata={
@@ -192,6 +211,7 @@ def _scan_azure() -> list[AIComponent]:
                             "service": "cognitive_services",
                             "kind": acct.kind or "",
                             "location": acct.location or "",
+                            "endpoint_url": endpoint_url,
                         },
                     )
                 )

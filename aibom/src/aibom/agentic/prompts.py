@@ -81,10 +81,12 @@ You receive two lists:
 
 ## Protected asset categories (do NOT prune)
 
-- model, agent, tool, prompt, embedding, vector_store, retriever, memory
+- model, llm_endpoint, model_endpoint, agent, tool, prompt
+- embedding, vector_store, retriever, knowledge_base, feature_store, memory
 - dataset, training_run, hyperparameter, model_artifact
 - experiment_tracker, model_registry, data_versioning, ml_pipeline
-- mcp_server, mcp_client, skill, guardrail, observability, secret, dependency
+- mcp_server, mcp_client, mcp_gateway, skill, guardrail
+- observability, secret, dependency
 
 Prompts (PromptTemplate, ChatPromptTemplate, SystemMessage, etc.) are
 first-class AI assets — always keep them.

@@ -235,7 +235,7 @@ def evaluate_policy(policy: Policy, scan_result: ScanResult) -> PolicyResult:
 
         elif kind == PolicyRuleKind.REQUIRE_PINNED_MODELS:
             for c in components:
-                if c.component_type != AIComponentType.MODEL:
+                if not c.component_type.is_model_related:
                     continue
                 mn = c.model_name
                 if not mn or not str(mn).strip():
@@ -280,7 +280,7 @@ def evaluate_policy(policy: Policy, scan_result: ScanResult) -> PolicyResult:
         elif kind == PolicyRuleKind.BLOCKED_MODELS:
             blocked = list(params.get("models") or [])
             for c in components:
-                if c.component_type != AIComponentType.MODEL:
+                if not c.component_type.is_model_related:
                     continue
                 mn = c.model_name
                 if mn and _model_matches_blocklist(str(mn), blocked):

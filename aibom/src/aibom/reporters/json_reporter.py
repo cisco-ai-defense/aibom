@@ -18,10 +18,25 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from pathlib import PurePosixPath
 from typing import IO, Any
 
 from ..models import AIComponent, ScanResult
 from .base import BaseReporter
+
+
+def _friendly_source_name(path: str) -> str:
+    """Derive a short, meaningful source label from a local path or URL.
+
+    For paths containing ``github.com``, extracts ``org/repo``.
+    Otherwise falls back to the last path component.
+    """
+    parts = PurePosixPath(path).parts
+    if "github.com" in parts:
+        idx = parts.index("github.com")
+        if idx + 2 < len(parts):
+            return f"{parts[idx + 1]}/{parts[idx + 2]}"
+    return PurePosixPath(path).name or path
 
 
 def _components_by_type(components: Iterable[AIComponent]) -> dict[str, list[dict[str, Any]]]:
@@ -38,7 +53,8 @@ def _aibom_payload(result: ScanResult) -> dict[str, Any]:
     for src in result.sources:
         comps = _components_by_type(src.components)
         total_components = sum(len(v) for v in comps.values())
-        sources_out[src.path] = {
+        source_key = _friendly_source_name(src.path)
+        sources_out[source_key] = {
             "components": comps,
             "relationships": [r.model_dump(mode="json") for r in src.relationships],
             "summary": {

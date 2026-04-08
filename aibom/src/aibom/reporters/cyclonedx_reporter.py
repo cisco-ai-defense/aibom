@@ -34,6 +34,8 @@ from .base import BaseReporter
 _NATIVE_CDX_TYPES: frozenset[AIComponentType] = frozenset(
     {
         AIComponentType.MODEL,
+        AIComponentType.LLM_ENDPOINT,
+        AIComponentType.MODEL_ENDPOINT,
         AIComponentType.EMBEDDING,
         AIComponentType.MODEL_ARTIFACT,
         AIComponentType.DATASET,
@@ -45,6 +47,8 @@ _NATIVE_CDX_TYPES: frozenset[AIComponentType] = frozenset(
 def _cyclonedx_component_type(kind: AIComponentType) -> ComponentType:
     if kind in (
         AIComponentType.MODEL,
+        AIComponentType.LLM_ENDPOINT,
+        AIComponentType.MODEL_ENDPOINT,
         AIComponentType.EMBEDDING,
         AIComponentType.MODEL_ARTIFACT,
     ):

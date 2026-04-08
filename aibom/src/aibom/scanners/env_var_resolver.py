@@ -292,13 +292,16 @@ def _classify_assignment(text: str, env_match_start: int) -> str | None:
     return None
 
 
-def _env_context_to_component_type(ctx: str) -> AIComponentType:
+def _env_context_to_component_type(ctx: str, env_name: str = "") -> AIComponentType:
     if ctx in ("model_kwarg", "model_assignment"):
         return AIComponentType.MODEL
     if ctx in ("api_key_kwarg", "api_key_envname"):
         return AIComponentType.SECRET
     if ctx == "endpoint_kwarg":
-        return AIComponentType.DEPENDENCY
+        eu = env_name.upper()
+        if any(tok in eu for tok in ("SAGEMAKER", "INFERENCE", "SERVING")):
+            return AIComponentType.MODEL_ENDPOINT
+        return AIComponentType.LLM_ENDPOINT
     return AIComponentType.MODEL
 
 
@@ -361,7 +364,7 @@ class EnvVarResolver(BaseScanner):
                         continue
                     seen.add(dedup_key)
 
-                    comp_type = _env_context_to_component_type(ctx)
+                    comp_type = _env_context_to_component_type(ctx, env_name)
                     line_no = _line_number(text, match_start)
 
                     components.append(AIComponent(

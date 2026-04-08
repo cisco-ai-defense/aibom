@@ -292,6 +292,28 @@ def _consolidate_vector_stores(
     return merged
 
 
+def _dedup_tool_vs_vector_store(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """If the same entity appears as both TOOL and VECTOR_STORE, keep only VECTOR_STORE."""
+    vs_names: set[str] = set()
+    for c in components:
+        if c.component_type == AIComponentType.VECTOR_STORE:
+            vs_names.add((c.model_name or c.name).lower().strip())
+
+    if not vs_names:
+        return components
+
+    result: list["AIComponent"] = []
+    for c in components:
+        if c.component_type == AIComponentType.TOOL:
+            key = (c.model_name or c.name).lower().strip()
+            if key in vs_names:
+                continue
+        result.append(c)
+    return result
+
+
 class ScanPipeline:
     """Four-stage v2 scan pipeline wired into a single ``run()`` call."""
 
@@ -579,6 +601,15 @@ class ScanPipeline:
             _LOGGER.info(
                 "Vector store dedup: %d → %d components (-%d)",
                 before_vs, after_vs, before_vs - after_vs,
+            )
+
+        before_td = len(components)
+        components = _dedup_tool_vs_vector_store(components)
+        after_td = len(components)
+        if before_td != after_td:
+            _LOGGER.info(
+                "Tool/vector_store priority dedup: %d → %d (-%d)",
+                before_td, after_td, before_td - after_td,
             )
 
         agentic_count = sum(1 for c in components if c.needs_agentic)

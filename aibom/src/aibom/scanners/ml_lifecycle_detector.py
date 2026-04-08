@@ -130,7 +130,6 @@ _CI_TRAIN_IMAGE_RE = re.compile(
 
 _HP_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\blearning_rate\s*=\s*([^,\n#)]+)"), "learning_rate"),
-    (re.compile(r"\bbatch_size\s*=\s*([^,\n#)]+)"), "batch_size"),
     (re.compile(r"\bnum_epochs\s*=\s*([^,\n#)]+)"), "num_epochs"),
     (re.compile(r"\bwarmup_steps\s*=\s*([^,\n#)]+)"), "warmup_steps"),
     (re.compile(r"\bweight_decay\s*=\s*([^,\n#)]+)"), "weight_decay"),
@@ -141,6 +140,15 @@ _HP_RULES: list[tuple[re.Pattern[str], str]] = [
     ),
     (re.compile(r"\bfp16\s*=\s*([^,\n#)]+)"), "fp16"),
     (re.compile(r"\bbf16\s*=\s*([^,\n#)]+)"), "bf16"),
+    (re.compile(r"\bdropout\s*=\s*([^,\n#)]+)"), "dropout"),
+]
+
+_HP_CONTEXT_RULES: list[tuple[re.Pattern[str], str, re.Pattern[str]]] = [
+    (
+        re.compile(r"\bbatch_size\s*=\s*([^,\n#)]+)"),
+        "batch_size",
+        re.compile(r"(?:Trainer|TrainingArguments|DataLoader|fit|train)", re.IGNORECASE),
+    ),
 ]
 
 _CONCEPT_PATTERNS: list[ConceptPattern] = [
@@ -317,7 +325,7 @@ _CONCEPT_PATTERNS: list[ConceptPattern] = [
         [
             (re.compile(r"""boto3\.client\s*\(\s*["']sagemaker["']\s*\)"""), "aws-sagemaker"),
             (re.compile(r"""\bcreate_training_job\s*\("""), "aws-sagemaker"),
-            (re.compile(r"""\bcreate_endpoint\s*\("""), "aws-sagemaker"),
+            (re.compile(r"""\bcreate_endpoint_config\s*\("""), "aws-sagemaker"),
             (re.compile(r"""\bSageMaker(?:Estimator|Processor|Pipeline)\s*\("""), "aws-sagemaker"),
             (re.compile(r"""\bHuggingFace(?:Processor|Model|Estimator)\s*\("""), "aws-sagemaker"),
             (re.compile(r"""\bCustomJob\s*\("""), "gcp-vertex-ai"),
@@ -572,7 +580,11 @@ class MLLifecycleDetector(BaseScanner):
                 if is_py:
                     hp_conf = 0.85 if file_has_ml else 0.35
                     hp_agentic = not file_has_ml
-                    for hp_rx, hp_key in _HP_RULES:
+                    all_hp_rules: list[tuple[re.Pattern[str], str]] = list(_HP_RULES)
+                    for ctx_rx, ctx_key, ctx_guard in _HP_CONTEXT_RULES:
+                        if ctx_guard.search(text):
+                            all_hp_rules.append((ctx_rx, ctx_key))
+                    for hp_rx, hp_key in all_hp_rules:
                         for m in hp_rx.finditer(line):
                             raw = m.group(1).strip()
                             val = _normalize_hp_value(raw)

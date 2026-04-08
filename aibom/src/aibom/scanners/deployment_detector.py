@@ -132,40 +132,51 @@ def _is_known_model(value: str) -> bool:
     from .model_detector import _registry_lookup
     return _registry_lookup(stripped) is not None
 
-_AI_ENV_NAMES: frozenset[str] = frozenset(
-    {
+_LLM_ENDPOINT_ENV_KEYS: frozenset[str] = frozenset({
+    "AZURE_OPENAI_ENDPOINT", "OPENAI_API_BASE",
+    "AZURE_OPENAI_API_BASE", "ANTHROPIC_API_BASE",
+})
+
+_MODEL_ENDPOINT_ENV_KEYS: frozenset[str] = frozenset({
+    "MODEL_ENDPOINT", "INFERENCE_ENDPOINT",
+    "AWS_SAGEMAKER_ENDPOINT", "INFERENCE_URL",
+})
+
+_SECRET_ENV_NAMES: frozenset[str] = frozenset({
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "HUGGINGFACE_TOKEN",
+    "HF_TOKEN",
+    "COHERE_API_KEY",
+    "MISTRAL_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "GOOGLE_AI_API_KEY",
+})
+
+_AI_ENV_NAMES: frozenset[str] = (
+    _LLM_ENDPOINT_ENV_KEYS
+    | _MODEL_ENDPOINT_ENV_KEYS
+    | _SECRET_ENV_NAMES
+    | frozenset({
         "MODEL_NAME",
         "MODEL_ID",
         "MODEL_PATH",
-        "MODEL_ENDPOINT",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "HUGGINGFACE_TOKEN",
-        "HF_TOKEN",
-        "COHERE_API_KEY",
-        "MISTRAL_API_KEY",
-        "AWS_SAGEMAKER_ENDPOINT",
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_API_KEY",
-        "GOOGLE_AI_API_KEY",
         "EMBEDDING_MODEL",
         "LLM_MODEL",
-        "INFERENCE_ENDPOINT",
-    }
+    })
 )
 
-_SECRET_ENV_NAMES: frozenset[str] = frozenset(
-    {
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "HUGGINGFACE_TOKEN",
-        "HF_TOKEN",
-        "COHERE_API_KEY",
-        "MISTRAL_API_KEY",
-        "AZURE_OPENAI_API_KEY",
-        "GOOGLE_AI_API_KEY",
-    }
-)
+def _classify_env(key: str, value: str) -> AIComponentType:
+    """Resolve component type for a K8s/Helm env var."""
+    if key in _SECRET_ENV_NAMES:
+        return AIComponentType.SECRET
+    is_url = value.strip().startswith(("http://", "https://"))
+    if key in _LLM_ENDPOINT_ENV_KEYS and is_url:
+        return AIComponentType.LLM_ENDPOINT
+    if key in _MODEL_ENDPOINT_ENV_KEYS and is_url:
+        return AIComponentType.MODEL_ENDPOINT
+    return AIComponentType.MODEL
+
 
 _TRAINING_IMAGE_HINTS: tuple[str, ...] = (
     "huggingface",
@@ -482,11 +493,7 @@ def _parse_k8s_yaml(
                     continue
                 if ek in _AI_ENV_NAMES and isinstance(ev, str) and ev.strip():
                     ln = _line_for_needle(raw, ev) if raw else 1
-                    comp_type = (
-                        AIComponentType.SECRET
-                        if ek in _SECRET_ENV_NAMES
-                        else AIComponentType.MODEL
-                    )
+                    comp_type = _classify_env(ek, ev)
                     out.append(
                         _emit(
                             f"env:{ek}",
@@ -560,11 +567,7 @@ def _parse_k8s_yaml(
                 val = ent.get("value", "")
                 if not isinstance(val, str):
                     val = ""
-                comp_type = (
-                    AIComponentType.SECRET
-                    if ename in _SECRET_ENV_NAMES
-                    else AIComponentType.MODEL
-                )
+                comp_type = _classify_env(ename, val)
                 ln = _line_for_needle(raw, ename) if raw else 1
                 out.append(
                     _emit(
@@ -603,7 +606,13 @@ def _walk_helm_values(
     file_path: str,
     out: list[AIComponent],
     key_path: str = "",
+    raw_content: str = "",
 ) -> None:
+    def _resolve_line(needle: str) -> int:
+        if raw_content:
+            return _line_for_needle(raw_content, needle)
+        return 1
+
     if isinstance(obj, dict):
         for k, v in obj.items():
             if not isinstance(k, str):
@@ -612,13 +621,14 @@ def _walk_helm_values(
             sub = f"{key_path}.{k}" if key_path else k
             if isinstance(v, str):
                 stripped = v.strip()
+                ln = _resolve_line(stripped) if stripped else 1
                 if _image_matches_ai(v):
                     out.append(
                         _emit(
                             v[:200],
                             AIComponentType.DEPENDENCY,
                             file_path,
-                            1,
+                            _resolve_line(v[:80]),
                             metadata={"helm_key": sub, "image": v},
                         )
                     )
@@ -628,7 +638,7 @@ def _walk_helm_values(
                             stripped[:120],
                             AIComponentType.MODEL,
                             file_path,
-                            1,
+                            ln,
                             model_name=stripped,
                             metadata={"helm_key": sub},
                             confidence=0.95,
@@ -641,7 +651,7 @@ def _walk_helm_values(
                             stripped[:120],
                             AIComponentType.MODEL,
                             file_path,
-                            1,
+                            ln,
                             model_name=stripped,
                             metadata={"helm_key": sub},
                             confidence=0.5,
@@ -655,20 +665,22 @@ def _walk_helm_values(
                         f"gpu:{sub}",
                         AIComponentType.TRAINING_RUN,
                         file_path,
-                        1,
+                        _resolve_line(f"{k}:"),
                         metadata={"gpu_count": v, "helm_key": sub},
                     )
                 )
             elif isinstance(v, (dict, list)):
-                _walk_helm_values(v, file_path, out, sub)
+                _walk_helm_values(v, file_path, out, sub, raw_content)
     elif isinstance(obj, list):
         for i, item in enumerate(obj):
-            _walk_helm_values(item, file_path, out, f"{key_path}[{i}]")
+            _walk_helm_values(item, file_path, out, f"{key_path}[{i}]", raw_content)
 
 
-def _parse_helm_values(file_path: Path, data: dict[str, Any]) -> list[AIComponent]:
+def _parse_helm_values(
+    file_path: Path, data: dict[str, Any], raw_content: str = "",
+) -> list[AIComponent]:
     out: list[AIComponent] = []
-    _walk_helm_values(data, str(file_path), out)
+    _walk_helm_values(data, str(file_path), out, raw_content=raw_content)
     return out
 
 
@@ -1097,7 +1109,7 @@ def _process_file(path: Path) -> list[AIComponent]:
             try:
                 fmt = _classify_yaml_json(path, content, doc)
                 if fmt == "helm":
-                    all_out.extend(_parse_helm_values(path, doc))
+                    all_out.extend(_parse_helm_values(path, doc, content))
                 elif fmt == "k8s":
                     all_out.extend(_parse_k8s_yaml(path, doc, content))
                 elif fmt == "cloudformation":
