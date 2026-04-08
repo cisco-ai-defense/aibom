@@ -136,7 +136,7 @@ transformers
         assert "langchain" in idx.packages
         assert "openai" in idx.packages
         assert "transformers" in idx.packages
-        assert "requests" not in idx.packages
+        assert "requests" in idx.packages
 
     def test_package_json(self, tmp_path: Path) -> None:
         payload = {
@@ -153,7 +153,7 @@ transformers
         idx = build_package_index([str(tmp_path)])
         assert "@langchain/core" in idx.packages
         assert "@anthropic-ai/sdk" in idx.packages
-        assert "express" not in idx.packages
+        assert "express" in idx.packages
 
     def test_pyproject_toml(self, tmp_path: Path) -> None:
         (tmp_path / "pyproject.toml").write_text(
@@ -167,7 +167,7 @@ ml = ["transformers>=4.40"]
         idx = build_package_index([str(tmp_path)])
         assert "torch" in idx.packages
         assert "transformers" in idx.packages
-        assert "pydantic" not in idx.packages
+        assert "pydantic" in idx.packages
 
     def test_go_mod(self, tmp_path: Path) -> None:
         (tmp_path / "go.mod").write_text(
@@ -181,7 +181,7 @@ require (
         )
         idx = build_package_index([str(tmp_path)])
         assert "github.com/openai/openai-go" in idx.packages
-        assert "github.com/gin-gonic/gin" not in idx.packages
+        assert "github.com/gin-gonic/gin" in idx.packages
 
 
 class TestResolveComponents:

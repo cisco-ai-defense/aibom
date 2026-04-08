@@ -146,7 +146,7 @@ class ResolveEnvVarArgs(BaseModel):
 
 class LookupModelArgs(BaseModel):
     identifier: str = Field(
-        description="Model identifier (e.g. 'gpt-4o', 'meta-llama/Llama-3-70B')."
+        description="Model identifier (e.g. 'gpt-5.4', 'meta-llama/Llama-3-70B')."
     )
 
 
@@ -468,6 +468,165 @@ def search_codebase_impl(
 
 
 # ---------------------------------------------------------------------------
+# search_package_info — query package registries for AI relevance
+# ---------------------------------------------------------------------------
+
+_PKG_CACHE_DIR = Path.home() / ".cache" / "cisco-aibom" / "packages"
+
+
+class SearchPackageInfoArgs(BaseModel):
+    package_name: str = Field(description="Package name (e.g. 'openai', 'langchain', 'chromadb')")
+    ecosystem: str = Field(
+        default="pypi",
+        description="Package ecosystem: 'pypi', 'npm', or 'go'",
+    )
+
+
+def _read_pkg_cache(name: str, ecosystem: str) -> dict[str, Any] | None:
+    cache_file = _PKG_CACHE_DIR / ecosystem / f"{name}.json"
+    if cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text())
+            age_days = (time.time() - cache_file.stat().st_mtime) / 86400
+            if age_days < 7:
+                data["is_cached"] = True
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def _write_pkg_cache(name: str, ecosystem: str, data: dict[str, Any]) -> None:
+    cache_file = _PKG_CACHE_DIR / ecosystem / f"{name}.json"
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(data))
+    except OSError:
+        pass
+
+
+def _fetch_pypi(name: str) -> dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    url = f"https://pypi.org/pypi/{name}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        info = data.get("info", {})
+        return {
+            "name": info.get("name", name),
+            "summary": info.get("summary", ""),
+            "description": (info.get("description") or "")[:500],
+            "keywords": info.get("keywords") or "",
+            "classifiers": info.get("classifiers", []),
+            "home_page": info.get("home_page") or info.get("project_url", ""),
+        }
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+        return _fetch_pip_fallback(name, str(exc))
+
+
+def _fetch_npm(name: str) -> dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    url = f"https://registry.npmjs.org/{name}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return {
+            "name": data.get("name", name),
+            "summary": data.get("description", ""),
+            "description": data.get("description", ""),
+            "keywords": data.get("keywords", []),
+            "classifiers": [],
+            "home_page": data.get("homepage", ""),
+        }
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        return {"name": name, "error": "npm registry unreachable"}
+
+
+def _fetch_go(module: str) -> dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    url = f"https://proxy.golang.org/{module}/@latest"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return {
+            "name": module,
+            "summary": f"Go module {module}",
+            "description": f"Version: {data.get('Version', 'unknown')}",
+            "keywords": "",
+            "classifiers": [],
+            "home_page": f"https://pkg.go.dev/{module}",
+        }
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        return {"name": module, "error": "Go proxy unreachable"}
+
+
+def _fetch_pip_fallback(name: str, original_error: str) -> dict[str, Any]:
+    """Fall back to locally installed package metadata via pip show."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["pip", "show", "--verbose", name],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            lines = result.stdout.splitlines()
+            info: dict[str, str] = {}
+            for line in lines:
+                if ": " in line:
+                    key, _, val = line.partition(": ")
+                    info[key.strip()] = val.strip()
+            return {
+                "name": info.get("Name", name),
+                "summary": info.get("Summary", ""),
+                "description": info.get("Summary", ""),
+                "keywords": "",
+                "classifiers": [
+                    c.strip() for c in lines
+                    if c.strip().startswith(("Topic", "Intended", "License"))
+                ],
+                "home_page": info.get("Home-page", ""),
+            }
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return {"name": name, "error": f"Could not fetch package info: {original_error}"}
+
+
+def search_package_info_impl(package_name: str, ecosystem: str = "pypi") -> str:
+    """Query a package registry and return metadata for AI-relevance assessment."""
+    stats = _batch_tool_stats.get({})
+    t0 = time.monotonic()
+
+    cached = _read_pkg_cache(package_name, ecosystem)
+    if cached:
+        stats.setdefault("search_package_info", {}).setdefault("calls", []).append(
+            {"package": package_name, "ecosystem": ecosystem, "cached": True,
+             "elapsed_ms": int((time.monotonic() - t0) * 1000)}
+        )
+        return json.dumps(cached)
+
+    fetchers = {"pypi": _fetch_pypi, "npm": _fetch_npm, "go": _fetch_go}
+    fetcher = fetchers.get(ecosystem, _fetch_pypi)
+    result = fetcher(package_name)
+    result["is_cached"] = False
+
+    if "error" not in result:
+        _write_pkg_cache(package_name, ecosystem, result)
+
+    stats.setdefault("search_package_info", {}).setdefault("calls", []).append(
+        {"package": package_name, "ecosystem": ecosystem, "cached": False,
+         "elapsed_ms": int((time.monotonic() - t0) * 1000)}
+    )
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
 # LangChain StructuredTool factory (lazy — only called when deepagents used)
 # ---------------------------------------------------------------------------
 
@@ -535,5 +694,144 @@ def build_tools() -> list[Any]:
             ),
             func=search_codebase_impl,
             args_schema=SearchCodebaseArgs,
+        ),
+        StructuredTool.from_function(
+            name="search_package_info",
+            description=(
+                "Query a package registry (PyPI, npm, or Go proxy) for "
+                "metadata about a dependency. Returns name, summary, "
+                "description, keywords, and classifiers. Use this to "
+                "determine if a dependency is genuinely AI/ML related."
+            ),
+            func=search_package_info_impl,
+            args_schema=SearchPackageInfoArgs,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Triage tools — repo exploration for the triage agent
+# ---------------------------------------------------------------------------
+
+
+class ListDirectoryTreeArgs(BaseModel):
+    path: str = Field(description="Root directory to list.")
+    max_depth: int = Field(
+        default=3, description="Maximum directory depth to recurse."
+    )
+    max_entries: int = Field(
+        default=200, description="Maximum total entries to return."
+    )
+
+
+def list_directory_tree_impl(
+    path: str, max_depth: int = 3, max_entries: int = 200
+) -> str:
+    """Recursive directory listing capped by depth and entry count."""
+    root = Path(path)
+    if not root.is_dir():
+        return json.dumps({"error": f"not a directory: {path}"})
+
+    entries: list[str] = []
+    _SKIP_DIRS = frozenset({
+        ".git", "__pycache__", "node_modules", ".venv", "venv",
+        ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
+        ".eggs", "*.egg-info",
+    })
+
+    def _walk(cur: Path, depth: int, prefix: str) -> None:
+        if depth > max_depth or len(entries) >= max_entries:
+            return
+        try:
+            children = sorted(cur.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+        except OSError:
+            return
+        for child in children:
+            if len(entries) >= max_entries:
+                entries.append(f"{prefix}... (truncated at {max_entries})")
+                return
+            if child.is_dir():
+                if child.name in _SKIP_DIRS or child.name.endswith(".egg-info"):
+                    continue
+                entries.append(f"{prefix}{child.name}/")
+                _walk(child, depth + 1, prefix + "  ")
+            else:
+                entries.append(f"{prefix}{child.name}")
+
+    _walk(root, 1, "")
+    return "\n".join(entries) if entries else "(empty directory)"
+
+
+class ReadFileSnippetArgs(BaseModel):
+    path: str = Field(description="File path to read.")
+    max_lines: int = Field(
+        default=200, description="Maximum number of lines to return."
+    )
+
+
+def read_file_snippet_impl(path: str, max_lines: int = 200) -> str:
+    """Read the first N lines of a file."""
+    p = Path(path)
+    if not p.is_file():
+        return json.dumps({"error": f"not a file: {path}"})
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        return json.dumps({"error": str(e)})
+    truncated = len(lines) > max_lines
+    snippet = "\n".join(lines[:max_lines])
+    if truncated:
+        snippet += f"\n... ({len(lines) - max_lines} more lines)"
+    return snippet
+
+
+def build_triage_tools(repo_root: str) -> list[Any]:
+    """Build tools for the repo triage agent.
+
+    Scopes search_codebase to the given repo root.  Bundles directory
+    listing, file reading, codebase search, and package-registry lookup.
+    """
+    from langchain_core.tools import StructuredTool
+
+    set_allowed_search_roots([repo_root])
+
+    return [
+        StructuredTool.from_function(
+            name="list_directory_tree",
+            description=(
+                "List the directory tree of a path recursively (up to a depth "
+                "limit). Returns file and directory names with indentation."
+            ),
+            func=list_directory_tree_impl,
+            args_schema=ListDirectoryTreeArgs,
+        ),
+        StructuredTool.from_function(
+            name="read_file_snippet",
+            description=(
+                "Read the first N lines of a file. Use to inspect README, "
+                "manifests, config files, Helm values, or source code."
+            ),
+            func=read_file_snippet_impl,
+            args_schema=ReadFileSnippetArgs,
+        ),
+        StructuredTool.from_function(
+            name="search_codebase",
+            description=(
+                "Search across the repository for a regex or literal pattern. "
+                "Returns matching file paths, line numbers, and context."
+            ),
+            func=search_codebase_impl,
+            args_schema=SearchCodebaseArgs,
+        ),
+        StructuredTool.from_function(
+            name="search_package_info",
+            description=(
+                "Query a package registry (PyPI, npm, or Go proxy) for "
+                "metadata about a dependency. Returns name, summary, "
+                "description, keywords, and classifiers. Use this to "
+                "determine if a dependency is genuinely AI/ML related."
+            ),
+            func=search_package_info_impl,
+            args_schema=SearchPackageInfoArgs,
         ),
     ]

@@ -65,15 +65,14 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 
 | Option | Env Var | Description |
 |--------|---------|-------------|
-| `--llm-model` | `AIBOM_LLM_MODEL` | LLM model name (e.g. `gpt-4o`, `us.anthropic.claude-sonnet-4-20250514-v1:0`). Enables agentic enrichment (requires `cisco-aibom[agentic]`). |
+| `--llm-model` | `AIBOM_LLM_MODEL` | **Required.** LLM model name (e.g. `gpt-5.4`, `us.anthropic.claude-sonnet-4-20250514-v1:0`). The LLM agent classifies every scanner candidate (requires `cisco-aibom[agentic]`). |
 | `--llm-provider` | `AIBOM_LLM_PROVIDER` | LangChain provider name: `openai`, `azure_openai`, `bedrock`, `anthropic`, `google_genai`, `ollama`, etc. Inferred from the model name if not set. |
 | `--llm-api-key` | `AIBOM_LLM_API_KEY` | LLM API key. Optional for local LLMs and AWS Bedrock. |
 | `--llm-api-base` | `AIBOM_LLM_API_BASE` | LLM API base URL. |
 | `--llm-api-version` | `AIBOM_LLM_API_VERSION` | LLM API version (required for Azure OpenAI). |
-| `--agentic-scope` | — | `candidates` (only ambiguous items, default) or `all` (every component). |
-| `--agentic-batch-size` | — | Max components per LLM invocation (default `5`). |
+| `--agentic-batch-size` | — | Max components per LLM invocation (default `15`). |
 | `--agentic-concurrency` | — | Max parallel agentic LLM batches (default `1`). |
-| `--agentic-fast-model` | — | Cheaper/faster model for simple confirmations (Tier 1 candidates). |
+| `--agentic-fast-model` | — | Cheaper/faster model for simple confirmations (e.g. dependency checks). |
 | `--agentic-timeout` | — | Wall-clock timeout in seconds per agentic batch (default `120`). |
 
 ### Analysis Options
@@ -93,39 +92,45 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 
 ```bash
 # Basic scan with JSON output
-cisco-aibom analyze ./my-app -o json -O report.json
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Container image scan
-cisco-aibom analyze my-app:latest -o json -O report.json
+cisco-aibom analyze my-app:latest -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # HTML dashboard
-cisco-aibom analyze ./my-app -o html -O dashboard.html
+cisco-aibom analyze ./my-app -o html -O dashboard.html \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # CycloneDX BOM
-cisco-aibom analyze ./my-app -o cyclonedx -O bom.json
-
-# With agentic enrichment
-cisco-aibom analyze ./my-app -o json -O report.json \
-  --llm-model gpt-4o --llm-provider openai --llm-api-key $OPENAI_API_KEY
+cisco-aibom analyze ./my-app -o cyclonedx -O bom.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Multi-repo scan with discovery
-cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json
+cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # GitHub org scan
 cisco-aibom analyze --github-org my-org --platform-token $GITHUB_TOKEN \
-  --max-repos 50 --parallel-repos 4 -o json -O report.json
+  --max-repos 50 --parallel-repos 4 -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Policy gate in CI
-cisco-aibom analyze ./my-app -o json -O report.json --policy policy.yaml --fail-on high
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY --policy policy.yaml --fail-on high
 
 # Timing breakdown
-cisco-aibom analyze ./my-app -o json -O report.json --timing
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY --timing
 
-# Strict mode (deterministic only)
-cisco-aibom analyze ./my-app -o json -O report.json --strict
+# Strict mode (minimal LLM calls)
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY --strict
 
 # Compliance check
-cisco-aibom analyze ./my-app -o json -O report.json --compliance eu-ai-act
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY --compliance eu-ai-act
 ```
 
 ---
@@ -226,7 +231,7 @@ components:
   - type: model
     count: 3
     names:
-      - gpt-4o
+      - gpt-5.4
       - text-embedding-ada-002
       - gemma-2b
   - type: agent
@@ -353,7 +358,7 @@ cisco-aibom plugin list
 |----------|-------------|
 | `AIBOM_ENV_FILE` | Path to a `.env` file to load. Falls back to `./.env` if present. |
 | `AIBOM_LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
-| `AIBOM_LLM_MODEL` | LLM model name for agentic enrichment. |
+| `AIBOM_LLM_MODEL` | **Required.** LLM model name for agentic classification. |
 | `AIBOM_LLM_PROVIDER` | LangChain provider name. |
 | `AIBOM_LLM_API_KEY` | LLM API key. |
 | `AIBOM_LLM_API_BASE` | LLM API base URL. |

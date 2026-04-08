@@ -4,7 +4,7 @@
 [![Cisco AI Defense](https://img.shields.io/badge/Cisco-AI%20Defense-049fd9?logo=cisco&logoColor=white)](https://www.cisco.com/site/us/en/products/security/ai-defense/index.html)
 [![AI Security and Safety Framework](https://img.shields.io/badge/AI%20Security-Framework-orange)](https://learn-cloudsecurity.cisco.com/ai-security-framework)
 
-Cisco AI BOM scans codebases, container images, and cloud environments to produce an AI Bill of Materials — a structured inventory of models, agents, tools, MCP servers/clients, datasets, prompts, guardrails, secrets, and other AI assets used in your software. It supports Python, JavaScript/TypeScript, Java, Go, Rust, Ruby, C#, and PHP, with deterministic detection, cross-reference resolution, and optional LLM-powered agentic enrichment.
+Cisco AI BOM scans codebases, container images, and cloud environments to produce an AI Bill of Materials — a structured inventory of models, agents, tools, MCP servers/clients, datasets, prompts, guardrails, secrets, and other AI assets used in your software. It supports Python, JavaScript/TypeScript, Java, Go, Rust, Ruby, C#, and PHP, with deterministic candidate detection, cross-reference resolution, and LLM-powered agentic classification.
 
 ## Table of Contents
 
@@ -35,7 +35,7 @@ Cisco AI BOM scans codebases, container images, and cloud environments to produc
 - **10 output formats** — Plaintext, JSON, CycloneDX, SARIF, SPDX, HTML dashboard, Markdown, CSV, JUnit, and a live API server.
 - **Container image scanning** — Extract and analyze application source code from Docker, Podman, nerdctl, Buildah, Skopeo, Crane, or Undock images, with Anchore Syft for SBOM metadata.
 - **Cross-repo and org-level scanning** — Scan multiple local repos, GitHub orgs, GitLab groups, or Bitbucket projects, with incremental caching.
-- **Agentic enrichment** — Optional LLM pass (via Deep Agents + LangChain) to resolve ambiguous detections, extract model names, and classify uncertain components.
+- **Agentic classification** — LLM agent (via Deep Agents + LangChain) classifies every scanner candidate, eliminating false positives and enriching confirmed components with concrete identifiers.
 - **Policy engine** — YAML-driven pass/fail gates for CI/CD integration (max-risk, required fields, blocked/required component types).
 - **Compliance checks** — EU AI Act, OWASP Agentic Top 10, NIST AI RMF advisory mappings.
 - **Watch mode** — Real-time file-system monitoring with debounced re-scan and delta reporting.
@@ -61,7 +61,7 @@ docs/    # Documentation (CLI reference, guides, API docs)
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv) (Python package manager)
 - Docker / Podman (optional, for container image analysis)
-- LLM provider credentials (optional, for agentic enrichment)
+- LLM provider credentials (required for `--llm-model`; see [Agentic Classification](#agentic-enrichment))
 
 ### Install from PyPI
 
@@ -120,25 +120,28 @@ When working from source, you can also use `uv run cisco-aibom ...` or `uv run p
 ## Quick Start
 
 ```bash
-# Scan a local project
-cisco-aibom analyze /path/to/project -o json -O report.json
+# Scan a local project (--llm-model is required)
+cisco-aibom analyze /path/to/project -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Scan a container image
-cisco-aibom analyze my-app:latest -o json -O report.json
-
-# Scan with agentic enrichment
-cisco-aibom analyze /path/to/project -o json -O report.json \
-  --llm-model gpt-4o --llm-provider openai --llm-api-key $OPENAI_API_KEY
+cisco-aibom analyze my-app:latest -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Scan multiple repos under a directory
-cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json
+cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # HTML dashboard
-cisco-aibom analyze /path/to/project -o html -O dashboard.html
+cisco-aibom analyze /path/to/project -o html -O dashboard.html \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Policy gate for CI
-cisco-aibom analyze /path/to/project -o json -O report.json --policy policy.yaml
+cisco-aibom analyze /path/to/project -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY --policy policy.yaml
 ```
+
+All LLM options can be set via environment variables (`AIBOM_LLM_MODEL`, `AIBOM_LLM_API_KEY`, etc.) for cleaner commands.
 
 ## Commands
 
@@ -168,21 +171,21 @@ See [docs/CLI_REFERENCE.md](https://github.com/cisco-ai-defense/aibom/blob/main/
 
 ## Agentic Enrichment
 
-When `--llm-model` is supplied (requires `cisco-aibom[agentic]`), the CLI runs a second pass using LLM-powered agents to:
+The `--llm-model` option (or `AIBOM_LLM_MODEL` env var) is required. The LLM agent acts as the final classifier for every scanner candidate (requires `cisco-aibom[agentic]`):
 
-- Resolve ambiguous component classifications
-- Extract model names from code context
-- Confirm or remove false positives from deterministic detection
-- Discover components missed by static analysis
+- Confirms or removes every scanner candidate (no unverified findings)
+- Classifies and enriches components with concrete identifiers
+- Verifies dependencies against package registries (PyPI, npm, Go)
+- Discovers components missed by static analysis
 
 ```bash
 # OpenAI
 cisco-aibom analyze ./my-app -o json -O report.json \
-  --llm-model gpt-4o --llm-provider openai --llm-api-key $OPENAI_API_KEY
+  --llm-model gpt-5.4 --llm-provider openai --llm-api-key $OPENAI_API_KEY
 
 # Azure OpenAI
 cisco-aibom analyze ./my-app -o json -O report.json \
-  --llm-model gpt-4o --llm-provider azure_openai \
+  --llm-model gpt-5.4 --llm-provider azure_openai \
   --llm-api-base https://my-endpoint.openai.azure.com \
   --llm-api-key $AZURE_OPENAI_API_KEY --llm-api-version 2024-12-01-preview
 
@@ -202,11 +205,10 @@ All LLM options can also be set via environment variables or a `.env` file. See 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--agentic-scope` | `candidates` | `candidates` (only ambiguous items) or `all` (every component). |
-| `--agentic-batch-size` | `5` | Max components per LLM invocation. |
+| `--agentic-batch-size` | `15` | Max components per LLM invocation. |
 | `--agentic-concurrency` | `1` | Max parallel LLM batches. |
 | `--agentic-timeout` | `120` | Wall-clock seconds per batch before timeout. |
-| `--agentic-fast-model` | — | Cheaper model for simple confirmations. |
+| `--agentic-fast-model` | — | Cheaper model for simple confirmations (model lookups, dependency checks). |
 
 ## Container Scanning
 
@@ -424,8 +426,8 @@ uv run pytest tests -v
 
 - **DuckDB catalog errors:** Run `cisco-aibom kb download` to fetch the latest catalog, or set `AIBOM_DB_PATH` to point at an existing file. Use `cisco-aibom kb verify` to check integrity.
 - **Container extraction fails:** Ensure Docker or an alternative runtime is installed and running. Use `--container-extraction-tier` to force a specific tool. See [docs/CONTAINER_SCANNING.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CONTAINER_SCANNING.md).
-- **Agentic mode not activating:** Install the agentic extra (`uv tool install "cisco-aibom[agentic,llm-openai]"`) and supply `--llm-model`. See [docs/AGENTIC_MODE.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md).
+- **Missing `--llm-model`:** The LLM agent is required. Install the agentic extra (`uv tool install "cisco-aibom[agentic,llm-openai]"`) and supply `--llm-model` or set `AIBOM_LLM_MODEL`. See [docs/AGENTIC_MODE.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md).
 - **LLM provider errors:** Ensure `--llm-provider` matches the installed LangChain integration package. For Azure OpenAI, `--llm-api-version` is required.
-- **Slow scans on large repos:** Use `--timing` to identify bottlenecks. Consider `--strict` to skip agentic candidates, or `--agentic-scope candidates` (default) to only send ambiguous items.
+- **Slow scans on large repos:** Use `--timing` to identify bottlenecks. Use `--agentic-fast-model` for a cheaper model on simple confirmations, or increase `--agentic-concurrency` for parallel batches.
 - **Missing output files:** `--output-file` / `-O` is required for all file-based formats.
 - **Report submission:** Set `AIBOM_POST_URL` and `AI_DEFENSE_API_KEY`. Regional endpoints: US (`api.security.cisco.com`), APJ (`api.apj.security.cisco.com`), EU (`api.eu.security.cisco.com`), UAE (`api.uae.security.cisco.com`).

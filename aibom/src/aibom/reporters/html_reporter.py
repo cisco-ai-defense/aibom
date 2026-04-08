@@ -832,7 +832,7 @@ class HtmlReporter(BaseReporter):
             "risk_score": risk_score,
             "risk_severity": summary["risk_severity"],
             "risk_marker_pct": min(100, max(0, risk_score)),
-            "agentic_candidates": summary["agentic_candidates"],
+            "agentic_candidates": summary.get("pending_agent_review", 0),
             "test_only_components": test_only,
             "test_prod_test": test_only,
             "test_prod_production": production,

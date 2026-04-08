@@ -34,7 +34,7 @@ class AIComponent(BaseModel):
     framework: str = ""
     detection_source: DetectionSource = DetectionSource.CODE_ANALYSIS
     confidence: float = 1.0
-    needs_agentic: bool = False
+    needs_agentic: bool = True
     agentic_hint: str = ""
 
     model_name: Optional[str] = None
@@ -237,13 +237,12 @@ class ScanResult(BaseModel):
             if c.metadata.get("test_only"):
                 test_only_count += 1
                 continue
-            if not c.needs_agentic:
-                by_type[c.component_type.value] = by_type.get(c.component_type.value, 0) + 1
-        agentic = [c for c in components if c.needs_agentic]
+            by_type[c.component_type.value] = by_type.get(c.component_type.value, 0) + 1
+        pending_review = sum(1 for c in components if c.needs_agentic)
         return {
             "total_sources": len(self.sources),
-            "total_components": len(components) - len(agentic) - test_only_count,
-            "agentic_candidates": len(agentic),
+            "total_components": len(components) - test_only_count,
+            "pending_agent_review": pending_review,
             "test_only_components": test_only_count,
             "component_types": by_type,
             "total_relationships": len(self.all_relationships),

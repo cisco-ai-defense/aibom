@@ -44,7 +44,8 @@ The first available tool is used. If none are found, the pure-Python tarball fal
 ### Basic container scan
 
 ```bash
-cisco-aibom analyze my-app:latest -o json -O report.json
+cisco-aibom analyze my-app:latest -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 ```
 
 The CLI auto-detects the image reference and extracts source code using the best available tool.
@@ -52,7 +53,9 @@ The CLI auto-detects the image reference and extracts source code using the best
 ### Force a specific tier
 
 ```bash
-cisco-aibom analyze my-app:latest -o json -O report.json --container-extraction-tier podman
+cisco-aibom analyze my-app:latest -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY \
+  --container-extraction-tier podman
 ```
 
 Valid values: `auto`, `syft`, `docker`, `podman`, `nerdctl`, `buildah`, `crane`, `skopeo`, `tarball`.
@@ -61,14 +64,15 @@ Valid values: `auto`, `syft`, `docker`, `podman`, `nerdctl`, `buildah`, `crane`,
 
 ```bash
 # images.json: ["app1:latest", "app2:v1.2", "app3:prod"]
-cisco-aibom analyze --images-file images.json -o json -O report.json
+cisco-aibom analyze --images-file images.json -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 ```
 
-### Container scan with agentic enrichment
+### Container scan with explicit provider
 
 ```bash
 cisco-aibom analyze my-app:latest -o json -O report.json \
-  --llm-model gpt-4o --llm-provider openai --llm-api-key $OPENAI_API_KEY
+  --llm-model gpt-5.4 --llm-provider openai --llm-api-key $OPENAI_API_KEY
 ```
 
 ## Syft Integration
@@ -108,5 +112,5 @@ The agent examines file listings, Dockerfile metadata, and directory naming patt
 
 - **"No container runtime found"** — Install Docker, Podman, or another supported runtime. Alternatively, use `--container-extraction-tier syft` for metadata-only analysis.
 - **Extraction timeout** — Large images may take time to extract. The extraction runs synchronously; consider pulling the image first (`docker pull my-app:latest`) to separate network transfer from analysis.
-- **Wrong source directory extracted** — Use agentic mode (`--llm-model`) to enable smart layout resolution. Or, extract manually and scan the directory directly.
+- **Wrong source directory extracted** — The LLM agent performs smart layout resolution automatically. Or, extract manually and scan the directory directly.
 - **Syft not found** — Syft is optional. Install it for richer SBOM metadata, but scans work without it.

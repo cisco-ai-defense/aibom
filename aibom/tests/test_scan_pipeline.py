@@ -121,8 +121,8 @@ class TestPipelineTiming:
 
 
 class TestAgenticScope:
-    def test_candidates_scope_skips_confirmed(self, tmp_path: Path) -> None:
-        """Default 'candidates' scope should skip agentic when no candidates."""
+    def test_all_components_sent_to_agent(self, tmp_path: Path) -> None:
+        """All components are sent to the agent for classification."""
         (tmp_path / "app.py").write_text(
             'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
         )
@@ -130,22 +130,6 @@ class TestAgenticScope:
         pipeline = ScanPipeline(
             scan_paths=[str(tmp_path)],
             llm_config=llm_cfg,
-            agentic_scope="candidates",
-        )
-        with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
-            result = pipeline.run()
-        mock_enrich.assert_not_called()
-
-    def test_all_scope_sends_everything(self, tmp_path: Path) -> None:
-        """'all' scope should invoke agentic enrichment with all components."""
-        (tmp_path / "app.py").write_text(
-            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
-        )
-        llm_cfg = {"model": "test/model", "api_key": "fake", "api_base": "http://x"}
-        pipeline = ScanPipeline(
-            scan_paths=[str(tmp_path)],
-            llm_config=llm_cfg,
-            agentic_scope="all",
         )
         with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
             mock_enrich.return_value = ([], [], [])

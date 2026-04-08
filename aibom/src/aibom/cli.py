@@ -508,10 +508,11 @@ def analyze(
         "--llm-model",
         envvar="AIBOM_LLM_MODEL",
         help=(
-            "LLM model name (e.g. gpt-4o, us.anthropic.claude-sonnet-4-20250514-v1:0).  "
-            "Enables agentic enrichment after the deterministic scan "
-            "(requires 'cisco-aibom[agentic]').  The legacy 'provider/model' "
-            "prefix is still accepted for backward compatibility."
+            "LLM model name (e.g. gpt-5.4, us.anthropic.claude-sonnet-4-20250514-v1:0).  "
+            "Required: the LLM agent classifies every scanner candidate for "
+            "accurate results (requires 'cisco-aibom[agentic]').  "
+            "Set via --llm-model or AIBOM_LLM_MODEL env var.  "
+            "The legacy 'provider/model' prefix is still accepted."
         ),
     ),
     llm_provider: Optional[str] = typer.Option(
@@ -590,13 +591,10 @@ def analyze(
         help="Print a per-stage and per-scanner timing breakdown after analysis.",
     ),
     agentic_scope: str = typer.Option(
-        "candidates",
+        "all",
         "--agentic-scope",
-        help=(
-            "Which components to send to the LLM for agentic enrichment. "
-            "'candidates' (default) sends only needs_agentic items; "
-            "'all' sends every component."
-        ),
+        hidden=True,
+        help="Deprecated: all components are now sent to the agent. Kept for backward compatibility.",
     ),
     agentic_batch_size: int = typer.Option(
         5,
@@ -741,11 +739,7 @@ def analyze(
         console.print(f"[red]Invalid output format[/] '{output_format}'. Must be one of: {valid}")
         raise typer.Exit(code=1)
 
-    if agentic_scope not in ("candidates", "all"):
-        logging.error(
-            f"Invalid --agentic-scope '{agentic_scope}'. Must be: candidates, all"
-        )
-        raise typer.Exit(code=1)
+    agentic_scope = "all"
 
     if compliance is not None:
         allowed_cf = frozenset({"eu-ai-act", "owasp-agentic", "nist-ai-rmf", "all"})
@@ -780,6 +774,14 @@ def analyze(
             "api_base": llm_api_base,
             "api_version": llm_api_version,
         }
+    else:
+        console.print(
+            "[bold red]Error:[/] --llm-model (or AIBOM_LLM_MODEL env var) is required.\n"
+            "The LLM agent classifies every scanner candidate for accurate results.\n"
+            "Example: cisco-aibom analyze --llm-model gpt-5.4 ./my-repo",
+            highlight=False,
+        )
+        raise typer.Exit(code=1)
     
     sources_to_process = list(sources) if sources else []
     if images_file:

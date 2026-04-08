@@ -29,7 +29,6 @@ import yaml
 from .models.enums import AIComponentType
 from .models.scan import AIComponent
 from .scanners.dependency_scanner import (
-    AI_PACKAGES,
     _GO_REQUIRE,
     _normalize_pypi_name,
     _REQUIREMENT_NAME,
@@ -247,19 +246,16 @@ def build_env_index(paths: Iterable[str]) -> CrossRefIndex:
     return _scan_env_paths(paths)
 
 
-def _pypi_candidate_ai(name: str) -> bool:
-    norm = _normalize_pypi_name(name)
-    return norm in AI_PACKAGES["pypi"]
+def _pypi_candidate_ai(name: str) -> bool:  # noqa: ARG001
+    return True
 
 
-def _npm_candidate_ai(name: str) -> bool:
-    return name in AI_PACKAGES["npm"]
+def _npm_candidate_ai(name: str) -> bool:  # noqa: ARG001
+    return True
 
 
-def _go_candidate_ai(module: str) -> bool:
-    if module in AI_PACKAGES["go"]:
-        return True
-    return module == "github.com/openai/openai-go"
+def _go_candidate_ai(module: str) -> bool:  # noqa: ARG001
+    return True
 
 
 def _parse_requirements(content: str, index: CrossRefIndex) -> None:

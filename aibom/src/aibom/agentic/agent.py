@@ -178,7 +178,7 @@ def create_aibom_agent(
     return agent
 
 
-_DEFAULT_BATCH_SIZE = 5
+_DEFAULT_BATCH_SIZE = 15
 
 # LangGraph default since v1.0.6 and also the Deep Agents default.
 # Set explicitly so the intent is clear: this is a safety net against
@@ -198,15 +198,22 @@ def _classify_candidates(
 ) -> tuple[list[AIComponent], list[AIComponent]]:
     """Split candidates into simple (registry-confirmable) vs complex.
 
-    Simple candidates: known model/dependency/embedding with a model_name
-    that just needs registry lookup confirmation.
+    Simple candidates:
+    - known model/dependency/embedding with a model_name that just needs
+      registry lookup confirmation.
+    - dependency components tagged with ``known_ai_package=True`` (from
+      the KNOWN_AI_PACKAGES hint list).
     Complex candidates: everything else — ambiguous types, missing model
-    names, multi-file reasoning required.
+    names, unknown packages, multi-file reasoning required.
     """
     simple: list[AIComponent] = []
     complex_: list[AIComponent] = []
     for c in components:
-        is_simple = (
+        known_ai_dep = (
+            c.component_type.value == "dependency"
+            and c.metadata.get("known_ai_package") is True
+        )
+        is_simple = known_ai_dep or (
             c.component_type.value in _SIMPLE_CANDIDATE_TYPES
             and c.model_name
             and not c.metadata.get("env")
@@ -802,16 +809,17 @@ def run_agentic_enrichment(
     all_flags: list[RiskFlag] = []
 
     tier_model = fast_model or model_string
+    simple_batch_size = max(batch_size, 15)
     if simple:
         _LOGGER.info(
-            "Tier 1 (simple confirmations): %d candidates via %s",
-            len(simple), tier_model,
+            "Tier 1 (simple confirmations): %d candidates via %s (batch=%d)",
+            len(simple), tier_model, simple_batch_size,
         )
         agent = create_aibom_agent(tier_model, llm_config=llm_config)
         e, n, r, f = _run_tier(
             agent, middleware, simple,
             deterministic_relationships, scan_paths,
-            batch_size, max_concurrent, deterministic_components, cache,
+            simple_batch_size, max_concurrent, deterministic_components, cache,
             timeout_s=timeout_s,
             max_consecutive_failures=max_consecutive_failures,
         )

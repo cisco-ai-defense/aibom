@@ -80,6 +80,8 @@ CI (`version-sync.yml`) validates these fields stay in sync.
 
 ## Useful Environment Variables
 
+- `AIBOM_LLM_MODEL`: **Required** — LLM model name for agentic classification (e.g. `gpt-5.4`)
+- `AIBOM_LLM_API_KEY`: LLM API key (optional for local LLMs and AWS Bedrock)
 - `AIBOM_MANIFEST_PATH`: override manifest location
 - `AIBOM_DB_PATH`: override local DuckDB file path
 - `AIBOM_DB_SHA256`: override expected DuckDB checksum

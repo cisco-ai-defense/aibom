@@ -16,38 +16,27 @@
 
 """Agentic repo triage for org-scale scanning.
 
-Instead of blindly scanning every repository or truncating with --max-repos,
-this module lets the LLM reason about each repo's manifests and README to
-decide: **deep-scan**, **skip**, or **needs-clone**.
+The triage agent explores each repository with tools (directory listing,
+file reading, codebase search, package-registry lookup) and decides:
+**deep-scan**, **skip**, or **needs-clone**.
 
-Deterministic fast-path: If a manifest contains any known AI package from
-``dependency_scanner.AI_PACKAGES``, the repo is auto-promoted to deep-scan
-without spending an LLM call.
+No hardcoded package list is used as a gate.  The agent is the sole
+authority on whether a repository contains AI/ML assets.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
-_TRIAGE_SYSTEM_PROMPT = """\
-You are an AI-BOM repo triage assistant.  Given a repo's manifest files and
-README, decide whether the repository contains AI/ML assets worth scanning.
-
-Respond ONLY with a JSON object:
-{"decision": "deep-scan" | "skip" | "needs-clone", "reason": "<one sentence>"}
-
-- **deep-scan**: The repo clearly uses AI/ML frameworks, models, agents, or
-  MCP servers.
-- **skip**: The repo has no AI/ML relevance (pure infrastructure, frontend, etc.).
-- **needs-clone**: Not enough info in manifests/README to decide; a full clone
-  is required for deeper analysis.
-"""
+_TRIAGE_RECURSION_LIMIT = 20
+_TRIAGE_TIMEOUT_S = 30
 
 
 @dataclass
@@ -55,125 +44,64 @@ class TriageResult:
     repo_path: str
     decision: str  # "deep-scan" | "skip" | "needs-clone"
     reason: str
-    method: str = ""  # "deterministic" or "agentic"
+    evidence: list[str] = field(default_factory=list)
+    method: str = ""  # "agentic"
 
 
 @dataclass
 class RepoTriager:
-    """Triage repos for AI relevance using a deterministic + agentic approach."""
+    """Triage repos for AI relevance using a tool-equipped agent."""
 
-    llm_config: Optional[dict] = None
+    llm_config: Optional[dict[str, Any]] = None
     results: list[TriageResult] = field(default_factory=list)
 
     def triage_repos(self, repo_paths: list[str]) -> list[TriageResult]:
-        from .scanners.dependency_scanner import AI_PACKAGES
-
-        all_ai_pkgs: set[str] = set()
-        for ecosystem_pkgs in AI_PACKAGES.values():
-            all_ai_pkgs.update(p.lower() for p in ecosystem_pkgs)
-
-        deterministic: list[TriageResult] = []
-        needs_llm: list[str] = []
+        results: list[TriageResult] = []
 
         for repo_path in repo_paths:
             root = Path(repo_path)
             if not root.exists():
-                deterministic.append(
-                    TriageResult(repo_path, "skip", "path does not exist", "deterministic")
+                results.append(
+                    TriageResult(
+                        repo_path, "skip", "path does not exist", method="deterministic",
+                    )
                 )
                 continue
+            result = self._triage_single(repo_path)
+            results.append(result)
 
-            manifest_ai = self._check_manifests_for_ai(root, all_ai_pkgs)
-            if manifest_ai:
-                deterministic.append(
-                    TriageResult(
-                        repo_path, "deep-scan",
-                        f"manifest contains AI packages: {', '.join(sorted(manifest_ai)[:5])}",
-                        "deterministic",
-                    )
-                )
-            else:
-                needs_llm.append(repo_path)
-
-        agentic: list[TriageResult] = []
-        if needs_llm and self.llm_config:
-            agentic = self._agentic_triage(needs_llm)
-        elif needs_llm:
-            for rp in needs_llm:
-                agentic.append(
-                    TriageResult(
-                        rp, "needs-clone",
-                        "no AI packages in manifest; agentic mode not available",
-                        "deterministic",
-                    )
-                )
-
-        self.results = deterministic + agentic
+        self.results = results
         return self.results
 
-    def _check_manifests_for_ai(
-        self, root: Path, all_ai_pkgs: set[str]
-    ) -> set[str]:
-        """Fast structural check: parse manifests for known AI packages."""
-        found: set[str] = set()
-
-        manifest_names = {
-            "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
-            "pipfile", "poetry.lock", "uv.lock",
-            "package.json", "package-lock.json",
-            "go.mod", "cargo.toml", "gemfile",
-            "pom.xml", "build.gradle", "build.gradle.kts",
-        }
-
-        for child in root.iterdir():
-            if child.name.lower() in manifest_names:
-                try:
-                    text = child.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                text_lower = text.lower()
-                for pkg in all_ai_pkgs:
-                    if pkg in text_lower:
-                        found.add(pkg)
-            if found:
-                break
-
-        return found
-
-    def _agentic_triage(self, repo_paths: list[str]) -> list[TriageResult]:
-        """Use LLM to reason about repos that lack obvious AI manifest entries."""
-        results: list[TriageResult] = []
+    def _triage_single(self, repo_path: str) -> TriageResult:
+        """Run the triage agent on a single repository."""
+        if not self.llm_config:
+            return TriageResult(
+                repo_path, "deep-scan",
+                "no LLM config — defaulting to deep-scan (safe bias)",
+                method="deterministic",
+            )
 
         try:
+            from .agentic.prompts import TRIAGE_AGENT_SYSTEM_PROMPT
+            from .agentic.tools import build_triage_tools
             from .llm_factory import build_chat_model
+
+            from deepagents import create_deep_agent
         except ImportError:
             _LOGGER.warning(
                 "Agentic triage requires 'cisco-aibom[agentic]'; "
-                "falling back to needs-clone for all"
+                "defaulting to deep-scan"
             )
-            return [
-                TriageResult(rp, "needs-clone", "agentic extras unavailable", "deterministic")
-                for rp in repo_paths
-            ]
-
-        summaries: list[tuple[str, str]] = []
-        for rp in repo_paths:
-            root = Path(rp)
-            summary = self._build_repo_summary(root)
-            summaries.append((rp, summary))
-
-        batch_prompt = "Triage the following repositories. For each, respond with a JSON array of objects.\n\n"
-        for i, (rp, summary) in enumerate(summaries):
-            batch_prompt += f"### Repo {i + 1}: {Path(rp).name}\n{summary}\n\n"
-
-        batch_prompt += (
-            "\nRespond with a JSON array of objects, one per repo, in order:\n"
-            '[{"decision": "...", "reason": "..."}, ...]\n'
-        )
+            return TriageResult(
+                repo_path, "deep-scan",
+                "agentic extras unavailable — defaulting to deep-scan",
+                method="deterministic",
+            )
 
         try:
-            cfg = dict(self.llm_config) if self.llm_config else {}
-            model_string = cfg.get("model", "gpt-4o-mini")
+            cfg = dict(self.llm_config)
+            model_string = cfg["model"]
 
             model = build_chat_model(
                 model_string,
@@ -183,73 +111,92 @@ class RepoTriager:
                 api_version=cfg.get("api_version"),
             )
 
-            from langchain_core.messages import HumanMessage, SystemMessage
+            tools = build_triage_tools(repo_path)
 
-            messages = [
-                SystemMessage(content=_TRIAGE_SYSTEM_PROMPT),
-                HumanMessage(content=batch_prompt),
-            ]
-            resp = model.invoke(messages)
-            raw = resp.content.strip()  # type: ignore[union-attr]
-            start = raw.find("[")
-            end = raw.rfind("]")
-            if start >= 0 and end > start:
-                decisions = json.loads(raw[start : end + 1])
-            else:
-                decisions = [json.loads(raw)]
+            agent = create_deep_agent(
+                model=model,
+                tools=tools,
+                system_prompt=TRIAGE_AGENT_SYSTEM_PROMPT,
+                response_format=None,
+                name="aibom-triage",
+            )
 
-            for (rp, _), dec in zip(summaries, decisions):
-                results.append(
-                    TriageResult(
-                        rp,
-                        dec.get("decision", "needs-clone"),
-                        dec.get("reason", ""),
-                        "agentic",
-                    )
-                )
+            repo_name = Path(repo_path).name
+            user_msg = (
+                f"Triage repository: {repo_name}\n"
+                f"Path: {repo_path}\n"
+                f"Decide if this repo contains AI/ML assets worth scanning."
+            )
+
+            result = self._invoke_with_timeout(agent, user_msg)
+            return self._parse_result(repo_path, result)
+
         except Exception:
-            _LOGGER.warning("Agentic triage failed; defaulting to needs-clone", exc_info=True)
-            results = [
-                TriageResult(rp, "needs-clone", "agentic triage failed", "deterministic")
-                for rp in repo_paths
-            ]
+            _LOGGER.warning(
+                "Agentic triage failed for %s; defaulting to deep-scan",
+                repo_path, exc_info=True,
+            )
+            return TriageResult(
+                repo_path, "deep-scan",
+                "agentic triage failed — defaulting to deep-scan",
+                method="agentic",
+            )
 
-        return results
+    def _invoke_with_timeout(self, agent: Any, user_msg: str) -> Any:
+        """Invoke the agent with a wall-clock timeout."""
+        async def _run() -> Any:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: agent.invoke(
+                        {"messages": [{"role": "user", "content": user_msg}]},
+                        config={"recursion_limit": _TRIAGE_RECURSION_LIMIT},
+                    ),
+                ),
+                timeout=_TRIAGE_TIMEOUT_S,
+            )
 
-    def _build_repo_summary(self, root: Path) -> str:
-        """Build a compact summary of the repo for the LLM."""
-        parts: list[str] = []
+        return asyncio.run(_run())
 
-        readme_names = ["README.md", "readme.md", "README.rst", "README.txt", "README"]
-        for rn in readme_names:
-            rp = root / rn
-            if rp.is_file():
-                try:
-                    text = rp.read_text(encoding="utf-8", errors="replace")
-                    parts.append(f"**README** (first 500 chars):\n{text[:500]}")
-                except OSError:
-                    pass
-                break
+    def _parse_result(self, repo_path: str, result: Any) -> TriageResult:
+        """Extract the triage decision from the agent response."""
+        content = None
+        sr = result.get("structured_response") if isinstance(result, dict) else None
+        if sr is not None:
+            if hasattr(sr, "model_dump"):
+                content = sr.model_dump()
+            elif isinstance(sr, dict):
+                content = sr
 
-        manifest_names = [
-            "requirements.txt", "pyproject.toml", "package.json", "go.mod",
-            "Cargo.toml", "Gemfile", "pom.xml", "build.gradle",
-        ]
-        for mn in manifest_names:
-            mp = root / mn
-            if mp.is_file():
-                try:
-                    text = mp.read_text(encoding="utf-8", errors="replace")
-                    parts.append(f"**{mn}** (first 1000 chars):\n{text[:1000]}")
-                except OSError:
-                    pass
+        if content is None:
+            messages = result.get("messages", []) if isinstance(result, dict) else []
+            for msg in reversed(messages):
+                text = getattr(msg, "content", "") if hasattr(msg, "content") else str(msg)
+                if not text:
+                    continue
+                start = text.find("{")
+                end = text.rfind("}")
+                if start >= 0 and end > start:
+                    try:
+                        content = json.loads(text[start : end + 1])
+                        break
+                    except json.JSONDecodeError:
+                        continue
 
-        if not parts:
-            try:
-                top = sorted(root.iterdir())[:30]
-                names = [f.name for f in top]
-                parts.append(f"**Top-level files**: {', '.join(names)}")
-            except OSError:
-                parts.append("(empty or unreadable)")
+        if not content or not isinstance(content, dict):
+            return TriageResult(
+                repo_path, "deep-scan",
+                "could not parse agent response — defaulting to deep-scan",
+                method="agentic",
+            )
 
-        return "\n".join(parts)
+        decision = content.get("decision", "deep-scan")
+        if decision not in ("deep-scan", "skip", "needs-clone"):
+            decision = "deep-scan"
+
+        return TriageResult(
+            repo_path=repo_path,
+            decision=decision,
+            reason=content.get("reason", ""),
+            evidence=content.get("evidence", []),
+            method="agentic",
+        )

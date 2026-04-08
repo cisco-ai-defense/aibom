@@ -20,7 +20,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import yaml  # type: ignore[import-untyped]
 from pathspec import PathSpec
@@ -29,7 +29,7 @@ from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
 
-AI_PACKAGES: dict[str, set[str]] = {
+KNOWN_AI_PACKAGES: dict[str, set[str]] = {
     "pypi": {
         "openai",
         "langchain",
@@ -165,7 +165,7 @@ AI_PACKAGES: dict[str, set[str]] = {
 _MAVEN_GROUP_PREFIX = "dev.langchain4j"
 _MAVEN_EXACT_COORDS = frozenset(
     c
-    for c in AI_PACKAGES["maven"]
+    for c in KNOWN_AI_PACKAGES["maven"]
     if ":" in c and not c.startswith(_MAVEN_GROUP_PREFIX + ":")
 )
 
@@ -851,7 +851,8 @@ _MANIFEST_PARSERS: dict[str, _ManifestParser] = {
 }
 
 
-def _is_ai(ecosystem: str, name: str) -> bool:
+def _is_known_ai(ecosystem: str, name: str) -> bool:
+    """Check if a package is in the known-AI hint list (not a gate)."""
     if ecosystem == "nuget":
         return False
     if ecosystem == "maven":
@@ -865,11 +866,11 @@ def _is_ai(ecosystem: str, name: str) -> bool:
             return True
         return False
     if ecosystem == "go":
-        for mod in AI_PACKAGES["go"]:
+        for mod in KNOWN_AI_PACKAGES["go"]:
             if name == mod or name.startswith(mod + "/"):
                 return True
         return False
-    pkgs = AI_PACKAGES.get(ecosystem, set())
+    pkgs = KNOWN_AI_PACKAGES.get(ecosystem, set())
     if ecosystem == "pypi":
         return _normalize_pypi_name(name) in pkgs
     return name in pkgs
@@ -947,7 +948,7 @@ def discover_ai_package_set(context: ScanContext) -> frozenset[str]:
         if key not in _MANIFEST_PARSERS and not key.endswith(".csproj"):
             continue
         for name, _spec, _line, _ver, ecosystem in _parse_manifest(path):
-            if not _is_ai(ecosystem, name):
+            if not _is_known_ai(ecosystem, name):
                 continue
             pkgs.add(_display_name(ecosystem, name))
     return frozenset(pkgs)
@@ -968,8 +969,6 @@ class DependencyScanner(BaseScanner):
             if key not in _MANIFEST_PARSERS and not key.endswith(".csproj"):
                 continue
             for name, raw_spec, line_no, pinned_ver, ecosystem in _parse_manifest(path):
-                if not _is_ai(ecosystem, name):
-                    continue
                 disp = _display_name(ecosystem, name)
                 dedup_key = disp.lower()
                 if dedup_key in seen:
@@ -978,10 +977,12 @@ class DependencyScanner(BaseScanner):
                         prev.sdk_version = pinned_ver
                         prev.metadata["version_spec"] = raw_spec
                     continue
-                meta = {
+                known_ai = _is_known_ai(ecosystem, name)
+                meta: dict[str, Any] = {
                     "ecosystem": ecosystem,
                     "version_spec": raw_spec,
                     "manifest": path.name,
+                    "known_ai_package": known_ai,
                 }
                 comp = AIComponent(
                     name=disp,

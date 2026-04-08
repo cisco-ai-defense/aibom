@@ -8,10 +8,10 @@
 | **Config + Manifest** | Loads `manifest.json` from `AIBOM_MANIFEST_PATH`, packaged defaults, or CWD fallback. Environment overrides for DB path, SHA, and post URL. |
 | **Knowledge Base Loader** | Resolves a local DuckDB catalog path (from env or manifest), verifies SHA-256, and returns the validated file path. |
 | **Source Resolver** | Distinguishes local paths, container images, and remote repos. For images, runs tiered container extraction (Docker/Podman/nerdctl/Buildah/Skopeo/Crane/tarball). For remote repos, clones via platform adapters (GitHub/GitLab/Bitbucket). |
-| **Scan Pipeline** | Four-stage orchestrator: Scan → Cross-Ref → Agentic → Assemble. Runs all registered scanners, resolves env-var references, optionally enriches via LLM, and applies filtering. |
+| **Scan Pipeline** | Four-stage orchestrator: Scan → Cross-Ref → Agentic → Assemble. Runs all registered scanners, resolves env-var references, classifies all candidates via the mandatory LLM agent, and applies filtering. |
 | **Scanners (21 built-in)** | Pluggable scanner registry with `__init_subclass__` auto-registration. Each scanner implements `scan(ctx) → (components, relationships)`. Covers models, dependencies, secrets, vulnerabilities, MCP, ML lifecycle, cloud, CI/CD, deployments, containers, data files, config, skills, workflows, and more. |
 | **Cross-Reference Index** | Builds env-var and package indexes across all scanned files. Resolves env-var references to concrete values (model names, API keys, endpoints) by correlating source code with `.env`, `docker-compose.yaml`, Helm values, and Terraform files. |
-| **Agentic Layer** | Optional LLM-powered enrichment via Deep Agents + LangChain. Three-tier classification (simple/complex candidates), locality-aware batching, sub-agent dispatch, structured output parsing, content-hash caching, and circuit breaker. |
+| **Agentic Layer** | Mandatory LLM-powered classification via Deep Agents + LangChain. Every scanner candidate is confirmed or rejected by the agent. Two-tier classification (simple/complex candidates), locality-aware batching, sub-agent dispatch, structured output parsing, content-hash caching, and circuit breaker. |
 | **Policy Engine** | YAML-driven pass/fail gates: max risk score, required/blocked component types, required fields, and custom rules. |
 | **Reporters (10 formats)** | Pluggable reporter registry. Built-in: Plaintext, JSON, CycloneDX (1.6), SARIF (2.1.0), SPDX (3.0), HTML dashboard, Markdown, CSV, JUnit. Plus live FastAPI API server. |
 | **Custom Catalog** | Loads `.aibom.yaml`/`.yml`/`.json`: custom component entries, base-class rules, exclude patterns, relationship hints, and custom relationship types. |
@@ -24,7 +24,7 @@
 4. **Source Acquisition** — For each source: detect container image vs local path vs remote repo. Extract container images via the tiered extractor. Clone remote repos via platform adapters.
 5. **Scan Pipeline Stage 1: Scan** — Run all registered scanners against the source files. Each scanner produces components and relationships. File I/O uses async caching for performance.
 6. **Scan Pipeline Stage 2: Cross-Ref** — Build env-var and package indexes. Resolve env-var references (`os.getenv("MODEL_NAME")`) to concrete values by correlating across files, `.env`, docker-compose, Helm, and Terraform.
-7. **Scan Pipeline Stage 3: Agentic** — If `--llm-model` is set, classify components into simple/complex candidates. Run locality-aware batched LLM enrichment. Apply structured output (enrichments, new components, removals, risk findings). Cache results by content hash.
+7. **Scan Pipeline Stage 3: Agentic** — Classify all candidates into simple/complex tiers. Run locality-aware batched LLM classification. The agent confirms, rejects, reclassifies, or enriches each candidate using tools (`read_file_lines`, `search_package_info`). Apply structured output (enrichments, new components, removals, risk findings). Cache results by content hash.
 8. **Scan Pipeline Stage 4: Assemble** — Apply `--strict` filtering (drop `needs_agentic` items), collect counts and timing, build the final `PipelineResult`.
 9. **Reporting** — Route `PipelineResult` to the selected reporter. Convert container temp paths to container-style paths. Build per-source summaries and run metadata.
 10. **Post-Processing** — Optionally POST the JSON report with retries, run policy checks, display compliance advisories, render Rich console summary.
@@ -75,14 +75,14 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `catalog_db.py` | DuckDB access layer for catalog lookup with custom entry merging. |
 | `db_loader.py` | Manifest/env path resolution and SHA-256 verification. |
 | `agentic/agent.py` | Agentic enrichment core — candidate classification, locality-aware batching, sub-agent dispatch, circuit breaker, content-hash caching. |
-| `agentic/tools.py` | LangChain tools for file reading, import analysis, and code search. |
+| `agentic/tools.py` | LangChain tools for file reading, import analysis, code search, package registry queries (PyPI/npm/Go), and repo triage (directory tree, file snippets). |
 | `agentic/middleware.py` | Structured output parser — extracts enrichments, new components, removals, risk findings from LLM JSON responses. |
 | `agentic/prompts.py` | System prompts for the agentic enrichment agent. |
 | `llm_factory.py` | Centralized `build_chat_model()` — provider resolution, parameter mapping for OpenAI/Azure/Bedrock/Ollama/etc. |
 | `llm_client.py` | Lightweight LLM client for semantic parsing (model name extraction). |
 | `scanners/container_extractor.py` | Tiered container source extraction (Docker/Podman/nerdctl/Buildah/Skopeo/Crane/tarball). |
 | `scanners/model_detector.py` | Model detection via LiteLLM catalog, HuggingFace Hub, and import context. |
-| `scanners/dependency_scanner.py` | Multi-format dependency parsing (pip, npm, Maven, Go, Rust, Ruby, C#, PHP). |
+| `scanners/dependency_scanner.py` | Multi-format dependency parsing (pip, npm, Maven, Go, Rust, Ruby, C#, PHP). Emits all manifest packages as candidates; `KNOWN_AI_PACKAGES` is a hint, not a gate. |
 | `scanners/secret_detector.py` | Secret detection via Yelp `detect-secrets` integration. |
 | `scanners/vuln_scanner.py` | Vulnerability scanning via OSV.dev API. |
 | `scanners/env_var_resolver.py` | Multi-language env-var extraction (Python, JS/TS, Go, Java, Ruby, C#, Rust, PHP). |
@@ -98,7 +98,7 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `platform_adapters.py` | GitHub/GitLab/Bitbucket API adapters for repo discovery. |
 | `multi_repo.py` | Multi-repo scan orchestration with parallel execution. |
 | `incremental.py` | Commit-SHA keyed scan caching (`--skip-unchanged`). |
-| `repo_triage.py` | Agentic repository triage — LLM-assisted repo prioritization. |
+| `repo_triage.py` | Agent-first repository triage — tool-using agent explores repos (directory tree, file reading, codebase search, package registry) to decide deep-scan vs skip. |
 | `report_sender.py` | POST JSON reports with retry/backoff. |
 | `workflow_analyzer.py` | AST-based function index and call graph for workflow context. |
 | `models/enums.py` | `AIComponentType` (24 types), `Severity`, `Confidence` enums. |
@@ -154,12 +154,12 @@ Reporters use a registry pattern. Custom reporters can be added via the `aibom.r
 
 ## 7. Agentic Enrichment Architecture
 
-The agentic layer uses Deep Agents (LangChain-based) with structured output:
+The agentic layer is the mandatory final classifier. Scanners generate candidates; the agent is the single source of truth.
 
-1. **Candidate classification** — Components are split into "simple" (registry-confirmable: known model/dependency with a model name) and "complex" (ambiguous type, missing model name, multi-file reasoning needed).
-2. **Locality-aware batching** — Components are grouped by parent directory, then split into batches of configurable size. This provides coherent code context per batch.
-3. **Sub-agent dispatch** — When scanning multiple directory groups exceeding a threshold, independent agents are dispatched per group.
-4. **Structured output** — The agent returns JSON with `enriched_components`, `new_components`, `remove_components`, and `risk_findings`.
+1. **Candidate triage** — All candidates are split into "simple" (registry-confirmable: known model IDs, manifest dependencies) and "complex" (ambiguous type, missing model name, multi-file reasoning needed).
+2. **Locality-aware batching** — Candidates are grouped by parent directory, then split into batches of configurable size (default 15). This provides coherent code context per batch.
+3. **Agent tools** — The agent uses `read_file_lines` (inspect source), `search_package_info` (query PyPI/npm/Go registries for dependency metadata), and code context to make decisions.
+4. **Structured output** — Each batch returns JSON with `enriched_components`, `new_components`, `remove_components`, and `risk_findings`. The agent must explicitly confirm or remove every candidate.
 5. **Content-hash caching** — Each component's cache key is derived from its file path, line number, name, type, and surrounding code content. Unchanged components reuse cached LLM results.
 6. **Circuit breaker** — After N consecutive batch failures, remaining batches are skipped to prevent runaway costs.
 7. **Timeout** — Per-batch wall-clock timeout with graceful degradation.

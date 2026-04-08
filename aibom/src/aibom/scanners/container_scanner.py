@@ -43,7 +43,7 @@ from .base import BaseScanner
 
 _LOGGER = logging.getLogger(__name__)
 
-_AI_PACKAGES: frozenset[str] = frozenset({
+_KNOWN_AI_PACKAGES: frozenset[str] = frozenset({
     "torch", "tensorflow", "transformers", "openai", "anthropic",
     "langchain", "langchain-core", "langchain-openai", "langchain-community",
     "llama-index", "crewai", "autogen", "dspy", "deepagents",
@@ -214,23 +214,26 @@ def _extract_from_syft_json(image_ref: str, data: dict[str, Any]) -> list[AIComp
 
     for artifact in data.get("artifacts", []):
         pkg_name = artifact.get("name", "")
-        if pkg_name.lower().replace("_", "-") in _AI_PACKAGES:
-            version = artifact.get("version", "")
-            components.append(
-                AIComponent(
-                    name=pkg_name,
-                    component_type=AIComponentType.DEPENDENCY,
-                    file_path=f"container:{image_ref}",
-                    line_number=0,
-                    sdk_version=version,
-                    framework="pip",
-                    detection_source=DetectionSource.DEPENDENCY_MANIFEST,
-                    metadata={
-                        "container_image": image_ref,
-                        "package_type": artifact.get("type", ""),
-                    },
-                )
+        if not pkg_name:
+            continue
+        version = artifact.get("version", "")
+        known_ai = pkg_name.lower().replace("_", "-") in _KNOWN_AI_PACKAGES
+        components.append(
+            AIComponent(
+                name=pkg_name,
+                component_type=AIComponentType.DEPENDENCY,
+                file_path=f"container:{image_ref}",
+                line_number=0,
+                sdk_version=version,
+                framework="pip",
+                detection_source=DetectionSource.DEPENDENCY_MANIFEST,
+                metadata={
+                    "container_image": image_ref,
+                    "package_type": artifact.get("type", ""),
+                    "known_ai_package": known_ai,
+                },
             )
+        )
 
     return components
 
@@ -305,7 +308,8 @@ def _check_package_metadata(
             version = line.split(":", 1)[1].strip()
         if name and version:
             break
-    if name and name.lower().replace("_", "-") in _AI_PACKAGES:
+    if name:
+        known_ai = name.lower().replace("_", "-") in _KNOWN_AI_PACKAGES
         components.append(
             AIComponent(
                 name=name,
@@ -315,6 +319,10 @@ def _check_package_metadata(
                 sdk_version=version,
                 framework="pip",
                 detection_source=DetectionSource.DEPENDENCY_MANIFEST,
-                metadata={"container_image": image_ref, "installed_path": meta_path},
+                metadata={
+                    "container_image": image_ref,
+                    "installed_path": meta_path,
+                    "known_ai_package": known_ai,
+                },
             )
         )
