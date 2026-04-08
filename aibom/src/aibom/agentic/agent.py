@@ -125,6 +125,7 @@ def create_aibom_agent(
     *,
     llm_config: dict[str, Any] | None = None,
     system_prompt: str | None = None,
+    tools: list[Any] | None = None,
 ) -> Any:
     """Create a Deep Agents-powered AIBOM scanning agent.
 
@@ -139,6 +140,9 @@ def create_aibom_agent(
         passed through from the CLI ``--llm-*`` flags.
     system_prompt:
         Override the default AIBOM agent system prompt.
+    tools:
+        Override the default tool set.  When ``None`` the standard
+        per-repo enrichment tools are used.
 
     Returns
     -------
@@ -163,11 +167,10 @@ def create_aibom_agent(
         )
     except ImportError as exc:
         raise ImportError(str(exc)) from exc
-    tools = build_tools()
 
     agent = create_deep_agent(
         model=model,
-        tools=tools,
+        tools=tools if tools is not None else build_tools(),
         system_prompt=system_prompt or AIBOM_AGENT_SYSTEM_PROMPT,
         response_format=AgentResponse,
         name="aibom-scanner",
@@ -1024,21 +1027,50 @@ def _extract_structured_response(result: Any) -> dict[str, Any] | None:
 
 
 _CROSS_REPO_COORDINATOR_PROMPT = """\
-You are an AI-BOM cross-repository coordinator. You have received scan results
-from multiple repositories. Your job is to resolve cross-repo references that
-individual per-repo scans could not resolve on their own.
+You are an AI-BOM cross-repository coordinator. You receive an orientation
+summary from multiple repository scans and must identify cross-repo
+relationships that individual per-repo scans could not resolve.
 
-Focus on:
-1. **Env var resolution**: If repo A uses os.getenv("MODEL_NAME") and repo B
-   sets MODEL_NAME=gpt-4o in docker-compose.yaml, link them.
-2. **Shared model references**: If multiple repos reference the same model
-   by different names or through env vars, unify them.
-3. **Service-to-service links**: If repo A calls POST /api/predict and repo B
-   serves that endpoint, create a relationship.
-4. **Shared dependencies**: If repos share internal packages via git references
-   or local paths, note the cross-repo dependency.
+## Tools
 
-Return a JSON object:
+- **get_repo_components(repo_name)** — Returns full component data (names,
+  types, model names, file paths, metadata, unresolved env vars) for one
+  repository. Call this to drill into repos that look interesting from the
+  orientation summary.
+- **resolve_env_var(var_name)** — Resolve an environment variable across all
+  scanned repos. Checks .env, docker-compose, Terraform, Helm, K8s configs.
+- **resolve_iac_ref(ref_expression, iac_type)** — Resolve an IaC reference
+  (Terraform var, Helm value, CloudFormation Ref, ARM parameter).
+
+## Input structure
+
+The orientation summary contains:
+- **repos** — Per-repo overview: total component count, breakdown by type,
+  and unresolved env var names.
+- **pre_resolved_env_vars** — Env vars already resolved deterministically
+  (component → env var → concrete value + where it is defined). These are
+  confirmed facts — do NOT re-resolve them.
+- **shared_env_vars** — Env var names defined in multiple repos.
+- **shared_packages** — Packages used by multiple repos.
+- **unresolved_env_var_refs** — Env var names referenced in code but not
+  defined in any scanned config file.
+
+## Workflow
+
+1. Read the orientation summary. Note which repos share env vars, packages,
+   or have unresolved references.
+2. Call `get_repo_components` for each repo to get full component details.
+3. Cross-reference: match components across repos by model name, env var,
+   endpoint URL, or service name. Use `resolve_env_var` or `resolve_iac_ref`
+   for any references not already pre-resolved.
+4. Identify relationships: which components in different repos are connected?
+5. Flag risks: mismatched model versions, env vars with different values
+   across repos, unresolved references, or missing configurations.
+6. Output your JSON — then STOP.
+
+## Output format
+
+Return a SINGLE JSON object:
 ```json
 {
   "resolved_references": [
@@ -1046,7 +1078,7 @@ Return a JSON object:
       "source_repo": "...",
       "target_repo": "...",
       "reference_type": "env_var|model|service|dependency",
-      "source_component_id": "...",
+      "source_component": "...",
       "resolved_value": "...",
       "explanation": "..."
     }
@@ -1067,6 +1099,14 @@ Return a JSON object:
   ]
 }
 ```
+
+## Rules
+
+1. Do NOT hallucinate. Every finding must be backed by tool results or the
+   orientation data.
+2. Pre-resolved env vars are confirmed facts — use them, do not re-resolve.
+3. Your FINAL message must be valid JSON and nothing else. No preamble,
+   no markdown fences, no explanation. First character `{`, last character `}`.
 """
 
 
@@ -1081,52 +1121,74 @@ def run_cross_repo_coordination(
     to resolve cross-repo references (env vars, shared models, service links)
     that individual scans could not resolve.
 
-    Parameters
-    ----------
-    model_string:
-        LLM model identifier.
-    per_repo_results:
-        Dict mapping source name → scan output dict (must contain
-        ``components`` and optionally ``_unresolved_env_vars``).
-    llm_config:
-        LLM connection config.
-
-    Returns
-    -------
-    Tuple of (new_cross_repo_relationships, risk_flags).
+    The coordinator receives a slim orientation prompt with pre-resolved env
+    vars and cross-repo summary data.  Full component data is available
+    on-demand via the ``get_repo_components`` tool.
     """
     if len(per_repo_results) < 2:
         return [], []
 
-    repo_summaries: list[dict[str, Any]] = []
+    scan_paths = list(per_repo_results.keys())
+
+    # --- Deterministic pre-computation -----------------------------------
+    from .cross_repo import (
+        build_cross_repo_tools,
+        cross_repo_summary_tool,
+    )
+    from ..cross_ref import build_env_index
+
+    summary_json = cross_repo_summary_tool(scan_paths)
+    summary = json.loads(summary_json)
+
+    env_index = build_env_index(scan_paths)
+
+    pre_resolved: list[dict[str, str]] = []
+    for source, data in per_repo_results.items():
+        for c in data.get("components", []):
+            mn = c.model_name if hasattr(c, "model_name") else c.get("model_name", "")
+            if not mn or not mn.startswith("env:"):
+                continue
+            var_name = mn[4:]
+            entries = env_index.env.get(var_name, [])
+            if entries:
+                pre_resolved.append({
+                    "component": c.name if hasattr(c, "name") else c.get("name", ""),
+                    "repo": source,
+                    "env_var": var_name,
+                    "resolved_value": entries[0].value,
+                    "defined_in": entries[0].source_path,
+                })
+
+    repo_overview: list[dict[str, Any]] = []
     for source, data in per_repo_results.items():
         components = data.get("components", [])
-        comp_list = []
+        type_counts: dict[str, int] = {}
         for c in components:
-            if hasattr(c, "model_dump"):
-                comp_list.append({
-                    "name": c.name,
-                    "type": c.component_type.value,
-                    "model_name": c.model_name,
-                    "file": c.file_path,
-                    "metadata": c.metadata,
-                })
-            elif isinstance(c, dict):
-                comp_list.append(c)
-
+            ct = (
+                c.component_type.value if hasattr(c, "component_type")
+                else c.get("type", "unknown")
+            )
+            type_counts[ct] = type_counts.get(ct, 0) + 1
         unresolved = data.get("_unresolved_env_vars", [])
-        repo_summaries.append({
+        repo_overview.append({
             "repo": source,
-            "component_count": len(comp_list),
-            "components": comp_list[:50],
-            "unresolved_env_vars": unresolved[:20],
+            "total_components": len(components),
+            "by_type": type_counts,
+            "unresolved_env_vars": unresolved,
         })
 
-    context = json.dumps(repo_summaries, indent=2, default=str)
+    orientation = {
+        "repos": repo_overview,
+        "pre_resolved_env_vars": pre_resolved,
+        "shared_env_vars": summary.get("shared_env_vars", []),
+        "shared_packages": summary.get("shared_packages", []),
+        "unresolved_env_var_refs": summary.get("unresolved_env_var_refs", []),
+    }
+
     prompt = (
-        "Here are scan results from multiple repositories. "
-        "Please identify cross-repo references and resolve them.\n\n"
-        f"```json\n{context}\n```"
+        "Below is an orientation summary across all scanned repositories.\n"
+        "Use `get_repo_components` to drill into any repo for full details.\n\n"
+        f"```json\n{json.dumps(orientation, indent=2, default=str)}\n```"
     )
 
     _LOGGER.info(
@@ -1134,15 +1196,30 @@ def run_cross_repo_coordination(
         len(per_repo_results), model_string,
     )
 
+    xrepo_tools = build_cross_repo_tools(per_repo_results, scan_paths)
+
     try:
         agent = create_aibom_agent(
             model_string,
             llm_config=llm_config,
             system_prompt=_CROSS_REPO_COORDINATOR_PROMPT,
+            tools=xrepo_tools,
         )
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": prompt}]}
+        result = asyncio.run(
+            asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: agent.invoke(
+                        {"messages": [{"role": "user", "content": prompt}]}
+                    ),
+                ),
+                timeout=_DEFAULT_AGENTIC_TIMEOUT_S,
+            )
         )
+    except asyncio.TimeoutError:
+        _LOGGER.warning(
+            "Cross-repo coordination timed out after %ds", _DEFAULT_AGENTIC_TIMEOUT_S,
+        )
+        return [], []
     except Exception as exc:
         _LOGGER.warning("Cross-repo coordination failed: %s", exc)
         return [], []
