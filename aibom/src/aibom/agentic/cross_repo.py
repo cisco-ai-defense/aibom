@@ -587,3 +587,96 @@ def cross_repo_summary_tool(scan_paths: list[str]) -> str:
         return json.dumps({"error": str(exc)})
 
 
+class GetRepoComponentsArgs(BaseModel):
+    repo_name: str = Field(description="Repository name (as shown in the overview)")
+
+
+class _CoordResolveEnvVarArgs(BaseModel):
+    var_name: str = Field(description="Environment variable name to resolve")
+
+
+class _CoordResolveIaCRefArgs(BaseModel):
+    ref_expression: str = Field(
+        description="IaC reference expression (e.g., var.model_name, !Ref ModelParam)"
+    )
+    iac_type: str = Field(description="IaC type: terraform, cloudformation, arm, helm")
+
+
+def build_cross_repo_tools(
+    per_repo_results: dict[str, dict[str, Any]],
+    scan_paths: list[str],
+) -> list:
+    """Build LangChain StructuredTools for the cross-repo coordinator agent.
+
+    The ``get_repo_components`` tool is a closure over *per_repo_results* so
+    the LLM can pull full component data for any repo on demand.
+
+    The env-var and IaC tools close over *scan_paths* so the LLM does not
+    need to supply them.
+    """
+    from langchain_core.tools import StructuredTool
+
+    def _get_repo_components(repo_name: str) -> str:
+        data = per_repo_results.get(repo_name)
+        if data is None:
+            for key in per_repo_results:
+                if repo_name in key or key in repo_name:
+                    data = per_repo_results[key]
+                    break
+        if data is None:
+            return json.dumps({
+                "error": f"Repo '{repo_name}' not found. "
+                f"Available: {list(per_repo_results.keys())}",
+            })
+        components = data.get("components", [])
+        serialized = []
+        for c in components:
+            if hasattr(c, "model_dump"):
+                serialized.append(c.model_dump(mode="json"))
+            elif isinstance(c, dict):
+                serialized.append(c)
+        return json.dumps({
+            "repo": repo_name,
+            "component_count": len(serialized),
+            "components": serialized,
+            "unresolved_env_vars": data.get("_unresolved_env_vars", []),
+        }, default=str)
+
+    def _resolve_env(var_name: str) -> str:
+        return resolve_env_var_tool(var_name, scan_paths)
+
+    def _resolve_iac(ref_expression: str, iac_type: str) -> str:
+        return resolve_iac_ref_tool(ref_expression, iac_type, scan_paths)
+
+    return [
+        StructuredTool.from_function(
+            name="get_repo_components",
+            description=(
+                "Get full component data for a specific repository. "
+                "Returns all components with complete metadata, file paths, "
+                "model names, and unresolved env vars for that repo."
+            ),
+            func=_get_repo_components,
+            args_schema=GetRepoComponentsArgs,
+        ),
+        StructuredTool.from_function(
+            name="resolve_env_var",
+            description=(
+                "Search for an environment variable definition across all "
+                "scanned repositories. Checks .env files, docker-compose, "
+                "Terraform tfvars, Helm values.yaml, and other config files."
+            ),
+            func=_resolve_env,
+            args_schema=_CoordResolveEnvVarArgs,
+        ),
+        StructuredTool.from_function(
+            name="resolve_iac_ref",
+            description=(
+                "Resolve an Infrastructure-as-Code reference (Terraform var, "
+                "Helm value, CloudFormation Ref, ARM parameter) to its "
+                "concrete value across all scanned repositories."
+            ),
+            func=_resolve_iac,
+            args_schema=_CoordResolveIaCRefArgs,
+        ),
+    ]
