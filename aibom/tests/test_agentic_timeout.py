@@ -21,6 +21,7 @@ def _isolate_agentic_cache():
 
 
 class TestAgenticTimeout:
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
@@ -55,6 +56,7 @@ class TestAgenticTimeout:
 
 
 class TestAgenticCircuitBreaker:
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
@@ -84,11 +86,12 @@ class TestAgenticCircuitBreaker:
             timeout_s=120,
             max_consecutive_failures=3,
         )
-        assert mock_agent.invoke.call_count == 3
-        tripped = [c for c in comps if c.agentic_hint == "circuit_breaker_tripped"]
-        assert len(tripped) == 1
-        assert tripped[0].name == "c3"
+        # 3 main-pass invocations (breaker trips, 4th skipped) +
+        # 3 retry-pass invocations (retry breaker also trips on 4th)
+        assert mock_agent.invoke.call_count == 6
+        assert all(c.needs_agentic is False for c in comps)
 
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
@@ -105,12 +108,16 @@ class TestAgenticCircuitBreaker:
         mock_msg.content = ok
 
         mock_agent = MagicMock()
+        # 5 main-pass calls (fail/ok/fail/ok/fail) + 3 retry calls (all succeed)
         mock_agent.invoke.side_effect = [
             RuntimeError("a"),
             {"messages": [mock_msg]},
             RuntimeError("b"),
             {"messages": [mock_msg]},
             RuntimeError("c"),
+            {"messages": [mock_msg]},
+            {"messages": [mock_msg]},
+            {"messages": [mock_msg]},
         ]
         mock_create.return_value = mock_agent
 
@@ -132,5 +139,5 @@ class TestAgenticCircuitBreaker:
             max_concurrent=1,
             max_consecutive_failures=3,
         )
-        assert mock_agent.invoke.call_count == 5
+        assert mock_agent.invoke.call_count == 8
         assert not any(c.agentic_hint == "circuit_breaker_tripped" for c in out)

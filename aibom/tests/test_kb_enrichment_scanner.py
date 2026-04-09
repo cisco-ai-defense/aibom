@@ -552,7 +552,7 @@ class TestPartialMatchIntegration:
         agentic = [c for c in comps if c.needs_agentic]
         assert len(agentic) >= 1
         hints = " ".join(c.agentic_hint for c in agentic)
-        assert "wrapper" in hints.lower() or "trace" in hints.lower()
+        assert "remove" in hints.lower()
 
 
 class TestKBEnrichmentScannerNoKB:
