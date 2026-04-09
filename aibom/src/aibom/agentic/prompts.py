@@ -72,6 +72,10 @@ You receive two lists:
    - If confirmed: enrich with concrete identifiers you find in the context
    - If false positive: `remove_components` with reason
    - If wrong type: `reclassify_components` with correct type and reason
+   - When a class name contains `Vector`, `Vectorizer`, `Embedding`,
+     `Retriever`, or `Index` but is typed as `model`, check code_context —
+     it is likely `vector_store`, `retriever`, or `embedding` instead.
+     Reclassify based on what the code does, not the scanner's guess.
 
 2. **Dependency verification**: For `dependency` components, use
    `search_package_info` to fetch registry metadata. Decide if the package
@@ -132,6 +136,28 @@ You receive two lists:
 - **vector_store** = a vector database service endpoint (Weaviate, Pinecone,
   Qdrant, Chroma, Milvus). NOT an LLM or embedding endpoint.
 
+## Per-type verification checklist
+
+Apply these checks when processing each component by type:
+
+- **model**: Confirm ONLY if the name is a recognized model ID (GPT, Claude,
+  Llama, Mistral, etc.) or a model name string passed to an LLM client
+  constructor. REMOVE if: API handler class, pipeline orchestrator, DB
+  manager, retry handler, executor, or env var for config/timeout.
+  RECLASSIFY to `agent` if the class orchestrates LLM calls with
+  tools/routing logic.
+- **prompt**: Confirm ONLY if it is a named template (PromptTemplate,
+  ChatPromptTemplate, Freeplay prompt name, f-string with `{placeholders}`),
+  or a multi-line system/user instruction string. REMOVE if: it is a generic
+  variable name (`resp`, `messages`, `content`, `question`, `all_messages`,
+  `response`) that merely holds transient LLM I/O.
+- **memory**: Confirm ONLY if the class manages conversation state that feeds
+  into an LLM prompt (ChatHistory, ConversationBufferMemory,
+  ConversationSummaryMemory). REMOVE if: it is a CRUD API handler, ORM
+  entity, or request/response DTO for conversations (CreateConversation,
+  GetConversation, UpdateConversation, ListConversation, *ReqBody,
+  *Response).
+
 ## Precision rules — what IS and IS NOT an AI component
 
 ### IS an AI component (confirm these)
@@ -171,8 +197,17 @@ You receive two lists:
   inference provider.
 - **Stdlib / utility classes**: ThreadPoolExecutor, retry handlers, timeout
   configs, concurrency helpers are infrastructure.
-- **Test mocks / SDK types**: `ChatCompletionMessage`, `CallToolResult`,
-  and similar SDK type imports in test files are not components.
+- **Test-only detections**: Components detected ONLY in test files
+  (`test_*`, `*_test.*`, `tests/` directories) should be REMOVED unless
+  the identical component also appears in production code. Test mocks
+  (`Fake*`, `Mock*`), SDK type annotations (`ChatCompletionMessage`,
+  `CallToolResult`), and test helper classes are never AI components.
+- **Non-AI environment variables**: For components with names starting with
+  `env:`, the env var name is a strong signal. Env vars ending in `_TIMEOUT`,
+  `_CONFIG`, `_COUNT`, `_SIZE`, `_LIMIT`, `_PORT`, `_HOST`, `_RETRIES`,
+  `_INTERVAL` are infrastructure config, not AI assets — REMOVE them. Only
+  env vars whose resolved value is a model name, endpoint URL, or API key
+  should be kept.
 
 ## Output format
 
