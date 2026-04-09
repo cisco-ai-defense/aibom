@@ -237,13 +237,13 @@ Return a SINGLE JSON object:
   ],
   "remove_components": [
     {
-      "instance_id": "<existing instance_id>",
+      "instance_id": "COPY THE EXACT instance_id FROM THE INPUT — e.g. MyClass_/absolute/path/to/file.py_42",
       "reason": "Why this is a false positive"
     }
   ],
   "reclassify_components": [
     {
-      "instance_id": "<existing instance_id>",
+      "instance_id": "COPY THE EXACT instance_id FROM THE INPUT — e.g. MyClass_/absolute/path/to/file.py_42",
       "new_type": "memory|retriever|tool|...",
       "reason": "Correct classification"
     }
@@ -274,6 +274,12 @@ Return a SINGLE JSON object:
 2. Prefer concrete values. If you cannot resolve a reference, say so.
 3. When using search_codebase or resolve_env_var, ONLY pass paths from the
    `scan_paths` field in the input. NEVER search outside those directories.
+5. instance_id values in remove_components, reclassify_components, and
+   enriched_components MUST be copied VERBATIM from the input. They contain
+   underscores, full absolute paths, and line numbers (e.g.
+   `MyClass_/Users/dev/project/src/file.py_42`). Do NOT shorten, use colons,
+   use relative paths, or drop the line number — mismatched IDs cause silent
+   data loss.
 4. After you have finished using tools and are ready to respond:
    - Your FINAL message MUST be **valid JSON and nothing else**.
    - Do NOT write any explanation, analysis, summary, or commentary.

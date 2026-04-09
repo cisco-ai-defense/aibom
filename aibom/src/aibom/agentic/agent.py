@@ -45,9 +45,15 @@ from ..models import (
 from .middleware import AIBOMScannerMiddleware
 from .prompts import AIBOM_AGENT_SYSTEM_PROMPT
 
+_IID_DESC = (
+    "The EXACT instance_id string as provided in the input — "
+    "copy it verbatim including underscores, full absolute paths, "
+    "and trailing line numbers. Do NOT shorten, reformat, or omit any part."
+)
+
 
 class _EnrichedComponent(BaseModel):
-    instance_id: str = ""
+    instance_id: str = Field(default="", description=_IID_DESC)
     updates: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -62,12 +68,12 @@ class _NewComponent(BaseModel):
 
 
 class _RemoveComponent(BaseModel):
-    instance_id: str = ""
+    instance_id: str = Field(default="", description=_IID_DESC)
     reason: str = ""
 
 
 class _ReclassifyComponent(BaseModel):
-    instance_id: str = ""
+    instance_id: str = Field(default="", description=_IID_DESC)
     new_type: str = ""
     reason: str = ""
 
