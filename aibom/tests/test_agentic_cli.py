@@ -39,7 +39,8 @@ def sample_dir(tmp_path: Path) -> Path:
 
 
 class TestAgenticEnrichmentViaCLI:
-    def test_without_llm_model_runs_deterministic_only(self, sample_dir, tmp_path):
+    def test_without_llm_model_exits_with_error(self, sample_dir, tmp_path):
+        """--llm-model is mandatory; omitting it should fail with a clear message."""
         out = tmp_path / "report.txt"
         result = runner.invoke(
             app,
@@ -48,9 +49,10 @@ class TestAgenticEnrichmentViaCLI:
                 "--output-format", "plaintext",
                 "--output-file", str(out),
             ],
+            env={"AIBOM_LLM_MODEL": ""},
         )
-        assert result.exit_code == 0
-        assert "Enriching" not in result.output
+        assert result.exit_code == 1
+        assert "llm-model" in result.output.lower() or "AIBOM_LLM_MODEL" in result.output
 
     @patch("aibom.agentic.agent.create_aibom_agent")
     def test_llm_model_triggers_agentic_enrichment(self, mock_create, sample_dir, tmp_path):
