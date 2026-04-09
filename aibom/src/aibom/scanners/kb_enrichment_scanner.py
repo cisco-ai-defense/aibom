@@ -741,9 +741,13 @@ def _emit_suggestive_candidates(
                 confidence=0.2,
                 needs_agentic=True,
                 agentic_hint=(
-                    f"Class '{class_name}' in suggestive path "
-                    f"'{py_file.parent.name}/' has AI-indicative name. "
-                    f"Agent should read this file and trace imports to confirm."
+                    f"Class '{class_name}' in path "
+                    f"'{py_file.parent.name}/'. A class name alone is "
+                    f"NOT proof of an AI component. REMOVE unless "
+                    f"code_context proves this is a genuine AI "
+                    f"{inferred_type.value}. Classes in AI-adjacent "
+                    f"directories are often ordinary handlers, "
+                    f"utilities, or DTOs."
                 ),
                 metadata={
                     "suggestive_signal": True,
@@ -790,8 +794,9 @@ def _detect_cache_ai_co_occurrence(
                 needs_agentic=True,
                 agentic_hint=(
                     f"File imports both an AI framework and '{cache_lib}'. "
-                    f"Agent should confirm whether the cache is used for LLM "
-                    f"response caching or conversation memory."
+                    f"REMOVE unless code_context shows the cache stores "
+                    f"LLM responses or conversation history — generic app "
+                    f"caching is not an AI component."
                 ),
                 metadata={"cache_ai_co_occurrence": True, "cache_library": cache_lib},
             )
@@ -871,7 +876,10 @@ def _detect_import_based_assets(
                 needs_agentic=name_ambiguous,
                 agentic_hint=(
                     f"Name-inferred as '{comp_type.value}' from import "
-                    f"'{imp_line.strip()}'; confirm or reclassify."
+                    f"'{imp_line.strip()}'. Name matching alone is WEAK "
+                    f"evidence — REMOVE unless code_context proves this "
+                    f"is a genuine AI {comp_type.value}, not a CRUD "
+                    f"handler, DTO, ETL utility, or test artifact."
                 ) if name_ambiguous else "",
                 metadata={"import_statement": imp_line.strip()},
             )
@@ -1473,14 +1481,14 @@ def _process_file_with_cache(
                     agentic_hint=(
                         f"KB catalog matched '{display_name}' as "
                         f"'{concept}' (type={comp_type.value}, "
-                        f"id={kb_entry['id']}). Verify in code_context: "
-                        f"(1) Is this a genuine AI component or a false "
-                        f"positive? (2) Is the assigned type correct — "
-                        f"reclassify if the code does something different "
-                        f"from what the name suggests. (3) Look at nearby "
-                        f"lines for concrete identifiers (model names, "
-                        f"endpoint URLs, class parameters, config values) "
-                        f"and enrich with them."
+                        f"id={kb_entry['id']}). Default: REMOVE if "
+                        f"code_context reveals a CRUD handler, DTO, "
+                        f"utility, or test artifact. Only KEEP if it is "
+                        f"a genuine AI component — then (1) verify the "
+                        f"assigned type matches what the code does, "
+                        f"(2) enrich with concrete identifiers (model "
+                        f"names, endpoint URLs, config values) from "
+                        f"nearby lines."
                     ),
                     metadata=meta,
                 )
@@ -1495,10 +1503,12 @@ def _process_file_with_cache(
             if obs_data.get("type") == "decorator" and obs_data.get("decorated"):
                 display_name = obs_data["decorated"]
             hint = (
-                f"Class '{display_name}' matches KB entry '{match.partial_kb_id}' "
-                f"but import module '{match.obs_module}' differs from KB "
-                f"framework '{match.partial_kb_framework}'. "
-                f"Agent should trace the wrapper chain to confirm."
+                f"Class '{display_name}' partially matches KB entry "
+                f"'{match.partial_kb_id}' but import module "
+                f"'{match.obs_module}' differs from KB framework "
+                f"'{match.partial_kb_framework}'. Module mismatch is a "
+                f"red flag — REMOVE unless wrapper chain in code_context "
+                f"proves this resolves to a genuine model identifier."
             )
             meta_partial: dict[str, Any] = {
                 "partial_kb_id": match.partial_kb_id,
@@ -1693,14 +1703,14 @@ def _process_file(
                     agentic_hint=(
                         f"KB catalog matched '{display_name}' as "
                         f"'{concept}' (type={comp_type.value}, "
-                        f"id={kb_entry['id']}). Verify in code_context: "
-                        f"(1) Is this a genuine AI component or a false "
-                        f"positive? (2) Is the assigned type correct — "
-                        f"reclassify if the code does something different "
-                        f"from what the name suggests. (3) Look at nearby "
-                        f"lines for concrete identifiers (model names, "
-                        f"endpoint URLs, class parameters, config values) "
-                        f"and enrich with them."
+                        f"id={kb_entry['id']}). Default: REMOVE if "
+                        f"code_context reveals a CRUD handler, DTO, "
+                        f"utility, or test artifact. Only KEEP if it is "
+                        f"a genuine AI component — then (1) verify the "
+                        f"assigned type matches what the code does, "
+                        f"(2) enrich with concrete identifiers (model "
+                        f"names, endpoint URLs, config values) from "
+                        f"nearby lines."
                     ),
                     metadata={
                         "kb_id": kb_entry["id"],
@@ -1717,10 +1727,12 @@ def _process_file(
             if obs_data["type"] == "decorator" and obs_data.get("decorated"):
                 display_name = obs_data["decorated"]
             hint = (
-                f"Class '{display_name}' matches KB entry '{match.partial_kb_id}' "
-                f"but import module '{match.obs_module}' differs from KB "
-                f"framework '{match.partial_kb_framework}'. "
-                f"Agent should trace the wrapper chain to confirm."
+                f"Class '{display_name}' partially matches KB entry "
+                f"'{match.partial_kb_id}' but import module "
+                f"'{match.obs_module}' differs from KB framework "
+                f"'{match.partial_kb_framework}'. Module mismatch is a "
+                f"red flag — REMOVE unless wrapper chain in code_context "
+                f"proves this resolves to a genuine model identifier."
             )
             components.append(
                 AIComponent(

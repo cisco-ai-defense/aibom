@@ -229,6 +229,27 @@ _SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
 
 _SUB_AGENT_THRESHOLD = 50
 
+_RETRY_COOLDOWN_S = 30
+_RETRYABLE_HINTS = frozenset({
+    "batch_timeout",
+    "batch_recursion_limit",
+    "circuit_breaker_tripped",
+})
+
+
+def _collect_failed(
+    enriched: list[AIComponent],
+) -> tuple[list[AIComponent], list[AIComponent]]:
+    """Partition enriched results into ok and retryable components."""
+    ok: list[AIComponent] = []
+    retry: list[AIComponent] = []
+    for c in enriched:
+        if c.agentic_hint in _RETRYABLE_HINTS:
+            retry.append(c.model_copy(update={"needs_agentic": True, "agentic_hint": ""}))
+        else:
+            ok.append(c)
+    return ok, retry
+
 
 def _classify_candidates(
     components: list[AIComponent],
@@ -867,6 +888,71 @@ def _run_tier(
                 consecutive_failures += 1
             else:
                 consecutive_failures = 0
+
+    ok, retry_candidates = _collect_failed(enriched)
+    if retry_candidates:
+        _LOGGER.info(
+            "Retry pass: %d degraded components, cooling down %ds",
+            len(retry_candidates), _RETRY_COOLDOWN_S,
+        )
+        time.sleep(_RETRY_COOLDOWN_S)
+
+        retry_batch_size = batch_size
+        has_recursion_failures = any(
+            c_orig.agentic_hint == "batch_recursion_limit"
+            for c_orig in enriched
+            if c_orig.agentic_hint in _RETRYABLE_HINTS
+        )
+        if has_recursion_failures:
+            retry_batch_size = max(1, batch_size // 2)
+
+        retry_batches = _locality_aware_batches(retry_candidates, retry_batch_size)
+        _LOGGER.info(
+            "Retrying %d batches sequentially (batch_size=%d)",
+            len(retry_batches), retry_batch_size,
+        )
+
+        retry_enriched: list[AIComponent] = []
+        retry_new: list[AIComponent] = []
+        retry_rels: list[ComponentRelationship] = []
+        retry_flags: list[RiskFlag] = []
+        retry_consecutive = 0
+        for idx, batch in enumerate(retry_batches, 1):
+            if retry_consecutive >= max_consecutive_failures:
+                _LOGGER.warning(
+                    "Retry circuit breaker: skipping retry batches %d–%d",
+                    idx, len(retry_batches),
+                )
+                for b in retry_batches[idx - 1:]:
+                    retry_enriched.extend(_degraded_batch_components(b, hint="retry_failed"))
+                break
+            e, n, r, f, batch_failed = _run_batch(
+                agent, middleware, batch,
+                relationships, scan_paths,
+                idx, len(retry_batches),
+                all_components=all_components,
+                timeout_s=timeout_s,
+            )
+            retry_enriched.extend(e)
+            retry_new.extend(n)
+            retry_rels.extend(r)
+            retry_flags.extend(f)
+            if batch_failed:
+                retry_consecutive += 1
+            else:
+                retry_consecutive = 0
+
+        recovered = sum(1 for c in retry_enriched if c.agentic_hint not in _RETRYABLE_HINTS and c.agentic_hint != "retry_failed")
+        still_degraded = len(retry_candidates) - recovered
+        _LOGGER.info(
+            "Retry pass complete: %d/%d recovered, %d still degraded",
+            recovered, len(retry_candidates), still_degraded,
+        )
+
+        enriched = ok + retry_enriched
+        new.extend(retry_new)
+        rels.extend(retry_rels)
+        flags.extend(retry_flags)
 
     if memo is not None:
         enriched_by_id = {c.instance_id: c for c in enriched}
