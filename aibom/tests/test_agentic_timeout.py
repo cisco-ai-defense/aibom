@@ -21,8 +21,10 @@ def _isolate_agentic_cache():
 
 
 class TestAgenticTimeout:
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_timeout_marks_components_not_agentic(self, mock_create: MagicMock) -> None:
+    def test_timeout_marks_components_not_agentic(self, mock_create: MagicMock, _mb: MagicMock, _mc: MagicMock) -> None:
         from aibom.agentic.agent import run_agentic_enrichment
 
         mock_agent = MagicMock()
@@ -53,8 +55,10 @@ class TestAgenticTimeout:
 
 
 class TestAgenticCircuitBreaker:
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_skips_after_three_consecutive_failures(self, mock_create: MagicMock) -> None:
+    def test_skips_after_three_consecutive_failures(self, mock_create: MagicMock, _mb: MagicMock, _mc: MagicMock) -> None:
         from aibom.agentic.agent import run_agentic_enrichment
 
         mock_agent = MagicMock()
@@ -85,8 +89,10 @@ class TestAgenticCircuitBreaker:
         assert len(tripped) == 1
         assert tripped[0].name == "c3"
 
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_non_consecutive_failures_do_not_trip(self, mock_create: MagicMock) -> None:
+    def test_non_consecutive_failures_do_not_trip(self, mock_create: MagicMock, _mb: MagicMock, _mc: MagicMock) -> None:
         from aibom.agentic.agent import run_agentic_enrichment
 
         ok = json.dumps({
