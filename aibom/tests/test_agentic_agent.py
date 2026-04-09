@@ -190,8 +190,10 @@ class TestLazyImport:
 
 
 class TestRunAgenticEnrichment:
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_merges_agent_output_into_components(self, mock_create):
+    def test_merges_agent_output_into_components(self, mock_create, _mock_build, _mock_close):
         from aibom.agentic.agent import run_agentic_enrichment
 
         agent_response = json.dumps({
@@ -235,8 +237,10 @@ class TestRunAgenticEnrichment:
         assert "existing" in names
         assert "agent-found-model" in names
 
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_handles_agent_failure_gracefully(self, mock_create):
+    def test_handles_agent_failure_gracefully(self, mock_create, _mock_build, _mock_close):
         from aibom.agentic.agent import run_agentic_enrichment
 
         mock_create.return_value = MagicMock(
@@ -258,8 +262,10 @@ class TestRunAgenticEnrichment:
         assert len(comps) == 1
         assert comps[0].name == "test-model"
 
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_batching_splits_large_input(self, mock_create):
+    def test_batching_splits_large_input(self, mock_create, _mock_build, _mock_close):
         from aibom.agentic.agent import run_agentic_enrichment
 
         mock_agent = MagicMock()
@@ -294,8 +300,10 @@ class TestRunAgenticEnrichment:
         )
         assert mock_agent.ainvoke.call_count >= 2  # 15 + 15 + 2, parallel
 
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_single_batch_uses_sequential(self, mock_create):
+    def test_single_batch_uses_sequential(self, mock_create, _mock_build, _mock_close):
         """A single batch should use invoke (sequential), not ainvoke."""
         from aibom.agentic.agent import run_agentic_enrichment
 
@@ -328,8 +336,10 @@ class TestRunAgenticEnrichment:
         )
         assert mock_agent.invoke.call_count == 1
 
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_tiered_model_uses_fast_for_simple(self, mock_create):
+    def test_tiered_model_uses_fast_for_simple(self, mock_create, mock_build, _mock_close):
         from aibom.agentic.agent import run_agentic_enrichment
 
         mock_agent = MagicMock()

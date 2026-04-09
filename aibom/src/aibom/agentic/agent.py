@@ -121,12 +121,57 @@ def _build_rate_limiter() -> Any:
     )
 
 
+def _build_model(
+    model_string: str,
+    llm_config: dict[str, Any] | None = None,
+) -> Any:
+    """Build a LangChain ``BaseChatModel`` for the given model string."""
+    from ..llm_factory import build_chat_model
+
+    cfg = llm_config or {}
+    rate_limiter = _build_rate_limiter()
+    return build_chat_model(
+        model_string,
+        provider=cfg.get("provider"),
+        api_key=cfg.get("api_key"),
+        api_base=cfg.get("api_base"),
+        api_version=cfg.get("api_version"),
+        rate_limiter=rate_limiter,
+    )
+
+
+def _close_model_clients(*models: Any) -> None:
+    """Best-effort shutdown of async HTTP transports inside LangChain models.
+
+    LangChain eagerly creates both sync and async OpenAI clients.  We only
+    use the sync path (``.invoke()``), but the unused ``async_client``'s
+    ``__del__`` tries to schedule cleanup on a closed event loop at
+    interpreter exit, producing noisy ``RuntimeError: Event loop is closed``
+    tracebacks.  Closing explicitly while the loop is still reachable
+    prevents that.
+    """
+    for model in models:
+        try:
+            ac = getattr(model, "async_client", None)
+            if ac is not None and hasattr(ac, "close"):
+                ac.close()
+        except Exception:
+            pass
+        try:
+            sc = getattr(model, "client", None)
+            if sc is not None and hasattr(sc, "close"):
+                sc.close()
+        except Exception:
+            pass
+
+
 def create_aibom_agent(
     model_string: str,
     *,
     llm_config: dict[str, Any] | None = None,
     system_prompt: str | None = None,
     tools: list[Any] | None = None,
+    model: Any | None = None,
 ) -> Any:
     """Create a Deep Agents-powered AIBOM scanning agent.
 
@@ -144,6 +189,10 @@ def create_aibom_agent(
     tools:
         Override the default tool set.  When ``None`` the standard
         per-repo enrichment tools are used.
+    model:
+        Pre-built ``BaseChatModel``.  When provided, *model_string* and
+        *llm_config* are ignored for model construction (the agent graph
+        is still new).
 
     Returns
     -------
@@ -151,23 +200,10 @@ def create_aibom_agent(
     """
     from deepagents import create_deep_agent
 
-    from ..llm_factory import build_chat_model
     from .tools import build_tools
 
-    cfg = llm_config or {}
-    rate_limiter = _build_rate_limiter()
-
-    try:
-        model = build_chat_model(
-            model_string,
-            provider=cfg.get("provider"),
-            api_key=cfg.get("api_key"),
-            api_base=cfg.get("api_base"),
-            api_version=cfg.get("api_version"),
-            rate_limiter=rate_limiter,
-        )
-    except ImportError as exc:
-        raise ImportError(str(exc)) from exc
+    if model is None:
+        model = _build_model(model_string, llm_config)
 
     agent = create_deep_agent(
         model=model,
@@ -950,48 +986,76 @@ def run_agentic_enrichment(
     all_rels: list[ComponentRelationship] = []
     all_flags: list[RiskFlag] = []
 
-    tier_model = fast_model or model_string
+    tier_model_name = fast_model or model_string
     simple_batch_size = batch_size
-    if simple:
-        _LOGGER.info(
-            "Tier 1 (simple confirmations): %d candidates via %s (batch=%d)",
-            len(simple), tier_model, simple_batch_size,
-        )
-        agent = create_aibom_agent(tier_model, llm_config=llm_config)
-        e, n, r, f = _run_tier(
-            agent, middleware, simple,
-            deterministic_relationships, scan_paths,
-            simple_batch_size, max_concurrent, deterministic_components, cache,
-            memo=memo,
-            timeout_s=timeout_s,
-            max_consecutive_failures=max_consecutive_failures,
-        )
-        all_enriched.extend(e)
-        all_new.extend(n)
-        all_rels.extend(r)
-        all_flags.extend(f)
 
-    if complex_:
-        dir_groups = _group_by_top_dir(complex_, scan_paths)
-        use_sub_agents = (
-            len(dir_groups) > 1
-            and len(complex_) > _SUB_AGENT_THRESHOLD
-        )
+    tier_model_obj = _build_model(tier_model_name, llm_config)
+    if model_string == tier_model_name:
+        complex_model_obj = tier_model_obj
+        models_to_close = [tier_model_obj]
+    else:
+        complex_model_obj = _build_model(model_string, llm_config)
+        models_to_close = [tier_model_obj, complex_model_obj]
 
-        if use_sub_agents:
+    try:
+        if simple:
             _LOGGER.info(
-                "Sub-agent dispatch: %d directory groups for %d complex candidates",
-                len(dir_groups), len(complex_),
+                "Tier 1 (simple confirmations): %d candidates via %s (batch=%d)",
+                len(simple), tier_model_name, simple_batch_size,
             )
-            for dir_key, group in sorted(dir_groups.items()):
-                dir_label = Path(dir_key).name if dir_key != "__default__" else "default"
+            agent = create_aibom_agent(tier_model_name, model=tier_model_obj)
+            e, n, r, f = _run_tier(
+                agent, middleware, simple,
+                deterministic_relationships, scan_paths,
+                simple_batch_size, max_concurrent, deterministic_components, cache,
+                memo=memo,
+                timeout_s=timeout_s,
+                max_consecutive_failures=max_consecutive_failures,
+            )
+            all_enriched.extend(e)
+            all_new.extend(n)
+            all_rels.extend(r)
+            all_flags.extend(f)
+
+        if complex_:
+            dir_groups = _group_by_top_dir(complex_, scan_paths)
+            use_sub_agents = (
+                len(dir_groups) > 1
+                and len(complex_) > _SUB_AGENT_THRESHOLD
+            )
+
+            if use_sub_agents:
                 _LOGGER.info(
-                    "Sub-agent [%s]: %d candidates via %s",
-                    dir_label, len(group), model_string,
+                    "Sub-agent dispatch: %d directory groups for %d complex candidates",
+                    len(dir_groups), len(complex_),
                 )
-                agent = create_aibom_agent(model_string, llm_config=llm_config)
+                for dir_key, group in sorted(dir_groups.items()):
+                    dir_label = Path(dir_key).name if dir_key != "__default__" else "default"
+                    _LOGGER.info(
+                        "Sub-agent [%s]: %d candidates via %s",
+                        dir_label, len(group), model_string,
+                    )
+                    agent = create_aibom_agent(model_string, model=complex_model_obj)
+                    e, n, r, f = _run_tier(
+                        agent, middleware, group,
+                        deterministic_relationships, scan_paths,
+                        batch_size, max_concurrent, deterministic_components, cache,
+                        memo=memo,
+                        timeout_s=timeout_s,
+                        max_consecutive_failures=max_consecutive_failures,
+                    )
+                    all_enriched.extend(e)
+                    all_new.extend(n)
+                    all_rels.extend(r)
+                    all_flags.extend(f)
+            else:
+                _LOGGER.info(
+                    "Tier 2 (complex reasoning): %d candidates via %s",
+                    len(complex_), model_string,
+                )
+                agent = create_aibom_agent(model_string, model=complex_model_obj)
                 e, n, r, f = _run_tier(
-                    agent, middleware, group,
+                    agent, middleware, complex_,
                     deterministic_relationships, scan_paths,
                     batch_size, max_concurrent, deterministic_components, cache,
                     memo=memo,
@@ -1002,24 +1066,8 @@ def run_agentic_enrichment(
                 all_new.extend(n)
                 all_rels.extend(r)
                 all_flags.extend(f)
-        else:
-            _LOGGER.info(
-                "Tier 2 (complex reasoning): %d candidates via %s",
-                len(complex_), model_string,
-            )
-            agent = create_aibom_agent(model_string, llm_config=llm_config)
-            e, n, r, f = _run_tier(
-                agent, middleware, complex_,
-                deterministic_relationships, scan_paths,
-                batch_size, max_concurrent, deterministic_components, cache,
-                memo=memo,
-                timeout_s=timeout_s,
-                max_consecutive_failures=max_consecutive_failures,
-            )
-            all_enriched.extend(e)
-            all_new.extend(n)
-            all_rels.extend(r)
-            all_flags.extend(f)
+    finally:
+        _close_model_clients(*models_to_close)
 
     all_components = all_enriched + all_new
 
@@ -1351,12 +1399,13 @@ def run_cross_repo_coordination(
 
     xrepo_tools = build_cross_repo_tools(per_repo_results, scan_paths)
 
+    model_obj = _build_model(model_string, llm_config)
     try:
         agent = create_aibom_agent(
             model_string,
-            llm_config=llm_config,
             system_prompt=_CROSS_REPO_COORDINATOR_PROMPT,
             tools=xrepo_tools,
+            model=model_obj,
         )
         result = asyncio.run(
             asyncio.wait_for(
@@ -1376,6 +1425,8 @@ def run_cross_repo_coordination(
     except Exception as exc:
         _LOGGER.warning("Cross-repo coordination failed: %s", exc)
         return [], []
+    finally:
+        _close_model_clients(model_obj)
 
     data = _extract_structured_response(result)
     if not data:
@@ -1496,39 +1547,28 @@ def resolve_container_layout(
     """
     from deepagents import create_deep_agent
 
-    from ..llm_factory import build_chat_model
-
-    cfg = llm_config or {}
-
     try:
-        model = build_chat_model(
-            model_string,
-            provider=cfg.get("provider"),
-            api_key=cfg.get("api_key"),
-            api_base=cfg.get("api_base"),
-            api_version=cfg.get("api_version"),
-            rate_limiter=_build_rate_limiter(),
-        )
+        model = _build_model(model_string, llm_config)
     except Exception:
         _LOGGER.warning("Failed to init LLM for container layout, using all candidates", exc_info=True)
         return candidate_dirs
 
-    agent = create_deep_agent(
-        model=model,
-        tools=[],
-        system_prompt=_CONTAINER_LAYOUT_PROMPT,
-        response_format=ContainerLayoutResponse,
-        name="aibom-container-layout",
-    )
-
-    file_sample = file_listing[:2000]
-    user_message = json.dumps({
-        "image_config": image_config,
-        "candidate_directories": candidate_dirs,
-        "file_listing_sample": file_sample,
-    }, indent=2)
-
     try:
+        agent = create_deep_agent(
+            model=model,
+            tools=[],
+            system_prompt=_CONTAINER_LAYOUT_PROMPT,
+            response_format=ContainerLayoutResponse,
+            name="aibom-container-layout",
+        )
+
+        file_sample = file_listing[:2000]
+        user_message = json.dumps({
+            "image_config": image_config,
+            "candidate_directories": candidate_dirs,
+            "file_listing_sample": file_sample,
+        }, indent=2)
+
         result = asyncio.run(
             asyncio.wait_for(
                 asyncio.to_thread(
@@ -1543,6 +1583,8 @@ def resolve_container_layout(
     except Exception:
         _LOGGER.warning("Container layout agent failed, using all candidates", exc_info=True)
         return candidate_dirs
+    finally:
+        _close_model_clients(model)
 
     parsed = _extract_structured_response(result)
     if not parsed:
