@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from aibom.models.enums import AIComponentType
+from aibom.models import AIComponent, AIComponentType
 from aibom.scan_pipeline import ScanPipeline, StageTiming
 
 
@@ -185,3 +185,127 @@ class TestResolveComponentsProvenance:
             if c.metadata.get("resolved_from"):
                 assert c.metadata["resolved_from"] == "dotenv"
                 assert "resolved_source_file" in c.metadata
+
+
+class TestDedupForAgentic:
+    """Pre-agentic representative deduplication for context-free types."""
+
+    def test_context_free_dedup(self):
+        from aibom.scan_pipeline import _dedup_for_agentic
+
+        comps = [
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="c/req.txt", line_number=1),
+        ]
+        deduped, fanout = _dedup_for_agentic(comps)
+        assert len(deduped) == 1
+        assert len(fanout) == 1
+        rep_id = deduped[0].instance_id
+        assert len(fanout[rep_id]) == 3
+
+    def test_context_dependent_passthrough(self):
+        from aibom.scan_pipeline import _dedup_for_agentic
+
+        comps = [
+            AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="a.yaml", line_number=1),
+            AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="b.yaml", line_number=5),
+        ]
+        deduped, fanout = _dedup_for_agentic(comps)
+        assert len(deduped) == 2
+        assert len(fanout) == 0
+
+    def test_mixed_components(self):
+        from aibom.scan_pipeline import _dedup_for_agentic
+
+        comps = [
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
+            AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="a.yaml", line_number=1),
+        ]
+        deduped, fanout = _dedup_for_agentic(comps)
+        assert len(deduped) == 2
+        assert len(fanout) == 1
+
+    def test_picks_richest_representative(self):
+        from aibom.scan_pipeline import _dedup_for_agentic
+
+        sparse = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1)
+        rich = AIComponent(
+            name="torch", component_type=AIComponentType.DEPENDENCY,
+            file_path="b/req.txt", line_number=1,
+            description="PyTorch deep learning framework",
+            metadata={"version": "2.1.0", "known_ai_package": True},
+        )
+        deduped, fanout = _dedup_for_agentic([sparse, rich])
+        assert len(deduped) == 1
+        assert deduped[0].instance_id == rich.instance_id
+
+    def test_different_names_not_deduped(self):
+        from aibom.scan_pipeline import _dedup_for_agentic
+
+        comps = [
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a.txt", line_number=1),
+            AIComponent(name="tensorflow", component_type=AIComponentType.DEPENDENCY, file_path="b.txt", line_number=1),
+        ]
+        deduped, fanout = _dedup_for_agentic(comps)
+        assert len(deduped) == 2
+
+
+class TestFanoutAgenticResults:
+    """Propagation of agentic verdicts from representatives to siblings."""
+
+    def test_fanout_propagates_enrichment(self):
+        from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
+
+        comps = [
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
+            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
+        ]
+        deduped, fanout = _dedup_for_agentic(comps)
+        rep = deduped[0].model_copy(update={"confidence": 0.95, "needs_agentic": False})
+
+        result = _fanout_agentic_results([rep], fanout)
+        assert len(result) == 2
+        for c in result:
+            assert c.confidence == 0.95
+            assert c.needs_agentic is False
+
+    def test_fanout_propagates_removal(self):
+        from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
+
+        comps = [
+            AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
+            AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
+        ]
+        _, fanout = _dedup_for_agentic(comps)
+        result = _fanout_agentic_results([], fanout)
+        assert len(result) == 0
+
+    def test_fanout_propagates_reclassification(self):
+        from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
+
+        comps = [
+            AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="a.yaml", line_number=1),
+            AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="b.yaml", line_number=5),
+        ]
+        deduped, fanout = _dedup_for_agentic(comps)
+        rep = deduped[0].model_copy(update={
+            "component_type": AIComponentType.MODEL_ENDPOINT,
+            "confidence": 0.9,
+            "needs_agentic": False,
+        })
+
+        result = _fanout_agentic_results([rep], fanout)
+        assert len(result) == 2
+        for c in result:
+            assert c.component_type == AIComponentType.MODEL_ENDPOINT
+            assert c.needs_agentic is False
+
+    def test_non_fanout_components_pass_through(self):
+        from aibom.scan_pipeline import _fanout_agentic_results
+
+        ep = AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="v.yaml", line_number=1)
+        result = _fanout_agentic_results([ep], {})
+        assert len(result) == 1
+        assert result[0].instance_id == ep.instance_id

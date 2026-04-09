@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 from ..models import (
     AIComponent,
+    AIComponentType,
     ComponentRelationship,
     DetectionSource,
     RelationshipType,
@@ -355,6 +356,102 @@ class _AgenticResultCache:
         return enriched, all_new, all_rels, all_flags
 
 
+_MEMO_SAFE_TYPES: frozenset[str] = frozenset({
+    "dependency", "model", "model_artifact", "embedding",
+})
+
+
+class _DecisionMemo:
+    """Intra-run cache of agent verdicts for context-free component types.
+
+    Only components whose type is in ``_MEMO_SAFE_TYPES`` are eligible.
+    Keyed by ``(canonical_name, component_type)`` so the same package/model
+    encountered in a later tier or sub-agent group reuses the earlier verdict
+    without an additional LLM call.
+    """
+
+    def __init__(self) -> None:
+        self._verdicts: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _key(self, c: AIComponent) -> tuple[str, str] | None:
+        if c.component_type.value not in _MEMO_SAFE_TYPES:
+            return None
+        canonical = (c.model_name or c.name).lower().strip()
+        return (canonical, c.component_type.value)
+
+    def record(self, c_before: AIComponent, c_after: AIComponent | None) -> None:
+        """Record the agent's verdict for *c_before*.
+
+        *c_after* is the enriched component after the agent processed it,
+        or ``None`` if the agent removed it.
+        """
+        k = self._key(c_before)
+        if k is None:
+            return
+        if c_after is None:
+            self._verdicts[k] = {"action": "remove"}
+        elif c_after.component_type != c_before.component_type:
+            self._verdicts[k] = {
+                "action": "reclassify",
+                "new_type": c_after.component_type.value,
+                "confidence": c_after.confidence,
+            }
+        else:
+            self._verdicts[k] = {
+                "action": "keep",
+                "confidence": c_after.confidence,
+            }
+
+    def lookup(self, c: AIComponent) -> dict[str, Any] | None:
+        k = self._key(c)
+        return self._verdicts.get(k) if k else None
+
+    def partition(
+        self, components: list[AIComponent],
+    ) -> tuple[list[AIComponent], list[AIComponent]]:
+        """Split into (memo_hits, memo_misses)."""
+        hits: list[AIComponent] = []
+        misses: list[AIComponent] = []
+        for c in components:
+            if self.lookup(c) is not None:
+                hits.append(c)
+            else:
+                misses.append(c)
+        return hits, misses
+
+    def apply(self, components: list[AIComponent]) -> list[AIComponent]:
+        """Apply cached verdicts.  Returns only kept/reclassified components."""
+        result: list[AIComponent] = []
+        for c in components:
+            verdict = self.lookup(c)
+            if verdict is None:
+                result.append(c)
+                continue
+            action = verdict["action"]
+            if action == "remove":
+                continue
+            elif action == "reclassify":
+                try:
+                    new_type = AIComponentType(verdict["new_type"])
+                except ValueError:
+                    result.append(c)
+                    continue
+                result.append(c.model_copy(update={
+                    "component_type": new_type,
+                    "confidence": verdict.get("confidence", c.confidence),
+                    "needs_agentic": False,
+                }))
+            else:
+                result.append(c.model_copy(update={
+                    "confidence": verdict.get("confidence", c.confidence),
+                    "needs_agentic": False,
+                }))
+        return result
+
+    def __len__(self) -> int:
+        return len(self._verdicts)
+
+
 def _degraded_batch_components(
     batch: list[AIComponent],
     *,
@@ -552,53 +649,79 @@ async def _run_batches_parallel(
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
-    """Run locality-aware batches (ordered) with a circuit breaker.
+    """Run locality-aware batches with a concurrency-limited semaphore.
 
-    Batches are processed sequentially so consecutive failures are defined in
-    a stable order.  *max_concurrent* is accepted for API compatibility with
-    the CLI but does not enable overlapping invocations here.
+    Up to *max_concurrent* batches are in-flight simultaneously.  A shared
+    circuit breaker cancels remaining work after *max_consecutive_failures*
+    sequential failures (checked per-window, not globally across in-flight
+    batches, to avoid race conditions).
     """
-    del max_concurrent
+    sem = asyncio.Semaphore(max_concurrent)
+    tripped = asyncio.Event()
+    total = len(batches)
+
+    _BatchResult = tuple[
+        int,  # idx (1-based)
+        list[AIComponent],
+        list[AIComponent],
+        list[ComponentRelationship],
+        list[RiskFlag],
+        bool,  # failed
+    ]
+
+    async def _guarded(idx: int, batch: list[AIComponent]) -> _BatchResult:
+        if tripped.is_set():
+            return idx, _circuit_breaker_skipped_batch(batch), [], [], [], True
+        async with sem:
+            if tripped.is_set():
+                return idx, _circuit_breaker_skipped_batch(batch), [], [], [], True
+            try:
+                enriched, new, rels, flags, failed = await _run_batch_async(
+                    agent, middleware, batch,
+                    relationships, scan_paths,
+                    idx, total,
+                    all_components=all_components,
+                    timeout_s=timeout_s,
+                )
+                return idx, enriched, new, rels, flags, failed
+            except Exception as exc:
+                _LOGGER.warning("Parallel batch %d raised: %s", idx, exc)
+                return idx, list(batch), [], [], [], True
+
+    tasks = [
+        asyncio.create_task(_guarded(idx, batch))
+        for idx, batch in enumerate(batches, 1)
+    ]
+
+    results: list[_BatchResult] = []
+    consecutive_failures = 0
+    for coro in asyncio.as_completed(tasks):
+        r = await coro
+        results.append(r)
+        _, _, _, _, _, failed = r
+        if failed:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+        if consecutive_failures >= max_consecutive_failures and not tripped.is_set():
+            _LOGGER.warning(
+                "Agentic circuit breaker tripped after %d consecutive failures — "
+                "cancelling remaining batches",
+                max_consecutive_failures,
+            )
+            tripped.set()
+
+    results.sort(key=lambda r: r[0])
 
     all_enriched: list[AIComponent] = []
     all_new: list[AIComponent] = []
     all_rels: list[ComponentRelationship] = []
     all_flags: list[RiskFlag] = []
-    consecutive_failures = 0
-
-    for idx, batch in enumerate(batches, 1):
-        if consecutive_failures >= max_consecutive_failures:
-            _LOGGER.warning(
-                "Agentic circuit breaker: skipping batches %d–%d after "
-                "%d consecutive failures",
-                idx, len(batches), max_consecutive_failures,
-            )
-            for b in batches[idx - 1:]:
-                all_enriched.extend(_circuit_breaker_skipped_batch(b))
-            break
-
-        try:
-            enriched, new, rels, flags, batch_failed = await _run_batch_async(
-                agent, middleware, batch,
-                relationships, scan_paths,
-                idx, len(batches),
-                all_components=all_components,
-                timeout_s=timeout_s,
-            )
-        except Exception as exc:
-            _LOGGER.warning("Parallel batch %d raised: %s", idx, exc)
-            all_enriched.extend(batch)
-            consecutive_failures += 1
-            continue
-
+    for _, enriched, new, rels, flags, _ in results:
         all_enriched.extend(enriched)
         all_new.extend(new)
         all_rels.extend(rels)
         all_flags.extend(flags)
-        if batch_failed:
-            consecutive_failures += 1
-        else:
-            consecutive_failures = 0
 
     return all_enriched, all_new, all_rels, all_flags
 
@@ -624,6 +747,7 @@ def _run_tier(
     all_components: list[AIComponent] | None,
     cache: _AgenticResultCache | None,
     *,
+    memo: _DecisionMemo | None = None,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
@@ -646,6 +770,15 @@ def _run_tier(
             tier_new.extend(n)
             tier_rels.extend(r)
             tier_flags.extend(f)
+
+    if memo is not None and to_send:
+        memo_hits, to_send = memo.partition(to_send)
+        if memo_hits:
+            _LOGGER.info(
+                "Memo hit for %d/%d components — reusing earlier verdicts",
+                len(memo_hits), len(memo_hits) + len(to_send),
+            )
+            tier_enriched.extend(memo.apply(memo_hits))
 
     if not to_send:
         return tier_enriched, tier_new, tier_rels, tier_flags
@@ -698,6 +831,14 @@ def _run_tier(
                 consecutive_failures += 1
             else:
                 consecutive_failures = 0
+
+    if memo is not None:
+        enriched_by_id = {c.instance_id: c for c in enriched}
+        for batch in batches:
+            for c_before in batch:
+                c_after = enriched_by_id.get(c_before.instance_id)
+                memo.record(c_before, c_after)
+        _LOGGER.info("Decision memo now holds %d verdicts", len(memo))
 
     if cache:
         for batch in batches:
@@ -802,6 +943,7 @@ def run_agentic_enrichment(
 
     cache = _AgenticResultCache(_default_agentic_cache_dir())
     middleware = AIBOMScannerMiddleware()
+    memo = _DecisionMemo()
 
     all_enriched: list[AIComponent] = []
     all_new: list[AIComponent] = []
@@ -809,7 +951,7 @@ def run_agentic_enrichment(
     all_flags: list[RiskFlag] = []
 
     tier_model = fast_model or model_string
-    simple_batch_size = max(batch_size, 15)
+    simple_batch_size = batch_size
     if simple:
         _LOGGER.info(
             "Tier 1 (simple confirmations): %d candidates via %s (batch=%d)",
@@ -820,6 +962,7 @@ def run_agentic_enrichment(
             agent, middleware, simple,
             deterministic_relationships, scan_paths,
             simple_batch_size, max_concurrent, deterministic_components, cache,
+            memo=memo,
             timeout_s=timeout_s,
             max_consecutive_failures=max_consecutive_failures,
         )
@@ -851,6 +994,7 @@ def run_agentic_enrichment(
                     agent, middleware, group,
                     deterministic_relationships, scan_paths,
                     batch_size, max_concurrent, deterministic_components, cache,
+                    memo=memo,
                     timeout_s=timeout_s,
                     max_consecutive_failures=max_consecutive_failures,
                 )
@@ -868,6 +1012,7 @@ def run_agentic_enrichment(
                 agent, middleware, complex_,
                 deterministic_relationships, scan_paths,
                 batch_size, max_concurrent, deterministic_components, cache,
+                memo=memo,
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
             )

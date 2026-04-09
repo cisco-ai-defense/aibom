@@ -605,10 +605,10 @@ def search_package_info_impl(package_name: str, ecosystem: str = "pypi") -> str:
 
     cached = _read_pkg_cache(package_name, ecosystem)
     if cached:
-        stats.setdefault("search_package_info", {}).setdefault("calls", []).append(
-            {"package": package_name, "ecosystem": ecosystem, "cached": True,
-             "elapsed_ms": int((time.monotonic() - t0) * 1000)}
-        )
+        elapsed = time.monotonic() - t0
+        entry = stats.setdefault("search_package_info", {"calls": 0, "total_s": 0.0, "errors": 0})
+        entry["calls"] += 1
+        entry["total_s"] += elapsed
         return json.dumps(cached)
 
     fetchers = {"pypi": _fetch_pypi, "npm": _fetch_npm, "go": _fetch_go}
@@ -619,10 +619,10 @@ def search_package_info_impl(package_name: str, ecosystem: str = "pypi") -> str:
     if "error" not in result:
         _write_pkg_cache(package_name, ecosystem, result)
 
-    stats.setdefault("search_package_info", {}).setdefault("calls", []).append(
-        {"package": package_name, "ecosystem": ecosystem, "cached": False,
-         "elapsed_ms": int((time.monotonic() - t0) * 1000)}
-    )
+    elapsed = time.monotonic() - t0
+    entry = stats.setdefault("search_package_info", {"calls": 0, "total_s": 0.0, "errors": 0})
+    entry["calls"] += 1
+    entry["total_s"] += elapsed
     return json.dumps(result)
 
 

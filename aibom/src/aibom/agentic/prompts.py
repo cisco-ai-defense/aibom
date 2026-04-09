@@ -88,11 +88,18 @@ You receive two lists:
 5. **Env var resolution**: For components with env var references, call
    `resolve_env_var` ONCE per variable.
 
-6. **Endpoint verification**: For `llm_endpoint` components, verify the
-   URL/env var actually points to an AI inference endpoint (Azure OpenAI,
-   Bedrock, Vertex, vLLM, etc.). Remove endpoints that point to non-AI
-   services (observability collectors, network management APIs, security
-   orchestration, auth providers, identity services, etc.).
+6. **Endpoint verification**: For `llm_endpoint` components, check the
+   surrounding config context to decide the correct type:
+   - If the key path references a vector database (Weaviate, Pinecone,
+     Qdrant, Chroma) → reclassify as `vector_store`.
+   - If the key path references an embedding deployment and points to an
+     AI provider → reclassify as `model_endpoint` (NOT `embedding`).
+   - If the endpoint serves an LLM for chat/completion → keep as
+     `llm_endpoint`.
+   - If the endpoint is for AI observability (LangSmith, Freeplay,
+     Traceloop) → reclassify as `observability`.
+   - If the endpoint is for generic telemetry (OTEL, Datadog, Prometheus),
+     auth, networking, or any non-AI service → REMOVE.
 
 7. **Relationship discovery**: Using both lists, identify relationships
    (agent uses model, chain uses tool, service calls embedding, etc.).
@@ -110,6 +117,20 @@ You receive two lists:
 - experiment_tracker, model_registry, data_versioning, ml_pipeline
 - mcp_server, mcp_client, mcp_gateway, skill, guardrail
 - observability, secret, dependency
+
+## Type distinctions — avoid common misclassifications
+
+- **embedding** = an embedding MODEL identifier (e.g. text-embedding-ada-002,
+  all-MiniLM-L6-v2) or a class that GENERATES embeddings. NOT an endpoint
+  URL that happens to serve an embedding model.
+- **model_endpoint** = a URL/endpoint that serves ANY model, including
+  embedding models and guardrail models. Use for cloud-provider embedding
+  deployment endpoints, SageMaker inference endpoints, vLLM serving URLs, etc.
+- **llm_endpoint** = specifically an LLM chat/completion endpoint. A subset
+  of model_endpoint — use only when the endpoint serves a language model
+  for text generation.
+- **vector_store** = a vector database service endpoint (Weaviate, Pinecone,
+  Qdrant, Chroma, Milvus). NOT an LLM or embedding endpoint.
 
 ## Precision rules — what IS and IS NOT an AI component
 
