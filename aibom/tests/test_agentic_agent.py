@@ -482,6 +482,145 @@ class TestAgenticResultCache:
         assert cache2.get(key)["test"] is True
 
 
+class TestDecisionMemo:
+    """Intra-run decision memoization for context-free types."""
+
+    def test_memo_keys_context_free_types(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        dep = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="req.txt", line_number=1)
+        model = AIComponent(name="gpt-4o", component_type=AIComponentType.MODEL, file_path="a.py", line_number=1, model_name="gpt-4o")
+        emb = AIComponent(name="ada-002", component_type=AIComponentType.EMBEDDING, file_path="b.py", line_number=1)
+        artifact = AIComponent(name="model.onnx", component_type=AIComponentType.MODEL_ARTIFACT, file_path="c.py", line_number=1)
+
+        assert memo._key(dep) is not None
+        assert memo._key(model) is not None
+        assert memo._key(emb) is not None
+        assert memo._key(artifact) is not None
+
+    def test_memo_skips_context_dependent_types(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        endpoint = AIComponent(name="env:ENDPOINT", component_type=AIComponentType.LLM_ENDPOINT, file_path="v.yaml", line_number=5)
+        prompt = AIComponent(name="my-prompt", component_type=AIComponentType.PROMPT, file_path="p.py", line_number=1)
+        secret = AIComponent(name="api-key", component_type=AIComponentType.SECRET, file_path="s.py", line_number=1)
+
+        assert memo._key(endpoint) is None
+        assert memo._key(prompt) is None
+        assert memo._key(secret) is None
+
+    def test_record_and_lookup_keep(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        before = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="req.txt", line_number=1)
+        after = before.model_copy(update={"confidence": 0.95, "needs_agentic": False})
+
+        memo.record(before, after)
+        verdict = memo.lookup(before)
+        assert verdict is not None
+        assert verdict["action"] == "keep"
+        assert verdict["confidence"] == 0.95
+
+    def test_record_and_lookup_remove(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        before = AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="req.txt", line_number=5)
+
+        memo.record(before, None)
+        verdict = memo.lookup(before)
+        assert verdict is not None
+        assert verdict["action"] == "remove"
+
+    def test_record_and_lookup_reclassify(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        before = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="cfg.yaml", line_number=3)
+        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "confidence": 0.9})
+
+        memo.record(before, after)
+        verdict = memo.lookup(before)
+        assert verdict is not None
+        assert verdict["action"] == "reclassify"
+        assert verdict["new_type"] == "model_endpoint"
+        assert verdict["confidence"] == 0.9
+
+    def test_partition_separates_hits_and_misses(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        c1 = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a.txt", line_number=1)
+        memo.record(c1, c1.model_copy(update={"confidence": 0.9, "needs_agentic": False}))
+
+        c1_dup = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="c.txt", line_number=3)
+        c2 = AIComponent(name="flask", component_type=AIComponentType.DEPENDENCY, file_path="b.txt", line_number=2)
+        hits, misses = memo.partition([c1_dup, c2])
+        assert len(hits) == 1
+        assert hits[0].name == "torch"
+        assert len(misses) == 1
+        assert misses[0].name == "flask"
+
+    def test_apply_keeps(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        c = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
+        memo.record(c, c.model_copy(update={"confidence": 0.95}))
+
+        result = memo.apply([c])
+        assert len(result) == 1
+        assert result[0].confidence == 0.95
+        assert result[0].needs_agentic is False
+
+    def test_apply_removes(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        c = AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
+        memo.record(c, None)
+
+        result = memo.apply([c])
+        assert len(result) == 0
+
+    def test_apply_reclassifies(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        before = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="x.yaml", line_number=1)
+        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "confidence": 0.85})
+        memo.record(before, after)
+
+        dup = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="y.yaml", line_number=5)
+        result = memo.apply([dup])
+        assert len(result) == 1
+        assert result[0].component_type == AIComponentType.MODEL_ENDPOINT
+        assert result[0].confidence == 0.85
+        assert result[0].needs_agentic is False
+
+    def test_context_dependent_skips_memo(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        ep = AIComponent(name="env:WEAVIATE_EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="v.yaml", line_number=1)
+        memo.record(ep, ep.model_copy(update={"component_type": AIComponentType.VECTOR_STORE}))
+
+        assert memo.lookup(ep) is None
+        assert len(memo) == 0
+
+    def test_len(self):
+        from aibom.agentic.agent import _DecisionMemo
+
+        memo = _DecisionMemo()
+        assert len(memo) == 0
+        c = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
+        memo.record(c, c.model_copy(update={"confidence": 0.9}))
+        assert len(memo) == 1
+
+
 class TestSubAgentGrouping:
     """Sub-agent dispatch groups components by scan root."""
 

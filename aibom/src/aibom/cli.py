@@ -599,12 +599,16 @@ def analyze(
     agentic_batch_size: int = typer.Option(
         5,
         "--agentic-batch-size",
-        help="Max components per agentic LLM invocation (default 5).",
+        help="Components per agentic LLM invocation (1–50, default 5).",
+        min=1,
+        max=50,
     ),
     agentic_concurrency: int = typer.Option(
         1,
         "--agentic-concurrency",
-        help="Max parallel agentic LLM batches (default 1, sequential).",
+        help="Max parallel agentic LLM batches (1–8, default 1).",
+        min=1,
+        max=8,
     ),
     agentic_fast_model: Optional[str] = typer.Option(
         None,

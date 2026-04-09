@@ -99,6 +99,69 @@ def _consolidation_key(c: "AIComponent") -> tuple[str, str]:
     return (canonical, c.component_type.value)
 
 
+_CONTEXT_FREE_TYPES: frozenset[str] = frozenset({
+    "dependency", "model", "model_artifact", "embedding",
+})
+
+
+def _dedup_for_agentic(
+    components: list["AIComponent"],
+) -> tuple[list["AIComponent"], dict[str, list["AIComponent"]]]:
+    """Collapse context-free duplicates before the agentic stage.
+
+    Returns (deduped_list, fanout_map) where fanout_map maps each
+    representative's instance_id to the list of all original instances
+    sharing the same consolidation key.  Context-dependent components
+    (env vars, endpoints, prompts, secrets) pass through unchanged.
+    """
+    from collections import OrderedDict
+
+    fanout: dict[str, list["AIComponent"]] = {}
+    groups: OrderedDict[tuple, list["AIComponent"]] = OrderedDict()
+    passthrough: list["AIComponent"] = []
+
+    for c in components:
+        if c.component_type.value not in _CONTEXT_FREE_TYPES:
+            passthrough.append(c)
+            continue
+        key = _consolidation_key(c)
+        groups.setdefault(key, []).append(c)
+
+    representatives: list["AIComponent"] = []
+    for _key, group in groups.items():
+        rep = max(group, key=lambda c: len(c.metadata) + len(c.description or ""))
+        representatives.append(rep)
+        fanout[rep.instance_id] = group
+
+    return representatives + passthrough, fanout
+
+
+def _fanout_agentic_results(
+    enriched: list["AIComponent"],
+    fanout: dict[str, list["AIComponent"]],
+) -> list["AIComponent"]:
+    """Propagate agentic enrichments from representatives to all instances."""
+    result: list["AIComponent"] = []
+    for c in enriched:
+        siblings = fanout.get(c.instance_id)
+        if not siblings or len(siblings) <= 1:
+            result.append(c)
+            continue
+        for sib in siblings:
+            clone = sib.model_copy(deep=True)
+            clone.confidence = c.confidence
+            clone.needs_agentic = c.needs_agentic
+            if c.model_name:
+                clone.model_name = c.model_name
+            if c.component_type != sib.component_type:
+                clone.component_type = c.component_type
+            for k, v in c.metadata.items():
+                if k not in sib.metadata:
+                    clone.metadata[k] = v
+            result.append(clone)
+    return result
+
+
 _TEST_PATH_SEGMENTS: frozenset[str] = frozenset({
     "tests", "test", "__tests__", "spec", "testing", "testdata",
     "test_data", "fixtures",
@@ -536,10 +599,17 @@ class ScanPipeline:
             return components, relationships, []
 
         try:
+            deduped, fanout = _dedup_for_agentic(components)
+            if len(deduped) < len(components):
+                _LOGGER.info(
+                    "Pre-agentic dedup: %d → %d components (%d context-free duplicates removed)",
+                    len(components), len(deduped), len(components) - len(deduped),
+                )
+
             model_str = self.llm_config["model"]
             enriched, agentic_rels, agentic_flags = run_agentic_enrichment(
                 model_string=model_str,
-                deterministic_components=components,
+                deterministic_components=deduped,
                 deterministic_relationships=relationships,
                 scan_paths=self.scan_paths,
                 llm_config=self.llm_config,
@@ -548,6 +618,7 @@ class ScanPipeline:
                 fast_model=self.agentic_fast_model,
                 timeout_s=self.agentic_timeout,
             )
+            enriched = _fanout_agentic_results(enriched, fanout)
             relationships = relationships + agentic_rels
             return enriched, relationships, agentic_flags
 
