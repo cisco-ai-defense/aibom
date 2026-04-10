@@ -162,6 +162,39 @@ def _fanout_agentic_results(
     return result
 
 
+def _propagate_removals(
+    sent: list["AIComponent"],
+    received: list["AIComponent"],
+) -> list["AIComponent"]:
+    """If the agent removed ANY instance of (name, type), remove ALL.
+
+    The agent processes each instance independently and sometimes makes
+    inconsistent decisions (removes the usage at line 595 but keeps the
+    import at line 85).  This function treats a removal of *any* instance
+    as a removal of the logical component, keyed by consolidation key.
+    """
+    sent_ids = {c.instance_id for c in sent}
+    received_ids = {c.instance_id for c in received}
+    removed_ids = sent_ids - received_ids
+    if not removed_ids:
+        return received
+
+    removed_keys: set[tuple] = set()
+    for c in sent:
+        if c.instance_id in removed_ids:
+            removed_keys.add(_consolidation_key(c))
+
+    result = [c for c in received if _consolidation_key(c) not in removed_keys]
+    dropped = len(received) - len(result)
+    if dropped:
+        _LOGGER.info(
+            "Removal propagation: dropped %d additional component(s) "
+            "matching %d removal key(s)",
+            dropped, len(removed_keys),
+        )
+    return result
+
+
 _TEST_PATH_SEGMENTS: frozenset[str] = frozenset({
     "tests", "test", "__tests__", "spec", "testing", "testdata",
     "test_data", "fixtures",
@@ -619,6 +652,7 @@ class ScanPipeline:
                 timeout_s=self.agentic_timeout,
             )
             enriched = _fanout_agentic_results(enriched, fanout)
+            enriched = _propagate_removals(deduped, enriched)
             relationships = relationships + agentic_rels
             return enriched, relationships, agentic_flags
 
