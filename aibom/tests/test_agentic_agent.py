@@ -240,6 +240,64 @@ class TestRunAgenticEnrichment:
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_cached_rerun_replays_new_components(self, mock_create, _mock_build, _mock_close, tmp_path):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        agent_response = json.dumps({
+            "enriched_components": [],
+            "new_components": [
+                {
+                    "name": "agent-found-model",
+                    "component_type": "model",
+                    "file_path": "new.py",
+                    "line_number": 1,
+                    "framework": "openai",
+                    "model_name": "gpt-5",
+                }
+            ],
+            "new_relationships": [],
+            "risk_findings": [],
+        })
+
+        mock_agent = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.content = agent_response
+        mock_agent.invoke.return_value = {"messages": [mock_msg]}
+        mock_create.return_value = mock_agent
+
+        det_comps = [
+            AIComponent(
+                name="existing",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="app.py",
+                line_number=1,
+            )
+        ]
+
+        with patch(
+            "aibom.agentic.agent._default_agentic_cache_dir",
+            return_value=tmp_path / "agentic-cache",
+        ):
+            fresh, _, _ = run_agentic_enrichment(
+                model_string="test-model",
+                deterministic_components=det_comps,
+                deterministic_relationships=[],
+                scan_paths=["/tmp"],
+            )
+            cached, _, _ = run_agentic_enrichment(
+                model_string="test-model",
+                deterministic_components=det_comps,
+                deterministic_relationships=[],
+                scan_paths=["/tmp"],
+            )
+
+        assert {c.name for c in fresh} == {"existing", "agent-found-model"}
+        assert {c.name for c in cached} == {c.name for c in fresh}
+        assert mock_agent.invoke.call_count == 1
+
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
     def test_handles_agent_failure_gracefully(self, mock_create, _mock_build, _mock_close):
         from aibom.agentic.agent import run_agentic_enrichment
 
@@ -490,6 +548,155 @@ class TestAgenticResultCache:
         cache2 = _AgenticResultCache(cache_dir)
         assert cache2.get(key) is not None
         assert cache2.get(key)["test"] is True
+
+    def test_apply_cached_replays_full_component_snapshot(self, tmp_path):
+        from aibom.agentic.agent import _AgenticResultCache, _component_cache_key
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        cache = _AgenticResultCache(tmp_path / "cache")
+        before = AIComponent(
+            name="ada-ep",
+            component_type=AIComponentType.EMBEDDING,
+            file_path="cfg.yaml",
+            line_number=3,
+            description="legacy description",
+            framework="legacy",
+            metadata={"old": True},
+            confidence=0.2,
+            agentic_hint="stale_hint",
+        )
+        after = before.model_copy(update={
+            "component_type": AIComponentType.MODEL_ENDPOINT,
+            "description": "",
+            "framework": "openai",
+            "metadata": {"verified": True},
+            "confidence": 0.97,
+            "agentic_hint": "",
+            "needs_agentic": False,
+        })
+        cache.put(_component_cache_key(before), {
+            "cached_component": after.model_dump(mode="json"),
+            "enriched_components": [],
+            "new_components": [],
+            "remove_components": [],
+            "reclassify_components": [],
+            "new_relationships": [],
+            "risk_findings": [],
+        })
+
+        enriched, new, rels, flags = cache.apply_cached([before], AIBOMScannerMiddleware())
+
+        assert new == []
+        assert rels == []
+        assert flags == []
+        assert len(enriched) == 1
+        assert enriched[0].component_type == AIComponentType.MODEL_ENDPOINT
+        assert enriched[0].description == ""
+        assert enriched[0].framework == "openai"
+        assert enriched[0].metadata == {"verified": True}
+        assert enriched[0].confidence == 0.97
+        assert enriched[0].agentic_hint == ""
+        assert enriched[0].needs_agentic is False
+
+
+class TestRunTier:
+    def test_tier_cache_hit_populates_memo(self, tmp_path):
+        from aibom.agentic.agent import (
+            _AgenticResultCache,
+            _DecisionMemo,
+            _build_tier_cache_payload,
+            _run_tier,
+            _tier_cache_key,
+        )
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        comp = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="app.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        cached = comp.model_copy(update={"confidence": 0.99, "needs_agentic": False})
+        cache = _AgenticResultCache(tmp_path / "cache")
+        cache.put(_tier_cache_key([comp]), _build_tier_cache_payload([cached], [], [], []))
+
+        memo = _DecisionMemo()
+        agent = MagicMock()
+        enriched, new, rels, flags = _run_tier(
+            agent=agent,
+            middleware=AIBOMScannerMiddleware(),
+            components=[comp],
+            relationships=[],
+            scan_paths=["/tmp"],
+            batch_size=4,
+            max_concurrent=1,
+            all_components=[comp],
+            cache=cache,
+            memo=memo,
+        )
+
+        agent.invoke.assert_not_called()
+        assert new == []
+        assert rels == []
+        assert flags == []
+        assert len(enriched) == 1
+        assert enriched[0].confidence == 0.99
+        assert memo.lookup(comp) == {"action": "keep", "confidence": 0.99}
+
+    def test_cache_only_fast_path_populates_memo(self, tmp_path):
+        from aibom.agentic.agent import _AgenticResultCache, _DecisionMemo, _component_cache_key, _run_tier
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        comp = AIComponent(
+            name="ada-ep",
+            component_type=AIComponentType.EMBEDDING,
+            file_path="cfg.yaml",
+            line_number=7,
+        )
+        cached = comp.model_copy(update={
+            "component_type": AIComponentType.MODEL_ENDPOINT,
+            "confidence": 0.91,
+            "needs_agentic": False,
+        })
+        cache = _AgenticResultCache(tmp_path / "cache")
+        cache.put(_component_cache_key(comp), {
+            "cached_component": cached.model_dump(mode="json"),
+            "enriched_components": [],
+            "new_components": [],
+            "remove_components": [],
+            "reclassify_components": [],
+            "new_relationships": [],
+            "risk_findings": [],
+        })
+
+        memo = _DecisionMemo()
+        agent = MagicMock()
+        enriched, new, rels, flags = _run_tier(
+            agent=agent,
+            middleware=AIBOMScannerMiddleware(),
+            components=[comp],
+            relationships=[],
+            scan_paths=["/tmp"],
+            batch_size=4,
+            max_concurrent=1,
+            all_components=[comp],
+            cache=cache,
+            memo=memo,
+        )
+
+        agent.invoke.assert_not_called()
+        assert new == []
+        assert rels == []
+        assert flags == []
+        assert len(enriched) == 1
+        assert enriched[0].component_type == AIComponentType.MODEL_ENDPOINT
+        assert enriched[0].confidence == 0.91
+        assert memo.lookup(comp) == {
+            "action": "reclassify",
+            "new_type": "model_endpoint",
+            "confidence": 0.91,
+        }
 
 
 class TestDecisionMemo:

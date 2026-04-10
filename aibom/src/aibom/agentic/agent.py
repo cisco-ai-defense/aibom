@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from ..models import (
     AIComponent,
@@ -343,6 +343,72 @@ def _component_cache_key(c: AIComponent) -> str:
     return _hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
+_TIER_CACHE_VERSION = 1
+
+
+def _tier_cache_key(components: list[AIComponent]) -> str:
+    """Derive a cache key for the exact inputs to one tier run."""
+    raw = "|".join(_component_cache_key(c) for c in components)
+    return f"tier_{_hashlib.sha256(raw.encode()).hexdigest()[:24]}"
+
+
+def _build_tier_cache_payload(
+    enriched: list[AIComponent],
+    new: list[AIComponent],
+    rels: list[ComponentRelationship],
+    flags: list[RiskFlag],
+) -> dict[str, Any]:
+    """Serialize the exact tier outputs for deterministic cache replay."""
+    return {
+        "_tier_cache_version": _TIER_CACHE_VERSION,
+        "tier_enriched": [c.model_dump(mode="json") for c in enriched],
+        "tier_new": [c.model_dump(mode="json") for c in new],
+        "tier_rels": [r.model_dump(mode="json") for r in rels],
+        "tier_flags": [f.model_dump(mode="json") for f in flags],
+    }
+
+
+def _load_tier_cache_payload(
+    data: dict[str, Any] | None,
+) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]] | None:
+    """Deserialize a cached tier payload, returning None for non-tier entries."""
+    if not data or data.get("_tier_cache_version") != _TIER_CACHE_VERSION:
+        return None
+    return (
+        [AIComponent.model_validate(item) for item in data.get("tier_enriched", [])],
+        [AIComponent.model_validate(item) for item in data.get("tier_new", [])],
+        [ComponentRelationship.model_validate(item) for item in data.get("tier_rels", [])],
+        [RiskFlag.model_validate(item) for item in data.get("tier_flags", [])],
+    )
+
+
+def _load_cached_component_snapshot(data: dict[str, Any] | None) -> AIComponent | None:
+    """Deserialize a full component snapshot from the per-component cache."""
+    if not data:
+        return None
+    raw_component = data.get("cached_component")
+    if not isinstance(raw_component, dict):
+        return None
+    try:
+        return AIComponent.model_validate(raw_component)
+    except ValidationError:
+        return None
+
+
+def _record_memo_verdicts(
+    memo: _DecisionMemo | None,
+    original_components: list[AIComponent],
+    enriched_components: list[AIComponent],
+) -> None:
+    """Populate the decision memo from resolved tier outputs."""
+    if memo is None:
+        return
+    enriched_by_id = {c.instance_id: c for c in enriched_components}
+    for c_before in original_components:
+        memo.record(c_before, enriched_by_id.get(c_before.instance_id))
+    _LOGGER.info("Decision memo now holds %d verdicts", len(memo))
+
+
 class _AgenticResultCache:
     """In-process + optional on-disk cache for agentic batch results.
 
@@ -409,8 +475,12 @@ class _AgenticResultCache:
             data = self.get(key)
             if data:
                 new, rels, flags = middleware.extract_findings_from_dict(data)
-                enriched_batch = middleware.apply_enrichments_from_dict([c], data)
-                enriched.extend(enriched_batch)
+                cached_component = _load_cached_component_snapshot(data)
+                if cached_component is not None:
+                    enriched.append(cached_component)
+                else:
+                    enriched_batch = middleware.apply_enrichments_from_dict([c], data)
+                    enriched.extend(enriched_batch)
                 all_new.extend(new)
                 all_rels.extend(rels)
                 all_flags.extend(flags)
@@ -819,6 +889,17 @@ def _run_tier(
     tier_new: list[AIComponent] = []
     tier_rels: list[ComponentRelationship] = []
     tier_flags: list[RiskFlag] = []
+    tier_cache_key = _tier_cache_key(components) if cache else None
+
+    if cache and tier_cache_key is not None:
+        cached_tier = _load_tier_cache_payload(cache.get(tier_cache_key))
+        if cached_tier is not None:
+            _record_memo_verdicts(memo, components, cached_tier[0])
+            _LOGGER.info(
+                "Tier cache hit for %d components — skipping LLM",
+                len(components),
+            )
+            return cached_tier
 
     to_send = components
     if cache:
@@ -841,9 +922,16 @@ def _run_tier(
                 "Memo hit for %d/%d components — reusing earlier verdicts",
                 len(memo_hits), len(memo_hits) + len(to_send),
             )
-            tier_enriched.extend(memo.apply(memo_hits))
+            memo_results = memo.apply(memo_hits)
+            tier_enriched.extend(memo_results)
 
     if not to_send:
+        _record_memo_verdicts(memo, components, tier_enriched)
+        if cache and tier_cache_key is not None:
+            cache.put(
+                tier_cache_key,
+                _build_tier_cache_payload(tier_enriched, tier_new, tier_rels, tier_flags),
+            )
         return tier_enriched, tier_new, tier_rels, tier_flags
 
     batches = _locality_aware_batches(to_send, batch_size)
@@ -960,31 +1048,43 @@ def _run_tier(
         rels.extend(retry_rels)
         flags.extend(retry_flags)
 
-    if memo is not None:
-        enriched_by_id = {c.instance_id: c for c in enriched}
-        for batch in batches:
-            for c_before in batch:
-                c_after = enriched_by_id.get(c_before.instance_id)
-                memo.record(c_before, c_after)
-        _LOGGER.info("Decision memo now holds %d verdicts", len(memo))
-
     if cache:
-        for batch in batches:
-            for c in batch:
-                key = _component_cache_key(c)
+        enriched_by_id = {c.instance_id: c for c in enriched}
+        all_batch_components = [c for batch in batches for c in batch]
+        for c_before in all_batch_components:
+            key = _component_cache_key(c_before)
+            c_after = enriched_by_id.get(c_before.instance_id)
+            if c_after is None:
                 cache.put(key, {
+                    "enriched_components": [],
+                    "new_components": [],
+                    "remove_components": [{"instance_id": c_before.instance_id, "reason": "cached_removal"}],
+                    "reclassify_components": [],
+                    "new_relationships": [],
+                    "risk_findings": [],
+                })
+            else:
+                entry: dict[str, Any] = {
+                    "cached_component": c_after.model_dump(mode="json"),
                     "enriched_components": [],
                     "new_components": [],
                     "remove_components": [],
                     "reclassify_components": [],
                     "new_relationships": [],
                     "risk_findings": [],
-                })
+                }
+                cache.put(key, entry)
 
     tier_enriched.extend(enriched)
     tier_new.extend(new)
     tier_rels.extend(rels)
     tier_flags.extend(flags)
+    _record_memo_verdicts(memo, components, tier_enriched)
+    if cache and tier_cache_key is not None:
+        cache.put(
+            tier_cache_key,
+            _build_tier_cache_payload(tier_enriched, tier_new, tier_rels, tier_flags),
+        )
     return tier_enriched, tier_new, tier_rels, tier_flags
 
 

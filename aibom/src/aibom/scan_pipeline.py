@@ -166,6 +166,8 @@ def _propagate_removals(
     sent: list["AIComponent"],
     received: list["AIComponent"],
     all_candidates: list["AIComponent"] | None = None,
+    *,
+    pre_fanout_removed_ids: set[str] | None = None,
 ) -> list["AIComponent"]:
     """If the agent removed ANY instance of (name, type), remove ALL.
 
@@ -177,10 +179,18 @@ def _propagate_removals(
     *all_candidates*, when provided, is the full pre-dedup component list.
     Removal keys are built from this wider set so that siblings that were
     never sent to the agent (collapsed by dedup) are also caught.
+
+    *pre_fanout_removed_ids*, when provided, is the set of instance_ids
+    absent from the enriched output *before* fanout.  This avoids a subtle
+    bug where fanout can re-introduce an instance_id from a different dedup
+    group, masking the removal.
     """
-    sent_ids = {c.instance_id for c in sent}
-    received_ids = {c.instance_id for c in received}
-    removed_ids = sent_ids - received_ids
+    if pre_fanout_removed_ids is not None:
+        removed_ids = pre_fanout_removed_ids
+    else:
+        sent_ids = {c.instance_id for c in sent}
+        received_ids = {c.instance_id for c in received}
+        removed_ids = sent_ids - received_ids
     if not removed_ids:
         return received
 
@@ -188,9 +198,16 @@ def _propagate_removals(
     for c in sent:
         if c.instance_id in removed_ids:
             removed_keys.add(_consolidation_key(c))
+    if not removed_keys:
+        return received
 
     lookup_pool = all_candidates if all_candidates is not None else received
-    result = [c for c in lookup_pool if _consolidation_key(c) not in removed_keys]
+    removed_iids = {c.instance_id for c in lookup_pool if _consolidation_key(c) in removed_keys}
+    result = [
+        c for c in lookup_pool
+        if _consolidation_key(c) not in removed_keys
+        and c.instance_id not in removed_iids
+    ]
     dropped = len(lookup_pool) - len(result)
     if dropped:
         _LOGGER.info(
@@ -722,9 +739,19 @@ class ScanPipeline:
                 fast_model=self.agentic_fast_model,
                 timeout_s=self.agentic_timeout,
             )
-            enriched = _fanout_agentic_results(enriched, fanout)
-            enriched = _propagate_removals(deduped, enriched, all_candidates=components)
+            deduped_ids = {c.instance_id for c in deduped}
+            enriched_deduped_ids = {c.instance_id for c in enriched if c.instance_id in deduped_ids}
+            new_components = [c for c in enriched if c.instance_id not in deduped_ids]
+            pre_fanout_removed = deduped_ids - enriched_deduped_ids
+            enriched_for_fanout = [c for c in enriched if c.instance_id in deduped_ids]
+            enriched = _fanout_agentic_results(enriched_for_fanout, fanout)
+            enriched = _propagate_removals(
+                deduped, enriched, all_candidates=components,
+                pre_fanout_removed_ids=pre_fanout_removed,
+            )
             enriched = _evidence_gate(components, enriched)
+            if new_components:
+                enriched = enriched + new_components
             relationships = relationships + agentic_rels
             return enriched, relationships, agentic_flags
 
