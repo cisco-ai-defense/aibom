@@ -87,7 +87,13 @@ You receive two lists:
    knowledge base. These are especially suspect — the name may match but
    the code may do something entirely different.
 
-4. **Model verification**: For each model name, call `lookup_model` ONCE.
+4. **Model verification (MANDATORY)**: For EVERY component typed `model`,
+   call `lookup_model` with the component name. A `model` component MUST be
+   a concrete model identifier — a string that resolves in a model registry
+   (e.g. `gpt-4`, `text-embedding-ada-002`, `meta-llama/Llama-3-70B`).
+   Python/Go class names are NEVER model identifiers. If `lookup_model`
+   returns `found: false` AND the name is a class/function name (not a model
+   string from code), REMOVE the component.
 
 5. **Env var resolution**: For components with env var references, call
    `resolve_env_var` ONCE per variable.
@@ -156,7 +162,10 @@ Apply these checks when processing each component by type:
   ConversationSummaryMemory). REMOVE if: it is a CRUD API handler, ORM
   entity, or request/response DTO for conversations (CreateConversation,
   GetConversation, UpdateConversation, ListConversation, *ReqBody,
-  *Response).
+  *Response). Pydantic BaseModel / dataclass / TypedDict subclasses with
+  only scalar fields (str, int, bool, Optional, enum) are request/response
+  DTOs — REMOVE them even if their class name contains Conversation,
+  History, or Memory.
 
 ## Precision rules — what IS and IS NOT an AI component
 

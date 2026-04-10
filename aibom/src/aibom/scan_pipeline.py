@@ -165,6 +165,7 @@ def _fanout_agentic_results(
 def _propagate_removals(
     sent: list["AIComponent"],
     received: list["AIComponent"],
+    all_candidates: list["AIComponent"] | None = None,
 ) -> list["AIComponent"]:
     """If the agent removed ANY instance of (name, type), remove ALL.
 
@@ -172,6 +173,10 @@ def _propagate_removals(
     inconsistent decisions (removes the usage at line 595 but keeps the
     import at line 85).  This function treats a removal of *any* instance
     as a removal of the logical component, keyed by consolidation key.
+
+    *all_candidates*, when provided, is the full pre-dedup component list.
+    Removal keys are built from this wider set so that siblings that were
+    never sent to the agent (collapsed by dedup) are also caught.
     """
     sent_ids = {c.instance_id for c in sent}
     received_ids = {c.instance_id for c in received}
@@ -184,14 +189,80 @@ def _propagate_removals(
         if c.instance_id in removed_ids:
             removed_keys.add(_consolidation_key(c))
 
-    result = [c for c in received if _consolidation_key(c) not in removed_keys]
-    dropped = len(received) - len(result)
+    lookup_pool = all_candidates if all_candidates is not None else received
+    result = [c for c in lookup_pool if _consolidation_key(c) not in removed_keys]
+    dropped = len(lookup_pool) - len(result)
     if dropped:
         _LOGGER.info(
             "Removal propagation: dropped %d additional component(s) "
             "matching %d removal key(s)",
             dropped, len(removed_keys),
         )
+    return result
+
+
+def _evidence_gate(
+    before_agentic: list["AIComponent"],
+    after_agentic: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Remove post-agentic components that lack hard evidence.
+
+    Two checks:
+
+    1. **model + kb_enrichment**: If the name does not resolve in any model
+       registry (LiteLLM, built-in regex, HuggingFace), auto-remove.  This
+       does NOT touch ``model_detector`` detections (string literals from
+       code) — only class-name-inferred components from ``kb_enrichment``.
+
+    2. **memory + kb_enrichment**: If the agent kept the component unchanged
+       (no enrichment, no reclassification), auto-remove.  A genuine memory
+       component should have been enriched with specifics.
+    """
+    from .models.enums import DetectionSource
+    from .scanners.model_detector import _registry_lookup
+
+    before_map: dict[str, "AIComponent"] = {c.instance_id: c for c in before_agentic}
+
+    result: list["AIComponent"] = []
+    gate_removed = 0
+    for c in after_agentic:
+        orig = before_map.get(c.instance_id)
+        if orig is None:
+            result.append(c)
+            continue
+
+        if (
+            c.component_type == AIComponentType.MODEL
+            and orig.detection_source == DetectionSource.KB_ENRICHMENT
+            and _registry_lookup(c.name) is None
+        ):
+            _LOGGER.info(
+                "Evidence gate removed model '%s' (%s): "
+                "not found in any model registry and detection_source=kb_enrichment",
+                c.name, c.instance_id,
+            )
+            gate_removed += 1
+            continue
+
+        if (
+            c.component_type == AIComponentType.MEMORY
+            and orig.detection_source == DetectionSource.KB_ENRICHMENT
+            and c.metadata == orig.metadata
+            and c.model_name == orig.model_name
+            and c.component_type == orig.component_type
+        ):
+            _LOGGER.info(
+                "Evidence gate removed memory '%s' (%s): "
+                "agent kept kb_enrichment component unchanged",
+                c.name, c.instance_id,
+            )
+            gate_removed += 1
+            continue
+
+        result.append(c)
+
+    if gate_removed:
+        _LOGGER.info("Evidence gate: removed %d component(s)", gate_removed)
     return result
 
 
@@ -652,7 +723,8 @@ class ScanPipeline:
                 timeout_s=self.agentic_timeout,
             )
             enriched = _fanout_agentic_results(enriched, fanout)
-            enriched = _propagate_removals(deduped, enriched)
+            enriched = _propagate_removals(deduped, enriched, all_candidates=components)
+            enriched = _evidence_gate(components, enriched)
             relationships = relationships + agentic_rels
             return enriched, relationships, agentic_flags
 
