@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .model_pinning import is_model_pinned
 from .models import (
     AIComponent,
     AIComponentType,
@@ -140,7 +141,7 @@ class RiskScorer:
         if (
             component.component_type.is_model_related
             and component.model_name
-            and not _is_pinned(component.model_name)
+            and not is_model_pinned(component.model_name)
         ):
             self._add_flag(risk, "unpinned_model", component)
 
@@ -171,14 +172,3 @@ class RiskScorer:
     def should_fail(self, risk: RiskScore, threshold: Severity) -> bool:
         """Return True if *risk* meets or exceeds the given severity threshold."""
         return risk.severity >= threshold
-
-
-def _is_pinned(model_name: str) -> bool:
-    """Heuristic: a model name is pinned if it contains a date or version suffix."""
-    parts = model_name.split("-")
-    for part in parts:
-        if part.isdigit() and len(part) >= 4:
-            return True
-        if any(c.isdigit() for c in part) and "." in part:
-            return True
-    return False

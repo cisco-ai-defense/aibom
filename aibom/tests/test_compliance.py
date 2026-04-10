@@ -106,6 +106,13 @@ def test_nist2_model_without_version_fails():
     assert row.status == "fail"
 
 
+def test_nist2_registry_style_model_passes():
+    m = AIComponent(name="m", component_type=AIComponentType.MODEL, model_name="acme-org/my-model")
+    r = evaluate_compliance(ScanResult(sources=[_src([m])]), ComplianceFramework.NIST_AI_RMF)
+    row = next(x for x in r.results if x.requirement_id == "nist-2")
+    assert row.status == "pass"
+
+
 def test_all_frameworks_evaluate():
     scan = ScanResult(sources=[_src([])])
     reports = [

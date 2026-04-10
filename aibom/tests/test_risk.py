@@ -78,6 +78,18 @@ def test_unpinned_model_flag():
     assert not any(f.flag == "unpinned_model" for f in r2.flags)
 
 
+def test_registry_style_model_does_not_trigger_unpinned_model_flag():
+    pinned = AIComponent(
+        name="m3",
+        component_type=AIComponentType.MODEL,
+        model_name="acme-org/my-model",
+    )
+    risk = RiskScorer().score(
+        ScanResult(sources=[SourceResult(path="c", components=[pinned])])
+    )
+    assert not any(f.flag == "unpinned_model" for f in risk.flags)
+
+
 def test_metadata_risk_flags_critical_cve():
     comp = AIComponent(
         name="dep",

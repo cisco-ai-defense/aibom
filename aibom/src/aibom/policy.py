@@ -23,8 +23,8 @@ from typing import Any, Optional
 import yaml
 from pydantic import BaseModel, Field
 
+from aibom.model_pinning import is_model_pinned
 from aibom.models import AIComponentType, ScanResult, Severity
-from aibom.risk import _is_pinned
 
 _DEFAULT_RULE_SEVERITY: dict[str, Severity] = {
     "no_hardcoded_keys": Severity.CRITICAL,
@@ -248,7 +248,7 @@ def evaluate_policy(policy: Policy, scan_result: ScanResult) -> PolicyResult:
                             file_path=c.file_path or None,
                         )
                     )
-                elif not _is_pinned(str(mn)):
+                elif not is_model_pinned(str(mn)):
                     violations.append(
                         PolicyViolation(
                             rule=kind.value,

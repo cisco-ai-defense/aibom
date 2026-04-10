@@ -110,6 +110,27 @@ def test_require_pinned_models_violation() -> None:
     assert any(v.rule == "require_pinned_models" for v in pr.violations)
 
 
+def test_require_pinned_models_accepts_registry_style_identifier() -> None:
+    pol = load_policy_from_dict({"require_pinned_models": True})
+    sr = ScanResult(
+        sources=[
+            SourceResult(
+                path=".",
+                components=[
+                    AIComponent(
+                        name="m",
+                        component_type=AIComponentType.MODEL,
+                        model_name="acme-org/my-model",
+                    )
+                ],
+            )
+        ]
+    )
+    pr = evaluate_policy(pol, sr)
+    assert pr.passed
+    assert pr.violations == []
+
+
 def test_max_risk_score_violation() -> None:
     pol = load_policy_from_dict({"max_risk_score": 10})
     risk = sr_risk_score(50)

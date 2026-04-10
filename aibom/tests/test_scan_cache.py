@@ -31,6 +31,20 @@ class TestCacheKey:
         k2 = cache_key([str(tmp_path)])
         assert k1 != k2
 
+    def test_changes_when_analysis_settings_change(self, tmp_path: Path) -> None:
+        f = tmp_path / "app.py"
+        f.write_text("x = 1\n")
+        k1 = cache_key([str(tmp_path)], {"strict": False, "llm_config": {"model": "gpt-5.4"}})
+        k2 = cache_key([str(tmp_path)], {"strict": True, "llm_config": {"model": "gpt-5.4"}})
+        assert k1 != k2
+
+    def test_analysis_settings_are_order_insensitive(self, tmp_path: Path) -> None:
+        f = tmp_path / "app.py"
+        f.write_text("x = 1\n")
+        s1 = {"strict": True, "llm_config": {"model": "gpt-5.4", "provider": "azure_openai"}}
+        s2 = {"llm_config": {"provider": "azure_openai", "model": "gpt-5.4"}, "strict": True}
+        assert cache_key([str(tmp_path)], s1) == cache_key([str(tmp_path)], s2)
+
 
 class TestSaveLoadClear:
     def test_round_trip(self, tmp_path: Path) -> None:
@@ -40,7 +54,7 @@ class TestSaveLoadClear:
         loaded = load_cached(cd, "abc123")
         assert loaded is not None
         assert loaded["components"] == [{"name": "test"}]
-        assert loaded["_cache_version"] == 1
+        assert loaded["_cache_version"] == 2
 
     def test_miss_returns_none(self, tmp_path: Path) -> None:
         cd = tmp_path / "cache"

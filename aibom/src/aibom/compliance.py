@@ -15,13 +15,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
-
-import re
 from enum import Enum
 from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
 
+from .model_pinning import is_model_pinned
 from .models.enums import AIComponentType, RelationshipType
 from .models.scan import AIComponent, ComponentRelationship, ScanResult
 
@@ -60,7 +59,6 @@ class ComplianceReport(BaseModel):
 
 
 _SECRET_HIGH_CONFIDENCE = 0.8
-_VERSIONISH = re.compile(r"\d+\.\d+|@[\w.\-]+:[\d.]+|==\s*[\d.]+")
 
 
 def _by_id(components: list[AIComponent]) -> dict[str, AIComponent]:
@@ -413,7 +411,7 @@ def check_nist_model_pinned(scan: ScanResult, req: ComplianceRequirement) -> Com
     bad: list[AIComponent] = []
     for m in models:
         mn = (m.model_name or m.name or "").strip()
-        if not mn or not (_VERSIONISH.search(mn) or "/" in mn):
+        if not is_model_pinned(mn):
             bad.append(m)
     if bad:
         return ComplianceCheckResult(
