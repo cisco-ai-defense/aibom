@@ -309,3 +309,39 @@ class TestFanoutAgenticResults:
         result = _fanout_agentic_results([ep], {})
         assert len(result) == 1
         assert result[0].instance_id == ep.instance_id
+
+
+class TestPropagateRemovals:
+    def test_prefanout_removed_ids_drop_all_matching_siblings(self):
+        from aibom.scan_pipeline import _propagate_removals
+
+        removed_rep = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="a.yaml",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        sibling = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="b.yaml",
+            line_number=2,
+            model_name="gpt-4o",
+        )
+        untouched = AIComponent(
+            name="gpt-5",
+            component_type=AIComponentType.MODEL,
+            file_path="c.yaml",
+            line_number=3,
+            model_name="gpt-5",
+        )
+
+        result = _propagate_removals(
+            sent=[removed_rep, untouched],
+            received=[untouched],
+            all_candidates=[removed_rep, sibling, untouched],
+            pre_fanout_removed_ids={removed_rep.instance_id},
+        )
+
+        assert [c.name for c in result] == ["gpt-5"]
