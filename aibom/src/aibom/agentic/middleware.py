@@ -41,6 +41,12 @@ from ..models import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _ckey(c: AIComponent) -> tuple[str, str]:
+    """Consolidation key matching ``scan_pipeline._consolidation_key``."""
+    canonical = (c.model_name or c.name).lower().strip()
+    return (canonical, c.component_type.value)
+
+
 class AIBOMScannerMiddleware:
     """Extracts structured AIBOM data from agent output.
 
@@ -95,6 +101,7 @@ class AIBOMScannerMiddleware:
         """
 
         remove_ids: set[str] = set()
+        remove_keys: set[tuple[str, str]] = set()
         for item in data.get("remove_components", []):
             iid = item.get("instance_id", "")
             if iid:
@@ -121,9 +128,31 @@ class AIBOMScannerMiddleware:
             if iid:
                 updates_by_id[iid] = item.get("updates", {})
 
+        existing_ids = {c.instance_id for c in existing}
+        unmatched_remove_ids = remove_ids - existing_ids
+        if unmatched_remove_ids:
+            id_to_key = {c.instance_id: _ckey(c) for c in existing}
+            for bad_id in unmatched_remove_ids:
+                name_part = bad_id.rsplit("_", 1)[0].rsplit("_", 1)[0] if "_" in bad_id else bad_id
+                for comp in existing:
+                    ck = id_to_key[comp.instance_id]
+                    if ck[0] == name_part.lower().strip():
+                        remove_keys.add(ck)
+                        _LOGGER.warning(
+                            "Removal fallback: agent returned unmatched id '%s'; "
+                            "matched consolidation key %s via component %s",
+                            bad_id, ck, comp.instance_id,
+                        )
+                        break
+
         result: list[AIComponent] = []
         for comp in existing:
             if comp.instance_id in remove_ids:
+                continue
+            if remove_keys and _ckey(comp) in remove_keys:
+                _LOGGER.info(
+                    "Removing %s via consolidation-key fallback", comp.instance_id,
+                )
                 continue
 
             new_type_str = reclassify_map.get(comp.instance_id)
