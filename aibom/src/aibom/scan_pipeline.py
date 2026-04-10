@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .cross_ref import (
@@ -518,6 +519,7 @@ class ScanPipeline:
         agentic_concurrency: int = 1,
         agentic_fast_model: str | None = None,
         agentic_timeout: int = 120,
+        agentic_cache_dir: str | Path | None = None,
     ) -> None:
         self.scan_paths = scan_paths
         self.output_format = output_format
@@ -533,6 +535,11 @@ class ScanPipeline:
         self.agentic_concurrency = agentic_concurrency
         self.agentic_fast_model = agentic_fast_model
         self.agentic_timeout = agentic_timeout
+        self.agentic_cache_dir = (
+            Path(agentic_cache_dir)
+            if agentic_cache_dir is not None
+            else None
+        )
 
     def run(self) -> PipelineResult:
         clear_cache()
@@ -738,6 +745,7 @@ class ScanPipeline:
                 max_concurrent=self.agentic_concurrency,
                 fast_model=self.agentic_fast_model,
                 timeout_s=self.agentic_timeout,
+                cache_dir=self.agentic_cache_dir,
             )
             deduped_ids = {c.instance_id for c in deduped}
             enriched_deduped_ids = {c.instance_id for c in enriched if c.instance_id in deduped_ids}

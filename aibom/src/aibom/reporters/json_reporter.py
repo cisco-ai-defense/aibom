@@ -62,14 +62,26 @@ def _components_by_type(components: Iterable[AIComponent]) -> dict[str, list[dic
     return grouped
 
 
+def _disambiguate_source_key(source_name: str, seen: dict[str, int]) -> str:
+    count = seen.get(source_name, 0) + 1
+    seen[source_name] = count
+    if count == 1:
+        return source_name
+    return f"{source_name}#{count}"
+
+
 def _aibom_payload(result: ScanResult) -> dict[str, Any]:
     base = result.model_dump(mode="json")
     sources_out: dict[str, dict[str, Any]] = {}
+    seen_source_names: dict[str, int] = {}
     for src in result.sources:
         comps = _components_by_type(src.components)
         total_components = sum(len(v) for v in comps.values())
-        source_key = _friendly_source_name(src.path)
+        source_name = _friendly_source_name(src.path)
+        source_key = _disambiguate_source_key(source_name, seen_source_names)
         sources_out[source_key] = {
+            "source_name": source_name,
+            "source_path": src.path,
             "components": comps,
             "relationships": [r.model_dump(mode="json") for r in src.relationships],
             "summary": {

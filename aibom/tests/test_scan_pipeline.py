@@ -136,6 +136,22 @@ class TestAgenticScope:
             result = pipeline.run()
         mock_enrich.assert_called_once()
 
+    def test_agentic_cache_dir_is_forwarded(self, tmp_path: Path) -> None:
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake", "api_base": "http://x"}
+        agentic_cache_dir = tmp_path / "scan-cache" / "agentic"
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config=llm_cfg,
+            agentic_cache_dir=agentic_cache_dir,
+        )
+        with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+            mock_enrich.return_value = ([], [], [])
+            pipeline.run()
+        assert mock_enrich.call_args.kwargs["cache_dir"] == agentic_cache_dir
+
 
 class TestFileCache:
     def test_cache_deduplicates(self, tmp_path: Path) -> None:

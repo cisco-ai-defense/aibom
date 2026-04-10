@@ -357,6 +357,38 @@ class TestExtractSourceFromImage:
             assert result.tier_used == "python_tarball"
             assert (out_dir / "app" / "main.py").exists()
 
+    @patch("aibom.scanners.container_extractor._find_binary")
+    @patch("aibom.scanners.container_extractor._find_runtime")
+    @patch("aibom.scanners.container_extractor._run_discovery")
+    @patch("aibom.scanners.container_extractor._identify_app_dirs")
+    @patch("aibom.scanners.container_extractor._run_extraction")
+    def test_directory_only_extraction_reports_no_files(
+        self,
+        mock_extract,
+        mock_identify,
+        mock_discovery,
+        mock_runtime,
+        mock_binary,
+    ):
+        mock_runtime.return_value = None
+        mock_binary.return_value = None
+        mock_discovery.return_value = (ImageConfig(workdir="/app"), ["/app/main.py"])
+        mock_identify.return_value = (["/app"], False, None)
+
+        def _extract_only_dirs(*args, **kwargs):
+            output_dir = args[3]
+            (output_dir / "app").mkdir(parents=True, exist_ok=True)
+            return True
+
+        mock_extract.side_effect = _extract_only_dirs
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td) / "out"
+            result = extract_source_from_image("image.tar", output_dir=out_dir, tier="tarball")
+
+        assert result.error == "Extraction succeeded but no files found"
+        assert result.extracted_dir is None
+
 
 class TestValidateTier:
     def test_all_valid_tiers_accepted(self):

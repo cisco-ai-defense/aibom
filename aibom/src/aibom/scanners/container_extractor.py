@@ -978,7 +978,7 @@ def extract_source_from_image(
         )
         return result
 
-    has_files = any(output_dir.rglob("*"))
+    has_files = any(path.is_file() for path in output_dir.rglob("*"))
     if not has_files:
         result.error = "Extraction succeeded but no files found"
         return result

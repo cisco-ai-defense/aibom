@@ -192,6 +192,36 @@ class TestLazyImport:
 class TestRunAgenticEnrichment:
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent._AgenticResultCache")
+    def test_explicit_cache_dir_overrides_default_agentic_cache(
+        self,
+        mock_cache_cls,
+        _mock_build,
+        _mock_close,
+        tmp_path,
+    ):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        cache_dir = tmp_path / "agentic-cache"
+        with patch(
+            "aibom.agentic.agent._default_agentic_cache_dir",
+            side_effect=AssertionError("default cache dir should not be used"),
+        ):
+            comps, rels, flags = run_agentic_enrichment(
+                model_string="test-model",
+                deterministic_components=[],
+                deterministic_relationships=[],
+                scan_paths=["/tmp"],
+                cache_dir=cache_dir,
+            )
+
+        mock_cache_cls.assert_called_once_with(cache_dir)
+        assert comps == []
+        assert rels == []
+        assert flags == []
+
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
     def test_merges_agent_output_into_components(self, mock_create, _mock_build, _mock_close):
         from aibom.agentic.agent import run_agentic_enrichment

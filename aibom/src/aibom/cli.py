@@ -14,7 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-
+import hashlib
 import json
 import logging
 import os
@@ -180,6 +180,58 @@ def _record_analysis_error(
         source_summary["status"] = "failed"
     elif source_summary.get("status") not in {"failed", "completed_with_errors"}:
         source_summary["status"] = "completed_with_errors"
+
+
+def _file_cache_fingerprint(path: Optional[Path]) -> Optional[dict[str, Any]]:
+    """Return a stable fingerprint for an explicit file-based analysis input."""
+    if path is None:
+        return None
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser()
+    info: dict[str, Any] = {"path": str(resolved)}
+    try:
+        info["sha256"] = hashlib.sha256(resolved.read_bytes()).hexdigest()[:16]
+    except OSError:
+        info["exists"] = resolved.exists()
+    return info
+
+
+def _scan_cache_settings(
+    *,
+    strict: bool,
+    min_severity: SeverityEnum,
+    llm_config: Optional[Dict[str, Any]],
+    agentic_scope: str,
+    agentic_batch_size: int,
+    agentic_concurrency: int,
+    agentic_fast_model: Optional[str],
+    agentic_timeout: int,
+    container_tier: str,
+    custom_catalog: Optional[Path],
+) -> Dict[str, Any]:
+    """Build a stable settings payload for persistent scan-cache keys."""
+    safe_llm = None
+    if llm_config:
+        safe_llm = {
+            "model": llm_config.get("model"),
+            "provider": llm_config.get("provider"),
+            "api_base": llm_config.get("api_base"),
+            "api_version": llm_config.get("api_version"),
+        }
+    return {
+        "strict": strict,
+        "min_severity": min_severity.value,
+        "llm_config": safe_llm,
+        "agentic_scope": agentic_scope,
+        "agentic_batch_size": agentic_batch_size,
+        "agentic_concurrency": agentic_concurrency,
+        "agentic_fast_model": agentic_fast_model,
+        "agentic_timeout": agentic_timeout,
+        "container_tier": container_tier,
+        "custom_catalog": _file_cache_fingerprint(custom_catalog),
+    }
 
 
 @app.callback(invoke_without_command=True)
@@ -915,6 +967,19 @@ def analyze(
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
         explicit_config = load_custom_catalog(Path(custom_catalog))
+    scan_cache_settings = _scan_cache_settings(
+        strict=strict,
+        min_severity=severity_filter,
+        llm_config=llm_config,
+        agentic_scope=agentic_scope,
+        agentic_batch_size=agentic_batch_size,
+        agentic_concurrency=agentic_concurrency,
+        agentic_fast_model=agentic_fast_model,
+        agentic_timeout=agentic_timeout,
+        container_tier=container_tier,
+        custom_catalog=custom_catalog,
+    )
+    agentic_cache_dir = cache_dir / "agentic" if cache_dir else None
 
     clone_managers: list[Any] = []
 
@@ -925,34 +990,44 @@ def analyze(
 
         from .multi_repo import is_git_url, ClonedRepo
 
-        if is_git_url(source):
-            try:
-                clone_ctx = ClonedRepo(source)
-                cloned_path = clone_ctx.__enter__()
-                clone_managers.append(clone_ctx)
-                path_to_analyze = cloned_path
-            except RuntimeError as exc:
-                console.print(f"[red]Clone failed:[/] {exc}")
-                continue
+        is_git = is_git_url(source)
+        if is_git:
             is_container = False
         else:
             is_container = is_container_image(source)
-            path_to_analyze = Path(source)
 
         source_summary = {
-            "source_kind": (
-                "git-url" if clone_ctx
-                else "container" if is_container
-                else "local-path"
-            ),
+            "source_kind": "git-url" if is_git else "container" if is_container else "local-path",
             "status": "in_progress",
             "status_detail": None,
             "assets_discovered": 0,
             "branches_scanned": None,
             "last_generated_at": None,
             "errors": [],
+            "source_name": str(source),
+            "source_path": str(source),
         }
         source_outcomes[source] = source_summary
+
+        if is_git:
+            try:
+                clone_ctx = ClonedRepo(source)
+                cloned_path = clone_ctx.__enter__()
+                clone_managers.append(clone_ctx)
+                path_to_analyze = cloned_path
+            except RuntimeError as exc:
+                message = f"Clone failed: {exc}"
+                console.print(f"[red]{message}[/]")
+                _record_analysis_error(
+                    run_errors,
+                    source_summary,
+                    source,
+                    message,
+                    severity="fatal",
+                )
+                continue
+        else:
+            path_to_analyze = Path(source)
 
         if is_container:
             logging.info(f"Source '{source}' detected as a container image.")
@@ -1031,7 +1106,7 @@ def analyze(
         if cache_dir:
             from .scan_cache import cache_key, load_cached, save_cached
 
-            _ck = cache_key([scan_path])
+            _ck = cache_key([scan_path], scan_cache_settings)
             cached = load_cached(cache_dir, _ck)
             if cached:
                 _scan_cache_hit = True
@@ -1054,6 +1129,7 @@ def analyze(
             agentic_concurrency=agentic_concurrency,
             agentic_fast_model=agentic_fast_model,
             agentic_timeout=agentic_timeout,
+            agentic_cache_dir=agentic_cache_dir,
         )
         with console.status(f"[cyan]Scanning {source}"):
             result = pipeline.run()
@@ -1104,7 +1180,7 @@ def analyze(
         if cache_dir and not _scan_cache_hit:
             from .scan_cache import cache_key, save_cached
 
-            _ck = cache_key([scan_path])
+            _ck = cache_key([scan_path], scan_cache_settings)
             _serializable = {
                 "_v2": True,
                 "components": [c.model_dump(mode="json") for c in result.components],

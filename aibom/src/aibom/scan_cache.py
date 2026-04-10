@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 
 
 def _git_info(path: str) -> tuple[str, str] | None:
@@ -71,8 +71,24 @@ def _mtime_hash(path: str) -> str:
     return h.hexdigest()[:16]
 
 
-def cache_key(scan_paths: list[str]) -> str:
-    """Derive a cache key from the scan paths."""
+def _normalize_settings(value: Any) -> Any:
+    """Convert cache settings into a deterministic, JSON-serializable shape."""
+    if isinstance(value, dict):
+        return {str(k): _normalize_settings(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_settings(v) for v in value]
+    if isinstance(value, Path):
+        try:
+            return str(value.resolve())
+        except OSError:
+            return str(value)
+    if hasattr(value, "value"):
+        return getattr(value, "value")
+    return value
+
+
+def cache_key(scan_paths: list[str], settings: dict[str, Any] | None = None) -> str:
+    """Derive a cache key from the scan paths and analysis settings."""
     parts: list[str] = []
     for p in sorted(scan_paths):
         info = _git_info(p)
@@ -81,7 +97,14 @@ def cache_key(scan_paths: list[str]) -> str:
             parts.append(f"{url}@{sha}")
         else:
             parts.append(f"{p}@{_mtime_hash(p)}")
-    combined = "|".join(parts)
+    combined = json.dumps(
+        {
+            "paths": parts,
+            "settings": _normalize_settings(settings or {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(combined.encode()).hexdigest()[:32]
 
 

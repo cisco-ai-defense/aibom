@@ -197,6 +197,22 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
         assert "summary" in src_data
 
 
+def test_json_reporter_disambiguates_colliding_source_names(sample_scan_result: ScanResult):
+    from unittest.mock import patch
+
+    buf = StringIO()
+    with patch("aibom.reporters.json_reporter._friendly_source_name", return_value="dup"):
+        get_reporter("json").render(sample_scan_result, buf)
+
+    data = json.loads(buf.getvalue())
+    sources = data["aibom_analysis"]["sources"]
+    assert set(sources.keys()) == {"dup", "dup#2"}
+    assert sources["dup"]["source_name"] == "dup"
+    assert sources["dup"]["source_path"] == "/proj/src/alpha"
+    assert sources["dup#2"]["source_name"] == "dup"
+    assert sources["dup#2"]["source_path"] == "/proj/src/beta"
+
+
 def test_plaintext_reporter_render(sample_scan_result: ScanResult):
     buf = StringIO()
     get_reporter("plaintext").render(sample_scan_result, buf)

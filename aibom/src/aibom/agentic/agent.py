@@ -1121,6 +1121,7 @@ def run_agentic_enrichment(
     fast_model: str | None = None,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    cache_dir: Path | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Run the full agentic enrichment pipeline.
 
@@ -1149,6 +1150,9 @@ def run_agentic_enrichment(
     fast_model:
         Optional cheaper/faster model for simple confirmations.
         Falls back to ``model_string`` if not provided.
+    cache_dir:
+        Optional on-disk cache directory override. When not provided, the
+        default agentic cache location is used.
 
     Returns
     -------
@@ -1169,7 +1173,7 @@ def run_agentic_enrichment(
         max_concurrent,
     )
 
-    cache = _AgenticResultCache(_default_agentic_cache_dir())
+    cache = _AgenticResultCache(cache_dir if cache_dir is not None else _default_agentic_cache_dir())
     middleware = AIBOMScannerMiddleware()
     memo = _DecisionMemo()
 
