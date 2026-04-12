@@ -152,9 +152,10 @@ class TestAgenticScope:
             scan_paths=[str(tmp_path)],
             llm_config=llm_cfg,
         )
-        with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
-            mock_enrich.return_value = ([], [], [])
-            result = pipeline.run()
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([], [], [])
+                result = pipeline.run()
         mock_enrich.assert_called_once()
 
     def test_agentic_cache_dir_is_forwarded(self, tmp_path: Path) -> None:
@@ -168,9 +169,10 @@ class TestAgenticScope:
             llm_config=llm_cfg,
             agentic_cache_dir=agentic_cache_dir,
         )
-        with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
-            mock_enrich.return_value = ([], [], [])
-            pipeline.run()
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([], [], [])
+                pipeline.run()
         assert mock_enrich.call_args.kwargs["cache_dir"] == agentic_cache_dir
 
     def test_include_code_snippets_is_forwarded(self, tmp_path: Path) -> None:

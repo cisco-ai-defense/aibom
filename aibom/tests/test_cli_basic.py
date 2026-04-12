@@ -75,9 +75,10 @@ def test_analyze_defaults_cache_root_for_scan_and_agentic(tmp_path):
     assert seen["agentic_cache_dir"] == shared_root / "agentic"
 
 
+@patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
 @patch("aibom.multi_repo.is_git_url", return_value=True)
 @patch("aibom.multi_repo.ClonedRepo")
-def test_analyze_records_clone_failures_in_json_output(mock_cloned_repo, _mock_is_git_url, tmp_path):
+def test_analyze_records_clone_failures_in_json_output(mock_cloned_repo, _mock_is_git_url, _mock_preflight, tmp_path):
     report = tmp_path / "report.json"
     mock_cloned_repo.return_value.__enter__.side_effect = RuntimeError("network down")
 

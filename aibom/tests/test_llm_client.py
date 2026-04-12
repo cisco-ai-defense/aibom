@@ -95,11 +95,18 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(result, "tool description here")
 
 
+@patch(
+    "aibom.llm_factory.ensure_llm_runtime_available",
+    side_effect=lambda model_string, *, provider=None: (
+        __import__("aibom.llm_factory", fromlist=["resolve_provider"])
+        .resolve_provider(model_string, provider)
+    ),
+)
 class TestBuildChatModel(unittest.TestCase):
     """Tests that _build_chat_model delegates correctly to llm_factory."""
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_plain_model(self, mock_init):
+    def test_plain_model(self, mock_init, _mock_preflight):
         mock_init.return_value = MagicMock()
         _build_chat_model({"model": "gpt-4o", "api_key": "k"})
         _, kwargs = mock_init.call_args
@@ -107,7 +114,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["api_key"], "k")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_provider_prefix_bedrock(self, mock_init):
+    def test_provider_prefix_bedrock(self, mock_init, _mock_preflight):
         mock_init.return_value = MagicMock()
         _build_chat_model({"model": "bedrock/anthropic.claude-3-5-sonnet"})
         args, kwargs = mock_init.call_args
@@ -115,7 +122,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["model_provider"], "bedrock")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_explicit_provider_in_config(self, mock_init):
+    def test_explicit_provider_in_config(self, mock_init, _mock_preflight):
         """provider key in config is forwarded to build_chat_model."""
         mock_init.return_value = MagicMock()
         _build_chat_model({
@@ -127,7 +134,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["model_provider"], "bedrock")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_azure_endpoint_routing(self, mock_init):
+    def test_azure_endpoint_routing(self, mock_init, _mock_preflight):
         mock_init.return_value = MagicMock()
         _build_chat_model({
             "model": "gpt-4o",
@@ -143,7 +150,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertNotIn("base_url", kwargs)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_base_url_passthrough(self, mock_init):
+    def test_base_url_passthrough(self, mock_init, _mock_preflight):
         mock_init.return_value = MagicMock()
         _build_chat_model({
             "model": "llama3",
@@ -154,7 +161,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["base_url"], "http://localhost:11434")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_max_tokens_100(self, mock_init):
+    def test_max_tokens_100(self, mock_init, _mock_preflight):
         """llm_client sets max_tokens=100 for short extraction prompts."""
         mock_init.return_value = MagicMock()
         _build_chat_model({"model": "gpt-4o"})

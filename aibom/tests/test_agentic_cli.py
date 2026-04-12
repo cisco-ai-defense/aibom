@@ -133,6 +133,9 @@ class TestAgenticEnrichmentViaCLI:
         self, monkeypatch, sample_dir, tmp_path
     ):
         out = tmp_path / "report.txt"
+
+        monkeypatch.setattr("aibom.llm_factory.init_chat_model", lambda *a, **k: None)
+
         real_import_module = importlib.import_module
 
         def fake_import_module(name: str, package: str | None = None):
