@@ -55,10 +55,12 @@ class TestAgenticEnrichmentViaCLI:
         assert result.exit_code == 1
         assert "llm-model" in result.output.lower() or "AIBOM_LLM_MODEL" in result.output
 
+    @patch("aibom.scan_pipeline.ensure_llm_runtime_available", return_value=None)
+    @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_llm_model_triggers_agentic_enrichment(self, mock_create, _mock_build, _mock_close, sample_dir, tmp_path):
+    def test_llm_model_triggers_agentic_enrichment(self, mock_create, _mock_build, _mock_close, _mock_cli_preflight, _mock_pipeline_preflight, sample_dir, tmp_path):
         out = tmp_path / "report.txt"
         agent_response = json.dumps({
             "enriched_components": [],
