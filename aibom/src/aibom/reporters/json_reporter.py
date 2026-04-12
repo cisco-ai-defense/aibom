@@ -30,6 +30,7 @@ from .base import BaseReporter
 _LOGGER = logging.getLogger(__name__)
 
 _REMOTE_ORG_REPO_RE = re.compile(r"[/:]([^/]+)/([^/]+?)(?:\.git)?$")
+REPORT_SCHEMA_VERSION = "1"
 
 
 def _friendly_source_name(path: str) -> str:
@@ -72,28 +73,38 @@ def _disambiguate_source_key(source_name: str, seen: dict[str, int]) -> str:
 
 def _aibom_payload(result: ScanResult) -> dict[str, Any]:
     base = result.model_dump(mode="json")
+    raw_metadata = dict(base["metadata"])
+    source_outcomes = raw_metadata.pop("source_outcomes", {})
+    source_details = raw_metadata.pop("_report_source_details", {})
+    raw_metadata.setdefault("report_schema_version", REPORT_SCHEMA_VERSION)
     sources_out: dict[str, dict[str, Any]] = {}
     seen_source_names: dict[str, int] = {}
     for src in result.sources:
         comps = _components_by_type(src.components)
         total_components = sum(len(v) for v in comps.values())
-        source_name = _friendly_source_name(src.path)
+        detail = source_outcomes.get(src.path) or source_details.get(src.path) or {}
+        source_name = detail.get("source_name") or _friendly_source_name(src.path)
         source_key = _disambiguate_source_key(source_name, seen_source_names)
+        source_path = detail.get("source_path") or src.path
+        source_kind = detail.get("source_kind") or "local-path"
         sources_out[source_key] = {
             "source_name": source_name,
-            "source_path": src.path,
+            "source_path": source_path,
             "components": comps,
             "relationships": [r.model_dump(mode="json") for r in src.relationships],
             "summary": {
-                "status": "completed",
-                "source_kind": "local-path",
-                "assets_discovered": total_components,
-                "last_generated_at": base["metadata"].get("completed_at"),
+                "status": detail.get("status") or "completed",
+                "source_kind": source_kind,
+                "assets_discovered": detail.get("assets_discovered") or total_components,
+                "last_generated_at": (
+                    detail.get("last_generated_at")
+                    or raw_metadata.get("completed_at")
+                ),
             },
         }
     return {
         "aibom_analysis": {
-            "metadata": base["metadata"],
+            "metadata": raw_metadata,
             "sources": sources_out,
             "summary": result.summary,
             "risk": base["risk"],

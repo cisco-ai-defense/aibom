@@ -29,6 +29,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from .cross_ref import (
@@ -39,10 +40,12 @@ from .cross_ref import (
     detect_external_repo_deps,
     resolve_components,
 )
+from .llm_factory import ensure_llm_runtime_available
 from .models import ScanContext
 from .models.enums import AIComponentType
 from .models.scan import AIComponent, ComponentRelationship
 from .scanners import run_scanners
+from .scanners.dependency_scanner import discover_ai_package_set, is_known_ai_package
 from .scanners.file_cache import cache_stats, clear_cache
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,12 +75,12 @@ class PipelineResult:
     total_elapsed_s: float = 0.0
 
 
-def _service_dir(file_path: str, scan_paths: list[str] | None = None) -> str:
+def _service_dir(file_path: str) -> str:
     """Extract a logical service/directory key from a file path.
 
     Walks up from the file until it finds a directory that contains a
-    manifest (pyproject.toml, go.mod, package.json, Cargo.toml) or is
-    two levels deep from a scan root.  Falls back to the immediate parent.
+    manifest (pyproject.toml, go.mod, package.json, Cargo.toml). Falls back
+    to the immediate parent.
     """
     from pathlib import Path
 
@@ -291,10 +294,15 @@ _TEST_PATH_SEGMENTS: frozenset[str] = frozenset({
 
 
 def _is_test_file(file_path: str) -> bool:
-    """Return True when the file lives under a test directory."""
+    """Return True when the file is clearly test-only by path or filename."""
     from pathlib import Path
-    parts = Path(file_path).parts
-    return any(seg in _TEST_PATH_SEGMENTS for seg in parts)
+
+    path = Path(file_path)
+    if any(seg in _TEST_PATH_SEGMENTS for seg in path.parts):
+        return True
+
+    stem = path.stem.lower()
+    return stem.startswith("test_") or stem.endswith("_test")
 
 
 def _consolidate_components(
@@ -361,9 +369,81 @@ def _consolidate_components(
     return result
 
 
+def _filter_default_bom_scope_components(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Remove components that only occur under test/fixture paths."""
+    return [c for c in components if c.metadata.get("test_only") is not True]
+
+
+def _filter_ai_only_dependency_components(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Keep only AI-relevant dependency rows in the default BOM."""
+    filtered: list[AIComponent] = []
+    for comp in components:
+        if comp.component_type != AIComponentType.DEPENDENCY:
+            filtered.append(comp)
+            continue
+        if comp.metadata.get("known_ai_package") is True:
+            filtered.append(comp)
+            continue
+        ecosystem = str(comp.metadata.get("ecosystem", "") or "")
+        if ecosystem and is_known_ai_package(ecosystem, comp.name):
+            meta = dict(comp.metadata)
+            meta["known_ai_package"] = True
+            filtered.append(comp.model_copy(update={"metadata": meta}))
+    return filtered
+
+
+def _filter_relationships_for_components(
+    relationships: list["ComponentRelationship"],
+    components: list["AIComponent"],
+) -> list["ComponentRelationship"]:
+    """Drop relationships that reference excluded components."""
+    component_ids = {c.instance_id for c in components}
+    component_names = {
+        name.strip().lower()
+        for c in components
+        for name in (c.name, c.model_name or "")
+        if name
+    }
+
+    def _endpoint_present(instance_id: str, name: str) -> bool:
+        if instance_id:
+            return instance_id in component_ids
+        if name:
+            return name.strip().lower() in component_names
+        return False
+
+    return [
+        rel for rel in relationships
+        if _endpoint_present(rel.source_instance_id, rel.source_name)
+        and _endpoint_present(rel.target_instance_id, rel.target_name)
+    ]
+
+
+def _filter_risk_flags_for_default_scope(flags: list[Any]) -> list[Any]:
+    """Drop risk flags whose evidence comes only from test/fixture files."""
+    filtered: list[Any] = []
+    for flag in flags:
+        file_path = ""
+        if isinstance(flag, dict):
+            file_path = str(flag.get("file_path", "") or "")
+        else:
+            file_path = str(getattr(flag, "file_path", "") or "")
+        if file_path and _is_test_file(file_path):
+            continue
+        filtered.append(flag)
+    return filtered
+
+
 def _vector_store_technology(c: "AIComponent") -> str | None:
     if c.component_type != AIComponentType.VECTOR_STORE:
         return None
+    meta_tech = c.metadata.get("store_technology")
+    if isinstance(meta_tech, str) and meta_tech.strip():
+        return meta_tech.strip().lower()
     name_l = (c.model_name or c.name or "").lower()
     if "weaviate" in name_l:
         return "weaviate"
@@ -520,6 +600,8 @@ class ScanPipeline:
         agentic_fast_model: str | None = None,
         agentic_timeout: int = 120,
         agentic_cache_dir: str | Path | None = None,
+        include_code_snippets: bool = False,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.scan_paths = scan_paths
         self.output_format = output_format
@@ -540,6 +622,15 @@ class ScanPipeline:
             if agentic_cache_dir is not None
             else None
         )
+        self.include_code_snippets = include_code_snippets
+        self.progress_callback = progress_callback
+
+    def _emit_progress(self, event: str, **payload: Any) -> None:
+        """Send a best-effort progress event to the CLI."""
+        if not self.progress_callback:
+            return
+        progress_event = {"event": event, **payload}
+        self.progress_callback(progress_event)
 
     def run(self) -> PipelineResult:
         clear_cache()
@@ -563,6 +654,7 @@ class ScanPipeline:
             ctx_kwargs["min_severity"] = self.min_severity
         ctx = ScanContext(**ctx_kwargs)
 
+        self._emit_progress("stage_started", stage="scan", total_stages=4)
         t0 = time.monotonic()
         components, relationships = self._stage_scan(ctx)
         elapsed = time.monotonic() - t0
@@ -572,7 +664,14 @@ class ScanPipeline:
             f"{len(components)} components, {len(relationships)} relationships, "
             f"file cache {fc['hits']} hits / {fc['misses']} misses",
         ))
+        self._emit_progress(
+            "stage_completed",
+            stage="scan",
+            elapsed_s=elapsed,
+            detail=timings[-1].detail,
+        )
 
+        self._emit_progress("stage_started", stage="cross_ref", total_stages=4)
         t0 = time.monotonic()
         components, env_idx, pkg_idx, ext_deps = self._stage_cross_ref(
             components
@@ -583,7 +682,14 @@ class ScanPipeline:
             f"{sum(len(v) for v in env_idx.env.values())} env vars, "
             f"{len(pkg_idx.packages)} packages, {len(ext_deps)} external deps",
         ))
+        self._emit_progress(
+            "stage_completed",
+            stage="cross_ref",
+            elapsed_s=elapsed,
+            detail=timings[-1].detail,
+        )
 
+        self._emit_progress("stage_started", stage="agentic", total_stages=4)
         t0 = time.monotonic()
         components, relationships, agentic_flags = self._stage_agentic(
             components, relationships
@@ -594,13 +700,30 @@ class ScanPipeline:
             "agentic", elapsed,
             "skipped (no --llm-model)" if skipped else f"{len(agentic_flags)} risk flags",
         ))
+        self._emit_progress(
+            "stage_completed",
+            stage="agentic",
+            elapsed_s=elapsed,
+            detail=timings[-1].detail,
+        )
 
+        self._emit_progress("stage_started", stage="assemble", total_stages=4)
         t0 = time.monotonic()
         components, agentic_count = self._stage_assemble(components)
         elapsed = time.monotonic() - t0
         timings.append(StageTiming(
             "assemble", elapsed, f"{len(components)} final, {agentic_count} agentic",
         ))
+        self._emit_progress(
+            "stage_completed",
+            stage="assemble",
+            elapsed_s=elapsed,
+            detail=timings[-1].detail,
+        )
+        relationships = _filter_relationships_for_components(
+            relationships, components
+        )
+        agentic_flags = _filter_risk_flags_for_default_scope(agentic_flags)
 
         total_elapsed = time.monotonic() - pipeline_start
 
@@ -627,8 +750,6 @@ class ScanPipeline:
     ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
         _LOGGER.info("Stage 1/4 — scanning %d path(s)", len(self.scan_paths))
 
-        from .scanners.dependency_scanner import discover_ai_package_set
-
         ai_pkgs = discover_ai_package_set(ctx)
         if ai_pkgs:
             _LOGGER.info(
@@ -648,6 +769,10 @@ class ScanPipeline:
             from .scanners.file_cache import warm_cache_async
 
             all_paths = [e.path for entries in idx.values() for e in entries]
+            self._emit_progress(
+                "file_cache_prep_started",
+                files_total=len(all_paths),
+            )
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
@@ -665,8 +790,16 @@ class ScanPipeline:
                 "Pass 2 prep: pre-cached %d / %d files via async I/O",
                 warmed, len(all_paths),
             )
+            self._emit_progress(
+                "file_cache_prep_completed",
+                files_total=len(all_paths),
+                files_warmed=warmed,
+            )
 
-        return run_scanners(ctx_pass2)
+        return run_scanners(
+            ctx_pass2,
+            progress_callback=self.progress_callback,
+        )
 
     # ------------------------------------------------------------------
     # Stage 2: Cross-reference resolution
@@ -718,13 +851,18 @@ class ScanPipeline:
             len(components),
         )
 
+        ensure_llm_runtime_available(
+            self.llm_config["model"],
+            provider=self.llm_config.get("provider"),
+        )
+
         try:
             from .agentic.agent import run_agentic_enrichment
-        except ImportError:
-            _LOGGER.warning(
-                "Agentic classification requires 'cisco-aibom[agentic]'. Skipping."
-            )
-            return components, relationships, []
+        except ImportError as exc:
+            raise ImportError(
+                "Agentic classification requires the agentic runtime. "
+                'Install with: uv tool install "cisco-aibom[agentic]"'
+            ) from exc
 
         try:
             deduped, fanout = _dedup_for_agentic(components)
@@ -746,6 +884,7 @@ class ScanPipeline:
                 fast_model=self.agentic_fast_model,
                 timeout_s=self.agentic_timeout,
                 cache_dir=self.agentic_cache_dir,
+                include_code_snippets=self.include_code_snippets,
             )
             deduped_ids = {c.instance_id for c in deduped}
             enriched_deduped_ids = {c.instance_id for c in enriched if c.instance_id in deduped_ids}
@@ -763,6 +902,8 @@ class ScanPipeline:
             relationships = relationships + agentic_rels
             return enriched, relationships, agentic_flags
 
+        except ImportError:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("Agentic classification failed: %s", exc, exc_info=True)
 
@@ -802,6 +943,24 @@ class ScanPipeline:
             _LOGGER.info(
                 "Tool/vector_store priority dedup: %d → %d (-%d)",
                 before_td, after_td, before_td - after_td,
+            )
+
+        before_scope = len(components)
+        components = _filter_default_bom_scope_components(components)
+        after_scope = len(components)
+        if before_scope != after_scope:
+            _LOGGER.info(
+                "Default BOM scope: %d → %d components (-%d test/fixture-only)",
+                before_scope, after_scope, before_scope - after_scope,
+            )
+
+        before_deps = len(components)
+        components = _filter_ai_only_dependency_components(components)
+        after_deps = len(components)
+        if before_deps != after_deps:
+            _LOGGER.info(
+                "AI-only dependency policy: %d → %d components (-%d non-AI dependencies)",
+                before_deps, after_deps, before_deps - after_deps,
             )
 
         agentic_count = sum(1 for c in components if c.needs_agentic)

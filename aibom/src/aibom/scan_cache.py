@@ -112,21 +112,37 @@ def _cache_path(cache_dir: Path, key: str) -> Path:
     return cache_dir / f"{key}.json"
 
 
-def load_cached(cache_dir: Path, key: str) -> Optional[dict[str, Any]]:
+def load_cached(
+    cache_dir: Path,
+    key: str,
+    *,
+    search_dirs: list[Path] | None = None,
+) -> Optional[dict[str, Any]]:
     """Load a cached scan result. Returns None on miss or version mismatch."""
-    p = _cache_path(cache_dir, key)
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if data.get("_cache_version") != _CACHE_VERSION:
-            _LOGGER.debug("Cache version mismatch for %s", key)
+    dirs = [cache_dir]
+    if search_dirs:
+        dirs.extend(search_dirs)
+
+    seen: set[str] = set()
+    for directory in dirs:
+        resolved = str(directory)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        p = _cache_path(directory, key)
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if data.get("_cache_version") != _CACHE_VERSION:
+                _LOGGER.debug("Cache version mismatch for %s", key)
+                return None
+            _LOGGER.info("Cache hit: %s (cached %s)", key[:12], data.get("_cached_at", "?"))
+            return data
+        except (json.JSONDecodeError, OSError) as exc:
+            _LOGGER.debug("Cache load error for %s: %s", key, exc)
             return None
-        _LOGGER.info("Cache hit: %s (cached %s)", key[:12], data.get("_cached_at", "?"))
-        return data
-    except (json.JSONDecodeError, OSError) as exc:
-        _LOGGER.debug("Cache load error for %s: %s", key, exc)
-        return None
+    return None
 
 
 def save_cached(cache_dir: Path, key: str, data: dict[str, Any]) -> None:
@@ -157,20 +173,32 @@ def clear_cache(cache_dir: Path) -> int:
     return count
 
 
-def cache_info(cache_dir: Path) -> list[dict[str, Any]]:
+def cache_info(
+    cache_dir: Path,
+    *,
+    search_dirs: list[Path] | None = None,
+) -> list[dict[str, Any]]:
     """List all cached entries with metadata."""
-    if not cache_dir.exists():
-        return []
+    dirs = [cache_dir]
+    if search_dirs:
+        dirs.extend(search_dirs)
     entries = []
-    for f in sorted(cache_dir.glob("*.json")):
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            entries.append({
-                "key": data.get("_cache_key", f.stem),
-                "cached_at": data.get("_cached_at", "unknown"),
-                "size_kb": round(f.stat().st_size / 1024, 1),
-                "path": str(f),
-            })
-        except (json.JSONDecodeError, OSError):
+    seen_files: set[str] = set()
+    for directory in dirs:
+        if not directory.exists():
             continue
+        for f in sorted(directory.glob("*.json")):
+            if str(f) in seen_files:
+                continue
+            seen_files.add(str(f))
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                entries.append({
+                    "key": data.get("_cache_key", f.stem),
+                    "cached_at": data.get("_cached_at", "unknown"),
+                    "size_kb": round(f.stat().st_size / 1024, 1),
+                    "path": str(f),
+                })
+            except (json.JSONDecodeError, OSError):
+                continue
     return entries

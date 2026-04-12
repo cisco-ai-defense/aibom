@@ -95,6 +95,10 @@ KNOWN_AI_PACKAGES: dict[str, set[str]] = {
         "semantic-kernel",
         "promptflow",
         "deepeval",
+        "google-genai",
+        "guardrails",
+        "llmetry",
+        "openai-agents",
         # Observability
         "traceloop-sdk",
         "openllmetry",
@@ -105,8 +109,18 @@ KNOWN_AI_PACKAGES: dict[str, set[str]] = {
         "opik",
         "helicone",
         "tracia",
+        "opentelemetry-instrumentation-anthropic",
+        "opentelemetry-instrumentation-chromadb",
+        "opentelemetry-instrumentation-crewai",
+        "opentelemetry-instrumentation-google-generativeai",
+        "opentelemetry-instrumentation-llamaindex",
+        "opentelemetry-instrumentation-mistralai",
         "opentelemetry-instrumentation-openai",
+        "opentelemetry-instrumentation-openai-v2",
+        "opentelemetry-instrumentation-vertexai",
+        "opentelemetry-instrumentation-weaviate",
         "opentelemetry-instrumentation-langchain",
+        "opentelemetry-semantic-conventions-ai",
         # Guardrails
         "nemoguardrails",
         "guardrails-ai",
@@ -173,6 +187,7 @@ _REQUIREMENT_NAME = re.compile(r"^([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)")
 _PIPFILE_PKG = re.compile(r"^([a-zA-Z0-9_.-]+)\s*=")
 _TOML_STRING_DEP = re.compile(r"""["']([^"']+)["']""")
 _POETRY_DEP_KEY = re.compile(r"^([a-zA-Z0-9_.-]+)\s*=")
+_PURE_VERSION_TOKEN = re.compile(r"^[vV]?\d+(?:\.\d+)+(?:[a-zA-Z0-9._-]*)?$")
 _LOCK_PACKAGE = re.compile(r"^\[\[package\]\]\s*$")
 _LOCK_NAME = re.compile(r'^name\s*=\s*["\']([^"\']+)["\']')
 _LOCK_VERSION = re.compile(r'^version\s*=\s*["\']([^"\']+)["\']')
@@ -244,6 +259,8 @@ def _parse_pep508_name_version(spec: str) -> tuple[str, str, bool, Optional[str]
     if not m:
         return "", "", False, None
     name = m.group(1)
+    if _PURE_VERSION_TOKEN.fullmatch(name):
+        return "", "", False, None
     if not ver_part:
         return name, "*", False, None
     if sep_used in ("==", "==="):
@@ -325,7 +342,7 @@ def _parse_pipfile(text: str) -> list[tuple[str, str, int, Optional[str], str]]:
 def _parse_pyproject_toml(text: str) -> list[tuple[str, str, int, Optional[str], str]]:
     out: list[tuple[str, str, int, Optional[str], str]] = []
     lower = text.lower()
-    for marker in ("[project.dependencies]", "[tool.poetry.dependencies]"):
+    for marker in ("[project.dependencies]",):
         pos = lower.find(marker.lower())
         if pos < 0:
             continue
@@ -350,6 +367,37 @@ def _parse_pyproject_toml(text: str) -> list[tuple[str, str, int, Optional[str],
                             "pypi",
                         ),
                     )
+    poetry_re = re.compile(r"^\[(tool\.poetry(?:\.group\.[^.]+)?\.dependencies)\]\s*$", re.MULTILINE | re.IGNORECASE)
+    for m in poetry_re.finditer(text):
+        start = m.end()
+        rest = text[start:]
+        endm = re.search(r"^\[", rest, re.MULTILINE)
+        block = rest[: endm.start()] if endm else rest
+        line_base = text[:start].count("\n")
+        for i, line in enumerate(block.splitlines(), start=1):
+            ls = line.strip()
+            if not ls or ls.startswith("#"):
+                continue
+            key_match = _POETRY_DEP_KEY.match(ls)
+            if not key_match:
+                continue
+            name = key_match.group(1)
+            if name == "python" or _PURE_VERSION_TOKEN.fullmatch(name):
+                continue
+            rest = ls[key_match.end() :].strip()
+            ver_m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', rest)
+            quoted = re.search(r'["\']([^"\']+)["\']', rest)
+            raw_spec = ver_m.group(1) if ver_m else (quoted.group(1) if quoted else "*")
+            pinned, ver = _pypi_spec_pinned(raw_spec)
+            out.append(
+                (
+                    name,
+                    raw_spec,
+                    line_base + i,
+                    ver if pinned else None,
+                    "pypi",
+                ),
+            )
     opt_re = re.compile(
         r"^\[project\.optional-dependencies\.([^\]]+)\]\s*$",
         re.MULTILINE | re.IGNORECASE,
@@ -876,6 +924,11 @@ def _is_known_ai(ecosystem: str, name: str) -> bool:
     return name in pkgs
 
 
+def is_known_ai_package(ecosystem: str, name: str) -> bool:
+    """Public helper for enforcing the AI-only dependency policy."""
+    return _is_known_ai(ecosystem, name)
+
+
 def _display_name(ecosystem: str, name: str) -> str:
     if ecosystem == "pypi":
         return _normalize_pypi_name(name)
@@ -969,6 +1022,8 @@ class DependencyScanner(BaseScanner):
             if key not in _MANIFEST_PARSERS and not key.endswith(".csproj"):
                 continue
             for name, raw_spec, line_no, pinned_ver, ecosystem in _parse_manifest(path):
+                if not _is_known_ai(ecosystem, name):
+                    continue
                 disp = _display_name(ecosystem, name)
                 dedup_key = disp.lower()
                 if dedup_key in seen:
@@ -977,12 +1032,11 @@ class DependencyScanner(BaseScanner):
                         prev.sdk_version = pinned_ver
                         prev.metadata["version_spec"] = raw_spec
                     continue
-                known_ai = _is_known_ai(ecosystem, name)
                 meta: dict[str, Any] = {
                     "ecosystem": ecosystem,
                     "version_spec": raw_spec,
                     "manifest": path.name,
-                    "known_ai_package": known_ai,
+                    "known_ai_package": True,
                 }
                 comp = AIComponent(
                     name=disp,

@@ -27,11 +27,13 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
+from ..cache_paths import cache_read_dirs, ensure_cache_dir
 from ..models import (
     AIComponent,
     AIComponentType,
@@ -52,9 +54,24 @@ _IID_DESC = (
 )
 
 
+class _EvidenceLocation(BaseModel):
+    file_path: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    role: str = ""
+
+
+class _DecisionAnnotation(BaseModel):
+    decision: str = ""
+    justification: str = ""
+    evidence_kinds: list[str] = Field(default_factory=list)
+    evidence_locations: list[_EvidenceLocation] = Field(default_factory=list)
+
+
 class _EnrichedComponent(BaseModel):
     instance_id: str = Field(default="", description=_IID_DESC)
     updates: dict[str, Any] = Field(default_factory=dict)
+    decision_annotation: _DecisionAnnotation | None = None
 
 
 class _NewComponent(BaseModel):
@@ -65,6 +82,7 @@ class _NewComponent(BaseModel):
     framework: str = ""
     model_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    decision_annotation: _DecisionAnnotation | None = None
 
 
 class _RemoveComponent(BaseModel):
@@ -82,6 +100,7 @@ class _Relationship(BaseModel):
     source_name: str = ""
     target_name: str = ""
     relationship_type: str = ""
+    decision_annotation: _DecisionAnnotation | None = None
 
 
 class _RiskFinding(BaseModel):
@@ -90,6 +109,7 @@ class _RiskFinding(BaseModel):
     file_path: str = ""
     line_number: int = 0
     severity: str = "info"
+    decision_annotation: _DecisionAnnotation | None = None
 
 
 class AgentResponse(BaseModel):
@@ -344,12 +364,28 @@ def _component_cache_key(c: AIComponent) -> str:
 
 
 _TIER_CACHE_VERSION = 1
+_BATCH_CACHE_VERSION = 1
+_CROSS_REPO_CACHE_VERSION = 1
+
+
+@dataclass
+class _BatchArtifact:
+    inputs: list[AIComponent]
+    new: list[AIComponent]
+    rels: list[ComponentRelationship]
+    flags: list[RiskFlag]
 
 
 def _tier_cache_key(components: list[AIComponent]) -> str:
     """Derive a cache key for the exact inputs to one tier run."""
     raw = "|".join(_component_cache_key(c) for c in components)
     return f"tier_{_hashlib.sha256(raw.encode()).hexdigest()[:24]}"
+
+
+def _batch_cache_key(components: list[AIComponent]) -> str:
+    """Derive a cache key for one executed batch."""
+    raw = "|".join(_component_cache_key(c) for c in components)
+    return f"batch_{_hashlib.sha256(raw.encode()).hexdigest()[:24]}"
 
 
 def _build_tier_cache_payload(
@@ -379,6 +415,103 @@ def _load_tier_cache_payload(
         [AIComponent.model_validate(item) for item in data.get("tier_new", [])],
         [ComponentRelationship.model_validate(item) for item in data.get("tier_rels", [])],
         [RiskFlag.model_validate(item) for item in data.get("tier_flags", [])],
+    )
+
+
+def _build_batch_cache_payload(
+    new: list[AIComponent],
+    rels: list[ComponentRelationship],
+    flags: list[RiskFlag],
+) -> dict[str, Any]:
+    """Serialize batch-scope findings for mixed cache-hit replay."""
+    return {
+        "_batch_cache_version": _BATCH_CACHE_VERSION,
+        "batch_new": [c.model_dump(mode="json") for c in new],
+        "batch_rels": [r.model_dump(mode="json") for r in rels],
+        "batch_flags": [f.model_dump(mode="json") for f in flags],
+    }
+
+
+def _load_batch_cache_payload(
+    data: dict[str, Any] | None,
+) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]] | None:
+    """Deserialize cached batch findings, returning None for non-batch entries."""
+    if not data or data.get("_batch_cache_version") != _BATCH_CACHE_VERSION:
+        return None
+    return (
+        [AIComponent.model_validate(item) for item in data.get("batch_new", [])],
+        [ComponentRelationship.model_validate(item) for item in data.get("batch_rels", [])],
+        [RiskFlag.model_validate(item) for item in data.get("batch_flags", [])],
+    )
+
+
+def _normalized_cross_repo_results(
+    per_repo_results: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for source in sorted(per_repo_results):
+        data = per_repo_results[source]
+        components: list[dict[str, Any]] = []
+        for component in data.get("components", []):
+            if hasattr(component, "model_dump"):
+                item = component.model_dump(mode="json")
+            else:
+                item = dict(component)
+            components.append(item)
+        components.sort(
+            key=lambda item: (
+                str(item.get("instance_id", "")),
+                str(item.get("name", "")),
+                str(item.get("file_path", "")),
+                int(item.get("line_number", 0) or 0),
+            )
+        )
+        normalized[source] = {
+            "components": components,
+            "_unresolved_env_vars": sorted(
+                str(v) for v in data.get("_unresolved_env_vars", [])
+            ),
+        }
+    return normalized
+
+
+def _cross_repo_cache_key(
+    model_string: str,
+    per_repo_results: dict[str, dict[str, Any]],
+) -> str:
+    raw = json.dumps(
+        {
+            "model_string": model_string,
+            "per_repo_results": _normalized_cross_repo_results(per_repo_results),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return f"xrepo_{_hashlib.sha256(raw.encode()).hexdigest()[:24]}"
+
+
+def _build_cross_repo_cache_payload(
+    rels: list[ComponentRelationship],
+    flags: list[RiskFlag],
+) -> dict[str, Any]:
+    return {
+        "_cross_repo_cache_version": _CROSS_REPO_CACHE_VERSION,
+        "cross_repo_rels": [r.model_dump(mode="json") for r in rels],
+        "cross_repo_flags": [f.model_dump(mode="json") for f in flags],
+    }
+
+
+def _load_cross_repo_cache_payload(
+    data: dict[str, Any] | None,
+) -> tuple[list[ComponentRelationship], list[RiskFlag]] | None:
+    if not data or data.get("_cross_repo_cache_version") != _CROSS_REPO_CACHE_VERSION:
+        return None
+    return (
+        [
+            ComponentRelationship.model_validate(item)
+            for item in data.get("cross_repo_rels", [])
+        ],
+        [RiskFlag.model_validate(item) for item in data.get("cross_repo_flags", [])],
     )
 
 
@@ -416,20 +549,28 @@ class _AgenticResultCache:
     re-runs skips the LLM entirely.
     """
 
-    def __init__(self, cache_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        cache_dir: Path | None = None,
+        fallback_dirs: list[Path] | None = None,
+    ) -> None:
         self._mem: dict[str, dict[str, Any]] = {}
         self._disk_dir = cache_dir
+        self._fallback_dirs = fallback_dirs or []
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
             self._load_disk()
+        for fallback_dir in self._fallback_dirs:
+            self._load_disk(fallback_dir)
 
-    def _load_disk(self) -> None:
-        if not self._disk_dir:
+    def _load_disk(self, disk_dir: Path | None = None) -> None:
+        target_dir = disk_dir or self._disk_dir
+        if not target_dir:
             return
-        for p in self._disk_dir.glob("*.json"):
+        for p in target_dir.glob("*.json"):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
-                self._mem[p.stem] = data
+                self._mem.setdefault(p.stem, data)
             except (json.JSONDecodeError, OSError):
                 continue
 
@@ -470,17 +611,29 @@ class _AgenticResultCache:
         all_new: list[AIComponent] = []
         all_rels: list[ComponentRelationship] = []
         all_flags: list[RiskFlag] = []
+        seen_batch_keys: set[str] = set()
         for c in components:
             key = _component_cache_key(c)
             data = self.get(key)
             if data:
-                new, rels, flags = middleware.extract_findings_from_dict(data)
                 cached_component = _load_cached_component_snapshot(data)
                 if cached_component is not None:
-                    enriched.append(cached_component)
+                    enriched.append(middleware.hydrate_component(cached_component))
                 else:
                     enriched_batch = middleware.apply_enrichments_from_dict([c], data)
                     enriched.extend(enriched_batch)
+
+                batch_key = data.get("batch_artifact_key")
+                batch_payload = None
+                if isinstance(batch_key, str) and batch_key and batch_key not in seen_batch_keys:
+                    seen_batch_keys.add(batch_key)
+                    batch_payload = _load_batch_cache_payload(self.get(batch_key))
+
+                if batch_payload is not None:
+                    new, rels, flags = batch_payload
+                else:
+                    new, rels, flags = middleware.extract_findings_from_dict(data)
+
                 all_new.extend(new)
                 all_rels.extend(rels)
                 all_flags.extend(flags)
@@ -781,7 +934,13 @@ async def _run_batches_parallel(
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
-) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+) -> tuple[
+    list[AIComponent],
+    list[AIComponent],
+    list[ComponentRelationship],
+    list[RiskFlag],
+    list[_BatchArtifact],
+]:
     """Run locality-aware batches with a concurrency-limited semaphore.
 
     Up to *max_concurrent* batches are in-flight simultaneously.  A shared
@@ -795,6 +954,7 @@ async def _run_batches_parallel(
 
     _BatchResult = tuple[
         int,  # idx (1-based)
+        list[AIComponent],  # input batch
         list[AIComponent],
         list[AIComponent],
         list[ComponentRelationship],
@@ -804,10 +964,10 @@ async def _run_batches_parallel(
 
     async def _guarded(idx: int, batch: list[AIComponent]) -> _BatchResult:
         if tripped.is_set():
-            return idx, _circuit_breaker_skipped_batch(batch), [], [], [], True
+            return idx, batch, _circuit_breaker_skipped_batch(batch), [], [], [], True
         async with sem:
             if tripped.is_set():
-                return idx, _circuit_breaker_skipped_batch(batch), [], [], [], True
+                return idx, batch, _circuit_breaker_skipped_batch(batch), [], [], [], True
             try:
                 enriched, new, rels, flags, failed = await _run_batch_async(
                     agent, middleware, batch,
@@ -816,10 +976,10 @@ async def _run_batches_parallel(
                     all_components=all_components,
                     timeout_s=timeout_s,
                 )
-                return idx, enriched, new, rels, flags, failed
+                return idx, batch, enriched, new, rels, flags, failed
             except Exception as exc:
                 _LOGGER.warning("Parallel batch %d raised: %s", idx, exc)
-                return idx, list(batch), [], [], [], True
+                return idx, batch, list(batch), [], [], [], True
 
     tasks = [
         asyncio.create_task(_guarded(idx, batch))
@@ -831,7 +991,7 @@ async def _run_batches_parallel(
     for coro in asyncio.as_completed(tasks):
         r = await coro
         results.append(r)
-        _, _, _, _, _, failed = r
+        _, _, _, _, _, _, failed = r
         if failed:
             consecutive_failures += 1
         else:
@@ -850,21 +1010,21 @@ async def _run_batches_parallel(
     all_new: list[AIComponent] = []
     all_rels: list[ComponentRelationship] = []
     all_flags: list[RiskFlag] = []
-    for _, enriched, new, rels, flags, _ in results:
+    artifacts: list[_BatchArtifact] = []
+    for _, batch, enriched, new, rels, flags, _ in results:
         all_enriched.extend(enriched)
         all_new.extend(new)
         all_rels.extend(rels)
         all_flags.extend(flags)
+        artifacts.append(_BatchArtifact(batch, new, rels, flags))
 
-    return all_enriched, all_new, all_rels, all_flags
+    return all_enriched, all_new, all_rels, all_flags, artifacts
 
 
 def _default_agentic_cache_dir() -> Path | None:
     """Return the default on-disk cache directory, or None if unavailable."""
     try:
-        d = Path.home() / ".cache" / "cisco-aibom" / "agentic"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return ensure_cache_dir("agentic")
     except OSError:
         return None
 
@@ -941,7 +1101,7 @@ def _run_tier(
     )
 
     if max_concurrent > 1 and len(batches) > 1:
-        enriched, new, rels, flags = asyncio.run(
+        enriched, new, rels, flags, batch_artifacts = asyncio.run(
             _run_batches_parallel(
                 agent, middleware, batches,
                 relationships, scan_paths,
@@ -956,6 +1116,7 @@ def _run_tier(
         new: list[AIComponent] = []
         rels: list[ComponentRelationship] = []
         flags: list[RiskFlag] = []
+        batch_artifacts: list[_BatchArtifact] = []
         consecutive_failures = 0
         for idx, batch in enumerate(batches, 1):
             if consecutive_failures >= max_consecutive_failures:
@@ -978,6 +1139,7 @@ def _run_tier(
             new.extend(n)
             rels.extend(r)
             flags.extend(f)
+            batch_artifacts.append(_BatchArtifact(batch, n, r, f))
             if batch_failed:
                 consecutive_failures += 1
             else:
@@ -1031,6 +1193,7 @@ def _run_tier(
             retry_new.extend(n)
             retry_rels.extend(r)
             retry_flags.extend(f)
+            batch_artifacts.append(_BatchArtifact(batch, n, r, f))
             if batch_failed:
                 retry_consecutive += 1
             else:
@@ -1049,20 +1212,38 @@ def _run_tier(
         flags.extend(retry_flags)
 
     if cache:
+        artifact_key_by_instance_id: dict[str, str] = {}
+        for artifact in batch_artifacts:
+            if not (artifact.new or artifact.rels or artifact.flags):
+                continue
+            batch_key = _batch_cache_key(artifact.inputs)
+            cache.put(
+                batch_key,
+                _build_batch_cache_payload(
+                    artifact.new, artifact.rels, artifact.flags
+                ),
+            )
+            for c_in in artifact.inputs:
+                artifact_key_by_instance_id[c_in.instance_id] = batch_key
+
         enriched_by_id = {c.instance_id: c for c in enriched}
         all_batch_components = [c for batch in batches for c in batch]
         for c_before in all_batch_components:
             key = _component_cache_key(c_before)
             c_after = enriched_by_id.get(c_before.instance_id)
             if c_after is None:
-                cache.put(key, {
+                entry: dict[str, Any] = {
                     "enriched_components": [],
                     "new_components": [],
                     "remove_components": [{"instance_id": c_before.instance_id, "reason": "cached_removal"}],
                     "reclassify_components": [],
                     "new_relationships": [],
                     "risk_findings": [],
-                })
+                }
+                batch_key = artifact_key_by_instance_id.get(c_before.instance_id)
+                if batch_key:
+                    entry["batch_artifact_key"] = batch_key
+                cache.put(key, entry)
             else:
                 entry: dict[str, Any] = {
                     "cached_component": c_after.model_dump(mode="json"),
@@ -1073,6 +1254,9 @@ def _run_tier(
                     "new_relationships": [],
                     "risk_findings": [],
                 }
+                batch_key = artifact_key_by_instance_id.get(c_before.instance_id)
+                if batch_key:
+                    entry["batch_artifact_key"] = batch_key
                 cache.put(key, entry)
 
     tier_enriched.extend(enriched)
@@ -1122,6 +1306,7 @@ def run_agentic_enrichment(
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
     cache_dir: Path | None = None,
+    include_code_snippets: bool = False,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Run the full agentic enrichment pipeline.
 
@@ -1173,8 +1358,12 @@ def run_agentic_enrichment(
         max_concurrent,
     )
 
-    cache = _AgenticResultCache(cache_dir if cache_dir is not None else _default_agentic_cache_dir())
-    middleware = AIBOMScannerMiddleware()
+    resolved_cache_dir = cache_dir if cache_dir is not None else _default_agentic_cache_dir()
+    fallback_dirs: list[Path] = []
+    if cache_dir is None and resolved_cache_dir is not None:
+        fallback_dirs = [p for p in cache_read_dirs("agentic") if p != resolved_cache_dir]
+    cache = _AgenticResultCache(resolved_cache_dir, fallback_dirs=fallback_dirs)
+    middleware = AIBOMScannerMiddleware(include_code_snippets=include_code_snippets)
     memo = _DecisionMemo()
 
     all_enriched: list[AIComponent] = []
@@ -1511,6 +1700,7 @@ def run_cross_repo_coordination(
     model_string: str,
     per_repo_results: dict[str, dict[str, Any]],
     llm_config: dict[str, Any] | None = None,
+    cache_dir: Path | None = None,
 ) -> tuple[list[ComponentRelationship], list[RiskFlag]]:
     """Coordinate findings across multiple repos using an LLM.
 
@@ -1524,6 +1714,18 @@ def run_cross_repo_coordination(
     """
     if len(per_repo_results) < 2:
         return [], []
+
+    cache = _AgenticResultCache(
+        cache_dir if cache_dir is not None else _default_agentic_cache_dir()
+    )
+    cache_key = _cross_repo_cache_key(model_string, per_repo_results)
+    cached = _load_cross_repo_cache_payload(cache.get(cache_key))
+    if cached is not None:
+        _LOGGER.info(
+            "Cross-repo coordination cache hit across %d repos",
+            len(per_repo_results),
+        )
+        return cached
 
     scan_paths = list(per_repo_results.keys())
 
@@ -1661,6 +1863,7 @@ def run_cross_repo_coordination(
         "Cross-repo coordination: %d relationships, %d risk flags",
         len(rels), len(flags),
     )
+    cache.put(cache_key, _build_cross_repo_cache_payload(rels, flags))
     return rels, flags
 
 

@@ -24,6 +24,35 @@ from pydantic import BaseModel, Field
 from .enums import AIComponentType, DetectionSource, RelationshipType, Severity
 
 
+class EvidenceLocation(BaseModel):
+    """A structured source reference supporting a finding decision."""
+
+    file_path: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    role: str = ""
+
+
+class CodeSnippet(BaseModel):
+    """Optional source excerpt attached to a finding decision."""
+
+    file_path: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    text: str = ""
+    truncated: bool = False
+
+
+class DecisionAnnotation(BaseModel):
+    """Human-readable explanation and evidence for a final finding."""
+
+    decision: str = ""
+    justification: str = ""
+    evidence_kinds: list[str] = Field(default_factory=list)
+    evidence_locations: list[EvidenceLocation] = Field(default_factory=list)
+    code_snippet: CodeSnippet | None = None
+
+
 class AIComponent(BaseModel):
     """A detected AI asset in source code, configuration, or infrastructure."""
 
@@ -55,6 +84,7 @@ class AIComponent(BaseModel):
     kb_label: Optional[str] = None
     sdk_version: Optional[str] = None
 
+    decision_annotation: DecisionAnnotation | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     instance_id: str = ""
 
@@ -74,6 +104,7 @@ class ComponentRelationship(BaseModel):
     target_name: str = ""
     source_type: AIComponentType = AIComponentType.OTHER
     target_type: AIComponentType = AIComponentType.OTHER
+    decision_annotation: DecisionAnnotation | None = None
 
     def model_post_init(self, __context: Any) -> None:
         if not self.label:
@@ -89,6 +120,7 @@ class RiskFlag(BaseModel):
     description: str
     file_path: str = ""
     line_number: int = 0
+    decision_annotation: DecisionAnnotation | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

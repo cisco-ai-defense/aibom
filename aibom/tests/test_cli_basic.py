@@ -8,6 +8,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from aibom.cli import app
+from aibom.scan_pipeline import PipelineResult
 
 runner = CliRunner()
 
@@ -27,6 +28,51 @@ def test_analyze_rejects_legacy_ui_output_format():
     result = runner.invoke(app, ["analyze", "src", "--output-format", "ui"])
     assert result.exit_code != 0
     assert "Invalid output format" in result.output
+
+
+def test_analyze_defaults_cache_root_for_scan_and_agentic(tmp_path):
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    report = tmp_path / "report.json"
+    shared_root = tmp_path / "shared-cache"
+    seen: dict[str, object] = {}
+
+    def fake_pipeline_run(self):
+        seen["agentic_cache_dir"] = self.agentic_cache_dir
+        return PipelineResult(
+            components=[],
+            relationships=[],
+            agentic_risk_flags=[],
+            agentic_candidate_count=0,
+            external_deps=[],
+            timings=[],
+            total_elapsed_s=0.0,
+        )
+
+    with patch("aibom.cli.ensure_llm_runtime_available"):
+        with patch("aibom.cli.resolve_cache_root", return_value=shared_root):
+            with patch("aibom.scan_cache.load_cached", return_value=None) as mock_load:
+                with patch("aibom.scan_cache.save_cached") as mock_save:
+                    with patch("aibom.scan_pipeline.ScanPipeline.run", fake_pipeline_run):
+                        result = runner.invoke(
+                            app,
+                            [
+                                "analyze",
+                                str(source_dir),
+                                "--output-format",
+                                "json",
+                                "--output-file",
+                                str(report),
+                                "--llm-model",
+                                "test-model",
+                            ],
+                        )
+
+    assert result.exit_code == 0
+    assert mock_load.call_args.args[0] == shared_root / "scan"
+    assert mock_save.call_args.args[0] == shared_root / "scan"
+    assert seen["agentic_cache_dir"] == shared_root / "agentic"
 
 
 @patch("aibom.multi_repo.is_git_url", return_value=True)

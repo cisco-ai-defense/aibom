@@ -53,6 +53,24 @@ class TestPythonEnvVarExtraction:
         assert comps[0].metadata["env"] == "AZURE_ENDPOINT"
         assert comps[0].metadata["env_context"] == "endpoint_kwarg"
 
+    def test_embedding_endpoint_kwarg_is_model_endpoint(self, tmp_path: Path) -> None:
+        (tmp_path / "svc.py").write_text(
+            'client = AzureOpenAI(azure_endpoint=os.environ.get("AZURE_EMBEDDING_ENDPOINT"))\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        assert len(comps) == 1
+        assert comps[0].component_type == AIComponentType.MODEL_ENDPOINT
+
+    def test_vector_store_endpoint_kwarg_is_vector_store(self, tmp_path: Path) -> None:
+        (tmp_path / "svc.py").write_text(
+            'client = Client(endpoint=os.getenv("WEAVIATE_ENDPOINT"))\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        assert len(comps) == 1
+        assert comps[0].component_type == AIComponentType.VECTOR_STORE
+
     def test_model_name_assignment(self, tmp_path: Path) -> None:
         (tmp_path / "run.py").write_text(
             'model_name = os.getenv("MODEL_ID")\n'

@@ -4,6 +4,8 @@ Cisco AI BOM uses a three-tier detection architecture. Tiers 1 and 2 generate ca
 
 The `--llm-model` option (or `AIBOM_LLM_MODEL` env var) is **required**.
 
+If the required runtime extras are missing, `cisco-aibom analyze` fails fast with the exact `uv tool install ...` command to add the missing agentic or provider integration packages.
+
 ## Three-Tier Detection
 
 | Tier | Method | Purpose | Examples |
@@ -115,10 +117,12 @@ Environment variables set in the shell take precedence over `.env` values.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--agentic-batch-size` | `15` | Max components grouped into a single LLM invocation. Larger batches reduce API calls but may hit token limits. |
+| `--agentic-batch-size` | `5` | Max components grouped into a single LLM invocation. Larger batches reduce API calls but may hit token limits. |
 | `--agentic-concurrency` | `1` | Max parallel LLM batches. Increase for faster scans if your provider allows concurrent requests. |
 | `--agentic-timeout` | `120` | Wall-clock timeout in seconds per batch. Batches exceeding this are marked as `batch_timeout` and skipped. |
 | `--agentic-fast-model` | — | A cheaper/faster model for simple confirmations (e.g. registry lookups, dependency checks). The primary `--llm-model` is used for complex reasoning. |
+| `--progress` | `auto` | Show live per-stage and per-scanner progress in interactive terminals. |
+| `--include-code-snippets` | `off` | Include raw code snippets inside per-finding decision annotations. |
 
 ### Batch sizing guidance
 
@@ -131,8 +135,8 @@ Environment variables set in the shell take precedence over `.env` values.
 1. **Candidate triage** — After deterministic scanning, all candidates are split into "simple" (registry-confirmable, e.g. known model IDs, manifest dependencies) and "complex" (needs deeper reasoning) tiers.
 2. **Locality-aware batching** — Candidates are grouped by directory to provide better code context per batch.
 3. **Agent tools** — The agent has access to tools: `read_file_lines`, `search_package_info` (queries PyPI/npm/Go registries), and code context. It uses these to confirm or reject each candidate.
-4. **Structured output** — Each batch returns a structured JSON response with confirmed components, removed false positives, reclassifications, and risk findings.
-5. **Caching** — Results are cached by content hash at `~/.cache/cisco-aibom/agentic/`. Unchanged components reuse cached results on subsequent runs.
+4. **Structured output** — Each batch returns a structured JSON response with confirmed components, removed false positives, reclassifications, relationships, and risk findings. Kept findings carry `decision_annotation` metadata with justification and evidence references. Raw code snippets are only included when `--include-code-snippets` is enabled.
+5. **Caching** — Results are cached by content hash at `~/.aibom/cache/agentic/`. Unchanged components reuse cached results on subsequent runs.
 
 ## Circuit Breaker
 
@@ -144,7 +148,7 @@ To protect against runaway API costs, a circuit breaker trips after 3 consecutiv
 
 ## Cache Management
 
-Agentic results are cached on disk at `~/.cache/cisco-aibom/agentic/`. To clear:
+Agentic results are cached on disk at `~/.aibom/cache/agentic/`. To inspect or clear them:
 
 ```bash
 # Clear both scan cache and agentic cache
@@ -152,6 +156,12 @@ cisco-aibom cache clear
 
 # Clear scan cache only (skip agentic)
 cisco-aibom cache clear --no-agentic
+
+# List cached agentic entries
+cisco-aibom cache list --type agentic
+
+# Inspect one cached agentic entry
+cisco-aibom cache get agentic 0123456789ab
 ```
 
 ## Strict Mode

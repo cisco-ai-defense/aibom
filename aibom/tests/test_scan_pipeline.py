@@ -119,6 +119,27 @@ class TestPipelineTiming:
         scan_timing = next(t for t in result.timings if t.name == "scan")
         assert "file cache" in scan_timing.detail
 
+    def test_progress_callback_receives_stage_and_scanner_events(self, tmp_path: Path) -> None:
+        (tmp_path / "app.py").write_text("import openai\n")
+        events: list[dict[str, object]] = []
+        result = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            progress_callback=events.append,
+        ).run()
+
+        assert result.components is not None
+        event_names = [str(event["event"]) for event in events]
+        assert event_names[0] == "stage_started"
+        assert "scanners_discovered" in event_names
+        assert "scanner_completed" in event_names
+        assert event_names[-1] == "stage_completed"
+        stage_names = [
+            str(event["stage"])
+            for event in events
+            if event["event"] == "stage_started"
+        ]
+        assert stage_names == ["scan", "cross_ref", "agentic", "assemble"]
+
 
 class TestAgenticScope:
     def test_all_components_sent_to_agent(self, tmp_path: Path) -> None:
@@ -151,6 +172,23 @@ class TestAgenticScope:
             mock_enrich.return_value = ([], [], [])
             pipeline.run()
         assert mock_enrich.call_args.kwargs["cache_dir"] == agentic_cache_dir
+
+    def test_include_code_snippets_is_forwarded(self, tmp_path: Path) -> None:
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake", "api_base": "http://x"}
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config=llm_cfg,
+            include_code_snippets=True,
+        )
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available") as mock_runtime:
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([], [], [])
+                pipeline.run()
+        mock_runtime.assert_called_once()
+        assert mock_enrich.call_args.kwargs["include_code_snippets"] is True
 
 
 class TestFileCache:
@@ -361,3 +399,266 @@ class TestPropagateRemovals:
         )
 
         assert [c.name for c in result] == ["gpt-5"]
+
+
+class TestDefaultBomScope:
+    def test_stage_assemble_excludes_test_only_components(self):
+        component = AIComponent(
+            name="FakeTool",
+            component_type=AIComponentType.TOOL,
+            file_path="repo/tests/test_agent.py",
+            line_number=10,
+            confidence=0.8,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, agentic_count = pipeline._stage_assemble([component])
+
+        assert components == []
+        assert agentic_count == 0
+
+    def test_stage_assemble_excludes_test_prefix_filename_components(self):
+        component = AIComponent(
+            name="gpt-4o-mini",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/src/orchestrator/test_firewall_routing.py",
+            line_number=14,
+            confidence=0.8,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, agentic_count = pipeline._stage_assemble([component])
+
+        assert components == []
+        assert agentic_count == 0
+
+    def test_stage_assemble_excludes_test_suffix_filename_components(self):
+        component = AIComponent(
+            name="gpt-4o-mini",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/src/orchestrator/firewall_routing_test.py",
+            line_number=21,
+            confidence=0.8,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, agentic_count = pipeline._stage_assemble([component])
+
+        assert components == []
+        assert agentic_count == 0
+
+    def test_stage_assemble_keeps_non_test_prefixed_production_files(self):
+        component = AIComponent(
+            name="gpt-4o-mini",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/src/orchestrator/testimony_router.py",
+            line_number=8,
+            confidence=0.8,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, _ = pipeline._stage_assemble([component])
+
+        assert [c.name for c in components] == ["gpt-4o-mini"]
+
+    def test_stage_assemble_excludes_fixture_components(self):
+        component = AIComponent(
+            name="FakePrompt",
+            component_type=AIComponentType.PROMPT,
+            file_path="repo/fixtures/sample_prompt.py",
+            line_number=4,
+            confidence=0.8,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, agentic_count = pipeline._stage_assemble([component])
+
+        assert components == []
+        assert agentic_count == 0
+
+    def test_stage_assemble_keeps_components_with_production_evidence(self):
+        prod = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/app/service.py",
+            line_number=12,
+            confidence=0.9,
+        )
+        test = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/tests/test_service.py",
+            line_number=18,
+            confidence=0.7,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, _ = pipeline._stage_assemble([prod, test])
+
+        assert len(components) == 1
+        assert components[0].name == "gpt-4o"
+        assert components[0].metadata.get("test_only") is not True
+
+    def test_stage_assemble_keeps_github_automation_components(self):
+        component = AIComponent(
+            name="env:LLM_API_BASE",
+            component_type=AIComponentType.LLM_ENDPOINT,
+            file_path="repo/.github/workflows/ai-review.yml",
+            line_number=42,
+            confidence=0.8,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, _ = pipeline._stage_assemble([component])
+
+        assert len(components) == 1
+        assert components[0].file_path.endswith(".github/workflows/ai-review.yml")
+
+    def test_run_filters_test_scope_relationships_and_risk_flags(self):
+        from aibom.models.scan import ComponentRelationship, RiskFlag
+        from aibom.models.enums import RelationshipType, Severity
+
+        prod = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/app/service.py",
+            line_number=12,
+            confidence=0.9,
+            needs_agentic=False,
+        )
+        test = AIComponent(
+            name="FakeTool",
+            component_type=AIComponentType.TOOL,
+            file_path="repo/tests/test_agent.py",
+            line_number=10,
+            confidence=0.8,
+            needs_agentic=False,
+        )
+        kept_rel = ComponentRelationship(
+            source_instance_id=prod.instance_id,
+            target_instance_id=prod.instance_id,
+            relationship_type=RelationshipType.USES_MODEL,
+            source_name=prod.name,
+            target_name=prod.name,
+            source_type=prod.component_type,
+            target_type=prod.component_type,
+        )
+        dropped_rel = ComponentRelationship(
+            source_instance_id=test.instance_id,
+            target_instance_id=prod.instance_id,
+            relationship_type=RelationshipType.USES_TOOL,
+            source_name=test.name,
+            target_name=prod.name,
+            source_type=test.component_type,
+            target_type=prod.component_type,
+        )
+        kept_flag = RiskFlag(
+            flag="prod-risk",
+            severity=Severity.LOW,
+            weight=1,
+            description="prod",
+            file_path=prod.file_path,
+            line_number=prod.line_number,
+        )
+        dropped_flag = RiskFlag(
+            flag="test-risk",
+            severity=Severity.LOW,
+            weight=1,
+            description="test",
+            file_path=test.file_path,
+            line_number=test.line_number,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([prod, test], [kept_rel, dropped_rel])),
+            patch.object(pipeline, "_stage_cross_ref", return_value=([prod, test], MagicMock(), MagicMock(), [])),
+            patch.object(pipeline, "_stage_agentic", return_value=([prod, test], [kept_rel, dropped_rel], [kept_flag, dropped_flag])),
+        ):
+            result = pipeline.run()
+
+        assert [c.name for c in result.components] == ["gpt-4o"]
+        assert result.relationships == [kept_rel]
+
+
+class TestDependencyPolicyScope:
+    def test_stage_assemble_drops_non_ai_dependencies(self) -> None:
+        ai_dep = AIComponent(
+            name="openai",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="/repo/requirements.txt",
+            line_number=1,
+            metadata={
+                "ecosystem": "pypi",
+                "known_ai_package": True,
+            },
+            needs_agentic=False,
+        )
+        generic_dep = AIComponent(
+            name="requests",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="/repo/requirements.txt",
+            line_number=2,
+            metadata={
+                "ecosystem": "pypi",
+                "known_ai_package": False,
+            },
+            needs_agentic=False,
+        )
+        pipeline = ScanPipeline(scan_paths=["/repo"])
+
+        components, agentic_count = pipeline._stage_assemble([ai_dep, generic_dep])
+
+        assert agentic_count == 0
+        assert [c.name for c in components] == ["openai"]
+
+    def test_run_keeps_name_only_agentic_relationships_for_kept_components(self):
+        from aibom.models.scan import ComponentRelationship
+        from aibom.models.enums import RelationshipType
+
+        prod = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/app/service.py",
+            line_number=12,
+            confidence=0.9,
+            needs_agentic=False,
+            model_name="gpt-4o",
+        )
+        test = AIComponent(
+            name="FakeTool",
+            component_type=AIComponentType.TOOL,
+            file_path="repo/tests/test_agent.py",
+            line_number=10,
+            confidence=0.8,
+            needs_agentic=False,
+        )
+        kept_rel = ComponentRelationship(
+            source_instance_id="",
+            target_instance_id="",
+            relationship_type=RelationshipType.USES_MODEL,
+            source_name="gpt-4o",
+            target_name="gpt-4o",
+            source_type=prod.component_type,
+            target_type=prod.component_type,
+        )
+        dropped_rel = ComponentRelationship(
+            source_instance_id="",
+            target_instance_id="",
+            relationship_type=RelationshipType.USES_TOOL,
+            source_name="FakeTool",
+            target_name="gpt-4o",
+            source_type=test.component_type,
+            target_type=prod.component_type,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([prod, test], [kept_rel, dropped_rel])),
+            patch.object(pipeline, "_stage_cross_ref", return_value=([prod, test], MagicMock(), MagicMock(), [])),
+            patch.object(pipeline, "_stage_agentic", return_value=([prod, test], [kept_rel, dropped_rel], [])),
+        ):
+            result = pipeline.run()
+
+        assert [c.name for c in result.components] == ["gpt-4o"]
+        assert result.relationships == [kept_rel]

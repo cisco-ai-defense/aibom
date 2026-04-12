@@ -43,6 +43,34 @@ class TestConfigScanner:
             "LLM_NAME",
         }
 
+    def test_env_embedding_model_is_embedding(self, tmp_path: Path) -> None:
+        env = "OPENAI_EMBEDDING_MODEL=text-embedding-3-large\n"
+        comps, _ = run_scanner(ConfigScanner, tmp_path, {".env": env})
+        assert any(
+            c.component_type == AIComponentType.EMBEDDING
+            and c.model_name == "text-embedding-3-large"
+            for c in comps
+        )
+        assert not any(
+            c.component_type == AIComponentType.MODEL
+            and c.model_name == "text-embedding-3-large"
+            for c in comps
+        )
+
+    def test_env_weaviate_endpoint_is_vector_store(self, tmp_path: Path) -> None:
+        env = "WEAVIATE_CLOUD_ENDPOINT=https://cluster.example.weaviate.cloud\n"
+        comps, _ = run_scanner(ConfigScanner, tmp_path, {".env": env})
+        assert any(
+            c.component_type == AIComponentType.VECTOR_STORE
+            and c.metadata.get("env_var") == "WEAVIATE_CLOUD_ENDPOINT"
+            for c in comps
+        )
+        assert not any(
+            c.component_type == AIComponentType.LLM_ENDPOINT
+            and c.metadata.get("env_var") == "WEAVIATE_CLOUD_ENDPOINT"
+            for c in comps
+        )
+
     def test_crewai_yaml_agents(self, tmp_path: Path) -> None:
         cfg = "agents:\n  - name: Researcher\n    role: analyst\n"
         comps, _ = run_scanner(ConfigScanner, tmp_path, {"crewai.yaml": cfg})

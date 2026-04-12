@@ -140,6 +140,25 @@ _INFRA_ENV_PREFIXES: tuple[str, ...] = (
     "SPLUNK_", "SENTRY_", "MY_NODE_", "CLUSTER_", "POD_",
 )
 
+_KEY_TOKEN_SPLIT_RE = re.compile(r"[._-]+")
+
+_VECTOR_STORE_HINTS: frozenset[str] = frozenset({
+    "vector", "vectorstore", "vectorstores", "weaviate", "pinecone",
+    "qdrant", "chroma", "chromadb", "milvus", "pgvector", "faiss",
+})
+
+_EMBEDDING_HINTS: frozenset[str] = frozenset({
+    "embedding", "embeddings", "embed", "embedder",
+})
+
+_MODEL_ENDPOINT_HINTS: frozenset[str] = frozenset({
+    "sagemaker", "inference", "serving", "vllm",
+})
+
+
+def _key_tokens(value: str) -> set[str]:
+    return {tok for tok in _KEY_TOKEN_SPLIT_RE.split(value.lower()) if tok}
+
 # ---------------------------------------------------------------------------
 # Vault / Secret-manager patterns  (Fix 3: generalized secret fetch)
 #
@@ -293,13 +312,20 @@ def _classify_assignment(text: str, env_match_start: int) -> str | None:
 
 
 def _env_context_to_component_type(ctx: str, env_name: str = "") -> AIComponentType:
+    tokens = _key_tokens(env_name)
     if ctx in ("model_kwarg", "model_assignment"):
+        if tokens & _EMBEDDING_HINTS:
+            return AIComponentType.EMBEDDING
         return AIComponentType.MODEL
     if ctx in ("api_key_kwarg", "api_key_envname"):
         return AIComponentType.SECRET
     if ctx == "endpoint_kwarg":
-        eu = env_name.upper()
-        if any(tok in eu for tok in ("SAGEMAKER", "INFERENCE", "SERVING")):
+        lower_name = env_name.lower()
+        if any(hint in lower_name for hint in _VECTOR_STORE_HINTS):
+            return AIComponentType.VECTOR_STORE
+        if tokens & _EMBEDDING_HINTS:
+            return AIComponentType.MODEL_ENDPOINT
+        if tokens & _MODEL_ENDPOINT_HINTS:
             return AIComponentType.MODEL_ENDPOINT
         return AIComponentType.LLM_ENDPOINT
     return AIComponentType.MODEL

@@ -30,6 +30,7 @@ from unittest.mock import patch
 
 import pytest
 
+from aibom.cst_parser import parse_source_code
 from aibom.models import AIComponentType, DetectionSource, ScanContext
 from aibom.scanners.kb_enrichment_scanner import (
     ALLOWED_CONCEPTS,
@@ -42,6 +43,7 @@ from aibom.scanners.kb_enrichment_scanner import (
     _frameworks_related,
     _has_suggestive_signal,
     _match_observation_rich,
+    _process_file_with_cache,
     _resolve_kb_path,
 )
 
@@ -156,6 +158,54 @@ class TestMatchObservationRich:
         assert result.partial_kb_id == "langchain_community.llms.openai.OpenAI"
         assert result.partial_kb_framework == "langchain_community"
         assert result.obs_module == "models"
+
+
+class TestMethodLabelFiltering:
+    def test_kb_method_match_does_not_emit_vector_store_asset(self, tmp_path: Path):
+        helper = tmp_path / "helper.py"
+        helper.write_text(
+            "def create_store_adapter(config):\n"
+            "    return config\n"
+            "\n"
+            "store = create_store_adapter(config={})\n"
+        )
+
+        result = parse_source_code(str(helper), helper.read_text())
+        kb_entries = {
+            "langchain_community.utilities.fake.StoreFactory.create_store_adapter": {
+                "id": "langchain_community.utilities.fake.StoreFactory.create_store_adapter",
+                "concept": "datastore",
+                "framework": "langchain_community",
+                "label": "method",
+            },
+        }
+
+        comps = _process_file_with_cache(result, kb_entries)
+        assert [c for c in comps if c.component_type == AIComponentType.VECTOR_STORE] == []
+
+    def test_kb_class_match_still_emits_vector_store_asset(self, tmp_path: Path):
+        helper = tmp_path / "store.py"
+        helper.write_text(
+            "class FakeVectorStore:\n"
+            "    pass\n"
+            "\n"
+            "store = FakeVectorStore()\n"
+        )
+
+        result = parse_source_code(str(helper), helper.read_text())
+        kb_entries = {
+            "langchain_community.vectorstores.fake.FakeVectorStore": {
+                "id": "langchain_community.vectorstores.fake.FakeVectorStore",
+                "concept": "datastore",
+                "framework": "langchain_community",
+                "label": "class",
+            },
+        }
+
+        comps = _process_file_with_cache(result, kb_entries)
+        stores = [c for c in comps if c.component_type == AIComponentType.VECTOR_STORE]
+        assert len(stores) == 1
+        assert stores[0].name == "FakeVectorStore"
 
     def test_partial_match_wrapper_library(self):
         """Wrapper class that matches KB leaf via class segment extraction."""
@@ -497,10 +547,11 @@ class TestEmitSuggestiveCandidates:
     def test_emits_for_indicative_class(self, tmp_path: Path):
         f = tmp_path / "models" / "chat.py"
         f.parent.mkdir()
-        source = "client = OpenAIModel(api_key='x')\n"
+        source = "router = RouterAgent(api_key='x')\n"
         f.write_text(source)
         candidates = _emit_suggestive_candidates(f, source)
         assert len(candidates) == 1
+        assert candidates[0].component_type == AIComponentType.AGENT
         assert candidates[0].needs_agentic is True
         assert candidates[0].confidence == 0.2
         assert "suggestive_signal" in candidates[0].metadata
@@ -525,8 +576,8 @@ class TestEmitSuggestiveCandidates:
         f = tmp_path / "agents" / "multi.py"
         f.parent.mkdir()
         source = (
-            "llm = ChatModel()\n"
-            "emb = EmbeddingClient()\n"
+            "router = RouterAgent(api_key='x')\n"
+            "search = SearchTool(name='docs')\n"
         )
         f.write_text(source)
         candidates = _emit_suggestive_candidates(f, source)

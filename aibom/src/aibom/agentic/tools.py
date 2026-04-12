@@ -31,6 +31,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from ..cache_paths import cache_read_dirs, ensure_cache_dir
+
 _LOGGER = logging.getLogger(__name__)
 
 import contextvars
@@ -471,9 +473,6 @@ def search_codebase_impl(
 # search_package_info — query package registries for AI relevance
 # ---------------------------------------------------------------------------
 
-_PKG_CACHE_DIR = Path.home() / ".cache" / "cisco-aibom" / "packages"
-
-
 class SearchPackageInfoArgs(BaseModel):
     package_name: str = Field(description="Package name (e.g. 'openai', 'langchain', 'chromadb')")
     ecosystem: str = Field(
@@ -483,21 +482,22 @@ class SearchPackageInfoArgs(BaseModel):
 
 
 def _read_pkg_cache(name: str, ecosystem: str) -> dict[str, Any] | None:
-    cache_file = _PKG_CACHE_DIR / ecosystem / f"{name}.json"
-    if cache_file.exists():
-        try:
-            data = json.loads(cache_file.read_text())
-            age_days = (time.time() - cache_file.stat().st_mtime) / 86400
-            if age_days < 7:
-                data["is_cached"] = True
-                return data
-        except (json.JSONDecodeError, OSError):
-            pass
+    for cache_root in cache_read_dirs("packages"):
+        cache_file = cache_root / ecosystem / f"{name}.json"
+        if cache_file.exists():
+            try:
+                data = json.loads(cache_file.read_text())
+                age_days = (time.time() - cache_file.stat().st_mtime) / 86400
+                if age_days < 7:
+                    data["is_cached"] = True
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass
     return None
 
 
 def _write_pkg_cache(name: str, ecosystem: str, data: dict[str, Any]) -> None:
-    cache_file = _PKG_CACHE_DIR / ecosystem / f"{name}.json"
+    cache_file = ensure_cache_dir("packages") / ecosystem / f"{name}.json"
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(data))

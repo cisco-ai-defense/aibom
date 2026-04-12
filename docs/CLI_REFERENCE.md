@@ -40,7 +40,7 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 | `--repo-topic` | — | Filter discovered repos by topic/tag. |
 | `--max-repos` | — | Max repos when using discovery (sorted by last push, most recent first). |
 | `--parallel-repos` | — | Number of repositories to scan in parallel (default `1`). |
-| `--incremental` | — | Skip repos whose HEAD is unchanged since last cached scan. |
+| `--skip-unchanged` | — | Skip repos whose HEAD is unchanged since last cached scan. Org-cache writes default to `~/.aibom/cache/org` and still read legacy locations for compatibility. |
 
 ### Output Options
 
@@ -51,6 +51,7 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 | `--validate` | — | Validate output against the format's schema and report errors. |
 | `--show-summary` / `--no-show-summary` | — | Display a Rich summary table after analysis (default on). |
 | `--timing` | — | Print per-stage and per-scanner timing breakdown. |
+| `--progress` / `--no-progress` | — | Show live per-stage and per-scanner progress. Defaults to auto for interactive terminals. |
 
 ### Report Submission
 
@@ -65,12 +66,12 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 
 | Option | Env Var | Description |
 |--------|---------|-------------|
-| `--llm-model` | `AIBOM_LLM_MODEL` | **Required.** LLM model name (e.g. `gpt-5.4`, `us.anthropic.claude-sonnet-4-20250514-v1:0`). The LLM agent classifies every scanner candidate (requires `cisco-aibom[agentic]`). |
+| `--llm-model` | `AIBOM_LLM_MODEL` | **Required.** LLM model name (e.g. `gpt-5.4`, `us.anthropic.claude-sonnet-4-20250514-v1:0`). The LLM agent classifies every scanner candidate and requires `cisco-aibom[agentic]` plus any provider-specific integration extra. |
 | `--llm-provider` | `AIBOM_LLM_PROVIDER` | LangChain provider name: `openai`, `azure_openai`, `bedrock`, `anthropic`, `google_genai`, `ollama`, etc. Inferred from the model name if not set. |
 | `--llm-api-key` | `AIBOM_LLM_API_KEY` | LLM API key. Optional for local LLMs and AWS Bedrock. |
 | `--llm-api-base` | `AIBOM_LLM_API_BASE` | LLM API base URL. |
 | `--llm-api-version` | `AIBOM_LLM_API_VERSION` | LLM API version (required for Azure OpenAI). |
-| `--agentic-batch-size` | — | Max components per LLM invocation (default `15`). |
+| `--agentic-batch-size` | — | Max components per LLM invocation (default `5`). |
 | `--agentic-concurrency` | — | Max parallel agentic LLM batches (default `1`). |
 | `--agentic-fast-model` | — | Cheaper/faster model for simple confirmations (e.g. dependency checks). |
 | `--agentic-timeout` | — | Wall-clock timeout in seconds per agentic batch (default `120`). |
@@ -86,7 +87,8 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 | `--fail-on` | Exit non-zero if risk severity meets or exceeds: `critical`, `high`, `medium`, `low`. |
 | `--policy` | Path to a YAML policy file. Exits `1` if the policy does not pass. |
 | `--compliance` | Advisory compliance mapping: `eu-ai-act`, `owasp-agentic`, `nist-ai-rmf`, or `all`. |
-| `--cache-dir` | Directory for caching scan results keyed by `repo@commit_sha`. |
+| `--cache-dir` | Shared cache root. Defaults to `~/.aibom/cache` and stores `scan`, `agentic`, `org`, `model`, and `packages` caches beneath it. |
+| `--include-code-snippets` / `--no-code-snippets` | Include raw code snippets in per-finding decision annotations. Off by default. |
 
 ### Examples
 
@@ -137,29 +139,48 @@ cisco-aibom analyze ./my-app -o json -O report.json \
 
 ## `cisco-aibom report`
 
-Render a previously generated JSON report using Rich formatting.
+Show or upload a previously generated JSON report.
 
 ```bash
-cisco-aibom report [OPTIONS] REPORT_FILE
+cisco-aibom report REPORT_FILE
+cisco-aibom report show REPORT_FILE [--raw-json]
+cisco-aibom report upload REPORT_FILE --format json --post-url URL [OPTIONS]
 ```
+
+The JSON reporter writes `aibom_analysis.metadata.report_schema_version = "1"`. Unversioned legacy JSON reports are still accepted for `report upload`; the CLI warns and synthesizes the current schema version before submitting.
+
+### `report show`
 
 | Argument / Option | Description |
 |-------------------|-------------|
 | `REPORT_FILE` | Path to a JSON report file. |
 | `--raw-json` | Display the raw JSON with syntax highlighting before the summary. |
 
-### Example
+### `report upload`
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--format` | — | Upload format. Only `json` is currently supported. |
+| `--post-url` | `AIBOM_POST_URL` | HTTP endpoint to POST the JSON report to. Required for upload. |
+| `--ai-defense-api-key` | `AI_DEFENSE_API_KEY` | API key sent as `x-cisco-ai-defense-tenant-api-key`. |
+| `--post-timeout` | `AIBOM_POST_TIMEOUT` | Timeout in seconds for POSTing the report (default `30`). |
+| `--post-verify-tls` / `--no-post-verify-tls` | `AIBOM_POST_VERIFY_TLS` | Verify TLS certificates when POSTing (default on). |
+
+### Examples
 
 ```bash
 cisco-aibom report report.json
-cisco-aibom report report.json --raw-json
+cisco-aibom report show report.json --raw-json
+cisco-aibom report upload report.json --format json \
+  --post-url https://example.invalid/aibom/reports \
+  --ai-defense-api-key $AI_DEFENSE_API_KEY
 ```
 
 ---
 
 ## `cisco-aibom watch`
 
-Poll directories for file-system changes and re-run the scan pipeline, printing component deltas.
+Poll directories for file-system changes and re-run the deterministic scan pipeline, printing component deltas. This command does not invoke the agentic classification stage; use `analyze` for the full LLM-backed pipeline.
 
 ```bash
 cisco-aibom watch [OPTIONS] SOURCES...
@@ -313,7 +334,7 @@ cisco-aibom kb list-requests [OPTIONS]
 
 ## `cisco-aibom cache`
 
-Manage the scan result cache.
+Manage AIBOM cache entries under the shared cache root (`~/.aibom/cache` by default).
 
 ### `cache clear`
 
@@ -325,12 +346,12 @@ cisco-aibom cache clear [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--cache-dir` | `~/.aibom/cache` | Directory where cached scan results are stored. |
-| `--include-agentic` / `--no-agentic` | Include | Also clear the agentic enrichment cache at `~/.cache/cisco-aibom/agentic/`. |
+| `--cache-dir` | `~/.aibom/cache` | Cache root directory. |
+| `--include-agentic` / `--no-agentic` | Include | Also clear the agentic enrichment cache. |
 
 ### `cache list`
 
-List all cached scan result entries.
+List cached entries for a specific cache family.
 
 ```bash
 cisco-aibom cache list [OPTIONS]
@@ -338,7 +359,34 @@ cisco-aibom cache list [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--cache-dir` | `~/.aibom/cache` | Directory where cached scan results are stored. |
+| `--type` | `scan` | Cache family: `scan`, `agentic`, `org`, `model`, `packages`. |
+| `--cache-dir` | `~/.aibom/cache` | Cache root directory. |
+
+### `cache get`
+
+Inspect a specific cache entry by type.
+
+```bash
+cisco-aibom cache get CACHE_TYPE ENTRY_REF [OPTIONS]
+```
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `CACHE_TYPE` | Cache family: `scan`, `agentic`, `org`, `model`, `packages`. |
+| `ENTRY_REF` | Entry id, prefix, or logical reference. |
+| `--cache-dir` | Cache root directory (default `~/.aibom/cache`). |
+| `--sha` | Commit SHA for `org` cache lookups. |
+| `--model-id` | Optional model id filter for `model` cache lookups. |
+| `--raw-json` | Print the raw cache payload instead of a summary. |
+
+### Cache examples
+
+```bash
+cisco-aibom cache list --type scan
+cisco-aibom cache list --type agentic
+cisco-aibom cache get scan 0123456789ab
+cisco-aibom cache get org /path/to/repo --sha deadbeef
+```
 
 ---
 

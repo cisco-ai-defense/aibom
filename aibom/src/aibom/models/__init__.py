@@ -22,7 +22,10 @@ from .enums import (
 )
 from .scan import (
     AIComponent,
+    CodeSnippet,
     ComponentRelationship,
+    DecisionAnnotation,
+    EvidenceLocation,
     RiskFlag,
     RiskScore,
     ScanContext,
@@ -33,8 +36,11 @@ from .scan import (
 __all__ = [
     "AIComponent",
     "AIComponentType",
+    "CodeSnippet",
     "ComponentRelationship",
+    "DecisionAnnotation",
     "DetectionSource",
+    "EvidenceLocation",
     "RelationshipType",
     "RiskFlag",
     "RiskScore",

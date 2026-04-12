@@ -25,7 +25,10 @@ import pytest
 from aibom.models import (
     AIComponent,
     AIComponentType,
+    CodeSnippet,
     ComponentRelationship,
+    DecisionAnnotation,
+    EvidenceLocation,
     RelationshipType,
     RiskFlag,
     RiskScore,
@@ -186,6 +189,7 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
     analysis = data["aibom_analysis"]
     assert analysis["metadata"]["analyzer_version"] == "2.0.0-test"
     assert analysis["metadata"]["run_id"] == "run-test-001"
+    assert analysis["metadata"]["report_schema_version"] == "1"
     source_keys = set(analysis["sources"].keys())
     assert source_keys == {"alpha", "beta"}
     for src_path, src_data in analysis["sources"].items():
@@ -195,6 +199,49 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
         assert len(comps["agent"]) == 1
         assert len(comps["tool"]) == 1
         assert "summary" in src_data
+
+
+def test_json_reporter_preserves_decision_annotations():
+    component = AIComponent(
+        name="router_agent",
+        component_type=AIComponentType.AGENT,
+        file_path="/proj/src/app.py",
+        line_number=12,
+        decision_annotation=DecisionAnnotation(
+            decision="confirmed",
+            justification="The code instantiates and invokes the agent in the request path.",
+            evidence_kinds=["code_context"],
+            evidence_locations=[
+                EvidenceLocation(
+                    file_path="/proj/src/app.py",
+                    start_line=12,
+                    end_line=18,
+                    role="primary",
+                )
+            ],
+            code_snippet=CodeSnippet(
+                file_path="/proj/src/app.py",
+                start_line=12,
+                end_line=14,
+                text="agent = RouterAgent()\nagent.run(task)\n",
+                truncated=False,
+            ),
+        ),
+    )
+    result = ScanResult(
+        metadata={"analyzer_version": "2.0.0-test", "run_id": "run-test-annotations"},
+        sources=[SourceResult(path="/proj/src", components=[component], relationships=[])],
+        risk=RiskScore(),
+    )
+
+    buf = StringIO()
+    JsonReporter().render(result, buf)
+    data = json.loads(buf.getvalue())
+
+    rendered = data["aibom_analysis"]["sources"]["src"]["components"]["agent"][0]
+    assert rendered["decision_annotation"]["decision"] == "confirmed"
+    assert rendered["decision_annotation"]["evidence_locations"][0]["role"] == "primary"
+    assert rendered["decision_annotation"]["code_snippet"]["truncated"] is False
 
 
 def test_json_reporter_disambiguates_colliding_source_names(sample_scan_result: ScanResult):

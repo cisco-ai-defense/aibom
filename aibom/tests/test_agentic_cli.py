@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -98,3 +99,65 @@ class TestAgenticEnrichmentViaCLI:
         clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         assert "--llm-model" in clean
         assert "agentic" in clean
+
+    def test_missing_agentic_extras_fail_fast_with_install_hint(
+        self, monkeypatch, sample_dir, tmp_path
+    ):
+        out = tmp_path / "report.txt"
+
+        monkeypatch.setattr("aibom.llm_factory.init_chat_model", None)
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
+                "--llm-model",
+                "test-model",
+                "--llm-api-base",
+                "http://localhost:11434",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "cisco-aibom[agentic]" in result.output
+        assert "install" in result.output.lower()
+
+    def test_missing_openai_provider_extra_fails_fast_with_install_hint(
+        self, monkeypatch, sample_dir, tmp_path
+    ):
+        out = tmp_path / "report.txt"
+        real_import_module = importlib.import_module
+
+        def fake_import_module(name: str, package: str | None = None):
+            if name == "langchain_openai":
+                raise ImportError("missing langchain_openai")
+            return real_import_module(name, package)
+
+        monkeypatch.setattr("importlib.import_module", fake_import_module)
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
+                "--llm-model",
+                "gpt-5.4",
+                "--llm-provider",
+                "openai",
+                "--llm-api-key",
+                "not-a-real-key",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "llm-openai" in result.output
+        assert "cisco-aibom[agentic,llm-openai]" in result.output

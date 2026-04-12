@@ -21,6 +21,7 @@ Every code path that needs a ``BaseChatModel`` should call
 """
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any
 
@@ -30,6 +31,53 @@ try:
     from langchain.chat_models import init_chat_model
 except ImportError:
     init_chat_model = None  # agentic extras not installed
+
+_PROVIDER_IMPORT_HINTS: dict[str, tuple[str, str]] = {
+    "openai": ("langchain_openai", 'cisco-aibom[agentic,llm-openai]'),
+    "azure_openai": ("langchain_openai", 'cisco-aibom[agentic,llm-openai]'),
+    "bedrock": ("langchain_aws", 'cisco-aibom[agentic,llm-aws]'),
+}
+
+
+def resolve_provider(model_string: str, provider: str | None = None) -> str | None:
+    """Resolve the effective model provider from explicit or legacy syntax."""
+    if provider:
+        return provider
+    if "/" in model_string:
+        resolved_provider, _, _ = model_string.partition("/")
+        return resolved_provider or None
+    return None
+
+
+def ensure_llm_runtime_available(
+    model_string: str,
+    *,
+    provider: str | None = None,
+) -> str | None:
+    """Fail fast when the required agentic or provider extras are missing."""
+    if init_chat_model is None:
+        raise ImportError(
+            "LLM-assisted analysis requires the agentic extras. "
+            'Install with: uv tool install "cisco-aibom[agentic]"'
+        )
+
+    resolved_provider = resolve_provider(model_string, provider)
+    if not resolved_provider:
+        return None
+
+    provider_hint = _PROVIDER_IMPORT_HINTS.get(resolved_provider)
+    if not provider_hint:
+        return resolved_provider
+
+    module_name, install_target = provider_hint
+    try:
+        importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ImportError(
+            f"LLM provider '{resolved_provider}' requires additional runtime support. "
+            f'Install with: uv tool install "{install_target}"'
+        ) from exc
+    return resolved_provider
 
 
 def build_chat_model(
@@ -71,19 +119,18 @@ def build_chat_model(
     rate_limiter:
         Optional ``langchain_core.rate_limiters.BaseRateLimiter``.
     """
-    if init_chat_model is None:
-        raise ImportError(
-            "langchain is required for LLM features. "
-            "Install with: uv pip install 'cisco-aibom[agentic]'"
-        )
+    resolved_provider = ensure_llm_runtime_available(
+        model_string,
+        provider=provider,
+    )
 
     init_kwargs: dict[str, Any] = {}
 
     model_id = model_string
-    resolved_provider = provider
-
-    if not resolved_provider and "/" in model_string:
-        resolved_provider, _, model_id = model_string.partition("/")
+    if "/" in model_string:
+        inferred_provider, _, legacy_model_id = model_string.partition("/")
+        if not provider or provider == inferred_provider:
+            model_id = legacy_model_id
 
     if resolved_provider:
         init_kwargs["model_provider"] = resolved_provider

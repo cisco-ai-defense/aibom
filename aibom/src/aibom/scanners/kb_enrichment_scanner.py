@@ -284,10 +284,59 @@ _AMBIGUOUS_NAME_TYPES: frozenset[AIComponentType] = frozenset({
     AIComponentType.GUARDRAIL,
 })
 
+_EMBEDDING_IMPORT_SIGNALS: frozenset[str] = frozenset({
+    "embedding",
+    "embedder",
+    "embedders",
+    "openai",
+    "langchain",
+    "haystack",
+    "llama_index",
+    "sentence_transformers",
+    "transformers",
+    "chromadb",
+})
+
+_EMBEDDING_CALL_SIGNALS: frozenset[str] = frozenset({
+    "model=",
+    "model_name=",
+    "deployment=",
+    "deployment_name=",
+    "api_key=",
+    "client=",
+    "embedding_function=",
+})
+
 
 def _is_data_class_name(name: str) -> bool:
     """Return True when the class name looks like a data/schema class."""
     return any(name.endswith(s) for s in _NON_AI_CLASS_SUFFIXES)
+
+
+def _is_class_like_name(name: str) -> bool:
+    return bool(name) and name[0].isupper() and not name.isupper()
+
+
+def _has_embedding_type_name(name: str) -> bool:
+    lower = name.lower()
+    return (
+        lower.endswith("embedding")
+        or lower.endswith("embeddings")
+        or lower.endswith("embedder")
+    )
+
+
+def _has_embedding_import_evidence(text: str) -> bool:
+    lower = text.lower()
+    return any(signal in lower for signal in _EMBEDDING_IMPORT_SIGNALS)
+
+
+def _has_embedding_call_evidence(line: str, source: str) -> bool:
+    lower_line = line.lower()
+    return (
+        any(signal in lower_line for signal in _EMBEDDING_CALL_SIGNALS)
+        or _has_embedding_import_evidence(source)
+    )
 
 
 def _infer_type_from_name(name: str) -> tuple[AIComponentType, bool]:
@@ -730,6 +779,13 @@ def _emit_suggestive_candidates(
             continue
         seen_lines.add(i)
         inferred_type, _name_ambiguous = _infer_type_from_name(class_name)
+        if inferred_type == AIComponentType.MODEL:
+            continue
+        if inferred_type == AIComponentType.EMBEDDING and not (
+            _has_embedding_type_name(class_name)
+            and _has_embedding_call_evidence(stripped, source)
+        ):
+            continue
         candidates.append(
             AIComponent(
                 name=class_name,
@@ -849,6 +905,12 @@ def _detect_import_based_assets(
                 if not cleaned or cleaned in ("from", "import", "as"):
                     continue
                 inferred, name_ambiguous = _infer_type_from_name(cleaned)
+                if inferred == AIComponentType.EMBEDDING and not (
+                    _is_class_like_name(cleaned)
+                    and _has_embedding_type_name(cleaned)
+                    and _has_embedding_import_evidence(imp_lower)
+                ):
+                    continue
                 if inferred != AIComponentType.MODEL:
                     comp_type = inferred
                     matched_name = cleaned
@@ -1091,6 +1153,28 @@ _BARE_CLIENT_HINTS: dict[str, str] = {
 }
 
 
+def _is_confirmed_ai_prompt_call(qn: str) -> bool:
+    """Return True only for prompt kwargs on confirmed AI call chains.
+
+    Generic helpers frequently accept ``prompt=`` or ``messages=`` kwargs, so
+    we require the enclosing call to resolve to a known AI constructor or an AI
+    client method chain before emitting a prompt asset.
+    """
+    if not qn:
+        return False
+
+    short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+    if short == "create_deep_agent":
+        return True
+    if short in _KNOWN_AI_CLIENT_CLASSES:
+        return True
+    if short not in _AI_CLIENT_CALLS:
+        return False
+
+    class_segment = _extract_class_segment(qn)
+    return bool(class_segment and class_segment in _KNOWN_AI_CLIENT_CLASSES)
+
+
 def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
     """Extract models, LLM endpoints, and bare clients from AI constructor kwargs via LibCST.
 
@@ -1210,13 +1294,19 @@ def _detect_prompt_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
     """
     components: list[AIComponent] = []
     seen: set[tuple[str, int]] = set()
+    variable_map: dict[str, str] = {}
 
-    all_calls = list(result.calls) + [a.call for a in result.assignments]
-    all_lines = [c.line_number for c in result.calls] + [a.line_number for a in result.assignments]
+    for assignment in result.assignments:
+        if assignment.target_qualified_name and assignment.call.qualified_name:
+            variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
 
-    for call_obs, line in zip(all_calls, all_lines):
-        qn = call_obs.qualified_name or ""
-        short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+    all_calls = [(c, c.line_number) for c in result.calls]
+    all_calls += [(a.call, a.line_number) for a in result.assignments]
+
+    for call_obs, line in all_calls:
+        qn = _resolve_chain(call_obs.qualified_name or "", variable_map)
+        if not _is_confirmed_ai_prompt_call(qn):
+            continue
 
         for kwarg_name in _PROMPT_KWARG_NAMES:
             val = call_obs.arguments.get(kwarg_name)
@@ -1261,6 +1351,11 @@ def _detect_prompt_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                     )
                 )
     return components
+
+
+def _kb_entry_describes_method(kb_entry: dict[str, Any]) -> bool:
+    """KB method rows describe operations, not durable AI assets."""
+    return str(kb_entry.get("label") or "").strip().lower() == "method"
 
 
 def _find_python_files(context: ScanContext) -> list[Path]:
@@ -1447,6 +1542,8 @@ def _process_file_with_cache(
         if match.is_confirmed:
             kb_entry = match.entry
             assert kb_entry is not None  # noqa: S101
+            if _kb_entry_describes_method(kb_entry):
+                continue
             concept = kb_entry["concept"].lower()
             comp_type = _CONCEPT_TO_TYPE.get(concept)
             if not comp_type:
@@ -1675,6 +1772,8 @@ def _process_file(
         if match.is_confirmed:
             kb_entry = match.entry
             assert kb_entry is not None  # noqa: S101
+            if _kb_entry_describes_method(kb_entry):
+                continue
             concept = kb_entry["concept"].lower()
             comp_type = _CONCEPT_TO_TYPE.get(concept)
             if not comp_type:

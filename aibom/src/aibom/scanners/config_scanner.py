@@ -82,6 +82,62 @@ def _is_model_name(value: str) -> bool:
         return False
     return True
 
+
+_KEY_TOKEN_SPLIT_RE = re.compile(r"[._-]+")
+
+_VECTOR_STORE_HINTS: frozenset[str] = frozenset({
+    "vector", "vectorstore", "vectorstores", "weaviate", "pinecone",
+    "qdrant", "chroma", "chromadb", "milvus", "pgvector", "faiss",
+})
+
+_EMBEDDING_HINTS: frozenset[str] = frozenset({
+    "embedding", "embeddings", "embed", "embedder",
+})
+
+_MODEL_ENDPOINT_HINTS: frozenset[str] = frozenset({
+    "sagemaker", "inference", "serving", "vllm",
+})
+
+
+def _key_tokens(value: str) -> set[str]:
+    return {tok for tok in _KEY_TOKEN_SPLIT_RE.split(value.lower()) if tok}
+
+
+def _model_registry_entry(value: str) -> Optional[dict[str, Any]]:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    from .model_detector import _registry_lookup
+    return _registry_lookup(stripped)
+
+
+def _is_embedding_model_value(value: str) -> bool:
+    reg = _model_registry_entry(value)
+    if reg is not None and str(reg.get("family", "")).lower() == "embedding":
+        return True
+    return value.strip().lower().startswith("text-embedding")
+
+
+def _env_model_component_type(key: str, value: str) -> AIComponentType:
+    if _is_embedding_model_value(value):
+        return AIComponentType.EMBEDDING
+    if _key_tokens(key) & _EMBEDDING_HINTS:
+        return AIComponentType.EMBEDDING
+    return AIComponentType.MODEL
+
+
+def _env_endpoint_component_type(key: str, value: str) -> AIComponentType:
+    lower_key = key.lower()
+    lower_value = value.lower()
+    tokens = _key_tokens(key)
+    if any(hint in lower_key or hint in lower_value for hint in _VECTOR_STORE_HINTS):
+        return AIComponentType.VECTOR_STORE
+    if tokens & _EMBEDDING_HINTS:
+        return AIComponentType.MODEL_ENDPOINT
+    if tokens & _MODEL_ENDPOINT_HINTS:
+        return AIComponentType.MODEL_ENDPOINT
+    return AIComponentType.LLM_ENDPOINT
+
 _FROM_RE = re.compile(r"^\s*FROM\s+(--platform=\S+\s+)?(\S+)", re.IGNORECASE)
 _ENV_RE = re.compile(
     r"^\s*ENV\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$",
@@ -541,10 +597,7 @@ def _parse_env(
             or ku.endswith("_BASE_URL")
         )
         if is_endpoint_key and is_url:
-            is_custom_served = any(
-                tok in ku for tok in ("SAGEMAKER", "INFERENCE", "SERVING")
-            )
-            ctype = AIComponentType.MODEL_ENDPOINT if is_custom_served else AIComponentType.LLM_ENDPOINT
+            ctype = _env_endpoint_component_type(key, value)
             prov = _provider_from_env_key(key)
             out.append(
                 AIComponent(
@@ -586,13 +639,15 @@ def _parse_env(
             )
             continue
 
-        if "MODEL" in ku or "LLM" in ku:
+        if any(tok in ku for tok in ("MODEL", "LLM", "EMBEDDING", "ENGINE")):
             if _looks_like_model_name(value):
                 v = value.strip().strip("\"'")
+                ctype = _env_model_component_type(key, v)
+                name = f"env_embedding_{key}" if ctype == AIComponentType.EMBEDDING else f"env_model_{key}"
                 out.append(
                     AIComponent(
-                        name=f"env_model_{key}",
-                        component_type=AIComponentType.MODEL,
+                        name=name,
+                        component_type=ctype,
                         file_path=str(path.resolve()),
                         line_number=i,
                         detection_source=DetectionSource.CONFIG_FILE,
@@ -693,12 +748,14 @@ def _parse_dockerfile(
             ek = em.group(1)
             ev = em.group(2).strip().strip("\"'")
             ku = ek.upper()
-            if "MODEL" in ku or "LLM" in ku:
+            if any(tok in ku for tok in ("MODEL", "LLM", "EMBEDDING", "ENGINE")):
                 if _looks_like_model_name(ev):
+                    ctype = _env_model_component_type(ek, ev)
+                    name = f"dockerfile_env_{ek}"
                     out.append(
                         AIComponent(
-                            name=f"dockerfile_env_{ek}",
-                            component_type=AIComponentType.MODEL,
+                            name=name,
+                            component_type=ctype,
                             file_path=str(path.resolve()),
                             line_number=i,
                             detection_source=DetectionSource.CONFIG_FILE,

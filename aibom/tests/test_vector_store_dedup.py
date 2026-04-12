@@ -113,3 +113,17 @@ class TestConsolidateVectorStores:
         out = _consolidate_vector_stores(comps)
         assert len(out) == 1
         assert out[0].metadata.get("store_technology") == "milvus"
+
+    def test_metadata_store_technology_overrides_name_hint(self) -> None:
+        comps = [
+            AIComponent(
+                name="env:WEAVIATE_ENDPOINT",
+                component_type=AIComponentType.VECTOR_STORE,
+                file_path="values.yaml",
+                line_number=12,
+                metadata={"store_technology": "chromadb"},
+            ),
+        ]
+        out = _consolidate_vector_stores(comps)
+        assert len(out) == 1
+        assert out[0].metadata.get("store_technology") == "chromadb"
