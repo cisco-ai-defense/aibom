@@ -114,6 +114,37 @@ def test_non_git_directory_skips_caching(tmp_path) -> None:
     assert sr.sources[0].components[0].name == "live"
 
 
+def test_corrupt_primary_falls_through_to_fallback(tmp_path) -> None:
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("1", encoding="utf-8")
+    _git_commit(repo)
+
+    primary = tmp_path / "primary"
+    legacy = tmp_path / "legacy"
+    legacy_cache = OrgCache(base_dir=legacy)
+    legacy_cache.store(str(repo.resolve()), _make_scan("from-legacy"))
+
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True,
+    ).strip()
+
+    corrupt_dir = primary / OrgCache(base_dir=primary)._repo_dir(
+        str(repo.resolve()), primary
+    ).relative_to(primary)
+    corrupt_dir.mkdir(parents=True, exist_ok=True)
+    (corrupt_dir / f"{sha}.json").write_text("{BAD", encoding="utf-8")
+
+    cache = OrgCache.__new__(OrgCache)
+    cache.base_dir = primary
+    cache.fallback_dirs = [legacy]
+
+    result = cache.get_cached(str(repo.resolve()))
+    assert result is not None
+    assert result.sources[0].components[0].name == "from-legacy"
+
+
 def test_incremental_scan_cache_hit(tmp_path) -> None:
     repo = tmp_path / "r"
     repo.mkdir()

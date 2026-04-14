@@ -59,8 +59,14 @@ class AIBOMScannerMiddleware:
     that can be merged into the deterministic scan results.
     """
 
-    def __init__(self, *, include_code_snippets: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        include_code_snippets: bool = False,
+        allowed_roots: list[str] | None = None,
+    ) -> None:
         self.include_code_snippets = include_code_snippets
+        self.allowed_roots = allowed_roots or []
 
     def extract_findings(
         self, agent_output: str
@@ -386,8 +392,8 @@ class AIBOMScannerMiddleware:
             return annotation
         return annotation.model_copy(update={"code_snippet": snippet})
 
-    @staticmethod
     def _read_code_snippet(
+        self,
         file_path: str,
         start_line: int,
         end_line: int,
@@ -396,6 +402,16 @@ class AIBOMScannerMiddleware:
     ) -> CodeSnippet | None:
         if not file_path or start_line <= 0:
             return None
+        if self.allowed_roots:
+            try:
+                resolved = Path(file_path).resolve()
+            except OSError:
+                return None
+            if not any(
+                resolved == Path(r).resolve() or Path(r).resolve() in resolved.parents
+                for r in self.allowed_roots
+            ):
+                return None
         path = Path(file_path)
         try:
             lines = path.read_text(encoding="utf-8").splitlines(keepends=True)

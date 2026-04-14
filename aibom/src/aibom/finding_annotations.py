@@ -30,8 +30,28 @@ def _evidence_location(
     )
 
 
-def _read_code_snippet(location: EvidenceLocation | None) -> CodeSnippet | None:
+def _is_within_roots(file_path: str, allowed_roots: list[str]) -> bool:
+    """Return True only if *file_path* resolves inside one of *allowed_roots*."""
+    if not allowed_roots:
+        return False
+    try:
+        resolved = Path(file_path).resolve()
+    except OSError:
+        return False
+    return any(
+        resolved == Path(root).resolve() or Path(root).resolve() in resolved.parents
+        for root in allowed_roots
+    )
+
+
+def _read_code_snippet(
+    location: EvidenceLocation | None,
+    *,
+    allowed_roots: list[str] | None = None,
+) -> CodeSnippet | None:
     if location is None or not location.file_path:
+        return None
+    if allowed_roots is not None and not _is_within_roots(location.file_path, allowed_roots):
         return None
     try:
         lines = Path(location.file_path).read_text(encoding="utf-8").splitlines()
@@ -62,10 +82,11 @@ def _hydrate_annotation(
     *,
     include_code_snippets: bool,
     snippet_location: EvidenceLocation | None,
+    allowed_roots: list[str] | None = None,
 ) -> DecisionAnnotation:
     if not include_code_snippets or annotation.code_snippet is not None:
         return annotation
-    snippet = _read_code_snippet(snippet_location)
+    snippet = _read_code_snippet(snippet_location, allowed_roots=allowed_roots)
     if snippet is None:
         return annotation
     return annotation.model_copy(update={"code_snippet": snippet})
@@ -75,6 +96,7 @@ def _component_annotation(
     component: AIComponent,
     *,
     include_code_snippets: bool,
+    allowed_roots: list[str] | None = None,
 ) -> DecisionAnnotation:
     primary_location = _evidence_location(
         component.file_path,
@@ -86,6 +108,7 @@ def _component_annotation(
             component.decision_annotation,
             include_code_snippets=include_code_snippets,
             snippet_location=primary_location,
+            allowed_roots=allowed_roots,
         )
 
     evidence_locations = [primary_location] if primary_location is not None else []
@@ -102,6 +125,7 @@ def _component_annotation(
         annotation,
         include_code_snippets=include_code_snippets,
         snippet_location=primary_location,
+        allowed_roots=allowed_roots,
     )
 
 
@@ -110,6 +134,7 @@ def _relationship_annotation(
     *,
     component_by_id: dict[str, AIComponent],
     include_code_snippets: bool,
+    allowed_roots: list[str] | None = None,
 ) -> DecisionAnnotation:
     source = component_by_id.get(relationship.source_instance_id)
     target = component_by_id.get(relationship.target_instance_id)
@@ -135,6 +160,7 @@ def _relationship_annotation(
             relationship.decision_annotation,
             include_code_snippets=include_code_snippets,
             snippet_location=primary_location,
+            allowed_roots=allowed_roots,
         )
 
     source_label = relationship.source_name or relationship.source_instance_id or "source"
@@ -153,6 +179,7 @@ def _relationship_annotation(
         annotation,
         include_code_snippets=include_code_snippets,
         snippet_location=primary_location,
+        allowed_roots=allowed_roots,
     )
 
 
@@ -160,6 +187,7 @@ def _risk_annotation(
     flag: RiskFlag,
     *,
     include_code_snippets: bool,
+    allowed_roots: list[str] | None = None,
 ) -> DecisionAnnotation:
     primary_location = _evidence_location(
         flag.file_path,
@@ -171,6 +199,7 @@ def _risk_annotation(
             flag.decision_annotation,
             include_code_snippets=include_code_snippets,
             snippet_location=primary_location,
+            allowed_roots=allowed_roots,
         )
 
     evidence_locations = [primary_location] if primary_location is not None else []
@@ -184,6 +213,7 @@ def _risk_annotation(
         annotation,
         include_code_snippets=include_code_snippets,
         snippet_location=primary_location,
+        allowed_roots=allowed_roots,
     )
 
 
@@ -193,6 +223,7 @@ def annotate_findings(
     risk_flags: list[RiskFlag],
     *,
     include_code_snippets: bool = False,
+    allowed_roots: list[str] | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Ensure every final finding carries a decision annotation."""
     annotated_components = [
@@ -201,6 +232,7 @@ def annotate_findings(
                 "decision_annotation": _component_annotation(
                     component,
                     include_code_snippets=include_code_snippets,
+                    allowed_roots=allowed_roots,
                 )
             }
         )
@@ -214,6 +246,7 @@ def annotate_findings(
                     relationship,
                     component_by_id=component_by_id,
                     include_code_snippets=include_code_snippets,
+                    allowed_roots=allowed_roots,
                 )
             }
         )
@@ -225,6 +258,7 @@ def annotate_findings(
                 "decision_annotation": _risk_annotation(
                     flag,
                     include_code_snippets=include_code_snippets,
+                    allowed_roots=allowed_roots,
                 )
             }
         )

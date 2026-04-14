@@ -84,7 +84,7 @@ class OrgCache:
                 raw = json.loads(cache_file.read_text(encoding="utf-8"))
                 return ScanResult.model_validate(raw)
             except (json.JSONDecodeError, OSError, ValueError):
-                return None
+                continue
         return None
 
     def store(self, repo_path: str, result: ScanResult) -> None:

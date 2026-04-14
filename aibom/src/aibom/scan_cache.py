@@ -135,13 +135,13 @@ def load_cached(
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             if data.get("_cache_version") != _CACHE_VERSION:
-                _LOGGER.debug("Cache version mismatch for %s", key)
-                return None
+                _LOGGER.debug("Cache version mismatch for %s in %s", key, directory)
+                continue
             _LOGGER.info("Cache hit: %s (cached %s)", key[:12], data.get("_cached_at", "?"))
             return data
         except (json.JSONDecodeError, OSError) as exc:
-            _LOGGER.debug("Cache load error for %s: %s", key, exc)
-            return None
+            _LOGGER.debug("Cache load error for %s in %s: %s", key, directory, exc)
+            continue
     return None
 
 

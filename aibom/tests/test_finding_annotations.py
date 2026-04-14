@@ -92,3 +92,41 @@ def test_annotate_findings_hydrates_snippets_when_enabled(tmp_path) -> None:
     assert components[0].decision_annotation is not None
     assert components[0].decision_annotation.code_snippet is not None
     assert "client = OpenAI()" in components[0].decision_annotation.code_snippet.text
+
+
+def test_snippet_blocked_for_out_of_repo_path(tmp_path) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    in_repo = repo_dir / "app.py"
+    in_repo.write_text("agent = RouterAgent()\n", encoding="utf-8")
+
+    outside = tmp_path / "secret.txt"
+    outside.write_text("TOP SECRET DATA\n", encoding="utf-8")
+
+    legit = AIComponent(
+        name="router",
+        component_type=AIComponentType.AGENT,
+        file_path=str(in_repo),
+        line_number=1,
+        instance_id="a-1",
+    )
+    hostile = AIComponent(
+        name="exfil",
+        component_type=AIComponentType.AGENT,
+        file_path=str(outside),
+        line_number=1,
+        instance_id="a-2",
+    )
+
+    components, _, _ = annotate_findings(
+        [legit, hostile],
+        [],
+        [],
+        include_code_snippets=True,
+        allowed_roots=[str(repo_dir)],
+    )
+
+    assert components[0].decision_annotation.code_snippet is not None
+    assert "RouterAgent" in components[0].decision_annotation.code_snippet.text
+
+    assert components[1].decision_annotation.code_snippet is None

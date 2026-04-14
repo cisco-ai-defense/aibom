@@ -85,3 +85,34 @@ class TestCacheInfo:
     def test_empty_returns_empty(self, tmp_path: Path) -> None:
         cd = tmp_path / "cache"
         assert cache_info(cd) == []
+
+
+class TestFallbackOnCorruptPrimary:
+    def test_corrupt_primary_falls_through_to_legacy(self, tmp_path: Path) -> None:
+        primary = tmp_path / "primary"
+        legacy = tmp_path / "legacy"
+        primary.mkdir(parents=True)
+        legacy.mkdir(parents=True)
+
+        save_cached(legacy, "abc", {"components": [{"name": "good"}]})
+
+        corrupt_file = primary / "abc.json"
+        corrupt_file.write_text("{INVALID JSON", encoding="utf-8")
+
+        result = load_cached(primary, "abc", search_dirs=[legacy])
+        assert result is not None
+        assert result["components"] == [{"name": "good"}]
+
+    def test_version_mismatch_primary_falls_through_to_legacy(self, tmp_path: Path) -> None:
+        primary = tmp_path / "primary"
+        legacy = tmp_path / "legacy"
+        primary.mkdir(parents=True)
+
+        save_cached(legacy, "abc", {"components": [{"name": "good"}]})
+
+        stale = primary / "abc.json"
+        stale.write_text('{"_cache_version": 999}', encoding="utf-8")
+
+        result = load_cached(primary, "abc", search_dirs=[legacy])
+        assert result is not None
+        assert result["components"] == [{"name": "good"}]

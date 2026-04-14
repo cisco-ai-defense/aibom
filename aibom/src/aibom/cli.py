@@ -1609,6 +1609,7 @@ def analyze(
                 rels,
                 [],
                 include_code_snippets=include_code_snippets,
+                allowed_roots=[source_path],
             )
             v2_sources.append(SourceResult(
                 path=source_path,
@@ -1638,6 +1639,7 @@ def analyze(
         [],
         scan_result.risk.flags,
         include_code_snippets=include_code_snippets,
+        allowed_roots=list(all_analysis_outputs.keys()),
     )
     scan_result.risk.flags = annotated_risk_flags
 

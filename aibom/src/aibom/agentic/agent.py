@@ -1363,7 +1363,10 @@ def run_agentic_enrichment(
     if cache_dir is None and resolved_cache_dir is not None:
         fallback_dirs = [p for p in cache_read_dirs("agentic") if p != resolved_cache_dir]
     cache = _AgenticResultCache(resolved_cache_dir, fallback_dirs=fallback_dirs)
-    middleware = AIBOMScannerMiddleware(include_code_snippets=include_code_snippets)
+    middleware = AIBOMScannerMiddleware(
+        include_code_snippets=include_code_snippets,
+        allowed_roots=scan_paths,
+    )
     memo = _DecisionMemo()
 
     all_enriched: list[AIComponent] = []
