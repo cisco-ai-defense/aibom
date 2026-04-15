@@ -26,8 +26,8 @@ from urllib.parse import quote_plus
 
 import yaml
 from pathspec import PathSpec
-from platformdirs import user_cache_dir
 
+from ..cache_paths import cache_read_dirs, ensure_cache_dir
 from .file_cache import is_python_source, read_python_source, read_text_cached
 
 from ..models import AIComponent, ComponentRelationship, ScanContext
@@ -39,7 +39,6 @@ _LOGGER = logging.getLogger(__name__)
 _MODEL_CATALOG_URL = "https://models.litellm.ai/model_catalog"
 _HF_API_URL = "https://huggingface.co/api/models"
 _CACHE_TTL_SECONDS = 86400  # 24 hours
-_CACHE_DIR = Path(user_cache_dir("aibom")) / "model_cache"
 
 _HF_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -49,21 +48,23 @@ _HF_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def _cache_file(name: str) -> Path:
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return _CACHE_DIR / name
+    cache_dir = ensure_cache_dir("model")
+    return cache_dir / name
 
 
 def _load_cached(name: str) -> dict[str, dict[str, Any]] | None:
-    cp = _cache_file(name)
-    if not cp.exists():
-        return None
-    try:
-        data = json.loads(cp.read_text(encoding="utf-8"))
-        if time.time() - data.get("_ts", 0) > _CACHE_TTL_SECONDS:
+    for cache_dir in cache_read_dirs("model"):
+        cp = cache_dir / name
+        if not cp.exists():
+            continue
+        try:
+            data = json.loads(cp.read_text(encoding="utf-8"))
+            if time.time() - data.get("_ts", 0) > _CACHE_TTL_SECONDS:
+                return None
+            return data.get("models", {})
+        except Exception:
             return None
-        return data.get("models", {})
-    except Exception:
-        return None
+    return None
 
 
 def _save_cached(name: str, models: dict[str, dict[str, Any]]) -> None:

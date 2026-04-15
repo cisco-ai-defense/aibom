@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -54,10 +55,12 @@ class TestAgenticEnrichmentViaCLI:
         assert result.exit_code == 1
         assert "llm-model" in result.output.lower() or "AIBOM_LLM_MODEL" in result.output
 
+    @patch("aibom.scan_pipeline.ensure_llm_runtime_available", return_value=None)
+    @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_llm_model_triggers_agentic_enrichment(self, mock_create, _mock_build, _mock_close, sample_dir, tmp_path):
+    def test_llm_model_triggers_agentic_enrichment(self, mock_create, _mock_build, _mock_close, _mock_cli_preflight, _mock_pipeline_preflight, sample_dir, tmp_path):
         out = tmp_path / "report.txt"
         agent_response = json.dumps({
             "enriched_components": [],
@@ -98,3 +101,68 @@ class TestAgenticEnrichmentViaCLI:
         clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         assert "--llm-model" in clean
         assert "agentic" in clean
+
+    def test_missing_agentic_extras_fail_fast_with_install_hint(
+        self, monkeypatch, sample_dir, tmp_path
+    ):
+        out = tmp_path / "report.txt"
+
+        monkeypatch.setattr("aibom.llm_factory.init_chat_model", None)
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
+                "--llm-model",
+                "test-model",
+                "--llm-api-base",
+                "http://localhost:11434",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "cisco-aibom[agentic]" in result.output
+        assert "install" in result.output.lower()
+
+    def test_missing_openai_provider_extra_fails_fast_with_install_hint(
+        self, monkeypatch, sample_dir, tmp_path
+    ):
+        out = tmp_path / "report.txt"
+
+        monkeypatch.setattr("aibom.llm_factory.init_chat_model", lambda *a, **k: None)
+
+        real_import_module = importlib.import_module
+
+        def fake_import_module(name: str, package: str | None = None):
+            if name == "langchain_openai":
+                raise ImportError("missing langchain_openai")
+            return real_import_module(name, package)
+
+        monkeypatch.setattr("importlib.import_module", fake_import_module)
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
+                "--llm-model",
+                "gpt-5.4",
+                "--llm-provider",
+                "openai",
+                "--llm-api-key",
+                "not-a-real-key",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "llm-openai" in result.output
+        assert "cisco-aibom[agentic,llm-openai]" in result.output

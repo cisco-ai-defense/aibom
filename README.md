@@ -69,14 +69,14 @@ docs/    # Documentation (CLI reference, guides, API docs)
 # Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Core CLI
-uv tool install --python 3.13 cisco-aibom
-
-# With agentic enrichment (OpenAI / Azure OpenAI)
+# Analyze with OpenAI / Azure OpenAI
 uv tool install --python 3.13 "cisco-aibom[agentic,llm-openai]"
 
-# With agentic enrichment (AWS Bedrock)
+# Analyze with AWS Bedrock
 uv tool install --python 3.13 "cisco-aibom[agentic,llm-aws]"
+
+# Core CLI only (report rendering, cache inspection, KB commands, etc.)
+uv tool install --python 3.13 cisco-aibom
 
 # Everything
 uv tool install --python 3.13 "cisco-aibom[all]"
@@ -84,6 +84,8 @@ uv tool install --python 3.13 "cisco-aibom[all]"
 # Verify
 cisco-aibom --help
 ```
+
+`cisco-aibom analyze` always requires `--llm-model`. If the required agentic or provider extras are missing, the CLI fails fast with the exact `uv tool install ...` hint for the missing runtime.
 
 ### Install from source
 
@@ -148,8 +150,8 @@ All LLM options can be set via environment variables (`AIBOM_LLM_MODEL`, `AIBOM_
 | Command | Description |
 |---------|-------------|
 | `analyze` | Scan source code, container images, or repos and produce an AI BOM. |
-| `report` | Render a previously generated JSON report with Rich formatting. |
-| `watch` | Poll directories for changes and re-scan with delta reporting. |
+| `report` | Render or upload a previously generated JSON report. |
+| `watch` | Poll directories for changes and re-scan with delta reporting (deterministic pipeline only). |
 | `diff run` | Compare two AIBOM JSON reports side-by-side. |
 | `benchmark run` | Measure precision/recall/F1 against ground-truth YAML. |
 | `kb download` | Download the latest knowledge base. |
@@ -158,7 +160,8 @@ All LLM options can be set via environment variables (`AIBOM_LLM_MODEL`, `AIBOM_
 | `kb verify` | Verify KB integrity (SHA-256 checksum). |
 | `kb request` | Request a KB build for a specific SDK version. |
 | `cache clear` | Remove cached scan results and agentic cache. |
-| `cache list` | List cached scan entries. |
+| `cache list` | List cached entries by cache type. |
+| `cache get` | Inspect a specific cache entry. |
 | `plugin list` | List discovered plugins (entry points, MCP servers). |
 
 See [docs/CLI_REFERENCE.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CLI_REFERENCE.md) for complete option details.
@@ -171,7 +174,7 @@ See [docs/CLI_REFERENCE.md](https://github.com/cisco-ai-defense/aibom/blob/main/
 
 ## Agentic Enrichment
 
-The `--llm-model` option (or `AIBOM_LLM_MODEL` env var) is required. The LLM agent acts as the final classifier for every scanner candidate (requires `cisco-aibom[agentic]`):
+The `--llm-model` option (or `AIBOM_LLM_MODEL` env var) is required. The LLM agent acts as the final classifier for every scanner candidate and requires the `agentic` extra plus any provider-specific integration extra (for example `llm-openai` or `llm-aws`):
 
 - Confirms or removes every scanner candidate (no unverified findings)
 - Classifies and enriches components with concrete identifiers
@@ -205,10 +208,34 @@ All LLM options can also be set via environment variables or a `.env` file. See 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--agentic-batch-size` | `15` | Max components per LLM invocation. |
+| `--agentic-batch-size` | `5` | Max components per LLM invocation. |
 | `--agentic-concurrency` | `1` | Max parallel LLM batches. |
 | `--agentic-timeout` | `120` | Wall-clock seconds per batch before timeout. |
 | `--agentic-fast-model` | — | Cheaper model for simple confirmations (model lookups, dependency checks). |
+| `--progress` | `auto` | Show live per-stage and per-scanner progress in interactive terminals. |
+| `--include-code-snippets` | `off` | Include raw code snippets inside per-finding decision annotations. |
+
+### Report and cache utilities
+
+```bash
+# Render a saved report
+cisco-aibom report report.json
+
+# Explicit show form
+cisco-aibom report show report.json --raw-json
+
+# Upload an existing JSON report
+cisco-aibom report upload report.json --format json \
+  --post-url https://example.invalid/aibom/reports \
+  --ai-defense-api-key $AI_DEFENSE_API_KEY
+
+# Inspect cache families under the shared cache root
+cisco-aibom cache list --type scan
+cisco-aibom cache list --type agentic
+cisco-aibom cache get scan 0123456789ab
+```
+
+All cache families now default under `~/.aibom/cache`, including deterministic scan cache, agentic cache, org cache, model cache, and package metadata cache.
 
 ## Container Scanning
 
@@ -216,10 +243,13 @@ The CLI auto-detects container image references and extracts application source 
 
 ```bash
 # Auto-detect extraction method
-cisco-aibom analyze my-app:latest -o json -O report.json
+cisco-aibom analyze my-app:latest -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Force a specific extraction tier
-cisco-aibom analyze my-app:latest -o json -O report.json --container-extraction-tier podman
+cisco-aibom analyze my-app:latest -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY \
+  --container-extraction-tier podman
 ```
 
 Supported tiers: `auto`, `syft`, `docker`, `podman`, `nerdctl`, `buildah`, `crane`, `skopeo`, `tarball`.
@@ -230,23 +260,29 @@ See [docs/CONTAINER_SCANNING.md](https://github.com/cisco-ai-defense/aibom/blob/
 
 ```bash
 # Discover and scan all git repos under a directory
-cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json
+cisco-aibom analyze /path/to/repos --discover-repos -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Scan a GitHub org (requires GITHUB_TOKEN)
-cisco-aibom analyze --github-org my-org --platform-token $GITHUB_TOKEN -o json -O report.json
+cisco-aibom analyze --github-org my-org --platform-token $GITHUB_TOKEN -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Scan a GitLab group
-cisco-aibom analyze --gitlab-group my-group --platform-token $GITLAB_TOKEN -o json -O report.json
+cisco-aibom analyze --gitlab-group my-group --platform-token $GITLAB_TOKEN -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Scan repos from a file (JSON array or newline-delimited)
-cisco-aibom analyze --repos-file repos.txt -o json -O report.json
+cisco-aibom analyze --repos-file repos.txt -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Incremental scan (skip repos with unchanged HEAD)
-cisco-aibom analyze /path/to/repos --discover-repos --incremental -o json -O report.json
+cisco-aibom analyze /path/to/repos --discover-repos --skip-unchanged -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 
 # Limit and filter
 cisco-aibom analyze --github-org my-org --platform-token $GITHUB_TOKEN \
-  --max-repos 50 --repo-filter "ml-" --parallel-repos 4 -o json -O report.json
+  --max-repos 50 --repo-filter "ml-" --parallel-repos 4 -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 ```
 
 ## Output Formats
@@ -327,7 +363,8 @@ rules:
 ```
 
 ```bash
-cisco-aibom analyze ./my-app -o json -O report.json --policy policy.yaml
+cisco-aibom analyze ./my-app -o json -O report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY --policy policy.yaml
 # Exit code 1 if policy fails
 ```
 
@@ -404,7 +441,9 @@ docker build -t cisco-aibom .
 docker build -f Dockerfile.agentic -t cisco-aibom-agentic .
 
 # Run
-docker run --rm -v /path/to/project:/workspace cisco-aibom analyze /workspace -o json -O /workspace/report.json
+docker run --rm -v /path/to/project:/workspace cisco-aibom-agentic \
+  analyze /workspace -o json -O /workspace/report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
 ```
 
 ## Testing

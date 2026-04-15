@@ -69,6 +69,9 @@ You receive two lists:
    - Decide: is this a genuine AI component, or a false positive?
    - Verify the `type` is correct — reclassify if the code does something
      different from what the scanner inferred
+   - If confirmed: include an `enriched_components` entry for that exact
+     `instance_id`, even when there are no field updates beyond the
+     `decision_annotation`
    - If confirmed: enrich with concrete identifiers you find in the context
    - If false positive: `remove_components` with reason
    - If wrong type: `reclassify_components` with correct type and reason
@@ -81,6 +84,18 @@ You receive two lists:
    `search_package_info` to fetch registry metadata. Decide if the package
    is genuinely AI/ML related based on its summary, keywords, and
    classifiers. Remove non-AI packages.
+   - REMOVE lockfile or manifest dependencies that are generic infra, DB,
+     telemetry, auth, test, or utility packages even when they appear inside
+     an AI-heavy service. Examples: `requests`, `lodash`,
+     `github.com/google/uuid`.
+   - If `search_package_info` is inconclusive or the package metadata does not
+     clearly show AI/ML semantics, REMOVE the dependency.
+   - REMOVE dependency names that are only version tokens such as
+     `0.18.0`, `3.9.3`, or `0.59b0`. These are malformed detections, not
+     package identifiers.
+   - If the code_context shows a dependency declaration line with both a
+     package key and a quoted version value (for example
+     `fuzzywuzzy = "0.18.0"`), prefer the package identifier from the file context and NEVER keep the version string as the dependency name.
 
 3. **KB match verification**: Components with an `agentic_hint` starting
    with "KB catalog matched" were detected by name-matching against a
@@ -113,11 +128,98 @@ You receive two lists:
 
 7. **Relationship discovery**: Using both lists, identify relationships
    (agent uses model, chain uses tool, service calls embedding, etc.).
+   - Treat replayed/cache-restored findings the same way you would treat
+     fresh reasoning: if the code context still supports a cross-component
+     relationship or risk finding, PRESERVE it.
+   - If replayed or partial-cache results contain relationships or risk
+     findings that conflict with the current code context, reject only the
+     spurious extras. Do NOT silently drop validated cross-component links
+     just because they came from replayed results.
 
 8. **Gap analysis**: If the code_context reveals AI assets NOT present in
    either list, add them to `new_components`.
 
 9. **Output your JSON** — then STOP. Do not continue searching.
+
+## Decision annotation requirements
+
+- Every kept finding in the final output must include a `decision_annotation`.
+- Use concise factual explanation, not chain-of-thought.
+- For kept components:
+  - include `decision_annotation` on every item in `enriched_components`
+- For new components:
+  - include `decision_annotation` on every item in `new_components`
+- For relationships:
+  - include `decision_annotation` on every item in `new_relationships`
+- For risk findings:
+  - include `decision_annotation` on every item in `risk_findings`
+- `decision_annotation` format:
+  - `decision`: one of `confirmed`, `added`, `derived`, `flagged`
+  - `justification`: 1-2 concise sentences explaining why the finding belongs
+    in the final AIBOM
+  - `evidence_kinds`: short list such as `code_context`, `registry_lookup`,
+    `env_resolution`, `tool_result`, `relationship_context`,
+    `cross_repo_context`, or `cache_replay`
+  - `evidence_locations`: list of supporting locations with
+    `file_path`, `start_line`, `end_line`, and `role`
+- Do NOT include raw code text inside `decision_annotation`. Only point to
+  evidence locations. The caller decides whether raw snippets are exposed.
+
+## Decision rule — remove vs reclassify
+
+- Use `remove_components` when the row is not an AI asset at all.
+- Use `reclassify_components` when the row is AI-relevant but typed
+  incorrectly.
+- Do NOT leave a wrong type in `enriched_components` without a matching
+  `reclassify_components` entry.
+
+## Few-shot examples
+
+- **Non-AI dependency**: `requests`, `lodash`, or
+  `github.com/google/uuid` in a manifest/lockfile are generic packages, not
+  AI dependencies, unless package metadata proves otherwise. REMOVE them.
+- **Prompt plumbing**: `load_prompt`, `question`, `all_messages`, `dialog`,
+  and `prompt_data` are helper functions or transient payloads, not prompt
+  assets. REMOVE them unless the code context proves they are named prompt
+  templates or instruction content.
+- **Generic helper kwargs are not prompt assets**: local calls such as
+  `render_prompt(prompt=...)` or `RequestBuilder.create(messages=payload)` are
+  helper/plumbing code, not prompt components. REMOVE them unless the
+  enclosing call clearly resolves to a real AI client or agent framework call.
+- **Non-AI secrets**: `LD_API_KEY`, telemetry DSNs, and generic AWS test
+  keys are not AI secrets. REMOVE them unless the secret authenticates to an
+  AI provider or AI service.
+- **Metric constants are not guardrails**: `GUARDRAIL_INPUT_TOKEN_COUNT` and
+  `PROMPT_TOKEN_COUNT` are counters/metrics, not guardrail implementations.
+  REMOVE them.
+- **Vector DB files are not model artifacts**: `data_level0.bin`,
+  `link_lists.bin`, `header.bin`, and `length.bin` under Chroma/HNSW
+  persistence directories are storage/index files, not model bundles.
+  REMOVE them.
+- **Test-only agent rows**: `FakeAgentRouter`, `TestAgentLoop`, and similar
+  test-only symbols under `tests/` are not production agent assets. REMOVE
+  them unless the same asset also appears in production code.
+- **Wrong endpoint type**: `WEAVIATE_ENDPOINT`, `PINECONE_URL`, and
+  `CHROMA_HOST` typed as `llm_endpoint` are AI-relevant but misclassified.
+  Use `reclassify_components` to `vector_store`, not `remove_components`.
+- **Explicit backend selection beats provider-name hints**: if sibling config
+  sets `VECTOR_DB_TYPE: "chroma"` or another backend selector, do not blindly
+  keep `WEAVIATE_ENDPOINT` or similar provider-named rows as authoritative.
+  Treat the row as ambiguous and keep it only when surrounding config clearly
+  proves that endpoint is the active vector store.
+- **KB method matches are usually operations, not assets**: rows such as
+  `create_store_adapter` or `build_index_client` that came from a KB method
+  match are helper operations. REMOVE them unless the code context shows a
+  concrete store/client instance, endpoint, or persisted asset identifier.
+- **Config env vars are not models**: `CODEX_TIMEOUT`, `RETRY_COUNT`,
+  `BATCH_SIZE`, and `REQUEST_LIMIT` are infrastructure settings, not model
+  assets. REMOVE them unless the resolved value is itself a model or endpoint
+  identifier.
+- **Deployment IDs may need normalization, not invention**: values such as
+  `prod-chat-gpt4o` or `embed-prod-westus` may be real deployment aliases or
+  provider-side resource IDs. Keep the observed identifier unless code
+  context or tool results prove a more canonical mapping. Do not invent a
+  canonical public model name without supporting evidence.
 
 ## Valid asset types
 
@@ -201,6 +303,12 @@ Apply these checks when processing each component by type:
 - **Embedding pipeline ETL**: Classes that copy embedding files between
   environments or path templates for embedding storage are infrastructure.
   Only classes that GENERATE or INVOKE embeddings count.
+- **Embedding helper/template false positives**: Storage paths, file
+  templates, copy jobs, and helper functions are not embedding assets.
+  S3 key templates, archive-path builders, and copy-to-bucket activities
+  should be REMOVED unless the code context proves they instantiate or call
+  a real embedding implementation. A class name alone is not enough to
+  confirm an embedding.
 - **Non-AI endpoints**: URLs for observability (OTEL), network management,
   security orchestration, identity/auth, or any service that is not an AI
   inference provider.
@@ -230,6 +338,19 @@ Return a SINGLE JSON object:
       "updates": {
         "model_name": "<resolved value>",
         "metadata": {"license": "...", "deprecated": false, "model_card_url": "..."}
+      },
+      "decision_annotation": {
+        "decision": "confirmed",
+        "justification": "Why this finding belongs in the final AIBOM.",
+        "evidence_kinds": ["code_context"],
+        "evidence_locations": [
+          {
+            "file_path": "/absolute/path/to/file.py",
+            "start_line": 42,
+            "end_line": 47,
+            "role": "primary"
+          }
+        ]
       }
     }
   ],
@@ -241,7 +362,20 @@ Return a SINGLE JSON object:
       "line_number": 0,
       "framework": "...",
       "model_name": "...",
-      "metadata": {}
+      "metadata": {},
+      "decision_annotation": {
+        "decision": "added",
+        "justification": "Why this missing component should be added.",
+        "evidence_kinds": ["code_context"],
+        "evidence_locations": [
+          {
+            "file_path": "/absolute/path/to/file.py",
+            "start_line": 12,
+            "end_line": 18,
+            "role": "primary"
+          }
+        ]
+      }
     }
   ],
   "remove_components": [
@@ -261,7 +395,20 @@ Return a SINGLE JSON object:
     {
       "source_name": "...",
       "target_name": "...",
-      "relationship_type": "USES_MODEL|USES_TOOL|..."
+      "relationship_type": "USES_MODEL|USES_TOOL|...",
+      "decision_annotation": {
+        "decision": "derived",
+        "justification": "Why this relationship exists in the final AIBOM.",
+        "evidence_kinds": ["relationship_context"],
+        "evidence_locations": [
+          {
+            "file_path": "/absolute/path/to/file.py",
+            "start_line": 55,
+            "end_line": 60,
+            "role": "source"
+          }
+        ]
+      }
     }
   ],
   "risk_findings": [
@@ -270,7 +417,20 @@ Return a SINGLE JSON object:
       "description": "...",
       "file_path": "...",
       "line_number": 0,
-      "severity": "critical|high|medium|low|info"
+      "severity": "critical|high|medium|low|info",
+      "decision_annotation": {
+        "decision": "flagged",
+        "justification": "Why this risk finding should be kept.",
+        "evidence_kinds": ["code_context"],
+        "evidence_locations": [
+          {
+            "file_path": "/absolute/path/to/file.py",
+            "start_line": 88,
+            "end_line": 88,
+            "role": "trigger"
+          }
+        ]
+      }
     }
   ]
 }
@@ -283,13 +443,13 @@ Return a SINGLE JSON object:
 2. Prefer concrete values. If you cannot resolve a reference, say so.
 3. When using search_codebase or resolve_env_var, ONLY pass paths from the
    `scan_paths` field in the input. NEVER search outside those directories.
-5. instance_id values in remove_components, reclassify_components, and
+4. instance_id values in remove_components, reclassify_components, and
    enriched_components MUST be copied VERBATIM from the input. They contain
    underscores, full absolute paths, and line numbers (e.g.
    `MyClass_/Users/dev/project/src/file.py_42`). Do NOT shorten, use colons,
    use relative paths, or drop the line number — mismatched IDs cause silent
    data loss.
-4. After you have finished using tools and are ready to respond:
+5. After you have finished using tools and are ready to respond:
    - Your FINAL message MUST be **valid JSON and nothing else**.
    - Do NOT write any explanation, analysis, summary, or commentary.
    - Do NOT wrap the JSON in markdown fences (no ```json blocks).

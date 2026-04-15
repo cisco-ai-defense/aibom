@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
 
@@ -76,17 +77,22 @@ def _load_aibomignore(paths: list[str]) -> Optional[PathSpec]:
 
 async def _async_timed_scan(
     scanner: BaseScanner, ctx: ScanContext,
-) -> tuple[str, float, list[AIComponent], list[ComponentRelationship]]:
+) -> tuple[str, float, list[AIComponent], list[ComponentRelationship], Exception | None]:
     """Run a scanner in a thread (to release the event loop) and time it."""
     t0 = time.monotonic()
-    comps, rels = await asyncio.to_thread(scanner.scan, ctx)
+    try:
+        comps, rels = await asyncio.to_thread(scanner.scan, ctx)
+    except Exception as exc:  # pragma: no cover - exercised via async wrapper
+        elapsed = time.monotonic() - t0
+        return scanner.name, elapsed, [], [], exc
     elapsed = time.monotonic() - t0
-    return scanner.name, elapsed, comps, rels
+    return scanner.name, elapsed, comps, rels, None
 
 
 async def _run_scanners_async(
     context: ScanContext,
     extra_scanners: Optional[list[type[BaseScanner]]] = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
     """Run all applicable scanners concurrently using asyncio."""
     ignore_spec = _load_aibomignore(context.paths)
@@ -123,17 +129,34 @@ async def _run_scanners_async(
     all_relationships: list[ComponentRelationship] = []
     scanner_timings.clear()
 
-    tasks = [_async_timed_scan(s, context) for s in applicable]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    if progress_callback:
+        progress_callback({
+            "event": "scanners_discovered",
+            "total": len(applicable),
+        })
 
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            _LOGGER.exception("Scanner %s failed", applicable[i].name, exc_info=result)
+    tasks = [asyncio.create_task(_async_timed_scan(scanner, context)) for scanner in applicable]
+    completed = 0
+
+    for task in asyncio.as_completed(tasks):
+        name, elapsed, comps, rels, error = await task
+        if error is not None:
+            _LOGGER.exception("Scanner %s failed", name, exc_info=error)
             continue
-        name, elapsed, comps, rels = result
         scanner_timings[name] = elapsed
         all_components.extend(comps)
         all_relationships.extend(rels)
+        completed += 1
+        if progress_callback:
+            progress_callback({
+                "event": "scanner_completed",
+                "scanner": name,
+                "completed": completed,
+                "total": len(applicable),
+                "elapsed_s": elapsed,
+                "component_count": len(comps),
+                "relationship_count": len(rels),
+            })
 
     all_components = _merge_model_duplicates(all_components)
     return all_components, all_relationships
@@ -143,6 +166,7 @@ def run_scanners(
     context: ScanContext,
     workers: int = 4,
     extra_scanners: Optional[list[type[BaseScanner]]] = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
     """Instantiate and run all registered scanners concurrently via asyncio.
 
@@ -159,10 +183,23 @@ def run_scanners(
     if loop and loop.is_running():
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, _run_scanners_async(context, extra_scanners))
+            future = pool.submit(
+                asyncio.run,
+                _run_scanners_async(
+                    context,
+                    extra_scanners,
+                    progress_callback=progress_callback,
+                ),
+            )
             return future.result()
 
-    return asyncio.run(_run_scanners_async(context, extra_scanners))
+    return asyncio.run(
+        _run_scanners_async(
+            context,
+            extra_scanners,
+            progress_callback=progress_callback,
+        )
+    )
 
 
 _MERGE_LINE_PROXIMITY = 5

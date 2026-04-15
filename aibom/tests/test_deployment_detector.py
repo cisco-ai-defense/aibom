@@ -62,6 +62,106 @@ data:
         assert any(c.model_name == "gpt-4o-mini" for c in models)
         assert any("vllm" in (c.metadata.get("image") or "").lower() for c in deps)
 
+    def test_helm_weaviate_endpoint_is_vector_store(self, tmp_path: Path) -> None:
+        yml = """env:
+  WEAVIATE:
+    CLOUD_ENDPOINT: https://cluster.example.weaviate.cloud
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        url = "https://cluster.example.weaviate.cloud"
+        assert any(
+            c.component_type == AIComponentType.VECTOR_STORE
+            and c.metadata.get("endpoint_url") == url
+            for c in comps
+        )
+        assert not any(
+            c.component_type == AIComponentType.LLM_ENDPOINT
+            and c.metadata.get("endpoint_url") == url
+            for c in comps
+        )
+
+    def test_helm_conflicting_vector_backend_requires_agentic_review(self, tmp_path: Path) -> None:
+        yml = """orchestrator:
+  env:
+    WEAVIATE:
+      WEAVIATE_ENDPOINT: http://vector.example.internal
+      VECTOR_DB_TYPE: chroma
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        matches = [c for c in comps if c.name == "env:WEAVIATE_ENDPOINT"]
+        assert len(matches) == 1
+        comp = matches[0]
+        assert comp.component_type == AIComponentType.VECTOR_STORE
+        assert comp.needs_agentic is True
+        assert comp.metadata.get("store_technology") == "chromadb"
+        assert "vector_db_type" in comp.agentic_hint.lower()
+        assert "weaviate_endpoint" in comp.agentic_hint.lower()
+
+    def test_helm_embedding_endpoint_and_engine_use_correct_types(self, tmp_path: Path) -> None:
+        yml = """env:
+  AZURE:
+    EMBEDDING:
+      LARGE3:
+        ENDPOINT: https://example.openai.azure.com/
+        ENGINE: text-embedding-3-large
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        endpoint_url = "https://example.openai.azure.com/"
+        assert any(
+            c.component_type == AIComponentType.MODEL_ENDPOINT
+            and c.metadata.get("endpoint_url") == endpoint_url
+            for c in comps
+        )
+        assert any(
+            c.component_type == AIComponentType.EMBEDDING
+            and c.model_name == "text-embedding-3-large"
+            for c in comps
+        )
+        assert not any(
+            c.component_type == AIComponentType.MODEL
+            and c.model_name == "text-embedding-3-large"
+            for c in comps
+        )
+
+    def test_helm_endpoint_with_sibling_engine_is_model_endpoint(self, tmp_path: Path) -> None:
+        yml = """env:
+  AZURE:
+    CHAT_SERVICE:
+      ENDPOINT: https://example.openai.azure.com/
+      ENGINE: chat-model-deployment
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        endpoint_url = "https://example.openai.azure.com/"
+        assert any(
+            c.component_type == AIComponentType.MODEL_ENDPOINT
+            and c.metadata.get("endpoint_url") == endpoint_url
+            for c in comps
+        )
+        assert not any(
+            c.component_type == AIComponentType.LLM_ENDPOINT
+            and c.metadata.get("endpoint_url") == endpoint_url
+            for c in comps
+        )
+
+    def test_helm_endpoint_with_sibling_model_name_is_model_endpoint(self, tmp_path: Path) -> None:
+        yml = """env:
+  CHAT_SERVICE:
+    ENDPOINT: https://example.openai.azure.com/
+    MODEL_NAME: assistant-model
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        endpoint_url = "https://example.openai.azure.com/"
+        assert any(
+            c.component_type == AIComponentType.MODEL_ENDPOINT
+            and c.metadata.get("endpoint_url") == endpoint_url
+            for c in comps
+        )
+        assert not any(
+            c.component_type == AIComponentType.LLM_ENDPOINT
+            and c.metadata.get("endpoint_url") == endpoint_url
+            for c in comps
+        )
+
     def test_detects_training_job(self, tmp_path: Path) -> None:
         yml = """apiVersion: batch/v1
 kind: Job

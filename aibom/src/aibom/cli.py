@@ -29,10 +29,16 @@ from typing import Any, Dict, List, Optional
 import typer
 from rich import box
 from rich.console import Console
-
-_LOGGER = logging.getLogger(__name__)
+from rich.markup import escape
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.tree import Tree
@@ -40,6 +46,13 @@ from rich.tree import Tree
 from .report_sender import post_report_with_retries
 from .utils.version import resolve_package_version
 from .scanners.container_extractor import extract_source_from_image, is_container_image, VALID_TIERS, validate_tier
+from .cache_paths import (
+    cache_dir as resolve_cache_type_dir,
+    cache_read_dirs,
+    cache_types,
+    resolve_cache_root,
+)
+from .llm_factory import ensure_llm_runtime_available
 from .custom_catalog import (
     CustomCatalogConfig,
     load_custom_catalog,
@@ -48,6 +61,8 @@ from .api_handler import start_api_server
 from .reporters import get_reporter, reporter_registry
 from .models.enums import Severity as SeverityEnum
 from .kb.manager import KBManager, KBError
+
+_LOGGER = logging.getLogger(__name__)
 
 console = Console()
 
@@ -122,8 +137,6 @@ def _utcnow_iso() -> str:
 
 
 def _print_timing_table(console: "rich.console.Console", result: "PipelineResult") -> None:  # type: ignore[name-defined]
-    from rich.table import Table
-
     from .scanners import scanner_timings
 
     table = Table(title="Pipeline Timing", show_footer=True)
@@ -152,6 +165,108 @@ def _print_timing_table(console: "rich.console.Console", result: "PipelineResult
             sc_table.add_row(name, f"{elapsed:.2f}s", f"{pct:.1f}%", style=table_style)
 
         console.print(sc_table)
+
+
+def _should_render_progress(progress_enabled: Optional[bool]) -> bool:
+    """Choose whether to show live progress for the current terminal."""
+    if progress_enabled is not None:
+        return progress_enabled
+    return console.is_terminal and not os.environ.get("CI")
+
+
+def _run_pipeline_with_progress(source: str, pipeline: "ScanPipeline", progress_enabled: Optional[bool]) -> "PipelineResult":  # type: ignore[name-defined]
+    """Run a scan pipeline with either a Rich progress display or a spinner."""
+    if not _should_render_progress(progress_enabled):
+        with console.status(f"[cyan]Scanning {source}"):
+            return pipeline.run()
+
+    stage_labels = {
+        "scan": "Stage 1/4: deterministic scanners",
+        "cross_ref": "Stage 2/4: cross-reference resolution",
+        "agentic": "Stage 3/4: agentic enrichment",
+        "assemble": "Stage 4/4: final assembly",
+    }
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress_ui:
+        stage_task = progress_ui.add_task(f"{source}: preparing scan", total=4)
+        cache_task = progress_ui.add_task(
+            f"{source}: file cache prep",
+            total=1,
+            completed=0,
+            visible=False,
+        )
+        scanner_task = progress_ui.add_task(
+            f"{source}: deterministic scanners",
+            total=1,
+            completed=0,
+            visible=False,
+        )
+
+        def _on_progress(event: dict[str, Any]) -> None:
+            event_name = str(event.get("event", ""))
+            if event_name == "stage_started":
+                stage = str(event.get("stage", ""))
+                progress_ui.update(
+                    stage_task,
+                    description=f"{source}: {stage_labels.get(stage, stage)}",
+                )
+                return
+            if event_name == "stage_completed":
+                progress_ui.advance(stage_task, 1)
+                return
+            if event_name == "file_cache_prep_started":
+                total = max(int(event.get("files_total", 0) or 0), 1)
+                progress_ui.update(
+                    cache_task,
+                    total=total,
+                    completed=0,
+                    visible=True,
+                    description=f"{source}: file cache prep",
+                )
+                return
+            if event_name == "file_cache_prep_completed":
+                total = max(int(event.get("files_total", 0) or 0), 1)
+                warmed = min(int(event.get("files_warmed", 0) or 0), total)
+                progress_ui.update(
+                    cache_task,
+                    total=total,
+                    completed=warmed,
+                    visible=True,
+                    description=f"{source}: file cache prep",
+                )
+                return
+            if event_name == "scanners_discovered":
+                total = max(int(event.get("total", 0) or 0), 1)
+                progress_ui.update(
+                    scanner_task,
+                    total=total,
+                    completed=0,
+                    visible=True,
+                    description=f"{source}: deterministic scanners",
+                )
+                return
+            if event_name == "scanner_completed":
+                total = max(int(event.get("total", 0) or 0), 1)
+                completed = min(int(event.get("completed", 0) or 0), total)
+                scanner = str(event.get("scanner", "scanner"))
+                progress_ui.update(
+                    scanner_task,
+                    total=total,
+                    completed=completed,
+                    visible=True,
+                    description=f"{source}: scanner {completed}/{total} ({scanner})",
+                )
+
+        pipeline.progress_callback = _on_progress
+        return pipeline.run()
 
 
 def _record_analysis_error(
@@ -208,6 +323,7 @@ def _scan_cache_settings(
     agentic_concurrency: int,
     agentic_fast_model: Optional[str],
     agentic_timeout: int,
+    include_code_snippets: bool,
     container_tier: str,
     custom_catalog: Optional[Path],
 ) -> Dict[str, Any]:
@@ -229,6 +345,7 @@ def _scan_cache_settings(
         "agentic_concurrency": agentic_concurrency,
         "agentic_fast_model": agentic_fast_model,
         "agentic_timeout": agentic_timeout,
+        "include_code_snippets": include_code_snippets,
         "container_tier": container_tier,
         "custom_catalog": _file_cache_fingerprint(custom_catalog),
     }
@@ -405,11 +522,13 @@ def _map_source_kind(kind: Optional[str]) -> str:
 
 def _build_submission_payload(
     report: Dict[str, Any],
-    source_outcomes: Dict[str, Dict[str, Any]],
+    source_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Wrap the generated report in the API submission envelope."""
     analysis = report.get("aibom_analysis", {})
     metadata = analysis.get("metadata", {})
+    if not source_outcomes:
+        source_outcomes = _source_outcomes_from_report(report)
 
     source_kinds = {
         _map_source_kind(info.get("source_kind"))
@@ -444,6 +563,61 @@ def _build_submission_payload(
         "sources": sources_payload,
         "report": report,
     }
+
+
+def _source_outcomes_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Reconstruct per-source submission metadata from an on-disk JSON report."""
+    analysis = report.get("aibom_analysis", {})
+    sources = analysis.get("sources", {})
+    outcomes: Dict[str, Dict[str, Any]] = {}
+    for source_key, entry in sources.items():
+        if not isinstance(entry, dict):
+            continue
+        summary = entry.get("summary", {}) if isinstance(entry.get("summary"), dict) else {}
+        source_path = str(entry.get("source_path") or source_key)
+        outcomes[source_path] = {
+            "source_name": str(entry.get("source_name") or source_key),
+            "source_path": source_path,
+            "source_kind": summary.get("source_kind"),
+            "status": summary.get("status"),
+            "last_generated_at": summary.get("last_generated_at"),
+            "assets_discovered": summary.get("assets_discovered"),
+        }
+    return outcomes
+
+
+def _load_report_json_dict(report_file: Path) -> Dict[str, Any]:
+    """Read a report file and ensure it is valid JSON object content."""
+    try:
+        data = json.loads(report_file.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Failed to read report: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Report JSON must contain an object at the top level")
+    return data
+
+
+def _canonicalize_report_for_upload(report_file: Path) -> tuple[Dict[str, Any], bool]:
+    """Validate a report file and rebuild the canonical upload payload shape."""
+    from pydantic import ValidationError
+
+    from .diff import load_scan_result_json
+    from .reporters.json_reporter import _aibom_payload
+
+    raw_report = _load_report_json_dict(report_file)
+    analysis = raw_report.get("aibom_analysis")
+    if not isinstance(analysis, dict):
+        raise ValueError("Report does not contain an 'aibom_analysis' key")
+
+    legacy_schema = not bool(analysis.get("metadata", {}).get("report_schema_version"))
+    try:
+        scan_result = load_scan_result_json(report_file)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid report structure: {exc}") from exc
+
+    return _aibom_payload(scan_result), legacy_schema
 
 
 def _render_json_report_console(report: Dict[str, Any]) -> None:
@@ -481,21 +655,119 @@ def _render_json_report_console(report: Dict[str, Any]) -> None:
         _render_relationship_table(source_data.get("relationships", []))
 
 
-@app.command("report")
-def report_command(
-    report_file: Path = typer.Argument(..., exists=True, readable=True, dir_okay=False, help="Path to a JSON report file."),
-    raw: bool = typer.Option(False, "--raw-json", help="Display the raw JSON using syntax highlighting before the summary."),
-) -> None:
-    """Render a previously generated JSON report using Rich components."""
-    try:
-        data = json.loads(report_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        console.print(f"[red]Failed to parse JSON:[/] {exc}")
-        raise typer.Exit(code=1)
-
+def _show_report_impl(report_file: Path, *, raw: bool = False) -> None:
+    data = _load_report_json_dict(report_file)
     if raw:
         console.print(Syntax(json.dumps(data, indent=2), "json", theme="monokai"))
     _render_json_report_console(data)
+
+
+@app.command("report")
+def report_command(
+    action_or_file: str = typer.Argument(
+        ...,
+        help="Either a report file path, or one of: show, upload.",
+    ),
+    report_file: Optional[Path] = typer.Argument(
+        None,
+        readable=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Path to the JSON report file when using 'show' or 'upload'.",
+    ),
+    raw: bool = typer.Option(False, "--raw-json", help="Display the raw JSON using syntax highlighting before the summary."),
+    report_format: str = typer.Option(
+        "json",
+        "--format",
+        help="Upload format. Only 'json' is currently supported.",
+    ),
+    post_url: Optional[str] = typer.Option(
+        None,
+        "--post-url",
+        help="HTTP endpoint to POST the JSON report to (can also be set via AIBOM_POST_URL).",
+        envvar="AIBOM_POST_URL",
+    ),
+    ai_defense_api_key: Optional[str] = typer.Option(
+        None,
+        "--ai-defense-api-key",
+        help="API key sent when POSTing the report.",
+        envvar="AI_DEFENSE_API_KEY",
+    ),
+    post_timeout: float = typer.Option(
+        30.0,
+        "--post-timeout",
+        help="Timeout (seconds) for posting the JSON report.",
+        envvar="AIBOM_POST_TIMEOUT",
+    ),
+    post_verify_tls: bool = typer.Option(
+        True,
+        "--post-verify-tls/--no-post-verify-tls",
+        help="Verify TLS certificates when POSTing the report.",
+        envvar="AIBOM_POST_VERIFY_TLS",
+    ),
+) -> None:
+    """Show or upload a previously generated JSON report."""
+    action = action_or_file.lower()
+    if action in {"show", "upload"}:
+        target_report = report_file
+        if target_report is None:
+            console.print(f"[red]Missing report file for 'report {action}'.[/]")
+            raise typer.Exit(code=1)
+    else:
+        if report_file is not None:
+            console.print(
+                "[red]Unexpected extra argument.[/] "
+                "Use 'cisco-aibom report <report.json>' or "
+                "'cisco-aibom report show|upload <report.json>'."
+            )
+            raise typer.Exit(code=1)
+        action = "show"
+        target_report = Path(action_or_file).expanduser()
+
+    if not target_report.exists() or not target_report.is_file():
+        console.print(f"[red]Report file not found:[/] {target_report}")
+        raise typer.Exit(code=1)
+
+    if action == "show":
+        try:
+            _show_report_impl(target_report, raw=raw)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(code=1)
+        return
+
+    if report_format.lower() != "json":
+        console.print(
+            f"[red]Unsupported report upload format:[/] {report_format}. "
+            "Only 'json' is currently supported."
+        )
+        raise typer.Exit(code=1)
+    if not post_url:
+        console.print("[red]--post-url is required for 'report upload'.[/]")
+        raise typer.Exit(code=1)
+
+    try:
+        canonical_report, legacy_schema = _canonicalize_report_for_upload(target_report)
+        if legacy_schema:
+            console.print(
+                "[yellow]Warning:[/] Report uses a deprecated schema without "
+                "`report_schema_version`; synthesizing the current schema for upload."
+            )
+        submission_payload = _build_submission_payload(canonical_report)
+        post_report_with_retries(
+            post_url,
+            submission_payload,
+            api_key=ai_defense_api_key,
+            verify_tls=post_verify_tls,
+            timeout_seconds=post_timeout,
+        )
+        console.print(f"[green]Report uploaded to {post_url}[/]")
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Failed to POST report:[/] {exc}")
+        raise typer.Exit(code=1)
 
 
 @app.command("analyze")
@@ -642,6 +914,14 @@ def analyze(
         "--timing",
         help="Print a per-stage and per-scanner timing breakdown after analysis.",
     ),
+    progress: Optional[bool] = typer.Option(
+        None,
+        "--progress/--no-progress",
+        help=(
+            "Show live per-stage and per-scanner progress during analysis. "
+            "Defaults to auto when attached to an interactive terminal."
+        ),
+    ),
     agentic_scope: str = typer.Option(
         "all",
         "--agentic-scope",
@@ -675,6 +955,14 @@ def analyze(
         "--agentic-timeout",
         help="Wall-clock timeout (seconds) per agentic LLM batch (default 120).",
     ),
+    include_code_snippets: bool = typer.Option(
+        False,
+        "--include-code-snippets/--no-code-snippets",
+        help=(
+            "Include raw code snippets in per-finding decision annotations. "
+            "Disabled by default to limit report size and source exposure."
+        ),
+    ),
     container_tier: str = typer.Option(
         "auto",
         "--container-extraction-tier",
@@ -688,7 +976,8 @@ def analyze(
         None,
         "--cache-dir",
         help=(
-            "Directory for caching scan results keyed by repo@commit_sha. "
+            "Cache root directory. Scan results are stored under <cache-dir>/scan "
+            "and agentic cache under <cache-dir>/agentic. "
             "Repeated scans of the same codebase at the same revision are instant. "
             "Use 'cisco-aibom cache clear' to purge."
         ),
@@ -775,8 +1064,9 @@ def analyze(
         "--skip-unchanged",
         help=(
             "Skip scanning git repos whose HEAD has not changed since "
-            "the last cached scan.  Cache is stored under "
-            "~/.cache/cisco-aibom/org-cache/."
+            "the last cached scan. Cache is written under "
+            "~/.aibom/cache/org by default and still reads legacy org-cache "
+            "locations for compatibility."
         ),
     ),
     compliance: Optional[str] = typer.Option(
@@ -830,6 +1120,17 @@ def analyze(
             "api_base": llm_api_base,
             "api_version": llm_api_version,
         }
+        try:
+            ensure_llm_runtime_available(
+                llm_model,
+                provider=llm_provider,
+            )
+        except ImportError as exc:
+            console.print(
+                f"[bold red]Error:[/] {escape(str(exc))}",
+                highlight=False,
+            )
+            raise typer.Exit(code=1)
     else:
         console.print(
             "[bold red]Error:[/] --llm-model (or AIBOM_LLM_MODEL env var) is required.\n"
@@ -967,6 +1268,9 @@ def analyze(
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
         explicit_config = load_custom_catalog(Path(custom_catalog))
+    cache_root = resolve_cache_root(cache_dir)
+    scan_cache_dir = resolve_cache_type_dir("scan", cache_root)
+    scan_cache_read_dirs = [p for p in cache_read_dirs("scan", cache_root) if p != scan_cache_dir]
     scan_cache_settings = _scan_cache_settings(
         strict=strict,
         min_severity=severity_filter,
@@ -976,10 +1280,11 @@ def analyze(
         agentic_concurrency=agentic_concurrency,
         agentic_fast_model=agentic_fast_model,
         agentic_timeout=agentic_timeout,
+        include_code_snippets=include_code_snippets,
         container_tier=container_tier,
         custom_catalog=custom_catalog,
     )
-    agentic_cache_dir = cache_dir / "agentic" if cache_dir else None
+    agentic_cache_dir = resolve_cache_type_dir("agentic", cache_root)
 
     clone_managers: list[Any] = []
 
@@ -1080,7 +1385,7 @@ def analyze(
             if cached_sr is not None:
                 console.print(
                     f"[green]Org cache hit[/] for {source} "
-                    f"(~/.cache/cisco-aibom/org-cache)"
+                    f"(~/.aibom/cache/org)"
                 )
                 merged_components: list = []
                 merged_rels: list = []
@@ -1103,11 +1408,15 @@ def analyze(
                 continue
 
         _scan_cache_hit = False
-        if cache_dir:
+        if scan_cache_dir:
             from .scan_cache import cache_key, load_cached, save_cached
 
             _ck = cache_key([scan_path], scan_cache_settings)
-            cached = load_cached(cache_dir, _ck)
+            cached = load_cached(
+                scan_cache_dir,
+                _ck,
+                search_dirs=scan_cache_read_dirs,
+            )
             if cached:
                 _scan_cache_hit = True
                 console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
@@ -1130,9 +1439,9 @@ def analyze(
             agentic_fast_model=agentic_fast_model,
             agentic_timeout=agentic_timeout,
             agentic_cache_dir=agentic_cache_dir,
+            include_code_snippets=include_code_snippets,
         )
-        with console.status(f"[cyan]Scanning {source}"):
-            result = pipeline.run()
+        result = _run_pipeline_with_progress(source, pipeline, progress)
 
         if llm_config and result.agentic_risk_flags:
             console.print(
@@ -1177,7 +1486,7 @@ def analyze(
         }
         all_analysis_outputs[source] = output_data
 
-        if cache_dir and not _scan_cache_hit:
+        if scan_cache_dir and not _scan_cache_hit:
             from .scan_cache import cache_key, save_cached
 
             _ck = cache_key([scan_path], scan_cache_settings)
@@ -1191,7 +1500,7 @@ def analyze(
                 ],
                 "_agentic_candidate_count": result.agentic_candidate_count,
             }
-            save_cached(cache_dir, _ck, _serializable)
+            save_cached(scan_cache_dir, _ck, _serializable)
 
         if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
             from .incremental import OrgCache
@@ -1280,6 +1589,7 @@ def analyze(
         ScanResult,
         SourceResult,
     )
+    from .finding_annotations import annotate_findings
     from .models.scan import RiskFlag
     from .risk import RiskScorer
 
@@ -1294,11 +1604,19 @@ def analyze(
                 V2Relationship.model_validate(r) if isinstance(r, dict) else r
                 for r in output["relationships"]
             ]
+            comps, rels, _ = annotate_findings(
+                comps,
+                rels,
+                [],
+                include_code_snippets=include_code_snippets,
+                allowed_roots=[source_path],
+            )
             v2_sources.append(SourceResult(
                 path=source_path,
                 components=comps,
                 relationships=rels,
             ))
+    run_metadata["source_outcomes"] = source_outcomes
     scan_result = ScanResult(
         metadata=run_metadata,
         sources=v2_sources,
@@ -1315,6 +1633,15 @@ def analyze(
                     scan_result.risk.add_flag(rf)
                 elif isinstance(rf, dict):
                     scan_result.risk.add_flag(RiskFlag.model_validate(rf))
+
+    _, _, annotated_risk_flags = annotate_findings(
+        [],
+        [],
+        scan_result.risk.flags,
+        include_code_snippets=include_code_snippets,
+        allowed_roots=list(all_analysis_outputs.keys()),
+    )
+    scan_result.risk.flags = annotated_risk_flags
 
     if compliance:
         from .compliance import ComplianceFramework, evaluate_compliance, parse_compliance_cli_value
@@ -1590,16 +1917,16 @@ app.add_typer(kb_app, name="kb")
 # cisco-aibom cache  — manage scan result cache
 # ---------------------------------------------------------------------------
 
-cache_app = typer.Typer(help="Manage the scan result cache.", no_args_is_help=True)
+cache_app = typer.Typer(help="Manage AIBOM cache entries.", no_args_is_help=True)
 app.add_typer(cache_app, name="cache")
 
 
 @cache_app.command("clear")
 def cache_clear(
     cache_dir: Path = typer.Option(
-        Path.home() / ".aibom" / "cache",
+        resolve_cache_root(),
         "--cache-dir",
-        help="Directory where cached scan results are stored.",
+        help="Cache root directory.",
     ),
     include_agentic: bool = typer.Option(
         True,
@@ -1612,44 +1939,173 @@ def cache_clear(
 
     from .scan_cache import clear_cache as _clear
 
-    removed = _clear(cache_dir)
-    console.print(f"[green]Removed {removed} cached scan result(s) from {cache_dir}[/]")
+    cache_root = resolve_cache_root(cache_dir)
+    removed = 0
+    seen_dirs: set[str] = set()
+    for directory in cache_read_dirs("scan", cache_root):
+        key = str(directory)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        removed += _clear(directory)
+    console.print(
+        f"[green]Removed {removed} cached scan result(s) from {cache_root}[/]"
+    )
 
     if include_agentic:
-        agentic_dir = Path.home() / ".cache" / "cisco-aibom" / "agentic"
-        if agentic_dir.exists():
-            count = sum(1 for _ in agentic_dir.glob("*.json"))
-            shutil.rmtree(agentic_dir)
-            console.print(f"[green]Removed {count} agentic cache file(s) from {agentic_dir}[/]")
+        count = 0
+        for agentic_dir in cache_read_dirs("agentic", cache_root):
+            if agentic_dir.exists():
+                count += sum(1 for _ in agentic_dir.glob("*.json"))
+                shutil.rmtree(agentic_dir)
+        if count:
+            console.print(
+                f"[green]Removed {count} agentic cache file(s) from {cache_root}[/]"
+            )
         else:
             console.print("[dim]No agentic cache to clear.[/]")
 
 
 @cache_app.command("list")
 def cache_list(
+    cache_type: str = typer.Option(
+        "scan",
+        "--type",
+        help="Cache family: scan, agentic, org, model, packages.",
+    ),
     cache_dir: Path = typer.Option(
-        Path.home() / ".aibom" / "cache",
+        resolve_cache_root(),
         "--cache-dir",
-        help="Directory where cached scan results are stored.",
+        help="Cache root directory.",
     ),
 ) -> None:
-    """List all cached scan results."""
+    """List cached entries for one cache family."""
     from rich.table import Table
 
-    from .scan_cache import cache_info
+    from .cache_inspector import list_cache_entries
 
-    entries = cache_info(cache_dir)
+    if cache_type not in cache_types():
+        console.print(
+            f"[red]Unsupported cache type:[/] {cache_type}. "
+            f"Use one of: {', '.join(cache_types())}."
+        )
+        raise typer.Exit(code=1)
+
+    entries = list_cache_entries(cache_type, cache_dir)
     if not entries:
-        console.print("[dim]No cached scan results found.[/]")
+        console.print(f"[dim]No cached {cache_type} entries found.[/]")
         return
 
-    table = Table(title=f"Scan Cache ({cache_dir})")
-    table.add_column("Key")
+    table = Table(title=f"{cache_type.title()} Cache ({resolve_cache_root(cache_dir)})")
+    table.add_column("Entry", no_wrap=True)
+    table.add_column("Subtype")
     table.add_column("Cached At")
     table.add_column("Size", justify="right")
+    table.add_column("Detail")
     for e in entries:
-        table.add_row(e["key"][:16] + "…", e["cached_at"], f"{e['size_kb']} KB")
+        table.add_row(
+            str(e["id"]),
+            str(e.get("subtype", "")),
+            str(e.get("cached_at", "unknown")),
+            str(e.get("size", "")),
+            str(e.get("detail", "")),
+        )
     console.print(table)
+
+
+@cache_app.command("get")
+def cache_get(
+    cache_type: str = typer.Argument(..., help="Cache family to inspect."),
+    entry_ref: str = typer.Argument(..., help="Entry id, prefix, or logical reference."),
+    cache_dir: Path = typer.Option(
+        resolve_cache_root(),
+        "--cache-dir",
+        help="Cache root directory.",
+    ),
+    sha: Optional[str] = typer.Option(
+        None,
+        "--sha",
+        help="Commit SHA for org cache lookups.",
+    ),
+    model_id: Optional[str] = typer.Option(
+        None,
+        "--model-id",
+        help="Optional model id filter for model cache lookups.",
+    ),
+    raw_json: bool = typer.Option(
+        False,
+        "--raw-json",
+        help="Print the raw cache payload instead of a summary.",
+    ),
+) -> None:
+    """Inspect a specific cache entry by type."""
+    from .cache_inspector import get_cache_entry
+
+    if cache_type not in cache_types():
+        console.print(
+            f"[red]Unsupported cache type:[/] {cache_type}. "
+            f"Use one of: {', '.join(cache_types())}."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        entry = get_cache_entry(
+            cache_type,
+            entry_ref,
+            cache_root=cache_dir,
+            sha=sha,
+            model_id=model_id,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1)
+
+    if raw_json:
+        console.print(Syntax(json.dumps(entry["payload"], indent=2), "json", theme="monokai"))
+        return
+
+    summary = Table(title=f"{cache_type.title()} Cache Entry", box=box.SIMPLE_HEAVY)
+    summary.add_column("Field")
+    summary.add_column("Value")
+    summary.add_row("Entry", str(entry["id"]))
+    summary.add_row("Subtype", str(entry.get("subtype", "")))
+    summary.add_row("Path", str(entry.get("path", "")))
+    summary.add_row("Cached At", str(entry.get("cached_at", "unknown")))
+    summary.add_row("Size", str(entry.get("size", "")))
+    summary.add_row("Detail", str(entry.get("detail", "")))
+    if entry.get("repo_path"):
+        summary.add_row("Repo Path", str(entry["repo_path"]))
+    if entry.get("sha"):
+        summary.add_row("SHA", str(entry["sha"]))
+    console.print(summary)
+    if entry.get("repo_path"):
+        console.print(f"[cyan]Repo Path:[/] {entry['repo_path']}", soft_wrap=True)
+    if entry.get("sha"):
+        console.print(f"[cyan]SHA:[/] {entry['sha']}", soft_wrap=True)
+
+    payload = entry["payload"]
+    if cache_type == "scan":
+        component_names = [
+            str(item.get("name"))
+            for item in payload.get("components", [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        if component_names:
+            console.print(
+                f"[cyan]Components:[/] {', '.join(component_names[:10])}"
+            )
+    elif cache_type == "model":
+        models = payload.get("models", payload)
+        if isinstance(models, dict) and models:
+            console.print(
+                f"[cyan]Models:[/] {', '.join(list(models.keys())[:10])}"
+            )
+    elif cache_type == "packages":
+        if payload.get("summary"):
+            console.print(f"[cyan]Summary:[/] {payload['summary']}")
 
 
 # ---------------------------------------------------------------------------

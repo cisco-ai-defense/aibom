@@ -124,9 +124,22 @@ def load_scan_result_json(path: Path | str) -> ScanResult:
     data = json.loads(raw)
     if "aibom_analysis" in data:
         data = data["aibom_analysis"]
+    metadata = dict(data.get("metadata", {}))
     sources_raw: dict[str, Any] = data.get("sources", {})
     sources: list[SourceResult] = []
+    source_details: dict[str, Any] = {}
     for path_s, src in sources_raw.items():
+        source_path = str(src.get("source_path") or path_s)
+        summary = src.get("summary", {}) if isinstance(src, dict) else {}
+        source_details[source_path] = {
+            "source_key": path_s,
+            "source_name": src.get("source_name") or path_s,
+            "source_path": source_path,
+            "source_kind": summary.get("source_kind"),
+            "status": summary.get("status"),
+            "last_generated_at": summary.get("last_generated_at"),
+            "assets_discovered": summary.get("assets_discovered"),
+        }
         raw_comps = src.get("components", [])
         flat: list[AIComponent] = []
         if isinstance(raw_comps, dict):
@@ -137,11 +150,13 @@ def load_scan_result_json(path: Path | str) -> ScanResult:
             for item in raw_comps:
                 flat.append(AIComponent.model_validate(item))
         rels = [ComponentRelationship.model_validate(r) for r in src.get("relationships", [])]
-        sources.append(SourceResult(path=path_s, components=flat, relationships=rels))
+        sources.append(SourceResult(path=source_path, components=flat, relationships=rels))
     risk_data = data.get("risk", {})
     risk = RiskScore.model_validate(risk_data) if risk_data else RiskScore()
+    if source_details:
+        metadata["_report_source_details"] = source_details
     return ScanResult(
-        metadata=data.get("metadata", {}),
+        metadata=metadata,
         sources=sources,
         risk=risk,
         errors=list(data.get("errors", [])),

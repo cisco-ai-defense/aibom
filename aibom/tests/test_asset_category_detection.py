@@ -90,6 +90,50 @@ class TestEmbeddingImportDetection:
         assert len(emb_comps) >= 1
         assert all(c.component_type != AIComponentType.MODEL for c in comps if "Embed" in c.name)
 
+    def test_embedding_helper_function_import_is_not_detected(self, tmp_path: Path):
+        (tmp_path / "helpers.py").write_text(
+            "from storage_helpers import get_embeddings_archive_path\n"
+            "\n"
+            "def build_path() -> str:\n"
+            "    return get_embeddings_archive_path('foo', '1.0')\n"
+        )
+        from aibom.cst_parser import parse_source_code
+        from aibom.scanners.kb_enrichment_scanner import _detect_import_based_assets
+
+        source = (tmp_path / "helpers.py").read_text()
+        result = parse_source_code(str(tmp_path / "helpers.py"), source)
+        comps = _detect_import_based_assets(result)
+        assert comps == []
+
+    def test_embedding_constant_import_is_not_detected(self, tmp_path: Path):
+        (tmp_path / "constants_user.py").write_text(
+            "from storage_constants import EMBEDDINGS_ARCHIVE_TEMPLATE\n"
+            "\n"
+            "def build_key(product_name: str, version: str) -> str:\n"
+            "    return EMBEDDINGS_ARCHIVE_TEMPLATE.format(product_name=product_name, version=version)\n"
+        )
+        from aibom.cst_parser import parse_source_code
+        from aibom.scanners.kb_enrichment_scanner import _detect_import_based_assets
+
+        source = (tmp_path / "constants_user.py").read_text()
+        result = parse_source_code(str(tmp_path / "constants_user.py"), source)
+        comps = _detect_import_based_assets(result)
+        assert comps == []
+
+    def test_copy_embeddings_activity_is_not_suggestive_embedding(self, tmp_path: Path):
+        emb_dir = tmp_path / "etl" / "embeddings"
+        emb_dir.mkdir(parents=True)
+        activity = emb_dir / "copy.py"
+        activity.write_text(
+            "from base_activity import BaseActivity\n"
+            "\n"
+            "copy_job = CopyEmbeddingsArchiveToBucket(source_bucket='dev-bucket')\n"
+        )
+        from aibom.scanners.kb_enrichment_scanner import _emit_suggestive_candidates
+
+        comps = _emit_suggestive_candidates(activity, activity.read_text())
+        assert comps == []
+
 
 # ---------------------------------------------------------------------------
 # Gap 2: MCP Client detection
@@ -155,13 +199,13 @@ class TestGuardrailDetection:
         gr = [c for c in comps if "llm-guard" in c.name.lower()]
         assert len(gr) >= 1
 
-    def test_cisco_aidefense_sdk_in_requirements(self, tmp_path: Path):
-        (tmp_path / "requirements.txt").write_text("cisco-aidefense-sdk==1.0.0\n")
+    def test_rebuff_in_requirements(self, tmp_path: Path):
+        (tmp_path / "requirements.txt").write_text("rebuff==0.1.0\n")
         scanner = DependencyScanner()
         ctx = ScanContext(paths=[str(tmp_path)])
         comps, _ = scanner.scan(ctx)
-        cisco = [c for c in comps if "cisco-aidefense" in c.name.lower()]
-        assert len(cisco) >= 1
+        rebuff = [c for c in comps if "rebuff" in c.name.lower()]
+        assert len(rebuff) >= 1
 
     def test_guardrail_import_detected(self, tmp_path: Path):
         (tmp_path / "guard.py").write_text(

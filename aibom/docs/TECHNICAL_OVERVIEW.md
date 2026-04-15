@@ -25,9 +25,9 @@
 5. **Scan Pipeline Stage 1: Scan** — Run all registered scanners against the source files. Each scanner produces components and relationships. File I/O uses async caching for performance.
 6. **Scan Pipeline Stage 2: Cross-Ref** — Build env-var and package indexes. Resolve env-var references (`os.getenv("MODEL_NAME")`) to concrete values by correlating across files, `.env`, docker-compose, Helm, and Terraform.
 7. **Scan Pipeline Stage 3: Agentic** — Classify all candidates into simple/complex tiers. Run locality-aware batched LLM classification. The agent confirms, rejects, reclassifies, or enriches each candidate using tools (`read_file_lines`, `search_package_info`). Apply structured output (enrichments, new components, removals, risk findings). Cache results by content hash.
-8. **Scan Pipeline Stage 4: Assemble** — Apply `--strict` filtering (drop `needs_agentic` items), collect counts and timing, build the final `PipelineResult`.
-9. **Reporting** — Route `PipelineResult` to the selected reporter. Convert container temp paths to container-style paths. Build per-source summaries and run metadata.
-10. **Post-Processing** — Optionally POST the JSON report with retries, run policy checks, display compliance advisories, render Rich console summary.
+8. **Scan Pipeline Stage 4: Assemble** — Apply `--strict` filtering (drop `needs_agentic` items), collect counts and timing, build the final `PipelineResult`, and ensure final findings carry decision annotations.
+9. **Reporting** — Route `PipelineResult` to the selected reporter. Convert container temp paths to container-style paths. Build per-source summaries, schema version metadata, and run metadata.
+10. **Post-Processing** — Optionally POST the JSON report with retries or upload an already-generated JSON report, run policy checks, display compliance advisories, render Rich console summary.
 
 ## 3. Scanner Architecture
 
@@ -68,6 +68,7 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `scan_pipeline.py` | Four-stage pipeline orchestrator (Scan → Cross-Ref → Agentic → Assemble). |
 | `scanners/__init__.py` | Scanner registry and `run_scanners()` dispatcher. |
 | `scanners/base.py` | `BaseScanner` abstract class with `__init_subclass__` auto-registration. |
+| `cache_paths.py` | Shared cache-root resolution for `scan`, `agentic`, `org`, `model`, and `packages` caches. |
 | `cross_ref.py` | Env-var and package index builder, component resolver, external repo dep detection. |
 | `cst_parser.py` | LibCST-based Python parser for assignments, decorators, annotations, imports, class definitions, and inline annotations. |
 | `scanners/multi_language_scanner.py` | Tree-sitter-based parser for JS/TS, Java, Go, Rust, Ruby, C#, PHP. |
@@ -78,6 +79,7 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `agentic/tools.py` | LangChain tools for file reading, import analysis, code search, package registry queries (PyPI/npm/Go), and repo triage (directory tree, file snippets). |
 | `agentic/middleware.py` | Structured output parser — extracts enrichments, new components, removals, risk findings from LLM JSON responses. |
 | `agentic/prompts.py` | System prompts for the agentic enrichment agent. |
+| `finding_annotations.py` | Applies default per-finding justification and evidence metadata, with optional code snippet hydration. |
 | `llm_factory.py` | Centralized `build_chat_model()` — provider resolution, parameter mapping for OpenAI/Azure/Bedrock/Ollama/etc. |
 | `llm_client.py` | Lightweight LLM client for semantic parsing (model name extraction). |
 | `scanners/container_extractor.py` | Tiered container source extraction (Docker/Podman/nerdctl/Buildah/Skopeo/Crane/tarball). |
@@ -157,10 +159,10 @@ Reporters use a registry pattern. Custom reporters can be added via the `aibom.r
 The agentic layer is the mandatory final classifier. Scanners generate candidates; the agent is the single source of truth.
 
 1. **Candidate triage** — All candidates are split into "simple" (registry-confirmable: known model IDs, manifest dependencies) and "complex" (ambiguous type, missing model name, multi-file reasoning needed).
-2. **Locality-aware batching** — Candidates are grouped by parent directory, then split into batches of configurable size (default 15). This provides coherent code context per batch.
+2. **Locality-aware batching** — Candidates are grouped by parent directory, then split into batches of configurable size (CLI default `5`). This provides coherent code context per batch.
 3. **Agent tools** — The agent uses `read_file_lines` (inspect source), `search_package_info` (query PyPI/npm/Go registries for dependency metadata), and code context to make decisions.
 4. **Structured output** — Each batch returns JSON with `enriched_components`, `new_components`, `remove_components`, and `risk_findings`. The agent must explicitly confirm or remove every candidate.
-5. **Content-hash caching** — Each component's cache key is derived from its file path, line number, name, type, and surrounding code content. Unchanged components reuse cached LLM results.
+5. **Content-hash caching** — Each component's cache key is derived from its file path, line number, name, type, and surrounding code content. Unchanged components reuse cached LLM results from the shared cache root.
 6. **Circuit breaker** — After N consecutive batch failures, remaining batches are skipped to prevent runaway costs.
 7. **Timeout** — Per-batch wall-clock timeout with graceful degradation.
 

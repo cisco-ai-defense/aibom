@@ -142,6 +142,37 @@ _MODEL_ENDPOINT_ENV_KEYS: frozenset[str] = frozenset({
     "AWS_SAGEMAKER_ENDPOINT", "INFERENCE_URL",
 })
 
+_KEY_TOKEN_SPLIT_RE = re.compile(r"[._-]+")
+
+_VECTOR_STORE_HINTS: frozenset[str] = frozenset({
+    "vector", "vectorstore", "vectorstores", "weaviate", "pinecone",
+    "qdrant", "chroma", "chromadb", "milvus", "pgvector", "faiss",
+})
+
+_VECTOR_STORE_TECH_ALIASES: tuple[tuple[str, str], ...] = (
+    ("weaviate", "weaviate"),
+    ("pinecone", "pinecone"),
+    ("qdrant", "qdrant"),
+    ("chromadb", "chromadb"),
+    ("chroma", "chromadb"),
+    ("milvus", "milvus"),
+    ("pgvector", "pgvector"),
+    ("faiss", "faiss"),
+    ("redis", "redis"),
+)
+
+_EMBEDDING_HINTS: frozenset[str] = frozenset({
+    "embedding", "embeddings", "embed", "embedder",
+})
+
+_MODEL_ENDPOINT_HINTS: frozenset[str] = frozenset({
+    "sagemaker", "inference", "serving", "vllm",
+})
+
+_MODEL_ENDPOINT_SELECTOR_HINTS: frozenset[str] = frozenset({
+    "engine", "deployment",
+})
+
 _SECRET_ENV_NAMES: frozenset[str] = frozenset({
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -166,16 +197,144 @@ _AI_ENV_NAMES: frozenset[str] = (
     })
 )
 
+def _key_tokens(value: str) -> set[str]:
+    return {tok for tok in _KEY_TOKEN_SPLIT_RE.split(value.lower()) if tok}
+
+
+def _model_registry_entry(value: str) -> Optional[dict[str, Any]]:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    from .model_detector import _registry_lookup
+    return _registry_lookup(stripped)
+
+
+def _is_embedding_model_value(value: str) -> bool:
+    reg = _model_registry_entry(value)
+    if reg is not None and str(reg.get("family", "")).lower() == "embedding":
+        return True
+    return value.strip().lower().startswith("text-embedding")
+
+
+def _model_component_type_for_value(key_path: str, value: str) -> AIComponentType:
+    if _is_embedding_model_value(value):
+        return AIComponentType.EMBEDDING
+    if _key_tokens(key_path) & _EMBEDDING_HINTS:
+        return AIComponentType.EMBEDDING
+    return AIComponentType.MODEL
+
+
+def _normalized_vector_store_technology(value: str) -> str | None:
+    lower = value.lower()
+    for hint, technology in _VECTOR_STORE_TECH_ALIASES:
+        if hint in lower:
+            return technology
+    return None
+
+
+def _explicit_vector_backend(
+    sibling_values: Optional[dict[str, Any]],
+) -> tuple[str | None, str | None]:
+    if sibling_values is None:
+        return None, None
+
+    for sibling_key, sibling_val in sibling_values.items():
+        if not isinstance(sibling_key, str) or not isinstance(sibling_val, str):
+            continue
+
+        technology = _normalized_vector_store_technology(sibling_val)
+        if technology is None:
+            continue
+
+        tokens = _key_tokens(sibling_key)
+        if (
+            "backend" in tokens
+            or "provider" in tokens
+            or ("type" in tokens and tokens & {"vector", "db", "store"})
+        ):
+            return sibling_key, technology
+
+    return None, None
+
+
+def _has_model_endpoint_selector(
+    sibling_values: Optional[dict[str, Any]],
+) -> bool:
+    if sibling_values is None:
+        return False
+
+    for sibling_key, sibling_val in sibling_values.items():
+        if not isinstance(sibling_key, str) or not isinstance(sibling_val, str):
+            continue
+
+        stripped = sibling_val.strip()
+        if not stripped or stripped.startswith(("http://", "https://")):
+            continue
+
+        tokens = _key_tokens(sibling_key)
+        if tokens & _MODEL_ENDPOINT_SELECTOR_HINTS:
+            return True
+        if "model" in tokens and tokens & {"id", "name"}:
+            return True
+
+    return False
+
+
+def _endpoint_component_details(
+    key_path: str,
+    value: str,
+    sibling_values: Optional[dict[str, Any]] = None,
+) -> tuple[AIComponentType, str | None, bool, str | None]:
+    hinted_technology = _normalized_vector_store_technology(f"{key_path} {value}")
+    selector_key, explicit_backend = _explicit_vector_backend(sibling_values)
+
+    if explicit_backend is not None:
+        return (
+            AIComponentType.VECTOR_STORE,
+            explicit_backend,
+            bool(hinted_technology and hinted_technology != explicit_backend),
+            selector_key,
+        )
+
+    if hinted_technology is not None:
+        return AIComponentType.VECTOR_STORE, hinted_technology, False, None
+
+    if _has_model_endpoint_selector(sibling_values):
+        return AIComponentType.MODEL_ENDPOINT, None, False, None
+
+    tokens = _key_tokens(key_path)
+    if sibling_values is not None:
+        parent_path = key_path.rsplit(".", 1)[0]
+        for sibling_key, sibling_val in sibling_values.items():
+            if not isinstance(sibling_key, str) or not isinstance(sibling_val, str):
+                continue
+            sibling_path = f"{parent_path}.{sibling_key}" if parent_path else sibling_key
+            if _model_component_type_for_value(sibling_path, sibling_val) == AIComponentType.EMBEDDING:
+                return AIComponentType.MODEL_ENDPOINT, None, False, None
+
+    if tokens & _EMBEDDING_HINTS:
+        return AIComponentType.MODEL_ENDPOINT, None, False, None
+    if tokens & _MODEL_ENDPOINT_HINTS:
+        return AIComponentType.MODEL_ENDPOINT, None, False, None
+    return AIComponentType.LLM_ENDPOINT, None, False, None
+
+
+def _endpoint_component_type(
+    key_path: str,
+    value: str,
+    sibling_values: Optional[dict[str, Any]] = None,
+) -> AIComponentType:
+    return _endpoint_component_details(key_path, value, sibling_values)[0]
+
+
 def _classify_env(key: str, value: str) -> AIComponentType:
     """Resolve component type for a K8s/Helm env var."""
     if key in _SECRET_ENV_NAMES:
         return AIComponentType.SECRET
     is_url = value.strip().startswith(("http://", "https://"))
-    if key in _LLM_ENDPOINT_ENV_KEYS and is_url:
-        return AIComponentType.LLM_ENDPOINT
-    if key in _MODEL_ENDPOINT_ENV_KEYS and is_url:
-        return AIComponentType.MODEL_ENDPOINT
-    return AIComponentType.MODEL
+    if (key in _LLM_ENDPOINT_ENV_KEYS or key in _MODEL_ENDPOINT_ENV_KEYS) and is_url:
+        return _endpoint_component_type(key, value)
+    return _model_component_type_for_value(key, value)
 
 
 _HELM_ENDPOINT_KEY_RE = re.compile(
@@ -515,7 +674,9 @@ def _parse_k8s_yaml(
                             comp_type,
                             fp,
                             ln,
-                            model_name=ev.strip() if comp_type == AIComponentType.MODEL else None,
+                            model_name=ev.strip()
+                            if comp_type in (AIComponentType.MODEL, AIComponentType.EMBEDDING)
+                            else None,
                             metadata={"config_key": ek},
                         )
                     )
@@ -590,7 +751,9 @@ def _parse_k8s_yaml(
                         comp_type,
                         fp,
                         ln,
-                        model_name=val.strip() or None if comp_type == AIComponentType.MODEL else None,
+                        model_name=val.strip() or None
+                        if comp_type in (AIComponentType.MODEL, AIComponentType.EMBEDDING)
+                        else None,
                         metadata={"env": ename},
                     )
                 )
@@ -648,10 +811,11 @@ def _walk_helm_values(
                         )
                     )
                 elif _is_known_model(stripped):
+                    comp_type = _model_component_type_for_value(sub, stripped)
                     out.append(
                         _emit(
                             stripped[:120],
-                            AIComponentType.MODEL,
+                            comp_type,
                             file_path,
                             ln,
                             model_name=stripped,
@@ -663,28 +827,59 @@ def _walk_helm_values(
                     _helm_key_is_ai_endpoint(lk)
                     and stripped.startswith(("http://", "https://"))
                 ):
+                    (
+                        comp_type,
+                        store_technology,
+                        conflicting_backend,
+                        selector_key,
+                    ) = _endpoint_component_details(sub, stripped, obj)
+                    needs_agentic = (
+                        comp_type == AIComponentType.LLM_ENDPOINT
+                        or conflicting_backend
+                    )
+                    confidence = 0.5 if needs_agentic else 0.95
+                    if conflicting_backend:
+                        selector_label = selector_key or "backend selector"
+                        hint = (
+                            "Explicit backend selection beats provider-name "
+                            f"hints: sibling key '{selector_label}' selects "
+                            f"'{store_technology}', but endpoint key '{k}' "
+                            "still looks provider-specific. Treat the row as "
+                            "ambiguous and keep it only if surrounding config "
+                            "proves this endpoint is active."
+                        )
+                    elif needs_agentic:
+                        hint = (
+                            f"Helm key '{k}' ends with an endpoint suffix "
+                            f"and value is a URL. Confirm whether this is "
+                            f"an AI/LLM endpoint or an unrelated service."
+                        )
+                    else:
+                        hint = ""
+                    metadata = {"helm_key": sub, "endpoint_url": stripped}
+                    if store_technology is not None:
+                        metadata["store_technology"] = store_technology
+                    if selector_key is not None:
+                        metadata["backend_selector_key"] = selector_key
                     out.append(
                         _emit(
                             f"env:{k}",
-                            AIComponentType.LLM_ENDPOINT,
+                            comp_type,
                             file_path,
                             ln,
-                            metadata={"helm_key": sub, "endpoint_url": stripped},
-                            confidence=0.5,
-                            needs_agentic=True,
-                            agentic_hint=(
-                                f"Helm key '{k}' ends with an endpoint suffix "
-                                f"and value is a URL. Confirm whether this is "
-                                f"an AI/LLM endpoint or an unrelated service."
-                            ),
+                            metadata=metadata,
+                            confidence=confidence,
+                            needs_agentic=needs_agentic,
+                            agentic_hint=hint,
                         )
                     )
                 elif _helm_key_suggests_model(sub) and stripped and len(stripped) < 120:
                     hint = _azure_deployment_hint(sub, stripped)
+                    comp_type = _model_component_type_for_value(sub, stripped)
                     out.append(
                         _emit(
                             stripped[:120],
-                            AIComponentType.MODEL,
+                            comp_type,
                             file_path,
                             ln,
                             model_name=stripped,

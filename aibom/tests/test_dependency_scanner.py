@@ -54,6 +54,58 @@ class TestDependencyScanner:
         assert "openai" in names
         assert "anthropic" in names
 
+    def test_parse_poetry_dependencies_uses_key_not_version_value(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "pyproject.toml": (
+                    "[tool.poetry]\n"
+                    'name = "demo"\n'
+                    'version = "0.1.0"\n'
+                    "\n"
+                    "[tool.poetry.dependencies]\n"
+                    'python = "^3.12"\n'
+                    'stub-nonai-one = "0.18.0"\n'
+                    'stub-nonai-two = "3.9.3"\n'
+                    'freeplay = "0.5.4"\n'
+                ),
+            },
+        )
+        by_name = {c.name: c for c in comps}
+        names = set(by_name)
+        assert "freeplay" in names
+        assert "stub-nonai-one" not in names
+        assert "stub-nonai-two" not in names
+        assert "0.18.0" not in names
+        assert "3.9.3" not in names
+        assert "0.5.4" not in names
+        assert by_name["freeplay"].metadata["version_spec"] == "0.5.4"
+        assert by_name["freeplay"].sdk_version == "0.5.4"
+
+    def test_parse_pyproject_ignores_bare_version_strings(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "pyproject.toml": (
+                    "[tool.poetry]\n"
+                    'name = "demo"\n'
+                    'version = "0.1.0"\n'
+                    "\n"
+                    "[tool.poetry.dependencies]\n"
+                    'python = "^3.12"\n'
+                    '"0.18.0"\n'
+                    '"3.9.3"\n'
+                    'openai = "^1.99.9"\n'
+                ),
+            },
+        )
+        names = {c.name for c in comps}
+        assert "openai" in names
+        assert "0.18.0" not in names
+        assert "3.9.3" not in names
+
     def test_parse_go_mod_ai_packages(self, tmp_path: Path) -> None:
         comps, _ = run_scanner(
             DependencyScanner,
@@ -84,7 +136,7 @@ class TestDependencyScanner:
         names = {c.name for c in comps}
         assert "async-openai" in names
 
-    def test_emits_all_packages_with_known_ai_hint(self, tmp_path: Path) -> None:
+    def test_emits_only_ai_packages_from_mixed_manifests(self, tmp_path: Path) -> None:
         comps, _ = run_scanner(
             DependencyScanner,
             tmp_path,
@@ -94,9 +146,46 @@ class TestDependencyScanner:
             },
         )
         by_name = {c.name: c for c in comps}
-        assert "requests" in by_name
         assert "openai" in by_name
-        assert "lodash" in by_name
         assert by_name["openai"].metadata["known_ai_package"] is True
-        assert by_name["requests"].metadata["known_ai_package"] is False
-        assert by_name["lodash"].metadata["known_ai_package"] is False
+        assert "requests" not in by_name
+        assert "lodash" not in by_name
+
+    def test_emits_only_ai_packages_from_go_mod(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "go.mod": (
+                    "module example.com/x\n"
+                    "go 1.22\n"
+                    "require (\n"
+                    "\tgithub.com/sashabaranov/go-openai v1.17.9\n"
+                    "\tgithub.com/google/uuid v1.6.0\n"
+                    ")\n"
+                ),
+            },
+        )
+        names = {c.name for c in comps}
+        assert "github.com/sashabaranov/go-openai" in names
+        assert "github.com/google/uuid" not in names
+
+    def test_recognizes_additional_public_ai_packages(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "pyproject.toml": (
+                    "[project.dependencies]\n"
+                    '"guardrails>=0.5"\n'
+                    '"google-genai>=1.0"\n'
+                    '"openai-agents>=0.2"\n'
+                    '"llmetry>=0.1"\n'
+                ),
+            },
+        )
+        names = {c.name for c in comps}
+        assert "guardrails" in names
+        assert "google-genai" in names
+        assert "openai-agents" in names
+        assert "llmetry" in names

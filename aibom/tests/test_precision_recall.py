@@ -113,6 +113,56 @@ class TestPromptDetection:
         assert len(prompt_comps) >= 1
         assert prompt_comps[0].text == "You are a helpful assistant."
 
+    def test_resolves_ai_client_chain_for_prompt_kwargs(self, tmp_path: Path):
+        (tmp_path / "client.py").write_text(
+            "import openai\n"
+            "client = openai.OpenAI()\n"
+            'response = client.responses.create(instructions="Answer briefly.")\n'
+        )
+        from aibom.scanners.kb_enrichment_scanner import _detect_prompt_kwargs
+        from aibom.cst_parser import parse_source_code
+
+        source = (tmp_path / "client.py").read_text()
+        result = parse_source_code(str(tmp_path / "client.py"), source)
+        comps = _detect_prompt_kwargs(result)
+        prompt_comps = [c for c in comps if c.component_type == AIComponentType.PROMPT]
+        assert len(prompt_comps) == 1
+        assert prompt_comps[0].text == "Answer briefly."
+        assert prompt_comps[0].metadata["enclosing_call"] == "openai.OpenAI.responses.create"
+
+    def test_ignores_prompt_kwargs_on_non_ai_helpers(self, tmp_path: Path):
+        (tmp_path / "helpers.py").write_text(
+            "def render_prompt(prompt: str):\n"
+            "    return prompt\n"
+            "\n"
+            'render_prompt(prompt="local helper text")\n'
+        )
+        from aibom.scanners.kb_enrichment_scanner import _detect_prompt_kwargs
+        from aibom.cst_parser import parse_source_code
+
+        source = (tmp_path / "helpers.py").read_text()
+        result = parse_source_code(str(tmp_path / "helpers.py"), source)
+        comps = _detect_prompt_kwargs(result)
+        assert [c for c in comps if c.component_type == AIComponentType.PROMPT] == []
+
+    def test_ignores_variable_messages_on_non_ai_methods(self, tmp_path: Path):
+        (tmp_path / "helpers.py").write_text(
+            "class RequestBuilder:\n"
+            "    def create(self, messages):\n"
+            "        return messages\n"
+            "\n"
+            "payload = ['status']\n"
+            "builder = RequestBuilder()\n"
+            "request = builder.create(messages=payload)\n"
+        )
+        from aibom.scanners.kb_enrichment_scanner import _detect_prompt_kwargs
+        from aibom.cst_parser import parse_source_code
+
+        source = (tmp_path / "helpers.py").read_text()
+        result = parse_source_code(str(tmp_path / "helpers.py"), source)
+        comps = _detect_prompt_kwargs(result)
+        assert [c for c in comps if c.component_type == AIComponentType.PROMPT] == []
+
 
 class TestEmbeddingDetection:
     """6.0d: Cross-repo embedding detection via suggestive-signal regex."""

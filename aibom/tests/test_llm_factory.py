@@ -18,11 +18,18 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 
+@patch(
+    "aibom.llm_factory.ensure_llm_runtime_available",
+    side_effect=lambda model_string, *, provider=None: (
+        __import__("aibom.llm_factory", fromlist=["resolve_provider"])
+        .resolve_provider(model_string, provider)
+    ),
+)
 class TestBuildChatModel(unittest.TestCase):
     """Tests for ``aibom.llm_factory.build_chat_model``."""
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_plain_model_no_provider(self, mock_init):
+    def test_plain_model_no_provider(self, mock_init, _mock_preflight):
         """LangChain infers provider when neither flag nor prefix is given."""
         from aibom.llm_factory import build_chat_model
 
@@ -34,7 +41,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["api_key"], "k")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_explicit_provider_flag(self, mock_init):
+    def test_explicit_provider_flag(self, mock_init, _mock_preflight):
         """--llm-provider bedrock sets model_provider without touching model_string."""
         from aibom.llm_factory import build_chat_model
 
@@ -48,7 +55,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["model_provider"], "bedrock")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_slash_prefix_backward_compat(self, mock_init):
+    def test_slash_prefix_backward_compat(self, mock_init, _mock_preflight):
         """Legacy provider/model slash convention still works."""
         from aibom.llm_factory import build_chat_model
 
@@ -59,7 +66,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["model_provider"], "bedrock")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_explicit_provider_overrides_slash(self, mock_init):
+    def test_explicit_provider_overrides_slash(self, mock_init, _mock_preflight):
         """--llm-provider takes precedence over a slash in the model string."""
         from aibom.llm_factory import build_chat_model
 
@@ -73,7 +80,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["model_provider"], "bedrock_converse")
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_azure_endpoint_routing(self, mock_init):
+    def test_azure_endpoint_routing(self, mock_init, _mock_preflight):
         """azure_openai maps api_base to azure_endpoint, passes api_version."""
         from aibom.llm_factory import build_chat_model
 
@@ -92,7 +99,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertNotIn("base_url", kwargs)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_base_url_for_non_azure(self, mock_init):
+    def test_base_url_for_non_azure(self, mock_init, _mock_preflight):
         """Non-azure providers get api_base mapped to base_url."""
         from aibom.llm_factory import build_chat_model
 
@@ -107,7 +114,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertNotIn("azure_endpoint", kwargs)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_api_version_ignored_for_non_azure(self, mock_init):
+    def test_api_version_ignored_for_non_azure(self, mock_init, _mock_preflight):
         """api_version is only passed for azure_openai provider."""
         from aibom.llm_factory import build_chat_model
 
@@ -117,7 +124,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertNotIn("api_version", kwargs)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_temperature_default(self, mock_init):
+    def test_temperature_default(self, mock_init, _mock_preflight):
         """Default temperature is 0.0."""
         from aibom.llm_factory import build_chat_model
 
@@ -127,7 +134,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["temperature"], 0.0)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_max_tokens_passed_when_set(self, mock_init):
+    def test_max_tokens_passed_when_set(self, mock_init, _mock_preflight):
         """max_tokens forwarded only when explicitly provided."""
         from aibom.llm_factory import build_chat_model
 
@@ -137,7 +144,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["max_tokens"], 100)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_max_tokens_omitted_when_none(self, mock_init):
+    def test_max_tokens_omitted_when_none(self, mock_init, _mock_preflight):
         """max_tokens not in kwargs when left as None."""
         from aibom.llm_factory import build_chat_model
 
@@ -147,7 +154,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertNotIn("max_tokens", kwargs)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_rate_limiter_forwarded(self, mock_init):
+    def test_rate_limiter_forwarded(self, mock_init, _mock_preflight):
         """rate_limiter object is passed through to init_chat_model."""
         from aibom.llm_factory import build_chat_model
 
@@ -158,7 +165,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertIs(kwargs["rate_limiter"], limiter)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_rate_limiter_omitted_when_none(self, mock_init):
+    def test_rate_limiter_omitted_when_none(self, mock_init, _mock_preflight):
         """rate_limiter not in kwargs when left as None."""
         from aibom.llm_factory import build_chat_model
 
@@ -168,7 +175,7 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertNotIn("rate_limiter", kwargs)
 
     @patch("aibom.llm_factory.init_chat_model")
-    def test_bedrock_model_without_slash(self, mock_init):
+    def test_bedrock_model_without_slash(self, mock_init, _mock_preflight):
         """Bedrock model ID without slash + explicit provider works."""
         from aibom.llm_factory import build_chat_model
 

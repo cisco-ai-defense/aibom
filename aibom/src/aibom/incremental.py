@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from .cache_paths import cache_read_dirs, ensure_cache_dir
 from .models import ScanResult
 
 
@@ -40,12 +41,18 @@ def _repo_bucket_key(repo_path: str) -> str:
 
 class OrgCache:
     def __init__(self, base_dir: Optional[Path] = None) -> None:
-        self.base_dir = base_dir or (Path.home() / ".cache" / "cisco-aibom" / "org-cache")
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        if base_dir is None:
+            read_dirs = cache_read_dirs("org")
+            self.base_dir = ensure_cache_dir("org")
+            self.fallback_dirs = [p for p in read_dirs if p != self.base_dir]
+        else:
+            self.base_dir = base_dir
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self.fallback_dirs = []
 
-    def _repo_dir(self, repo_path: str) -> Path:
+    def _repo_dir(self, repo_path: str, base_dir: Optional[Path] = None) -> Path:
         key = _repo_bucket_key(repo_path)
-        return self.base_dir / key
+        return (base_dir or self.base_dir) / key
 
     @staticmethod
     def _get_head_sha(repo_path: str) -> Optional[str]:
@@ -68,14 +75,17 @@ class OrgCache:
         sha = self._get_head_sha(repo_path)
         if not sha:
             return None
-        cache_file = self._repo_dir(repo_path) / f"{sha}.json"
-        if not cache_file.is_file():
-            return None
-        try:
-            raw = json.loads(cache_file.read_text(encoding="utf-8"))
-            return ScanResult.model_validate(raw)
-        except (json.JSONDecodeError, OSError, ValueError):
-            return None
+        candidate_dirs = [self.base_dir, *self.fallback_dirs]
+        for base_dir in candidate_dirs:
+            cache_file = self._repo_dir(repo_path, base_dir) / f"{sha}.json"
+            if not cache_file.is_file():
+                continue
+            try:
+                raw = json.loads(cache_file.read_text(encoding="utf-8"))
+                return ScanResult.model_validate(raw)
+            except (json.JSONDecodeError, OSError, ValueError):
+                continue
+        return None
 
     def store(self, repo_path: str, result: ScanResult) -> None:
         sha = self._get_head_sha(repo_path)

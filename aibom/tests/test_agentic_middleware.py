@@ -112,6 +112,105 @@ class TestExtractFindings:
         comps, rels, flags = mw.extract_findings(output)
         assert comps == [] and rels == [] and flags == []
 
+    def test_extracts_decision_annotations_for_relationships_and_risk_flags(self, mw):
+        output = json.dumps(
+            {
+                "new_components": [],
+                "new_relationships": [
+                    {
+                        "source_name": "planner_agent",
+                        "target_name": "search_tool",
+                        "relationship_type": "USES_TOOL",
+                        "decision_annotation": {
+                            "decision": "derived",
+                            "justification": "The planner calls the search tool in the same workflow.",
+                            "evidence_kinds": ["relationship_context"],
+                            "evidence_locations": [
+                                {
+                                    "file_path": "/repo/app.py",
+                                    "start_line": 12,
+                                    "end_line": 16,
+                                    "role": "source",
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "risk_findings": [
+                    {
+                        "flag": "unpinned_model",
+                        "description": "The configured model identifier is not version-pinned.",
+                        "file_path": "/repo/app.py",
+                        "line_number": 18,
+                        "severity": "medium",
+                        "decision_annotation": {
+                            "decision": "flagged",
+                            "justification": "The model name is generic and lacks an immutable revision.",
+                            "evidence_kinds": ["code_context"],
+                            "evidence_locations": [
+                                {
+                                    "file_path": "/repo/app.py",
+                                    "start_line": 18,
+                                    "end_line": 18,
+                                    "role": "trigger",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+
+        _, rels, flags = mw.extract_findings(output)
+
+        assert rels[0].decision_annotation is not None
+        assert rels[0].decision_annotation.decision == "derived"
+        assert flags[0].decision_annotation is not None
+        assert flags[0].decision_annotation.justification.startswith("The model name")
+
+    def test_extracts_code_snippet_only_when_enabled(self, tmp_path):
+        source = tmp_path / "app.py"
+        source.write_text("line 1\nline 2\nline 3\n", encoding="utf-8")
+
+        output = json.dumps(
+            {
+                "new_components": [
+                    {
+                        "name": "router_agent",
+                        "component_type": "agent",
+                        "file_path": str(source),
+                        "line_number": 2,
+                        "framework": "custom",
+                        "decision_annotation": {
+                            "decision": "added",
+                            "justification": "The code declares and uses a request routing agent.",
+                            "evidence_kinds": ["code_context"],
+                            "evidence_locations": [
+                                {
+                                    "file_path": str(source),
+                                    "start_line": 2,
+                                    "end_line": 3,
+                                    "role": "primary",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+        )
+
+        without_snippets = AIBOMScannerMiddleware(include_code_snippets=False)
+        with_snippets = AIBOMScannerMiddleware(include_code_snippets=True)
+
+        comps_without, _, _ = without_snippets.extract_findings(output)
+        comps_with, _, _ = with_snippets.extract_findings(output)
+
+        assert comps_without[0].decision_annotation is not None
+        assert comps_without[0].decision_annotation.code_snippet is None
+        assert comps_with[0].decision_annotation is not None
+        assert comps_with[0].decision_annotation.code_snippet is not None
+        assert comps_with[0].decision_annotation.code_snippet.text == "line 2\nline 3\n"
+
 
 class TestApplyEnrichments:
     def test_updates_existing_component(self, mw):
@@ -169,6 +268,46 @@ class TestApplyEnrichments:
         result = mw.apply_enrichments(existing, output)
         assert len(result) == 1
         assert result[0].name == "a"
+
+    def test_applies_component_decision_annotation(self, mw):
+        existing = [
+            AIComponent(
+                name="my-model",
+                component_type=AIComponentType.MODEL,
+                file_path="app.py",
+                line_number=10,
+                instance_id="comp1_app.py_10",
+            )
+        ]
+        output = json.dumps(
+            {
+                "enriched_components": [
+                    {
+                        "instance_id": "comp1_app.py_10",
+                        "updates": {},
+                        "decision_annotation": {
+                            "decision": "confirmed",
+                            "justification": "The constructor argument shows this is an active model dependency.",
+                            "evidence_kinds": ["code_context"],
+                            "evidence_locations": [
+                                {
+                                    "file_path": "app.py",
+                                    "start_line": 10,
+                                    "end_line": 10,
+                                    "role": "primary",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+        )
+
+        enriched = mw.apply_enrichments(existing, output)
+
+        assert enriched[0].decision_annotation is not None
+        assert enriched[0].decision_annotation.decision == "confirmed"
+        assert "active model dependency" in enriched[0].decision_annotation.justification
 
 
 class TestRemoveComponents:

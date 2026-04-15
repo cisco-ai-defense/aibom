@@ -29,7 +29,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aibom.agentic.agent import _build_context_message, _extract_structured_response
-from aibom.models import AIComponent, AIComponentType, ComponentRelationship
+from aibom.models import (
+    AIComponent,
+    AIComponentType,
+    ComponentRelationship,
+    DecisionAnnotation,
+    EvidenceLocation,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -215,7 +221,7 @@ class TestRunAgenticEnrichment:
                 cache_dir=cache_dir,
             )
 
-        mock_cache_cls.assert_called_once_with(cache_dir)
+        mock_cache_cls.assert_called_once_with(cache_dir, fallback_dirs=[])
         assert comps == []
         assert rels == []
         assert flags == []
@@ -323,6 +329,210 @@ class TestRunAgenticEnrichment:
 
         assert {c.name for c in fresh} == {"existing", "agent-found-model"}
         assert {c.name for c in cached} == {c.name for c in fresh}
+        assert mock_agent.invoke.call_count == 1
+
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_partial_cached_rerun_replays_batch_findings_once(
+        self, mock_create, _mock_build, _mock_close, tmp_path
+    ):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        first_msg = MagicMock()
+        first_msg.content = json.dumps({
+            "enriched_components": [],
+            "new_components": [
+                {
+                    "name": "agent-found-model",
+                    "component_type": "model",
+                    "file_path": "new.py",
+                    "line_number": 1,
+                    "framework": "openai",
+                    "model_name": "gpt-5",
+                }
+            ],
+            "new_relationships": [
+                {
+                    "source_name": "existing-a",
+                    "target_name": "existing-b",
+                    "relationship_type": "USES_MODEL",
+                }
+            ],
+            "risk_findings": [
+                {
+                    "flag": "cache_replayed",
+                    "description": "cached finding",
+                    "file_path": "app_a.py",
+                    "line_number": 1,
+                    "severity": "low",
+                }
+            ],
+        })
+        second_msg = MagicMock()
+        second_msg.content = json.dumps({
+            "enriched_components": [],
+            "new_components": [],
+            "new_relationships": [],
+            "risk_findings": [],
+        })
+        mock_agent = MagicMock()
+        mock_agent.invoke.side_effect = [
+            {"messages": [first_msg]},
+            {"messages": [second_msg]},
+        ]
+        mock_create.return_value = mock_agent
+
+        det_comps_first = [
+            AIComponent(
+                name="existing-a",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="app_a.py",
+                line_number=1,
+            ),
+            AIComponent(
+                name="existing-b",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="app_b.py",
+                line_number=1,
+            ),
+        ]
+        det_comps_second = det_comps_first + [
+            AIComponent(
+                name="existing-c",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="app_c.py",
+                line_number=1,
+            )
+        ]
+        cache_dir = tmp_path / "agentic-cache"
+
+        fresh_components, fresh_rels, fresh_flags = run_agentic_enrichment(
+            model_string="test-model",
+            deterministic_components=det_comps_first,
+            deterministic_relationships=[],
+            scan_paths=["/tmp"],
+            cache_dir=cache_dir,
+        )
+        cached_components, cached_rels, cached_flags = run_agentic_enrichment(
+            model_string="test-model",
+            deterministic_components=det_comps_second,
+            deterministic_relationships=[],
+            scan_paths=["/tmp"],
+            cache_dir=cache_dir,
+        )
+
+        assert {c.name for c in fresh_components} == {
+            "existing-a", "existing-b", "agent-found-model",
+        }
+        assert {c.name for c in cached_components} == {
+            "existing-a", "existing-b", "existing-c", "agent-found-model",
+        }
+        assert sum(c.name == "agent-found-model" for c in cached_components) == 1
+        assert len(cached_rels) == 1
+        assert cached_rels[0].source_name == "existing-a"
+        assert cached_rels[0].target_name == "existing-b"
+        assert len(cached_flags) == 1
+        assert cached_flags[0].flag == "cache_replayed"
+        assert len(fresh_rels) == 1
+        assert len(fresh_flags) == 1
+        assert mock_agent.invoke.call_count == 2
+
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_cross_repo_coordination_rerun_uses_cache(
+        self, mock_create, _mock_build, _mock_close, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        from aibom.agentic.agent import run_cross_repo_coordination
+
+        mock_msg = MagicMock()
+        mock_msg.content = json.dumps({
+            "new_relationships": [
+                {
+                    "source_name": "repo-a-model",
+                    "target_name": "repo-b-endpoint",
+                    "relationship_type": "USES_MODEL",
+                }
+            ],
+            "risk_findings": [
+                {
+                    "flag": "cross_repo_env_var_mismatch",
+                    "description": "backend mismatch",
+                    "severity": "medium",
+                }
+            ],
+        })
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {"messages": [mock_msg]}
+        mock_create.return_value = mock_agent
+
+        per_repo_results = {
+            "/repo-a": {
+                "components": [
+                    AIComponent(
+                        name="repo-a-model",
+                        component_type=AIComponentType.MODEL,
+                        file_path="/repo-a/app.py",
+                        line_number=10,
+                        model_name="gpt-4o-mini",
+                    )
+                ],
+                "_unresolved_env_vars": [],
+            },
+            "/repo-b": {
+                "components": [
+                    AIComponent(
+                        name="repo-b-endpoint",
+                        component_type=AIComponentType.LLM_ENDPOINT,
+                        file_path="/repo-b/values.yaml",
+                        line_number=20,
+                    )
+                ],
+                "_unresolved_env_vars": [],
+            },
+        }
+
+        with (
+            patch(
+                "aibom.agentic.cross_repo.cross_repo_summary_tool",
+                return_value=json.dumps(
+                    {
+                        "shared_env_vars": [],
+                        "shared_packages": [],
+                        "unresolved_env_var_refs": [],
+                    }
+                ),
+            ),
+            patch(
+                "aibom.agentic.cross_repo.build_cross_repo_tools",
+                return_value=[MagicMock()],
+            ),
+            patch(
+                "aibom.cross_ref.build_env_index",
+                return_value=SimpleNamespace(env={}),
+            ),
+        ):
+            fresh_rels, fresh_flags = run_cross_repo_coordination(
+                model_string="test-model",
+                per_repo_results=per_repo_results,
+                cache_dir=tmp_path / "agentic-cache",
+            )
+            cached_rels, cached_flags = run_cross_repo_coordination(
+                model_string="test-model",
+                per_repo_results=per_repo_results,
+                cache_dir=tmp_path / "agentic-cache",
+            )
+
+        assert len(fresh_rels) == 1
+        assert len(cached_rels) == 1
+        assert fresh_rels[0].source_name == cached_rels[0].source_name
+        assert fresh_rels[0].target_name == cached_rels[0].target_name
+        assert len(fresh_flags) == 1
+        assert len(cached_flags) == 1
+        assert fresh_flags[0].flag == cached_flags[0].flag
         assert mock_agent.invoke.call_count == 1
 
     @patch("aibom.agentic.agent._close_model_clients")
@@ -627,6 +837,70 @@ class TestAgenticResultCache:
         assert enriched[0].confidence == 0.97
         assert enriched[0].agentic_hint == ""
         assert enriched[0].needs_agentic is False
+
+    def test_apply_cached_hydrates_component_snippet_when_enabled(self, tmp_path):
+        from aibom.agentic.agent import _AgenticResultCache, _component_cache_key
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        source = tmp_path / "service.py"
+        source.write_text(
+            "setup()\n"
+            "agent = RouterAgent()\n"
+            "agent.run(task)\n",
+            encoding="utf-8",
+        )
+
+        cache = _AgenticResultCache(tmp_path / "cache")
+        before = AIComponent(
+            name="router_agent",
+            component_type=AIComponentType.AGENT,
+            file_path=str(source),
+            line_number=2,
+        )
+        after = before.model_copy(
+            update={
+                "decision_annotation": DecisionAnnotation(
+                    decision="confirmed",
+                    justification="The code instantiates and runs the agent.",
+                    evidence_kinds=["code_context"],
+                    evidence_locations=[
+                        EvidenceLocation(
+                            file_path=str(source),
+                            start_line=2,
+                            end_line=3,
+                            role="primary",
+                        )
+                    ],
+                ),
+                "needs_agentic": False,
+            }
+        )
+        cache.put(
+            _component_cache_key(before),
+            {
+                "cached_component": after.model_dump(mode="json"),
+                "enriched_components": [],
+                "new_components": [],
+                "remove_components": [],
+                "reclassify_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            },
+        )
+
+        enriched, new, rels, flags = cache.apply_cached(
+            [before],
+            AIBOMScannerMiddleware(include_code_snippets=True),
+        )
+
+        assert new == []
+        assert rels == []
+        assert flags == []
+        assert enriched[0].decision_annotation is not None
+        assert enriched[0].decision_annotation.code_snippet is not None
+        assert enriched[0].decision_annotation.code_snippet.text == (
+            "agent = RouterAgent()\nagent.run(task)\n"
+        )
 
 
 class TestRunTier:
