@@ -634,8 +634,16 @@ class TestKBEnrichmentScannerNoKB:
             assert rels == []
 
 
+@pytest.mark.skipif(not _kb_available(), reason="No KB DuckDB installed")
 class TestAgentSpecificHint:
-    """Fix 3d: Import-inferred agents get a specialized hint."""
+    """Fix 3d: Import-inferred agents get a specialized hint.
+
+    Requires the live DuckDB KB (``~/.aibom/catalogs/``) because
+    ``KBEnrichmentScanner.scan`` short-circuits to ``[], []`` when no
+    KB path is resolvable. Marked as integration to keep CI hermetic;
+    matches the convention used by ``TestBuildKBPatterns`` and others
+    above.
+    """
 
     def test_agent_hint_mentions_three_conditions(self, tmp_path: Path):
         (tmp_path / "router.py").write_text(

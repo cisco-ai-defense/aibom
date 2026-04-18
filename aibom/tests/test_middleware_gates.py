@@ -25,7 +25,7 @@ from aibom.agentic.middleware import (
     AIBOMScannerMiddleware,
     _cap_confidence_if_unresolved,
     _drop_env_placeholder_identifiers,
-    _is_class_name,
+    _is_class_name_not_model_id,
     _is_negating_justification,
     _is_sentinel_name,
     _reject_class_name_models,
@@ -87,22 +87,22 @@ def _comp(name: str, comp_type: AIComponentType, **kwargs) -> AIComponent:
 
 class TestIsClassName:
     def test_pascal_case(self):
-        assert _is_class_name("MyLargeLanguageModel") is True
+        assert _is_class_name_not_model_id("MyLargeLanguageModel") is True
 
     def test_model_id_with_slash(self):
-        assert _is_class_name("meta-llama/Llama-3-70B") is False
+        assert _is_class_name_not_model_id("meta-llama/Llama-3-70B") is False
 
     def test_model_id_with_dash(self):
-        assert _is_class_name("gpt-4o") is False
+        assert _is_class_name_not_model_id("gpt-4o") is False
 
     def test_model_id_with_dots(self):
-        assert _is_class_name("text-embedding-ada-002") is False
+        assert _is_class_name_not_model_id("text-embedding-ada-002") is False
 
     def test_single_word_lowercase(self):
-        assert _is_class_name("agent") is False
+        assert _is_class_name_not_model_id("agent") is False
 
     def test_camel_case_wrapper_class(self):
-        assert _is_class_name("ChatCompletionClient") is True
+        assert _is_class_name_not_model_id("ChatCompletionClient") is True
 
 
 class TestRejectClassNameModels:

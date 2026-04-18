@@ -767,25 +767,16 @@ def _normalize_endpoint_model_name(comp: AIComponent) -> AIComponent:
     return comp.model_copy(update=updates)
 
 
-import re as _re
-
-_CAMEL_CASE_RE = _re.compile(r"^[A-Z][a-zA-Z0-9]+(?:[A-Z][a-zA-Z0-9]+)+$")
-
-
-def _is_class_name(name: str) -> bool:
-    """Return True if *name* looks like a PascalCase class name, not a model ID."""
-    if "/" in name or "." in name or "-" in name:
-        return False
-    return bool(_CAMEL_CASE_RE.match(name))
-
-
 def _reject_class_name_models(
     components: list[AIComponent],
 ) -> list[AIComponent]:
     """Remove ``model`` components whose name is a class name, not a model ID."""
     result: list[AIComponent] = []
     for comp in components:
-        if comp.component_type == AIComponentType.MODEL and _is_class_name(comp.name):
+        if (
+            comp.component_type == AIComponentType.MODEL
+            and _is_class_name_not_model_id(comp.name)
+        ):
             _LOGGER.debug("Class-name model gate: removing %s", comp.name)
             continue
         result.append(comp)

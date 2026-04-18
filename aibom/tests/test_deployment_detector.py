@@ -492,7 +492,7 @@ class TestObservabilityEndpointDetection:
         comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
         obs = [c for c in comps if c.component_type == AIComponentType.OBSERVABILITY]
         assert len(obs) >= 1
-        assert any("tracing.example.com" in c.name for c in obs)
+        assert any(c.name == "https://tracing.example.com/api/v1" for c in obs)
 
     def test_mlflow_endpoint_classified_as_observability(self, tmp_path: Path) -> None:
         yml = """env:
