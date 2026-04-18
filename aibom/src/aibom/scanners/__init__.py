@@ -29,9 +29,11 @@ from .ml_lifecycle_detector import MLLifecycleDetector
 from .model_detector import ModelDetector
 from .model_file_scanner import ModelFileScanner
 from .multi_language_scanner import MultiLanguageScanner
+from .remote_agent_resolver import RemoteAgentResolver
 from .secret_detector import SecretDetector
 from .shadow_ai_detector import ShadowAIDetector
 from .skill_detector import SkillDetector
+from .structural_agent_scanner import StructuralAgentScanner
 from .vuln_scanner import (
     BaseVulnProvider,
     GrypeProvider,
@@ -64,9 +66,11 @@ __all__ = [
     "MultiLanguageScanner",
     "OsvProvider",
     "PackageRef",
+    "RemoteAgentResolver",
     "SecretDetector",
     "ShadowAIDetector",
     "SkillDetector",
+    "StructuralAgentScanner",
     "VulnScanner",
     "Vulnerability",
     "WorkflowScanner",

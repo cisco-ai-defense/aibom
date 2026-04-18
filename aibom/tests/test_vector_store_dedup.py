@@ -16,21 +16,21 @@ class TestConsolidateVectorStores:
                 component_type=AIComponentType.VECTOR_STORE,
                 file_path="a.py",
                 line_number=1,
-                confidence=0.7,
+                heuristic_confidence=0.7,
             ),
             AIComponent(
                 name="WeaviateVectorStore",
                 component_type=AIComponentType.VECTOR_STORE,
                 file_path="b.py",
                 line_number=2,
-                confidence=0.9,
+                heuristic_confidence=0.9,
             ),
             AIComponent(
                 name="WeaviateManager",
                 component_type=AIComponentType.VECTOR_STORE,
                 file_path="c.py",
                 line_number=3,
-                confidence=0.5,
+                heuristic_confidence=0.5,
             ),
         ]
         out = _consolidate_vector_stores(comps)
@@ -84,14 +84,14 @@ class TestConsolidateVectorStores:
                 component_type=AIComponentType.VECTOR_STORE,
                 file_path="one.py",
                 line_number=10,
-                confidence=0.8,
+                heuristic_confidence=0.8,
             ),
             AIComponent(
                 name="QdrantWrapper",
                 component_type=AIComponentType.VECTOR_STORE,
                 file_path="two.py",
                 line_number=20,
-                confidence=0.6,
+                heuristic_confidence=0.6,
             ),
         ]
         out = _consolidate_vector_stores(comps)

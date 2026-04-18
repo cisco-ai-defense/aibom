@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -155,6 +155,13 @@ _AGENT_FRAMEWORK_PREFIXES: frozenset[str] = frozenset({
     "langchain",
     "crewai",
     "autogen",
+    # Strands Agents (https://strandsagents.com/) uses module-level
+    # ``from strands import Agent`` followed by ``agent = Agent(...)``
+    # (no class wrapper). Without ``strands`` here, the call-pattern
+    # gate below rejects the call and the agent is never emitted, which
+    # matches the symptom observed on published open-source Strands
+    # sample repositories.
+    "strands",
 })
 
 
@@ -244,24 +251,60 @@ _CLASS_NAME_TYPE_MAP: list[tuple[re.Pattern[str], AIComponentType]] = [
     (re.compile(r"Vector(?:Store|DB|Database)"), AIComponentType.VECTOR_STORE),
 ]
 
-_IMPORT_MODULE_TYPE_MAP: dict[str, AIComponentType] = {
-    "traceloop": AIComponentType.OBSERVABILITY,
-    "openllmetry": AIComponentType.OBSERVABILITY,
-    "langsmith": AIComponentType.OBSERVABILITY,
-    "langfuse": AIComponentType.OBSERVABILITY,
-    "arize": AIComponentType.OBSERVABILITY,
-    "phoenix": AIComponentType.OBSERVABILITY,
-    "opik": AIComponentType.OBSERVABILITY,
-    "helicone": AIComponentType.OBSERVABILITY,
-    "freeplay": AIComponentType.OBSERVABILITY,
-    "tracia": AIComponentType.OBSERVABILITY,
-    "llmetry": AIComponentType.OBSERVABILITY,
-    "nemoguardrails": AIComponentType.GUARDRAIL,
-    "guardrails": AIComponentType.GUARDRAIL,
-    "llm_guard": AIComponentType.GUARDRAIL,
-    "lakera_guard": AIComponentType.GUARDRAIL,
-    "rebuff": AIComponentType.GUARDRAIL,
+@dataclass(frozen=True)
+class PlatformEntry:
+    """A known AI platform with a primary type and optional additional types."""
+
+    primary: AIComponentType
+    additional: frozenset[AIComponentType] = field(default_factory=frozenset)
+
+    @property
+    def all_types(self) -> frozenset[AIComponentType]:
+        return frozenset({self.primary}) | self.additional
+
+
+_OBS = AIComponentType.OBSERVABILITY
+_GRD = AIComponentType.GUARDRAIL
+_REG = AIComponentType.MODEL_REGISTRY
+
+_IMPORT_MODULE_TYPE_MAP: dict[str, PlatformEntry] = {
+    # Pure observability
+    "traceloop":    PlatformEntry(_OBS),
+    "openllmetry":  PlatformEntry(_OBS),
+    "langsmith":    PlatformEntry(_OBS),
+    "langfuse":     PlatformEntry(_OBS),
+    "arize":        PlatformEntry(_OBS),
+    "phoenix":      PlatformEntry(_OBS),
+    "opik":         PlatformEntry(_OBS),
+    "helicone":     PlatformEntry(_OBS),
+    "freeplay":     PlatformEntry(_OBS),
+    "tracia":       PlatformEntry(_OBS),
+    "llmetry":      PlatformEntry(_OBS),
+    "galileo":      PlatformEntry(_OBS),
+    "honeyhive":    PlatformEntry(_OBS),
+    "promptlayer":  PlatformEntry(_OBS),
+    "humanloop":    PlatformEntry(_OBS),
+    "braintrust":   PlatformEntry(_OBS),
+    "whylabs":      PlatformEntry(_OBS),
+    # Observability + model registry
+    "wandb":            PlatformEntry(_OBS, frozenset({_REG})),
+    "weights_biases":   PlatformEntry(_OBS, frozenset({_REG})),
+    "mlflow":           PlatformEntry(_OBS, frozenset({_REG})),
+    "neptune":          PlatformEntry(_OBS, frozenset({_REG})),
+    "comet":            PlatformEntry(_OBS, frozenset({_REG})),
+    "deepchecks":       PlatformEntry(_OBS),
+    # Guardrails
+    "nemoguardrails":   PlatformEntry(_GRD),
+    "guardrails":       PlatformEntry(_GRD),
+    "llm_guard":        PlatformEntry(_GRD),
+    "lakera_guard":     PlatformEntry(_GRD),
+    "rebuff":           PlatformEntry(_GRD),
 }
+
+OBSERVABILITY_PLATFORM_TOKENS: frozenset[str] = frozenset(
+    k for k, entry in _IMPORT_MODULE_TYPE_MAP.items()
+    if _OBS in entry.all_types
+)
 
 
 _NON_AI_CLASS_SUFFIXES: tuple[str, ...] = (
@@ -418,8 +461,16 @@ def _build_kb_patterns(
             _LOGGER.debug("KB pattern query failed for %s", path_seg, exc_info=True)
             ids = []
 
+        try:
+            custom_ids = db.find_ids_in_custom_by_path_and_concept(path_seg, concepts)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "KB pattern custom query failed for %s", path_seg, exc_info=True
+            )
+            custom_ids = []
+
         kb_classes: set[str] = set()
-        for kid in ids:
+        for kid in (*ids, *custom_ids):
             cls = _extract_leaf_class(kid)
             if cls:
                 kb_classes.add(cls)
@@ -427,28 +478,33 @@ def _build_kb_patterns(
         combined = kb_classes | set(static_fallback)
         result[comp_type] = frozenset(combined)
         _LOGGER.debug(
-            "KB patterns for %s: %d from KB + %d static = %d total",
-            comp_type.value, len(kb_classes), len(static_fallback), len(combined),
+            "KB patterns for %s: %d from KB + %d custom + %d static = %d total",
+            comp_type.value,
+            len(kb_classes),
+            len(custom_ids),
+            len(static_fallback),
+            len(combined),
         )
 
     return result
 
 
 def _build_kb_framework_prefixes(db: CatalogDB) -> frozenset[str]:
-    """Extract unique framework root prefixes from the KB."""
+    """Extract unique framework root prefixes from the KB.
+
+    Always unions the DuckDB prefixes with :data:`_AGENT_FRAMEWORK_PREFIXES`
+    and any frameworks registered via custom/built-in catalog supplements so
+    we don't miss modern SDKs (e.g. Strands) that post-date the DuckDB
+    snapshot.
+    """
+    roots: set[str] = set(_AGENT_FRAMEWORK_PREFIXES)
     try:
-        rows = db._connection.execute(  # noqa: SLF001
-            "SELECT DISTINCT framework FROM component_catalog WHERE framework IS NOT NULL"
-        ).fetchall()
-        roots: set[str] = set()
-        for (fw,) in rows:
+        for fw in db.distinct_frameworks():
             if fw:
                 roots.add(fw.split("_")[0].split("-")[0])
-        if roots:
-            return frozenset(roots)
     except Exception:  # noqa: BLE001
         _LOGGER.debug("KB framework query failed", exc_info=True)
-    return _AGENT_FRAMEWORK_PREFIXES
+    return frozenset(roots)
 
 
 def _is_known_call(
@@ -539,6 +595,17 @@ class KBEnrichmentScanner(BaseScanner):
         components: list[AIComponent] = []
 
         with CatalogDB(kb_path) as db:
+            try:
+                from ..builtin_catalog import BUILTIN_CATALOG_ENTRIES
+
+                db.add_custom_entries(BUILTIN_CATALOG_ENTRIES)
+                _LOGGER.debug(
+                    "KB enrichment: loaded %d built-in catalog supplement(s)",
+                    len(BUILTIN_CATALOG_ENTRIES),
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("KB enrichment: built-in catalog load failed", exc_info=True)
+
             custom_cfg = context.config.get("custom_catalog")
             if custom_cfg is not None:
                 try:
@@ -641,22 +708,17 @@ def _build_kb_framework_names(db: CatalogDB) -> frozenset[str]:
 
     Returns both the raw framework values (``langchain_community``) **and**
     their root prefixes (``langchain``), giving us a complete allowlist
-    derived from the KB — no hardcoded guessing.
+    derived from the KB and from any custom/built-in catalog supplements.
     """
+    names: set[str] = set()
     try:
-        rows = db._connection.execute(  # noqa: SLF001
-            "SELECT DISTINCT framework FROM component_catalog WHERE framework IS NOT NULL"
-        ).fetchall()
-        names: set[str] = set()
-        for (fw,) in rows:
+        for fw in db.distinct_frameworks():
             if fw:
                 names.add(fw)
                 names.add(fw.split("_")[0].split("-")[0])
-        if names:
-            return frozenset(names)
     except Exception:  # noqa: BLE001
-        pass
-    return frozenset()
+        _LOGGER.debug("KB framework name query failed", exc_info=True)
+    return frozenset(names)
 
 
 _AMBIGUOUS_TOP_LEVEL = frozenset({
@@ -794,7 +856,7 @@ def _emit_suggestive_candidates(
                 line_number=i,
                 framework="",
                 detection_source=DetectionSource.KB_ENRICHMENT,
-                confidence=0.2,
+                heuristic_confidence=0.2,
                 needs_agentic=True,
                 agentic_hint=(
                     f"Class '{class_name}' in path "
@@ -846,7 +908,7 @@ def _detect_cache_ai_co_occurrence(
                 line_number=0,
                 framework=cache_lib,
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.4,
+                heuristic_confidence=0.4,
                 needs_agentic=True,
                 agentic_hint=(
                     f"File imports both an AI framework and '{cache_lib}'. "
@@ -884,12 +946,14 @@ def _detect_import_based_assets(
         imp_lower = imp_line.lower()
 
         comp_type: AIComponentType | None = None
+        extra_types: frozenset[AIComponentType] = frozenset()
         matched_name = ""
         name_ambiguous = False
 
-        for mod_key, mod_type in _IMPORT_MODULE_TYPE_MAP.items():
+        for mod_key, entry in _IMPORT_MODULE_TYPE_MAP.items():
             if mod_key in imp_lower:
-                comp_type = mod_type
+                comp_type = entry.primary
+                extra_types = entry.additional
                 matched_name = mod_key
                 break
 
@@ -926,26 +990,44 @@ def _detect_import_based_assets(
             continue
         seen.add(dedup)
 
-        candidates.append(
-            AIComponent(
-                name=matched_name,
-                component_type=comp_type,
-                file_path=result.file_path,
-                line_number=line_no,
-                framework="",
-                detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.35 if name_ambiguous else 0.65,
-                needs_agentic=name_ambiguous,
-                agentic_hint=(
-                    f"Name-inferred as '{comp_type.value}' from import "
-                    f"'{imp_line.strip()}'. Name matching alone is WEAK "
-                    f"evidence — REMOVE unless code_context proves this "
-                    f"is a genuine AI {comp_type.value}, not a CRUD "
-                    f"handler, DTO, ETL utility, or test artifact."
-                ) if name_ambiguous else "",
-                metadata={"import_statement": imp_line.strip()},
+        for ct in (comp_type, *extra_types):
+            is_additional = ct != comp_type
+            if ct == AIComponentType.AGENT:
+                hint = (
+                    f"Import-inferred as 'agent' from "
+                    f"'{imp_line.strip()}'. An agent requires: "
+                    f"(1) LLM-driven control flow, (2) tool/action "
+                    f"execution, (3) iterative loop. Use "
+                    f"`read_file_snippet` on the source module to "
+                    f"check for these patterns. If the class only "
+                    f"wraps a single LLM call with no loop or tool "
+                    f"dispatch, REMOVE it. Reclassify to `tool` only "
+                    f"if it is registered as a callable tool for "
+                    f"another agent (`@tool`, `tools=[...]`)."
+                )
+            else:
+                hint = (
+                    f"Import-inferred as '{ct.value}' from "
+                    f"'{imp_line.strip()}'. Import alone is weak "
+                    f"evidence — REMOVE unless surrounding code proves "
+                    f"this is a genuine AI {ct.value}."
+                )
+            candidates.append(
+                AIComponent(
+                    name=matched_name,
+                    component_type=ct,
+                    file_path=result.file_path,
+                    line_number=line_no,
+                    framework="",
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    heuristic_confidence=(
+                        0.35 if name_ambiguous else 0.40 if is_additional else 0.55
+                    ),
+                    needs_agentic=True,
+                    agentic_hint=hint,
+                    metadata={"import_statement": imp_line.strip()},
+                )
             )
-        )
 
     return candidates
 
@@ -960,7 +1042,7 @@ _TOOL_DECORATOR_NAMES: frozenset[str] = frozenset({
 
 _TOOL_DECORATOR_FRAMEWORKS: frozenset[str] = frozenset({
     "langchain", "langchain_core", "crewai", "smolagents", "pydantic_ai",
-    "autogen", "deepagents", "llama_index", "agno", "phidata",
+    "autogen", "deepagents", "llama_index", "agno", "phidata", "strands",
 })
 
 _TOOL_CONVERSION_CALLS: frozenset[str] = frozenset({
@@ -1144,12 +1226,35 @@ _KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset({
     "ChatBedrock", "BedrockChat", "ChatVertexAI", "ChatCohere",
     "ChatMistralAI", "ChatOllama", "ChatLiteLLM", "ChatFireworks",
     "ChatGroq", "ChatTogether", "VLLMOpenAI", "AzureOpenAI",
+    # Strands built-in model provider classes (``strands.models.*``). Each
+    # accepts a ``model_id=`` kwarg at construction time and is the primary
+    # way to wire a Strands ``Agent`` to a provider. Covering these here
+    # lets ``_detect_model_kwargs`` surface both the concrete model ID and,
+    # when the constructor is bare, a needs-agentic bare-client component.
+    "BedrockModel", "AnthropicModel", "OpenAIModel", "OllamaModel",
+    "LiteLLMModel", "GeminiModel", "MistralModel", "SageMakerModel",
+    "LlamaAPIModel", "WriterModel", "LlamaCppModel", "CohereModel",
 })
 
 _BARE_CLIENT_HINTS: dict[str, str] = {
     "AnthropicBedrock": "Resolve model ID from .messages.create(model=...) calls. Remove if no model ID found.",
     "BedrockChat": "Resolve model ID from model_id= kwarg or nearby invoke_model calls. Remove if no model ID found.",
     "ChatBedrock": "Resolve model ID from model_id= kwarg or nearby invoke_model calls. Remove if no model ID found.",
+    # Strands model providers: the model ID is normally passed to the
+    # constructor or supplied via environment variable. If neither surfaces,
+    # the bare client is not a reliable model evidence and should be pruned.
+    "BedrockModel": "Resolve model ID from model_id= kwarg, BEDROCK_MODEL_ID env, or nearby Agent(model=...) wiring. Remove if no model ID found.",
+    "AnthropicModel": "Resolve model ID from model_id= kwarg or ANTHROPIC_MODEL_ID env. Remove if no model ID found.",
+    "OpenAIModel": "Resolve model ID from model_id= kwarg or OPENAI_MODEL_ID env. Remove if no model ID found.",
+    "OllamaModel": "Resolve model ID from model_id= kwarg or OLLAMA_MODEL env. Remove if no model ID found.",
+    "LiteLLMModel": "Resolve model ID from model_id= kwarg. Remove if no model ID found.",
+    "GeminiModel": "Resolve model ID from model_id= kwarg or GEMINI_MODEL_ID env. Remove if no model ID found.",
+    "MistralModel": "Resolve model ID from model_id= kwarg or MISTRAL_MODEL_ID env. Remove if no model ID found.",
+    "SageMakerModel": "Resolve endpoint_name= and model_id= kwargs. Remove if neither found.",
+    "LlamaAPIModel": "Resolve model_id= kwarg. Remove if no model ID found.",
+    "WriterModel": "Resolve model_id= kwarg or WRITER_MODEL_ID env. Remove if no model ID found.",
+    "LlamaCppModel": "Resolve model_path= or model_id= kwarg. Remove if neither found.",
+    "CohereModel": "Resolve model_id= kwarg or COHERE_MODEL_ID env. Remove if no model ID found.",
 }
 
 
@@ -1185,7 +1290,7 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
     3. Known client class with neither model nor URL kwargs -> **needs_agentic MODEL**
        (bare client; prune if agentic layer cannot resolve a model ID).
     """
-    from .model_detector import _registry_lookup
+    from .model_detector import registry_lookup
 
     components: list[AIComponent] = []
     seen: set[tuple[str, int]] = set()
@@ -1222,7 +1327,7 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                     line_number=line,
                     framework=short,
                     detection_source=DetectionSource.CODE_ANALYSIS,
-                    confidence=0.9,
+                    heuristic_confidence=0.9,
                     metadata={
                         "endpoint_url": endpoint_url,
                         "constructor": short,
@@ -1241,7 +1346,7 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
             val = val.strip().strip("'\"")
             if not val or len(val) < 3:
                 continue
-            reg = _registry_lookup(val)
+            reg = registry_lookup(val)
             if reg:
                 seen.add(key)
                 components.append(
@@ -1273,7 +1378,7 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                     line_number=line,
                     framework=short,
                     detection_source=DetectionSource.CODE_ANALYSIS,
-                    confidence=0.3,
+                    heuristic_confidence=0.3,
                     needs_agentic=True,
                     agentic_hint=_BARE_CLIENT_HINTS[short],
                     metadata={
@@ -1342,7 +1447,7 @@ def _detect_prompt_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                         line_number=line,
                         framework=qn.split(".")[0] if "." in qn else "",
                         detection_source=DetectionSource.CODE_ANALYSIS,
-                        confidence=0.7,
+                        heuristic_confidence=0.7,
                         metadata={
                             "prompt_kwarg": kwarg_name,
                             "enclosing_call": qn,
@@ -1623,7 +1728,7 @@ def _process_file_with_cache(
                     line_number=obs_data["line"],
                     framework=match.obs_module,
                     detection_source=DetectionSource.KB_ENRICHMENT,
-                    confidence=0.3,
+                    heuristic_confidence=0.3,
                     needs_agentic=True,
                     agentic_hint=hint,
                     metadata=meta_partial,
@@ -1841,7 +1946,7 @@ def _process_file(
                     line_number=obs_data["line"],
                     framework=match.obs_module,
                     detection_source=DetectionSource.KB_ENRICHMENT,
-                    confidence=0.3,
+                    heuristic_confidence=0.3,
                     needs_agentic=True,
                     agentic_hint=hint,
                     metadata={
@@ -1917,9 +2022,20 @@ def _match_observation_rich(
     Tier 3: suffix match on SHORT class name, framework-related → confirmed.
     Partial: leaf class exists in KB suffix index but framework guard rejected.
     Empty: no KB overlap at all.
+
+    Bare, lowercase observations (e.g. ``agent`` from ``result = agent(...)``)
+    are variable invocations, not AI-component identifiers.  They carry no
+    module context so the suffix index cannot reason about framework
+    relatedness and they produce spurious matches against attribute KB
+    entries that share the same leaf token.  We short-circuit matching
+    for that shape after the exact-id check so callers still recover the
+    tier-1 path if the observation happens to be a top-level catalog id.
     """
     if obs_name in kb_by_id:
         return _MatchResult(entry=kb_by_id[obs_name])
+
+    if "." not in obs_name and obs_name[:1].islower():
+        return _MatchResult()
 
     obs_module = obs_name.split(".")[0] if "." in obs_name else ""
 

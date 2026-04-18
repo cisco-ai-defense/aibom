@@ -38,7 +38,7 @@ class TestDataFileScanner:
         comps, _ = scanner.scan(ctx)
         assert len(comps) == 1
         assert comps[0].component_type == AIComponentType.DATASET
-        assert comps[0].confidence == 0.9
+        assert comps[0].heuristic_confidence == 0.9
         assert comps[0].metadata["format"] == "parquet"
 
     def test_parquet_invalid_magic(self, tmp_path: Path, scanner: DataFileScanner) -> None:
@@ -77,7 +77,7 @@ class TestDataFileScanner:
         comps, _ = scanner.scan(ctx)
         assert len(comps) == 1
         assert comps[0].metadata["format"] == "arrow"
-        assert comps[0].confidence == 0.9
+        assert comps[0].heuristic_confidence == 0.9
 
     def test_feather_magic(self, tmp_path: Path, scanner: DataFileScanner) -> None:
         f = tmp_path / "t.feather"

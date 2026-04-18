@@ -204,12 +204,89 @@ def _parse_k8s_configmap(path: Path, index: CrossRefIndex) -> None:
             )
 
 
+_HELM_TPL_ENV_RE = re.compile(
+    r"-\s*name:\s*(\S+)\s*\n\s*value:\s*.*?\.Values\.(\S+?)[\s\}]",
+)
+
+
+def _build_helm_env_map(chart_dir: Path) -> dict[str, str]:
+    """Build dot-path -> env var name mapping from Helm templates."""
+    templates_dir = chart_dir / "templates"
+    if not templates_dir.is_dir():
+        return {}
+    result: dict[str, str] = {}
+    for tmpl in templates_dir.rglob("*.yaml"):
+        try:
+            content = tmpl.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _HELM_TPL_ENV_RE.finditer(content):
+            env_name = m.group(1).strip('"').strip("'")
+            values_path = m.group(2).strip().rstrip(" }|")
+            result[values_path] = env_name
+    return result
+
+
+def _find_helm_chart_dir(values_file: Path) -> Path | None:
+    """Walk up from a values file to find the Helm chart root."""
+    d = values_file.parent
+    for _ in range(5):
+        if (d / "Chart.yaml").exists() or (d / "templates").is_dir():
+            return d
+        parent = d.parent
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _walk_helm_leaves_with_env(
+    obj: Any,
+    index: CrossRefIndex,
+    source_path: str,
+    env_map: dict[str, str],
+    prefix: str = "",
+) -> None:
+    """Walk YAML leaves and also index under resolved Helm env var names."""
+    if isinstance(obj, Mapping):
+        for k, v in obj.items():
+            dot_path = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                val = "" if v is None else str(v)
+                _add_env(index, str(k), val, "helm-values", source_path)
+                resolved = env_map.get(dot_path)
+                if resolved and resolved != str(k):
+                    _add_env(index, resolved, val, "helm-values", source_path)
+            elif isinstance(v, Mapping):
+                _walk_helm_leaves_with_env(v, index, source_path, env_map, dot_path)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, (str, int, float, bool)) or item is None:
+                        val = "" if item is None else str(item)
+                        _add_env(index, str(k), val, "helm-values", source_path)
+                        resolved = env_map.get(dot_path)
+                        if resolved and resolved != str(k):
+                            _add_env(index, resolved, val, "helm-values", source_path)
+                    else:
+                        _walk_helm_leaves_with_env(
+                            item, index, source_path, env_map, dot_path,
+                        )
+
+
 def _parse_helm_values(path: Path, index: CrossRefIndex) -> None:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return
-    _walk_yaml_leaves(data, index, str(path), "helm-values")
+    chart_dir = _find_helm_chart_dir(path)
+    if chart_dir:
+        env_map = _build_helm_env_map(chart_dir)
+    else:
+        env_map = {}
+    if env_map:
+        _walk_helm_leaves_with_env(data, index, str(path), env_map)
+    else:
+        _walk_yaml_leaves(data, index, str(path), "helm-values")
 
 
 def _scan_env_paths(paths: Iterable[str]) -> CrossRefIndex:
@@ -398,8 +475,8 @@ def _substitute_placeholders(model_name: str, index: CrossRefIndex) -> str:
 def _try_registry(model_name: str) -> dict[str, Any] | None:
     """Attempt registry lookup; returns None on import failure."""
     try:
-        from .scanners.model_detector import _registry_lookup
-        return _registry_lookup(model_name)
+        from .scanners.model_detector import registry_lookup
+        return registry_lookup(model_name)
     except Exception:  # noqa: BLE001
         return None
 
@@ -433,8 +510,19 @@ def resolve_components(
                 if c.component_type == AIComponentType.VECTOR_STORE:
                     meta["index_name"] = val
                     new_c = c.model_copy(update={
-                        "confidence": max(c.confidence, 0.8),
+                        "heuristic_confidence": max(c.heuristic_confidence, 0.8),
                         "needs_agentic": False,
+                        "metadata": meta,
+                    })
+                elif c.component_type in (
+                    AIComponentType.LLM_ENDPOINT,
+                    AIComponentType.MODEL_ENDPOINT,
+                ) and val:
+                    meta["endpoint_url"] = val
+                    new_c = c.model_copy(update={
+                        "model_name": val,
+                        "heuristic_confidence": max(c.heuristic_confidence, 0.8),
+                        "needs_agentic": c.needs_agentic,
                         "metadata": meta,
                     })
                 elif c.model_name is None and val:
@@ -472,7 +560,7 @@ def resolve_components(
                 reg_meta["registry_source"] = reg_hit.get("source", "model_catalog")
                 reg_meta["provider"] = reg_hit.get("provider", "unknown")
                 new_c = new_c.model_copy(update={
-                    "confidence": max(new_c.confidence, 0.85),
+                    "heuristic_confidence": max(new_c.heuristic_confidence, 0.85),
                     "needs_agentic": False,
                     "agentic_hint": "",
                     "metadata": reg_meta,
@@ -481,7 +569,7 @@ def resolve_components(
                 agentic_meta = dict(new_c.metadata) if new_c.metadata else {}
                 agentic_meta["registry_source"] = "none"
                 new_c = new_c.model_copy(update={
-                    "confidence": max(new_c.confidence, 0.5),
+                    "heuristic_confidence": max(new_c.heuristic_confidence, 0.5),
                     "needs_agentic": True,
                     "agentic_hint": (
                         f"Resolved '{mn}' from env var "
@@ -490,6 +578,33 @@ def resolve_components(
                     ),
                     "metadata": agentic_meta,
                 })
+
+        # Canonicalize the component's ``name`` to the literal model string
+        # when it has been resolved. Without this, ``component_summary`` and
+        # downstream BOM artifacts display placeholders like ``env:LLM_MODEL``
+        # rather than the actual model ID (e.g.
+        # ``us.anthropic.claude-3-5-sonnet-20241022-v2:0``). Scope:
+        #   1) We only rename when the existing name is a placeholder emitted
+        #      by env_var_resolver (``env:<VAR>``) — other scanners already
+        #      emit the literal.
+        #   2) Only for MODEL / EMBEDDING components (URLs remain on
+        #      endpoint components where the name is already meaningful).
+        #   3) Preserve the original env var name in ``metadata.env_var`` so
+        #      downstream tooling can still trace the placeholder path.
+        if (
+            new_c.name.startswith("env:")
+            and new_c.component_type in (AIComponentType.MODEL, AIComponentType.EMBEDDING)
+            and isinstance(new_c.model_name, str)
+            and new_c.model_name
+            and not new_c.model_name.lower().startswith(("http://", "https://"))
+            and not _ENV_SUBST.search(new_c.model_name)
+        ):
+            canon_meta = dict(new_c.metadata) if new_c.metadata else {}
+            canon_meta.setdefault("env_var", new_c.name[len("env:"):])
+            new_c = new_c.model_copy(update={
+                "name": new_c.model_name,
+                "metadata": canon_meta,
+            })
 
         out.append(new_c)
     return out

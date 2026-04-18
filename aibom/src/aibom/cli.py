@@ -15,16 +15,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import io
 import json
 import logging
 import os
 import shutil
-import tempfile
+import sys
 import uuid
+from collections import Counter
 from datetime import datetime
 from importlib import resources as importlib_resources
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import typer
 from rich import box
@@ -209,63 +211,14 @@ def _run_pipeline_with_progress(source: str, pipeline: "ScanPipeline", progress_
             completed=0,
             visible=False,
         )
-
-        def _on_progress(event: dict[str, Any]) -> None:
-            event_name = str(event.get("event", ""))
-            if event_name == "stage_started":
-                stage = str(event.get("stage", ""))
-                progress_ui.update(
-                    stage_task,
-                    description=f"{source}: {stage_labels.get(stage, stage)}",
-                )
-                return
-            if event_name == "stage_completed":
-                progress_ui.advance(stage_task, 1)
-                return
-            if event_name == "file_cache_prep_started":
-                total = max(int(event.get("files_total", 0) or 0), 1)
-                progress_ui.update(
-                    cache_task,
-                    total=total,
-                    completed=0,
-                    visible=True,
-                    description=f"{source}: file cache prep",
-                )
-                return
-            if event_name == "file_cache_prep_completed":
-                total = max(int(event.get("files_total", 0) or 0), 1)
-                warmed = min(int(event.get("files_warmed", 0) or 0), total)
-                progress_ui.update(
-                    cache_task,
-                    total=total,
-                    completed=warmed,
-                    visible=True,
-                    description=f"{source}: file cache prep",
-                )
-                return
-            if event_name == "scanners_discovered":
-                total = max(int(event.get("total", 0) or 0), 1)
-                progress_ui.update(
-                    scanner_task,
-                    total=total,
-                    completed=0,
-                    visible=True,
-                    description=f"{source}: deterministic scanners",
-                )
-                return
-            if event_name == "scanner_completed":
-                total = max(int(event.get("total", 0) or 0), 1)
-                completed = min(int(event.get("completed", 0) or 0), total)
-                scanner = str(event.get("scanner", "scanner"))
-                progress_ui.update(
-                    scanner_task,
-                    total=total,
-                    completed=completed,
-                    visible=True,
-                    description=f"{source}: scanner {completed}/{total} ({scanner})",
-                )
-
-        pipeline.progress_callback = _on_progress
+        pipeline.progress_callback = _make_scan_progress_handler(
+            progress_ui,
+            source,
+            stage_task,
+            cache_task,
+            scanner_task,
+            stage_labels,
+        )
         return pipeline.run()
 
 
@@ -349,6 +302,375 @@ def _scan_cache_settings(
         "container_tier": container_tier,
         "custom_catalog": _file_cache_fingerprint(custom_catalog),
     }
+
+
+def _require_supported_cache_type(cache_type: str) -> None:
+    allowed = cache_types()
+    if cache_type in allowed:
+        return
+    console.print(
+        f"[red]Unsupported cache type:[/] {cache_type}. "
+        f"Use one of: {', '.join(allowed)}."
+    )
+    raise typer.Exit(code=1)
+
+
+def _v2_output_from_org_cache(cached_sr: Any) -> Dict[str, Any]:
+    merged_components: list = []
+    merged_rels: list = []
+    for s in cached_sr.sources:
+        merged_components.extend(s.components)
+        merged_rels.extend(s.relationships)
+    return {
+        "_v2": True,
+        "components": merged_components,
+        "relationships": merged_rels,
+        "_agentic_risk_flags": [],
+        "_agentic_candidate_count": 0,
+    }
+
+
+def _v2_output_from_pipeline_result(result: Any) -> Dict[str, Any]:
+    return {
+        "_v2": True,
+        "components": result.components,
+        "relationships": result.relationships,
+        "_agentic_risk_flags": result.agentic_risk_flags,
+        "_agentic_candidate_count": result.agentic_candidate_count,
+    }
+
+
+def _serializable_scan_cache_payload(result: Any) -> Dict[str, Any]:
+    return {
+        "_v2": True,
+        "components": [c.model_dump(mode="json") for c in result.components],
+        "relationships": [r.model_dump(mode="json") for r in result.relationships],
+        "_agentic_risk_flags": [
+            f.model_dump(mode="json") if hasattr(f, "model_dump") else str(f)
+            for f in result.agentic_risk_flags
+        ],
+        "_agentic_candidate_count": result.agentic_candidate_count,
+    }
+
+
+def _gather_analysis_sources(
+    *,
+    sources: Optional[List[str]],
+    images_file: Optional[Path],
+    repos_file: Optional[Path],
+    discover_repos: bool,
+    github_org: Optional[str],
+    gitlab_group: Optional[str],
+    bitbucket_project: Optional[str],
+    platform_token: Optional[str],
+    repo_name_filter: Optional[str],
+    repo_topic_filter: Optional[str],
+    max_repos: Optional[int],
+    parallel_repos: int,
+    llm_model: Optional[str],
+    llm_provider: Optional[str],
+    llm_api_base: Optional[str],
+    llm_api_key: Optional[str],
+    llm_api_version: Optional[str],
+) -> List[str]:
+    sources_to_process = list(sources) if sources else []
+    if images_file:
+        try:
+            with open(images_file, "r") as f:
+                images_from_file = json.load(f)
+                if isinstance(images_from_file, list):
+                    sources_to_process.extend(images_from_file)
+                else:
+                    logging.warning(
+                        "Expected a JSON array in %s, but found %s. Skipping.",
+                        images_file,
+                        type(images_from_file),
+                    )
+        except json.JSONDecodeError:
+            logging.error("Could not decode JSON from %s", images_file)
+            raise typer.Exit(code=1)
+
+    if repos_file:
+        from .multi_repo import read_repos_file
+
+        sources_to_process.extend(read_repos_file(repos_file))
+
+    if discover_repos:
+        from .multi_repo import discover_repos as _discover
+
+        expanded: list[str] = []
+        for src in sources_to_process:
+            p = Path(src)
+            if p.is_dir() and not (p / ".git").exists():
+                repos = _discover(p)
+                if repos:
+                    console.print(
+                        f"  [dim]Discovered {len(repos)} repo(s) under {src}[/]"
+                    )
+                    expanded.extend(str(r) for r in repos)
+                else:
+                    expanded.append(src)
+            else:
+                expanded.append(src)
+        sources_to_process = expanded
+
+    platform_pairs: list[tuple[str, str]] = []
+    if github_org:
+        platform_pairs.append(("github", github_org))
+    if gitlab_group:
+        platform_pairs.append(("gitlab", gitlab_group))
+    if bitbucket_project:
+        platform_pairs.append(("bitbucket", bitbucket_project))
+
+    if platform_pairs:
+        from .platform_adapters import get_adapter
+
+        for plat, ns in platform_pairs:
+            try:
+                adapter = get_adapter(plat, token=platform_token)
+                repos = adapter.list_repos(
+                    ns,
+                    name_filter=repo_name_filter,
+                    topic_filter=repo_topic_filter,
+                )
+                console.print(
+                    f"  [dim]{plat}: discovered {len(repos)} repo(s) "
+                    f"in {ns}[/]"
+                )
+                sources_to_process.extend(r.clone_url for r in repos)
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Warning: {plat} discovery failed: {exc}[/]"
+                )
+
+    if len(sources_to_process) > 1 and llm_model:
+        from .repo_triage import RepoTriager
+
+        triage_llm_cfg: Dict[str, Any] = {"model": llm_model}
+        if llm_provider:
+            triage_llm_cfg["provider"] = llm_provider
+        if llm_api_base:
+            triage_llm_cfg["api_base"] = llm_api_base
+        if llm_api_key:
+            triage_llm_cfg["api_key"] = llm_api_key
+        if llm_api_version:
+            triage_llm_cfg["api_version"] = llm_api_version
+
+        triager = RepoTriager(llm_config=triage_llm_cfg)
+        triage_results = triager.triage_repos(sources_to_process)
+
+        deep = [t.repo_path for t in triage_results if t.decision == "deep-scan"]
+        clone = [t.repo_path for t in triage_results if t.decision == "needs-clone"]
+        skipped = [t for t in triage_results if t.decision == "skip"]
+
+        if skipped:
+            for t in skipped:
+                _LOGGER.info(
+                    "Triage would skip %s — %s (%s); keeping because user-provided",
+                    t.repo_path,
+                    t.reason,
+                    t.method,
+                )
+            clone.extend(t.repo_path for t in skipped)
+
+        sources_to_process = deep + clone
+
+    if max_repos and len(sources_to_process) > max_repos:
+        console.print(
+            f"  [dim]Limiting to {max_repos} of {len(sources_to_process)} "
+            f"discovered repos (--max-repos)[/]"
+        )
+        sources_to_process = sources_to_process[:max_repos]
+
+    if parallel_repos > 1 and len(sources_to_process) > 1:
+        console.print(
+            f"  [dim]Scanning {len(sources_to_process)} repos with "
+            f"--parallel-repos={parallel_repos}[/]"
+        )
+
+    return sources_to_process
+
+
+def _make_scan_progress_handler(
+    progress_ui: Any,
+    source: str,
+    stage_task: Any,
+    cache_task: Any,
+    scanner_task: Any,
+    stage_labels: Dict[str, str],
+) -> Any:
+    def _on_progress(event: dict[str, Any]) -> None:
+        event_name = str(event.get("event", ""))
+        if event_name == "stage_started":
+            stage = str(event.get("stage", ""))
+            progress_ui.update(
+                stage_task,
+                description=f"{source}: {stage_labels.get(stage, stage)}",
+            )
+            return
+        if event_name == "stage_completed":
+            progress_ui.advance(stage_task, 1)
+            return
+        if event_name == "file_cache_prep_started":
+            total = max(int(event.get("files_total", 0) or 0), 1)
+            progress_ui.update(
+                cache_task,
+                total=total,
+                completed=0,
+                visible=True,
+                description=f"{source}: file cache prep",
+            )
+            return
+        if event_name == "file_cache_prep_completed":
+            total = max(int(event.get("files_total", 0) or 0), 1)
+            warmed = min(int(event.get("files_warmed", 0) or 0), total)
+            progress_ui.update(
+                cache_task,
+                total=total,
+                completed=warmed,
+                visible=True,
+                description=f"{source}: file cache prep",
+            )
+            return
+        if event_name == "scanners_discovered":
+            total = max(int(event.get("total", 0) or 0), 1)
+            progress_ui.update(
+                scanner_task,
+                total=total,
+                completed=0,
+                visible=True,
+                description=f"{source}: deterministic scanners",
+            )
+            return
+        if event_name == "scanner_completed":
+            total = max(int(event.get("total", 0) or 0), 1)
+            completed = min(int(event.get("completed", 0) or 0), total)
+            scanner = str(event.get("scanner", "scanner"))
+            progress_ui.update(
+                scanner_task,
+                total=total,
+                completed=completed,
+                visible=True,
+                description=f"{source}: scanner {completed}/{total} ({scanner})",
+            )
+
+    return _on_progress
+
+
+def _print_missing_repositories_panel(result: Any) -> None:
+    if not result.external_deps:
+        return
+    escaping = [d for d in result.external_deps if d.escapes_root]
+    if not escaping:
+        return
+    lines = [
+        f"[yellow bold]{len(escaping)} dependency(ies) reference "
+        f"repos not included in this scan:[/]\n"
+    ]
+    for d in escaping[:10]:
+        label = d.name or d.url_or_path
+        lines.append(
+            f"  • [bold]{label}[/] ({d.dep_type}) "
+            f"from {Path(d.source_file).name}"
+        )
+    if len(escaping) > 10:
+        lines.append(f"  … and {len(escaping) - 10} more")
+    lines.append(
+        "\n[dim]Include these repos in your scan for "
+        "better cross-reference resolution.[/]"
+    )
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="[bold]Missing Repositories[/]",
+            border_style="yellow",
+        )
+    )
+
+
+def _resolve_repo_ref(ref: str, scan_paths: list[str]) -> str:
+    """Resolve a repo name/path from LLM output to a full scan path.
+
+    Matches by exact path, trailing directory name, or substring.
+    Returns empty string if no match found.
+    """
+    if not ref:
+        return ""
+    for sp in scan_paths:
+        if ref == sp:
+            return sp
+    ref_lower = ref.lower().rstrip("/")
+    for sp in scan_paths:
+        if sp.lower().rstrip("/").endswith(ref_lower):
+            return sp
+        if ref_lower in sp.lower():
+            return sp
+    return ""
+
+
+def _cross_repo_llm_enrichment(
+    llm_config: Dict[str, Any],
+    v2_outputs: Dict[str, Any],
+) -> tuple[list[Any], list[Any]]:
+    from .agentic.agent import run_cross_repo_coordination
+    from .models.enums import CrossRepoLinkType
+    from .models.scan import CrossRepoLink, RepoOccurrence
+
+    console.print(
+        f"  [cyan]Cross-repo LLM coordination across "
+        f"{len(v2_outputs)} repos…[/]"
+    )
+    xrepo_rels, xrepo_flags = run_cross_repo_coordination(
+        model_string=llm_config["model"],
+        per_repo_results=v2_outputs,
+        llm_config=llm_config,
+    )
+    scan_paths = list(v2_outputs.keys())
+    comp_to_repo: Dict[str, str] = {}
+    for repo_path_key, out in v2_outputs.items():
+        for c in out.get("components", []):
+            cname = c.name if hasattr(c, "name") else c.get("name", "")
+            if cname:
+                comp_to_repo.setdefault(cname, repo_path_key)
+
+    new_links: list[Any] = []
+    for rel in xrepo_rels:
+        src_repo = (
+            _resolve_repo_ref(rel.source_repo, scan_paths)
+            if rel.source_repo
+            else comp_to_repo.get(rel.source_name, "")
+        )
+        tgt_repo = (
+            _resolve_repo_ref(rel.target_repo, scan_paths)
+            if rel.target_repo
+            else comp_to_repo.get(rel.target_name, "")
+        )
+        new_links.append(
+            CrossRepoLink(
+                link_type=CrossRepoLinkType.CUSTOM,
+                identifier=f"{rel.source_name}->{rel.target_name}",
+                occurrences=[
+                    RepoOccurrence(
+                        repo_path=src_repo,
+                        component_name=rel.source_name,
+                        role="source",
+                    ),
+                    RepoOccurrence(
+                        repo_path=tgt_repo,
+                        component_name=rel.target_name,
+                        role="target",
+                    ),
+                ],
+                evidence=f"LLM-derived: {rel.relationship_type.value}",
+                decision_annotation=rel.decision_annotation,
+            )
+        )
+    if xrepo_rels or xrepo_flags:
+        console.print(
+            f"  [magenta]LLM cross-repo: {len(xrepo_rels)} links, "
+            f"{len(xrepo_flags)} risk flags[/]"
+        )
+    return new_links, list(xrepo_flags)
 
 
 @app.callback(invoke_without_command=True)
@@ -452,7 +774,6 @@ def _render_relationship_table(relationships: List[Any]) -> None:
 
 def _display_v2_summary(source: str, components: list, relationships: list) -> None:
     """Rich summary for v2 detector output."""
-    from collections import Counter
     from .models import AIComponent as _V2Comp
     components = [
         _V2Comp.model_validate(c) if isinstance(c, dict) else c
@@ -497,14 +818,12 @@ def _display_analysis_summary(all_analysis_outputs: Dict[str, Any], max_examples
         panel_title = f"[bold green]Analysis Summary[/] • {source}"
         console.print(Panel(panel_title, style="green", expand=False))
         _render_component_table(source, categorized_components)
-        example_sections = 0
         for category, components in categorized_components.items():
             if not components:
                 continue
             console.print(Panel.fit(f"{category.upper()} details", style="bold white"))
             for component in components[:max_examples]:
                 console.print(_build_workflow_tree(component))
-            example_sections += 1
         relationships = getattr(output, "relationships", [])
         _render_relationship_table(relationships)
         console.print()  # spacing
@@ -812,7 +1131,7 @@ def analyze(
     ai_defense_api_key: Optional[str] = typer.Option(
         None,
         "--ai-defense-api-key",
-        help="API key sent as X-API-Key when POSTing the report to AI Defense endpoints.",
+        help="API key sent as x-cisco-ai-defense-tenant-api-key when POSTing the report to AI Defense endpoints.",
         envvar="AI_DEFENSE_API_KEY",
     ),
     post_timeout: float = typer.Option(
@@ -963,6 +1282,18 @@ def analyze(
             "Disabled by default to limit report size and source exposure."
         ),
     ),
+    component_summary: bool = typer.Option(
+        False,
+        "--component-summary/--no-component-summary",
+        help=(
+            "When --output-format=json, include a flat 'component_summary' "
+            "key in the report listing each non-test component as "
+            "{component_type, name, file_path, line_number}, grouped by "
+            "source and sorted by (component_type, name). Intended for "
+            "quick human review and demos; the full structured output is "
+            "unchanged."
+        ),
+    ),
     container_tier: str = typer.Option(
         "auto",
         "--container-extraction-tier",
@@ -1079,11 +1410,17 @@ def analyze(
     ),
 ):
     """Analyzes a Python codebase to generate an AI BOM."""
-    # Validate output format
     if output_format not in _VALID_OUTPUT_FORMATS:
         valid = ", ".join(sorted(_VALID_OUTPUT_FORMATS))
         console.print(f"[red]Invalid output format[/] '{output_format}'. Must be one of: {valid}")
         raise typer.Exit(code=1)
+
+    if component_summary and output_format != "json":
+        logging.warning(
+            "--component-summary has no effect with --output-format=%s; "
+            "the flag is only applied to JSON output.",
+            output_format,
+        )
 
     agentic_scope = "all"
 
@@ -1097,7 +1434,6 @@ def analyze(
             )
             raise typer.Exit(code=1)
 
-    # Validate severity options
     fail_on_severity: Optional[SeverityEnum] = None
     if fail_on:
         try:
@@ -1139,113 +1475,26 @@ def analyze(
             highlight=False,
         )
         raise typer.Exit(code=1)
-    
-    sources_to_process = list(sources) if sources else []
-    if images_file:
-        try:
-            with open(images_file, 'r') as f:
-                images_from_file = json.load(f)
-                if isinstance(images_from_file, list):
-                    sources_to_process.extend(images_from_file)
-                else:
-                    logging.warning(f"Expected a JSON array in {images_file}, but found {type(images_from_file)}. Skipping.")
-        except json.JSONDecodeError:
-            logging.error(f"Could not decode JSON from {images_file}")
-            raise typer.Exit(code=1)
 
-    if repos_file:
-        from .multi_repo import read_repos_file
-        sources_to_process.extend(read_repos_file(repos_file))
-
-    if discover_repos:
-        from .multi_repo import discover_repos as _discover
-        expanded: list[str] = []
-        for src in sources_to_process:
-            p = Path(src)
-            if p.is_dir() and not (p / ".git").exists():
-                repos = _discover(p)
-                if repos:
-                    console.print(
-                        f"  [dim]Discovered {len(repos)} repo(s) under {src}[/]"
-                    )
-                    expanded.extend(str(r) for r in repos)
-                else:
-                    expanded.append(src)
-            else:
-                expanded.append(src)
-        sources_to_process = expanded
-
-    _platform_pairs: list[tuple[str, str]] = []
-    if github_org:
-        _platform_pairs.append(("github", github_org))
-    if gitlab_group:
-        _platform_pairs.append(("gitlab", gitlab_group))
-    if bitbucket_project:
-        _platform_pairs.append(("bitbucket", bitbucket_project))
-
-    if _platform_pairs:
-        from .platform_adapters import get_adapter
-
-        for plat, ns in _platform_pairs:
-            try:
-                adapter = get_adapter(plat, token=platform_token)
-                repos = adapter.list_repos(
-                    ns,
-                    name_filter=repo_name_filter,
-                    topic_filter=repo_topic_filter,
-                )
-                console.print(
-                    f"  [dim]{plat}: discovered {len(repos)} repo(s) "
-                    f"in {ns}[/]"
-                )
-                sources_to_process.extend(r.clone_url for r in repos)
-            except Exception as exc:
-                console.print(
-                    f"[yellow]Warning: {plat} discovery failed: {exc}[/]"
-                )
-
-    if len(sources_to_process) > 1 and llm_model:
-        from .repo_triage import RepoTriager
-
-        triage_llm_cfg = {"model": llm_model}
-        if llm_provider:
-            triage_llm_cfg["provider"] = llm_provider
-        if llm_api_base:
-            triage_llm_cfg["api_base"] = llm_api_base
-        if llm_api_key:
-            triage_llm_cfg["api_key"] = llm_api_key
-        if llm_api_version:
-            triage_llm_cfg["api_version"] = llm_api_version
-
-        triager = RepoTriager(llm_config=triage_llm_cfg)
-        triage_results = triager.triage_repos(sources_to_process)
-
-        deep = [t.repo_path for t in triage_results if t.decision == "deep-scan"]
-        clone = [t.repo_path for t in triage_results if t.decision == "needs-clone"]
-        skipped = [t for t in triage_results if t.decision == "skip"]
-
-        if skipped:
-            for t in skipped:
-                _LOGGER.info(
-                    "Triage would skip %s — %s (%s); keeping because user-provided",
-                    t.repo_path, t.reason, t.method,
-                )
-            clone.extend(t.repo_path for t in skipped)
-
-        sources_to_process = deep + clone
-
-    if max_repos and len(sources_to_process) > max_repos:
-        console.print(
-            f"  [dim]Limiting to {max_repos} of {len(sources_to_process)} "
-            f"discovered repos (--max-repos)[/]"
-        )
-        sources_to_process = sources_to_process[:max_repos]
-
-    if parallel_repos > 1 and len(sources_to_process) > 1:
-        console.print(
-            f"  [dim]Scanning {len(sources_to_process)} repos with "
-            f"--parallel-repos={parallel_repos}[/]"
-        )
+    sources_to_process = _gather_analysis_sources(
+        sources=sources,
+        images_file=images_file,
+        repos_file=repos_file,
+        discover_repos=discover_repos,
+        github_org=github_org,
+        gitlab_group=gitlab_group,
+        bitbucket_project=bitbucket_project,
+        platform_token=platform_token,
+        repo_name_filter=repo_name_filter,
+        repo_topic_filter=repo_topic_filter,
+        max_repos=max_repos,
+        parallel_repos=parallel_repos,
+        llm_model=llm_model,
+        llm_provider=llm_provider,
+        llm_api_base=llm_api_base,
+        llm_api_key=llm_api_key,
+        llm_api_version=llm_api_version,
+    )
 
     if not sources_to_process:
         logging.error("No sources provided. Please specify a path or an images file.")
@@ -1264,6 +1513,10 @@ def analyze(
         "started_at": _utcnow_iso(),
         "output_format": output_format,
         "sources_requested": len(sources_to_process),
+        "llm_model": llm_model,
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
     }
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
@@ -1387,19 +1640,9 @@ def analyze(
                     f"[green]Org cache hit[/] for {source} "
                     f"(~/.aibom/cache/org)"
                 )
-                merged_components: list = []
-                merged_rels: list = []
-                for s in cached_sr.sources:
-                    merged_components.extend(s.components)
-                    merged_rels.extend(s.relationships)
-                all_analysis_outputs[source] = {
-                    "_v2": True,
-                    "components": merged_components,
-                    "relationships": merged_rels,
-                    "_agentic_risk_flags": [],
-                    "_agentic_candidate_count": 0,
-                }
-                source_summary["assets_discovered"] = len(merged_components)
+                cached_v2_output = _v2_output_from_org_cache(cached_sr)
+                all_analysis_outputs[source] = cached_v2_output
+                source_summary["assets_discovered"] = len(cached_v2_output["components"])
                 source_summary["last_generated_at"] = _utcnow_iso()
                 if source_summary["status"] == "in_progress":
                     source_summary["status"] = "completed"
@@ -1409,7 +1652,7 @@ def analyze(
 
         _scan_cache_hit = False
         if scan_cache_dir:
-            from .scan_cache import cache_key, load_cached, save_cached
+            from .scan_cache import cache_key, load_cached
 
             _ck = cache_key([scan_path], scan_cache_settings)
             cached = load_cached(
@@ -1440,6 +1683,7 @@ def analyze(
             agentic_timeout=agentic_timeout,
             agentic_cache_dir=agentic_cache_dir,
             include_code_snippets=include_code_snippets,
+            custom_catalog=explicit_config,
         )
         result = _run_pipeline_with_progress(source, pipeline, progress)
 
@@ -1449,58 +1693,23 @@ def analyze(
                 f"{len(result.agentic_risk_flags)} risk flags[/]"
             )
 
-        if result.external_deps:
-            escaping = [d for d in result.external_deps if d.escapes_root]
-            if escaping:
-                lines = [
-                    f"[yellow bold]{len(escaping)} dependency(ies) reference "
-                    f"repos not included in this scan:[/]\n"
-                ]
-                for d in escaping[:10]:
-                    label = d.name or d.url_or_path
-                    lines.append(
-                        f"  • [bold]{label}[/] ({d.dep_type}) "
-                        f"from {Path(d.source_file).name}"
-                    )
-                if len(escaping) > 10:
-                    lines.append(f"  … and {len(escaping) - 10} more")
-                lines.append(
-                    "\n[dim]Include these repos in your scan for "
-                    "better cross-reference resolution.[/]"
-                )
-                console.print(Panel(
-                    "\n".join(lines),
-                    title="[bold]Missing Repositories[/]",
-                    border_style="yellow",
-                ))
+        _print_missing_repositories_panel(result)
 
         if timing and result.timings:
             _print_timing_table(console, result)
 
-        output_data: dict[str, Any] = {
-            "_v2": True,
-            "components": result.components,
-            "relationships": result.relationships,
-            "_agentic_risk_flags": result.agentic_risk_flags,
-            "_agentic_candidate_count": result.agentic_candidate_count,
-        }
+        output_data = _v2_output_from_pipeline_result(result)
         all_analysis_outputs[source] = output_data
 
         if scan_cache_dir and not _scan_cache_hit:
             from .scan_cache import cache_key, save_cached
 
             _ck = cache_key([scan_path], scan_cache_settings)
-            _serializable = {
-                "_v2": True,
-                "components": [c.model_dump(mode="json") for c in result.components],
-                "relationships": [r.model_dump(mode="json") for r in result.relationships],
-                "_agentic_risk_flags": [
-                    f.model_dump(mode="json") if hasattr(f, "model_dump") else str(f)
-                    for f in result.agentic_risk_flags
-                ],
-                "_agentic_candidate_count": result.agentic_candidate_count,
-            }
-            save_cached(scan_cache_dir, _ck, _serializable)
+            save_cached(
+                scan_cache_dir,
+                _ck,
+                _serializable_scan_cache_payload(result),
+            )
 
         if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
             from .incremental import OrgCache
@@ -1524,6 +1733,13 @@ def analyze(
 
         source_summary["assets_discovered"] = len(result.components)
         source_summary["last_generated_at"] = _utcnow_iso()
+        source_summary["elapsed_s"] = round(result.total_elapsed_s, 2)
+        source_summary["prompt_tokens"] = result.prompt_tokens
+        source_summary["completion_tokens"] = result.completion_tokens
+        source_summary["total_tokens"] = result.total_tokens
+        run_metadata["total_tokens"] += result.total_tokens
+        run_metadata["prompt_tokens"] += result.prompt_tokens
+        run_metadata["completion_tokens"] += result.completion_tokens
         if source_summary["status"] == "in_progress":
             source_summary["status"] = "completed"
 
@@ -1546,41 +1762,58 @@ def analyze(
     else:
         run_metadata["status"] = "completed"
 
-    # Cross-repo coordination (agentic, multi-source only)
     v2_outputs = {
         k: v for k, v in all_analysis_outputs.items()
         if isinstance(v, dict) and v.get("_v2")
     }
+    _cross_repo_links: list = []
+    _cross_repo_risk_flags: list = []
+
+    if len(v2_outputs) > 1:
+        from .cross_repo_links import build_deterministic_cross_repo_links
+
+        scan_paths_for_xrepo = list(v2_outputs.keys())
+        _cross_repo_links = build_deterministic_cross_repo_links(
+            v2_outputs, scan_paths_for_xrepo,
+        )
+        if _cross_repo_links:
+            console.print(
+                f"  [magenta]Deterministic cross-repo links: "
+                f"{len(_cross_repo_links)}[/]"
+            )
+
     if llm_config and len(v2_outputs) > 1:
         try:
-            from .agentic.agent import run_cross_repo_coordination
-
-            console.print(
-                f"  [cyan]Cross-repo coordination across "
-                f"{len(v2_outputs)} repos…[/]"
-            )
-            xrepo_rels, xrepo_flags = run_cross_repo_coordination(
-                model_string=llm_config["model"],
-                per_repo_results=v2_outputs,
-                llm_config=llm_config,
-            )
-            if xrepo_rels or xrepo_flags:
-                first_key = next(iter(v2_outputs))
-                first = all_analysis_outputs[first_key]
-                first.setdefault("relationships", []).extend(xrepo_rels)
-                first.setdefault("_agentic_risk_flags", []).extend(xrepo_flags)
-                console.print(
-                    f"  [magenta]Cross-repo: {len(xrepo_rels)} relationships, "
-                    f"{len(xrepo_flags)} risk flags[/]"
-                )
+            extra_links, extra_flags = _cross_repo_llm_enrichment(llm_config, v2_outputs)
+            _cross_repo_links.extend(extra_links)
+            _cross_repo_risk_flags.extend(extra_flags)
         except ImportError:
             pass
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("Cross-repo coordination failed: %s", exc)
 
-    # Phase 4: Generate the report
+    if _cross_repo_links:
+        from .cross_repo_links import (
+            _filter_intra_repo_links,
+            _filter_quality_bar,
+        )
+        before = len(_cross_repo_links)
+        _cross_repo_links = _filter_intra_repo_links(_cross_repo_links)
+        _cross_repo_links = _filter_quality_bar(_cross_repo_links)
+        dropped = before - len(_cross_repo_links)
+        if dropped:
+            console.print(
+                f"  [dim]Filtered {dropped} intra-repo / low-quality "
+                f"cross-repo links[/]"
+            )
+
     report_data = None
-    reporter = get_reporter(output_format)
+    if output_format == "json" and component_summary:
+        from .reporters.json_reporter import JsonReporter
+
+        reporter: Optional[Any] = JsonReporter(include_component_summary=True)
+    else:
+        reporter = get_reporter(output_format)
 
     from .models import (
         AIComponent as V2Component,
@@ -1620,6 +1853,7 @@ def analyze(
     scan_result = ScanResult(
         metadata=run_metadata,
         sources=v2_sources,
+        cross_repo_links=_cross_repo_links,
         errors=[e.get("message", str(e)) for e in run_errors],
     )
 
@@ -1633,6 +1867,12 @@ def analyze(
                     scan_result.risk.add_flag(rf)
                 elif isinstance(rf, dict):
                     scan_result.risk.add_flag(RiskFlag.model_validate(rf))
+
+    for rf in _cross_repo_risk_flags:
+        if isinstance(rf, RiskFlag):
+            scan_result.risk.add_flag(rf)
+        elif isinstance(rf, dict):
+            scan_result.risk.add_flag(RiskFlag.model_validate(rf))
 
     _, _, annotated_risk_flags = annotate_findings(
         [],
@@ -1711,7 +1951,12 @@ def analyze(
             raise typer.Exit(code=1)
 
     if not reporter:
-        reporter = get_reporter(output_format)
+        if output_format == "json" and component_summary:
+            from .reporters.json_reporter import JsonReporter
+
+            reporter = JsonReporter(include_component_summary=True)
+        else:
+            reporter = get_reporter(output_format)
 
     if reporter:
         if validate:
@@ -1723,13 +1968,11 @@ def analyze(
                 console.print("[green]Validation passed.[/]")
 
         if output_file:
-            import io
             buf = io.StringIO()
             reporter.render(scan_result, buf)
             output_file.write_text(buf.getvalue(), encoding="utf-8")
             console.print(f"[green]Report written to {output_file}[/]")
         else:
-            import sys
             reporter.render(scan_result, sys.stdout)
 
     if fail_on_severity and scorer.should_fail(scan_result.risk, fail_on_severity):
@@ -1740,11 +1983,14 @@ def analyze(
         raise typer.Exit(code=2)
 
     if post_url and output_format == "json":
-        import io as _io
+        if component_summary:
+            from .reporters.json_reporter import JsonReporter
 
-        json_rep = get_reporter("json")
+            json_rep = JsonReporter(include_component_summary=True)
+        else:
+            json_rep = get_reporter("json")
         if json_rep:
-            buf = _io.StringIO()
+            buf = io.StringIO()
             json_rep.render(scan_result, buf)
             report_data = json.loads(buf.getvalue())
             try:
@@ -1928,42 +2174,98 @@ def cache_clear(
         "--cache-dir",
         help="Cache root directory.",
     ),
+    include_scan: bool = typer.Option(
+        True,
+        "--include-scan/--no-scan",
+        help="Clear the scan result cache.",
+    ),
     include_agentic: bool = typer.Option(
         True,
         "--include-agentic/--no-agentic",
-        help="Also clear the agentic enrichment result cache.",
+        help="Clear the agentic enrichment result cache.",
+    ),
+    include_model: bool = typer.Option(
+        True,
+        "--include-model/--no-model",
+        help="Clear the model registry cache (LiteLLM catalog, HuggingFace Hub).",
+    ),
+    include_packages: bool = typer.Option(
+        True,
+        "--include-packages/--no-packages",
+        help="Clear the package metadata cache (PyPI).",
+    ),
+    include_org: bool = typer.Option(
+        True,
+        "--include-org/--no-org",
+        help="Clear the org cache.",
     ),
 ) -> None:
-    """Remove all cached scan results (and optionally agentic results)."""
-    import shutil
+    """Remove cached data. All cache types are cleared by default.
 
-    from .scan_cache import clear_cache as _clear
+    Use ``--no-<type>`` to skip a specific cache (scan, agentic, model,
+    packages, org).
+    """
+    from .scan_cache import clear_cache as _clear_scan
 
     cache_root = resolve_cache_root(cache_dir)
-    removed = 0
-    seen_dirs: set[str] = set()
-    for directory in cache_read_dirs("scan", cache_root):
-        key = str(directory)
-        if key in seen_dirs:
-            continue
-        seen_dirs.add(key)
-        removed += _clear(directory)
-    console.print(
-        f"[green]Removed {removed} cached scan result(s) from {cache_root}[/]"
-    )
 
-    if include_agentic:
+    def _unlink_json_tree(root: Path) -> int:
+        """Unlink all ``*.json`` files under ``root`` (recursive). Returns count."""
+        if not root.exists():
+            return 0
+        removed = 0
+        for path in root.rglob("*.json"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    def _clear_type(
+        cache_type: str,
+        label: str,
+        clearer: Callable[[Path], int],
+    ) -> None:
         count = 0
-        for agentic_dir in cache_read_dirs("agentic", cache_root):
-            if agentic_dir.exists():
-                count += sum(1 for _ in agentic_dir.glob("*.json"))
-                shutil.rmtree(agentic_dir)
+        seen: set[str] = set()
+        for directory in cache_read_dirs(cache_type, cache_root):
+            key = str(directory)
+            if key in seen:
+                continue
+            seen.add(key)
+            count += clearer(directory)
         if count:
             console.print(
-                f"[green]Removed {count} agentic cache file(s) from {cache_root}[/]"
+                f"[green]Removed {count} {label} cache file(s) from {cache_root}[/]"
+            )
+        else:
+            console.print(f"[dim]No {label} cache to clear.[/]")
+
+    if include_scan:
+        _clear_type("scan", "scan", _clear_scan)
+
+    if include_agentic:
+        agentic_count = 0
+        for agentic_dir in cache_read_dirs("agentic", cache_root):
+            if agentic_dir.exists():
+                agentic_count += sum(1 for _ in agentic_dir.glob("*.json"))
+                shutil.rmtree(agentic_dir)
+        if agentic_count:
+            console.print(
+                f"[green]Removed {agentic_count} agentic cache file(s) from {cache_root}[/]"
             )
         else:
             console.print("[dim]No agentic cache to clear.[/]")
+
+    if include_model:
+        _clear_type("model", "model registry", _unlink_json_tree)
+
+    if include_packages:
+        _clear_type("packages", "package metadata", _unlink_json_tree)
+
+    if include_org:
+        _clear_type("org", "org", _unlink_json_tree)
 
 
 @cache_app.command("list")
@@ -1980,16 +2282,9 @@ def cache_list(
     ),
 ) -> None:
     """List cached entries for one cache family."""
-    from rich.table import Table
-
     from .cache_inspector import list_cache_entries
 
-    if cache_type not in cache_types():
-        console.print(
-            f"[red]Unsupported cache type:[/] {cache_type}. "
-            f"Use one of: {', '.join(cache_types())}."
-        )
-        raise typer.Exit(code=1)
+    _require_supported_cache_type(cache_type)
 
     entries = list_cache_entries(cache_type, cache_dir)
     if not entries:
@@ -2041,12 +2336,7 @@ def cache_get(
     """Inspect a specific cache entry by type."""
     from .cache_inspector import get_cache_entry
 
-    if cache_type not in cache_types():
-        console.print(
-            f"[red]Unsupported cache type:[/] {cache_type}. "
-            f"Use one of: {', '.join(cache_types())}."
-        )
-        raise typer.Exit(code=1)
+    _require_supported_cache_type(cache_type)
 
     try:
         entry = get_cache_entry(
@@ -2185,8 +2475,6 @@ def diff_run(
 @plugin_app.command("list")
 def plugin_list() -> None:
     """List all discovered plugins (entry_points, MCP servers, manifests)."""
-    from rich.table import Table
-
     from .plugins import list_plugins
 
     plugins = list_plugins()
@@ -2215,9 +2503,16 @@ def plugin_list() -> None:
 @kb_app.command("download")
 def kb_download(
     version: Optional[str] = typer.Option(None, "--version", "-v", help="Specific KB version to download (latest if omitted)."),
-    url: Optional[str] = typer.Option(None, "--url", help="Override the manifest URL."),
+    url: Optional[str] = typer.Option(
+        None,
+        "--url",
+        help=(
+            "KB manifest URL. Required: pass --url or set CISCO_AIBOM_MANIFEST_URL. "
+            "No default is shipped."
+        ),
+    ),
 ) -> None:
-    """Download the knowledge base from Cisco's public repository."""
+    """Download the knowledge base from the configured remote."""
     mgr = KBManager()
     try:
         path = mgr.download(version=version, url=url)
@@ -2356,7 +2651,6 @@ def kb_list_requests(
 
 def cli_entry_point() -> None:
     """Entry point for console_scripts."""
-    import sys
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
     app()
 

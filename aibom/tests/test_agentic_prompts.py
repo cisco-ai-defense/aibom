@@ -53,7 +53,7 @@ class TestAgenticPromptHardening:
         assert "load_prompt" in prompt
         assert "all_messages" in prompt
         assert "dialog" in prompt
-        assert "ld_api_key" in prompt
+        assert "feature-flag api keys" in prompt
         assert "guardrail_input_token_count" in prompt
 
     def test_prompt_rejects_generic_helper_prompt_kwargs(self) -> None:
@@ -85,6 +85,58 @@ class TestAgenticPromptHardening:
 
     def test_prompt_preserves_deployment_ids_without_inventing_canonical_models(self) -> None:
         prompt = _normalized_aibom_prompt()
-        assert "prod-chat-gpt4o" in prompt
+        assert "prod-chat-gpt4o-westus" in prompt
         assert "embed-prod-westus" in prompt
-        assert "do not invent a canonical public model name without supporting evidence" in prompt
+        assert "org/custom-model/stable" in prompt
+        assert "do not remove them" in prompt
+        assert "do not reclassify them" in prompt
+        assert "do not replace them with" in prompt
+        assert "middleware enforces this as a hard safety rail" in prompt
+
+    def test_prompt_defines_agent_three_conditions(self) -> None:
+        prompt = _normalized_aibom_prompt()
+        assert "llm-driven control flow" in prompt
+        assert "tool / action execution" in prompt
+        assert "iterative loop" in prompt
+        assert "all three" in prompt
+
+    def test_prompt_lists_agent_positive_patterns(self) -> None:
+        prompt = _normalized_aibom_prompt()
+        assert "react loops" in prompt or "react loop" in prompt
+        assert "agentexecutor" in prompt
+        assert "create_react_agent" in prompt
+        assert "agent_proxy" in prompt or "agent proxies" in prompt
+
+    def test_prompt_lists_agent_negative_patterns(self) -> None:
+        prompt = _normalized_aibom_prompt()
+        assert "a class that calls an llm once" in prompt
+        assert "sequentialchain" in prompt
+        assert "the name is misleading" in prompt
+
+    def test_prompt_agent_verification_procedure(self) -> None:
+        prompt = _normalized_aibom_prompt()
+        assert "read_file_snippet" in prompt
+        assert "verification procedure" in prompt
+        assert "source module" in prompt
+
+    def test_prompt_agent_relationship_discovery(self) -> None:
+        prompt = _normalized_aibom_prompt()
+        assert "agent relationship discovery procedure" in prompt
+        assert "client.chat.completions.create" in prompt
+        assert "uses_vector_store" in prompt
+
+    def test_prompt_read_file_snippet_tool(self) -> None:
+        assert "read_file_snippet" in AIBOM_AGENT_SYSTEM_PROMPT
+        assert "inspect class definitions" in AIBOM_AGENT_SYSTEM_PROMPT
+
+    def test_prompt_forbids_verdicts_for_other_detected_components(self) -> None:
+        prompt = _normalized_aibom_prompt()
+        assert "read-only context" in prompt
+        assert (
+            "you must not emit `remove_components`, `reclassify_components`, "
+            "or `enriched_components` entries for any `instance_id` that "
+            "appears in `other_detected_components`"
+        ) in prompt
+        assert (
+            "only ids that appear in `enrich_these` are valid targets"
+        ) in prompt

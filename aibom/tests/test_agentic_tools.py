@@ -158,3 +158,29 @@ class TestSearchCodebase:
     def test_invalid_regex_returns_error(self):
         result = json.loads(search_codebase_impl("[invalid", ["/tmp"]))
         assert "error" in result
+
+
+class TestReadFileSnippetInBuildTools:
+    """Fix 2: read_file_snippet must be in the main scanner tools."""
+
+    def test_build_tools_includes_read_file_snippet(self):
+        pytest.importorskip("langchain_core")
+        from aibom.agentic.tools import build_tools
+
+        tools = build_tools()
+        tool_names = [t.name for t in tools]
+        assert "read_file_snippet" in tool_names
+
+    def test_read_file_snippet_reads_file(self, tmp_path: Path):
+        from aibom.agentic.tools import read_file_snippet_impl
+
+        test_file = tmp_path / "agent.py"
+        test_file.write_text("class SecurityAgent:\n    pass\n")
+        result = read_file_snippet_impl(str(test_file))
+        assert "SecurityAgent" in result
+
+    def test_read_file_snippet_nonexistent(self):
+        from aibom.agentic.tools import read_file_snippet_impl
+
+        result = read_file_snippet_impl("/nonexistent/path.py")
+        assert "error" in result

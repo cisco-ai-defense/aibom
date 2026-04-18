@@ -32,6 +32,46 @@ class TestConfigScanner:
             for c in comps
         )
 
+    def test_env_aws_credentials_are_secrets(self, tmp_path: Path) -> None:
+        """AWS static credentials in a ``.env`` file must emit SECRET components.
+
+        These are the canonical boto3 / Bedrock / AWS Strands credentials.
+        ``AWS_SECRET_ACCESS_KEY`` ends with ``_KEY`` (not ``_API_KEY``) and
+        ``AWS_ACCESS_KEY_ID`` ends with ``_ID``, so without explicit
+        handling they would slip past the generic ``_API_KEY`` suffix branch.
+        """
+        env = (
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+            "AWS_SESSION_TOKEN=IQoJb3JpZ2luX2VjEXAMPLETOKEN\n"
+        )
+        comps, _ = run_scanner(ConfigScanner, tmp_path, {".env": env})
+        secrets = {
+            c.metadata.get("env_var"): c
+            for c in comps
+            if c.component_type == AIComponentType.SECRET
+        }
+        assert "AWS_ACCESS_KEY_ID" in secrets
+        assert "AWS_SECRET_ACCESS_KEY" in secrets
+        assert "AWS_SESSION_TOKEN" in secrets
+        for comp in secrets.values():
+            assert comp.metadata.get("redacted") is True
+            assert comp.metadata.get("provider") == "aws"
+            assert comp.framework == "aws"
+
+    def test_env_aws_non_secret_vars_are_not_secrets(self, tmp_path: Path) -> None:
+        """``AWS_PROFILE`` and ``AWS_REGION`` are NOT credentials and must not
+        emit SECRET components. They may surface as other component types or
+        be skipped entirely, but should never be classified as a secret."""
+        env = (
+            "AWS_PROFILE=default\n"
+            "AWS_REGION=us-west-2\n"
+            "AWS_DEFAULT_REGION=us-east-1\n"
+        )
+        comps, _ = run_scanner(ConfigScanner, tmp_path, {".env": env})
+        secrets = [c for c in comps if c.component_type == AIComponentType.SECRET]
+        assert secrets == []
+
     def test_env_model_vars_not_secrets(self, tmp_path: Path) -> None:
         env = "OPENAI_MODEL=gpt-4o\nLLM_NAME=meta-llama/Llama-3.2-1B\n"
         comps, _ = run_scanner(ConfigScanner, tmp_path, {".env": env})

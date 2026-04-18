@@ -23,6 +23,8 @@ LOGGER = logging.getLogger(__name__)
 
 _CATALOG_COLS = "id, label, concept, framework, sig_name, type, catalog_label"
 
+_LABEL_BLOCKLIST: tuple[str, ...] = ("parameter",)
+
 
 def is_excluded(name: str, patterns: List[str]) -> bool:
     """Return True if *name* suffix-matches or equals any pattern in *patterns*."""
@@ -82,30 +84,59 @@ class CatalogDB:
         """Lazily initialise the last-segment token table.
 
         If the catalog already ships a pre-built
-        ``component_catalog_last_seg`` table (new KBs), use it directly.
-        Otherwise build a temporary table from ``kb.component_catalog``.
+        ``component_catalog_last_seg`` table (new KBs), use it directly but
+        join against ``kb.component_catalog`` so we can filter out low-signal
+        ``label`` rows (currently ``parameter``) that pollute the suffix
+        index.  Otherwise build a temporary table from
+        ``kb.component_catalog`` with the blocklist applied.
 
         Returns the qualified table name to use in queries.
         """
         if self._token_table is not None:
             return self._token_table
 
+        label_filter_sql = self._label_filter_sql("cc")
+        build_filter_sql = self._label_filter_sql()
+
         try:
             self._connection.execute(
                 "SELECT 1 FROM kb.component_catalog_last_seg LIMIT 1"
             )
-            self._token_table = "kb.component_catalog_last_seg"
-            LOGGER.debug("Using pre-built token table from catalog")
+            LOGGER.debug(
+                "Pre-built token table found; filtering blocklisted labels in temp view"
+            )
+            self._connection.execute(
+                "CREATE TEMP TABLE _last_seg AS "
+                "SELECT ls.id, ls.last_seg "
+                "FROM kb.component_catalog_last_seg ls "
+                "JOIN kb.component_catalog cc USING (id) "
+                f"WHERE {label_filter_sql}"
+            )
+            self._token_table = "_last_seg"
         except duckdb.CatalogException:
             LOGGER.debug("Building temp last-segment token table")
             self._connection.execute(
                 "CREATE TEMP TABLE _last_seg AS "
                 "SELECT id, split_part(id, '.', -1) AS last_seg "
-                "FROM kb.component_catalog"
+                "FROM kb.component_catalog "
+                f"WHERE {build_filter_sql}"
             )
             self._token_table = "_last_seg"
 
         return self._token_table
+
+    @staticmethod
+    def _label_filter_sql(alias: str = "") -> str:
+        """SQL fragment rejecting rows whose ``label`` is in the blocklist.
+
+        Applying this filter at query time (rather than post-processing
+        Python-side) keeps the hot path off 1M+ parameter rows that never
+        represent top-level AI components and are a major source of
+        false positives during suffix matching.
+        """
+        col = f"{alias}.label" if alias else "label"
+        literals = ",".join(f"'{lbl}'" for lbl in _LABEL_BLOCKLIST)
+        return f"COALESCE({col}, '') NOT IN ({literals})"
 
     # ------------------------------------------------------------------
     # Public API
@@ -135,6 +166,49 @@ class CatalogDB:
         """Check if *entry_id* matches any exclude pattern (suffix match)."""
         return is_excluded(entry_id, self._excludes)
 
+    def distinct_frameworks(self) -> List[str]:
+        """Return the union of framework values from DuckDB and custom entries.
+
+        Used by KB enrichment helpers to build framework-prefix allowlists
+        that recognise custom/built-in catalog supplements (e.g. Strands)
+        alongside the prebuilt DuckDB snapshot.
+        """
+        names: set[str] = set()
+        try:
+            rows = self._connection.execute(
+                "SELECT DISTINCT framework FROM component_catalog "
+                "WHERE framework IS NOT NULL"
+            ).fetchall()
+            names.update(fw for (fw,) in rows if fw)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("distinct_frameworks DuckDB query failed", exc_info=True)
+
+        for entry in self._custom_index.values():
+            fw = entry.get("framework")
+            if fw:
+                names.add(fw)
+        return sorted(names)
+
+    def find_ids_in_custom_by_path_and_concept(
+        self, path_segment: str, concepts: Sequence[str]
+    ) -> List[str]:
+        """Scan the in-memory custom index for entries whose ID contains
+        *path_segment* and whose concept is in *concepts*.
+
+        Mirrors :meth:`find_ids_by_path_and_concept` but over the custom
+        index only, so pattern discovery also picks up built-in
+        supplements (e.g. Strands tool/model class names).
+        """
+        if not concepts:
+            return []
+        concept_lower = {c.lower() for c in concepts}
+        results: list[str] = []
+        for entry_id, entry in self._custom_index.items():
+            concept = (entry.get("concept") or "").lower()
+            if concept in concept_lower and path_segment in entry_id:
+                results.append(entry_id)
+        return results
+
     def find_ids_by_path_and_concept(
         self, path_segment: str, concepts: Sequence[str]
     ) -> List[str]:
@@ -143,9 +217,11 @@ class CatalogDB:
         if not concepts:
             return []
         placeholders = ",".join("?" for _ in concepts)
+        label_filter = self._label_filter_sql()
         query = f"""
             SELECT DISTINCT id FROM component_catalog
             WHERE id LIKE ? AND LOWER(concept) IN ({placeholders})
+              AND {label_filter}
         """
         params: list[str] = [f"%{path_segment}%"] + [c.lower() for c in concepts]
         rows = self._connection.execute(query, params).fetchall()
@@ -180,11 +256,13 @@ class CatalogDB:
                 tokens.add(s)
 
         matched_ids: set[str] = set()
+        label_filter = self._label_filter_sql()
 
         if full_paths:
             rows = self._connection.execute(
                 "SELECT id FROM kb.component_catalog "
-                "WHERE id IN (SELECT UNNEST(?))",
+                "WHERE id IN (SELECT UNNEST(?)) "
+                f"AND {label_filter}",
                 [full_paths],
             ).fetchall()
             matched_ids.update(r[0] for r in rows)
@@ -202,7 +280,8 @@ class CatalogDB:
             id_list = list(matched_ids)
             cursor = self._connection.execute(
                 f"SELECT {_CATALOG_COLS} FROM kb.component_catalog "
-                "WHERE id IN (SELECT UNNEST(?))",
+                "WHERE id IN (SELECT UNNEST(?)) "
+                f"AND {label_filter}",
                 [id_list],
             )
             columns = [desc[0] for desc in cursor.description]
@@ -214,7 +293,9 @@ class CatalogDB:
 
         for s in suffixes:
             for entry_id, entry in self._custom_index.items():
-                if entry_id.endswith(s) and entry_id not in seen_ids:
+                if entry_id not in seen_ids and self._custom_entry_matches_suffix(
+                    entry_id, s
+                ):
                     db_results.append(entry)
                     seen_ids.add(entry_id)
 
@@ -224,3 +305,18 @@ class CatalogDB:
             ]
 
         return db_results
+
+    @staticmethod
+    def _custom_entry_matches_suffix(entry_id: str, suffix: str) -> bool:
+        """Mirror the two-tier SQL matching for custom (in-memory) entries.
+
+        * Full-path suffixes (contain a dot) must match as an ``endswith``
+          exact path suffix.
+        * Single-token suffixes match only the last segment of the ID.
+        This mirrors ``find_components_by_suffixes``' DuckDB behaviour so
+        custom entries do not get picked up by unrelated suffixes.
+        """
+        if "." in suffix:
+            return entry_id == suffix or entry_id.endswith("." + suffix)
+        last_seg = entry_id.rsplit(".", 1)[-1]
+        return last_seg == suffix

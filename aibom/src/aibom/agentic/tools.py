@@ -302,9 +302,9 @@ def _search_yaml_for_key(
 @_track_tool("lookup_model")
 def lookup_model_impl(identifier: str) -> str:
     """Query model registries for metadata about *identifier*."""
-    from ..scanners.model_detector import _registry_lookup
+    from ..scanners.model_detector import registry_lookup
 
-    entry = _registry_lookup(identifier)
+    entry = registry_lookup(identifier)
     if entry is None:
         return json.dumps({
             "identifier": identifier,
@@ -705,6 +705,19 @@ def build_tools() -> list[Any]:
             ),
             func=search_package_info_impl,
             args_schema=SearchPackageInfoArgs,
+        ),
+        StructuredTool.from_function(
+            name="read_file_snippet",
+            description=(
+                "Read up to N lines from a file. Use this to inspect the "
+                "definition of an imported class, check for agent loop "
+                "patterns, or read code that is outside the provided "
+                "code_context window. For agent candidates detected via "
+                "import, you MUST read the source module to verify the "
+                "agent loop pattern before confirming or removing."
+            ),
+            func=read_file_snippet_impl,
+            args_schema=ReadFileSnippetArgs,
         ),
     ]
 

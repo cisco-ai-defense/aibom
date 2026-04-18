@@ -77,6 +77,12 @@ llm-openai = [
 llm-aws = [
     "langchain-aws>=0.2.0",
 ]
+llm-anthropic = [
+    "langchain-anthropic>=0.3.0",
+]
+llm-google = [
+    "langchain-google-genai>=2.0.0",
+]
 cloud = [
     "boto3>=1.35.0",
     "google-cloud-aiplatform>=1.74.0",
@@ -84,7 +90,7 @@ cloud = [
     "azure-mgmt-cognitiveservices>=13.6.0",
 ]
 all = [
-    "cisco-aibom[analysis,security,agentic,llm-openai,llm-aws,cloud]",
+    "cisco-aibom[analysis,security,agentic,llm-openai,llm-aws,llm-anthropic,llm-google,cloud]",
 ]
 
 [tool.pytest.ini_options]

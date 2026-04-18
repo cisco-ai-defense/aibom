@@ -36,7 +36,10 @@ from .base import BaseScanner
 
 _LOGGER = logging.getLogger(__name__)
 
-_MODEL_CATALOG_URL = "https://models.litellm.ai/model_catalog"
+_MODEL_CATALOG_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json"
+)
 _HF_API_URL = "https://huggingface.co/api/models"
 _CACHE_TTL_SECONDS = 86400  # 24 hours
 
@@ -86,6 +89,13 @@ def _save_cached(name: str, models: dict[str, dict[str, Any]]) -> None:
 def _fetch_model_catalog(
     provider: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Fetch the LiteLLM model catalog and normalize it to a list of dicts.
+
+    The canonical source is the GitHub-hosted ``model_prices_and_context_window.json``
+    which is a ``dict[model_id, metadata]`` payload. We also tolerate the
+    legacy ``{"data": [...]}`` / ``{"models": [...]}`` shapes and a bare list
+    in case an alternate mirror is substituted.
+    """
     import httpx
 
     params: dict[str, str] = {}
@@ -96,12 +106,32 @@ def _fetch_model_catalog(
             resp = client.get(_MODEL_CATALOG_URL, params=params)
             resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                return data.get("data", data.get("models", []))
-    except Exception:
-        _LOGGER.debug("Model catalog fetch failed", exc_info=True)
+        if isinstance(data, list):
+            entries = data
+        elif isinstance(data, dict):
+            if "data" in data or "models" in data:
+                entries = data.get("data", data.get("models", []))
+            else:
+                entries = [
+                    {"model_name": k, **v}
+                    for k, v in data.items()
+                    if k != "sample_spec" and isinstance(v, dict)
+                ]
+        else:
+            entries = []
+
+        if not entries:
+            _LOGGER.warning(
+                "Model catalog fetch returned 0 entries from %s",
+                _MODEL_CATALOG_URL,
+            )
+        return entries
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+        _LOGGER.warning(
+            "Model catalog fetch failed from %s: %s",
+            _MODEL_CATALOG_URL,
+            exc,
+        )
     return []
 
 
@@ -166,6 +196,63 @@ def _model_alias_keys(raw_id: str) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
+_NATIVE_PROVIDERS = frozenset(
+    {
+        "openai",
+        "anthropic",
+        "google",
+        "gemini",
+        "mistral",
+        "cohere",
+        "deepseek",
+        "xai",
+        "perplexity",
+        "groq",
+        "fireworks_ai",
+        "together_ai",
+        "ollama",
+        "huggingface",
+        "replicate",
+        "ai21",
+        "writer",
+        "voyage",
+    }
+)
+
+# LiteLLM sometimes uses internal provider aliases that differ from how
+# users think of the provider (e.g. ``gemini`` is Google's native API,
+# ``bedrock_converse`` is still AWS Bedrock). Canonicalize to the names
+# AIBOM's built-in registry and documentation use so the output is
+# consistent across resolution paths.
+_PROVIDER_CANONICAL_MAP: dict[str, str] = {
+    "gemini": "google",
+    "bedrock_converse": "bedrock",
+    "vertex_ai-anthropic_models": "vertex_ai",
+    "vertex_ai-gemini_models": "vertex_ai",
+    "vertex_ai-ai21_models": "vertex_ai",
+    "vertex_ai-code-chat-models": "vertex_ai",
+    "vertex_ai-chat-models": "vertex_ai",
+    "vertex_ai-code-text-models": "vertex_ai",
+    "vertex_ai-text-models": "vertex_ai",
+    "vertex_ai-language-models": "vertex_ai",
+    "vertex_ai-image-models": "vertex_ai",
+    "vertex_ai-embedding-models": "vertex_ai",
+    "vertex_ai-mistral_models": "vertex_ai",
+    "vertex_ai-llama_models": "vertex_ai",
+    "bedrock/invoke": "bedrock",
+}
+
+
+def _canonical_provider(provider: str) -> str:
+    low = provider.lower()
+    return _PROVIDER_CANONICAL_MAP.get(low, low)
+
+
+def _is_native_provider(provider: str) -> bool:
+    canonical = _canonical_provider(provider)
+    return canonical in _NATIVE_PROVIDERS
+
+
 def _build_model_registry() -> dict[str, dict[str, Any]]:
     cached = _load_cached("model_catalog.json")
     if cached is not None:
@@ -175,7 +262,13 @@ def _build_model_registry() -> dict[str, dict[str, Any]]:
     if not raw:
         return {}
 
+    # Four-tier registration so canonical (alias == literal model_id) and
+    # native-provider entries win regardless of the catalog's iteration
+    # order. Without this, the LiteLLM catalog's alphabetical ordering
+    # causes e.g. ``azure/gpt-4o-2024-08-06`` (alias ``gpt-4o``) to hijack
+    # the provider attribution of the native OpenAI ``gpt-4o`` entry.
     registry: dict[str, dict[str, Any]] = {}
+    prepared: list[tuple[str, list[str], dict[str, Any], bool]] = []
     for entry in raw:
         model_id = entry.get("model_name") or entry.get("id") or entry.get("model") or ""
         if not model_id:
@@ -188,14 +281,36 @@ def _build_model_registry() -> dict[str, dict[str, Any]]:
         aliases = _model_alias_keys(model_id)
         canonical = aliases[-1] if aliases else model_id.lower()
         meta = {
-            "provider": provider.lower(),
+            "provider": _canonical_provider(provider),
             "family": canonical.rsplit("-", 1)[0] if "-" in canonical else canonical,
-            "deprecated": entry.get("deprecated", False),
+            "mode": str(entry.get("mode") or "").lower(),
+            "deprecated": entry.get(
+                "deprecated", bool(entry.get("deprecation_date"))
+            ),
             "source": "model_catalog",
         }
-        for alias in aliases:
-            if alias not in registry:
-                registry[alias] = meta
+        prepared.append(
+            (model_id.lower(), aliases, meta, _is_native_provider(provider))
+        )
+
+    def _register(require_canonical: bool, require_native: bool) -> None:
+        for mid_low, aliases, meta, is_native in prepared:
+            if require_native and not is_native:
+                continue
+            if not require_native and is_native:
+                continue
+            for alias in aliases:
+                if require_canonical and alias != mid_low:
+                    continue
+                if alias not in registry:
+                    registry[alias] = meta
+
+    # Pass order: canonical-native, canonical-gateway, alias-native, alias-gateway.
+    _register(require_canonical=True, require_native=True)
+    _register(require_canonical=True, require_native=False)
+    _register(require_canonical=False, require_native=True)
+    _register(require_canonical=False, require_native=False)
+
     _save_cached("model_catalog.json", registry)
     return registry
 
@@ -320,6 +435,11 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "family": "claude-3-5-haiku",
         "deprecated": False,
     },
+    r"^claude-3-7-sonnet-\d{8}$": {
+        "provider": "anthropic",
+        "family": "claude-3-7-sonnet",
+        "deprecated": False,
+    },
     r"^claude-3-opus-\d{8}$": {
         "provider": "anthropic",
         "family": "claude-3-opus",
@@ -345,6 +465,21 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "family": "claude-4-opus",
         "deprecated": False,
     },
+    r"^claude-sonnet-4-\d{8}$": {
+        "provider": "anthropic",
+        "family": "claude-sonnet-4",
+        "deprecated": False,
+    },
+    r"^claude-opus-4-\d{8}$": {
+        "provider": "anthropic",
+        "family": "claude-opus-4",
+        "deprecated": False,
+    },
+    r"^claude-haiku-4-\d{8}$": {
+        "provider": "anthropic",
+        "family": "claude-haiku-4",
+        "deprecated": False,
+    },
     r"^claude-3-5-sonnet$": {
         "provider": "anthropic",
         "family": "claude-3-5-sonnet",
@@ -353,6 +488,11 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     r"^claude-3-5-haiku$": {
         "provider": "anthropic",
         "family": "claude-3-5-haiku",
+        "deprecated": False,
+    },
+    r"^claude-3-7-sonnet$": {
+        "provider": "anthropic",
+        "family": "claude-3-7-sonnet",
         "deprecated": False,
     },
     r"^claude-3-opus$": {
@@ -378,6 +518,21 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     r"^claude-4-opus$": {
         "provider": "anthropic",
         "family": "claude-4-opus",
+        "deprecated": False,
+    },
+    r"^claude-sonnet-4(?:-\d+)?$": {
+        "provider": "anthropic",
+        "family": "claude-sonnet-4",
+        "deprecated": False,
+    },
+    r"^claude-opus-4(?:-\d+)?$": {
+        "provider": "anthropic",
+        "family": "claude-opus-4",
+        "deprecated": False,
+    },
+    r"^claude-haiku-4(?:-\d+)?$": {
+        "provider": "anthropic",
+        "family": "claude-haiku-4",
         "deprecated": False,
     },
     r"^gemini-2\.5-pro$": {
@@ -406,6 +561,17 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     r"^llama[-_]3\.1": {"provider": "meta", "family": "llama-3.1", "deprecated": False},
     r"^llama[-_]3\b": {"provider": "meta", "family": "llama-3", "deprecated": False},
     r"^llama[-_]2\b": {"provider": "meta", "family": "llama-2", "deprecated": False},
+    # Bedrock-style Llama IDs omit the separator between "llama" and the major
+    # version, e.g. ``meta.llama3-70b-instruct-v1:0`` → alias ``llama3-70b-instruct-v1``.
+    # The minor version is expressed with a hyphen: ``llama3-1-`` is v3.1, ``llama3-2-``
+    # is v3.2, etc. Order matters: the more specific minor-version patterns must
+    # come before the bare ``^llama3\b`` fallback.
+    r"^llama4\b": {"provider": "meta", "family": "llama-4", "deprecated": False},
+    r"^llama3-3\b": {"provider": "meta", "family": "llama-3.3", "deprecated": False},
+    r"^llama3-2\b": {"provider": "meta", "family": "llama-3.2", "deprecated": False},
+    r"^llama3-1\b": {"provider": "meta", "family": "llama-3.1", "deprecated": False},
+    r"^llama3\b": {"provider": "meta", "family": "llama-3", "deprecated": False},
+    r"^llama2\b": {"provider": "meta", "family": "llama-2", "deprecated": False},
     r"^mistral-7b": {
         "provider": "mistral",
         "family": "mistral-7b",
@@ -449,12 +615,86 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "family": "deepseek-v2",
         "deprecated": False,
     },
-    r"^command-r-plus$": {
+    r"^command-r-plus(?:-v\d+)?$": {
         "provider": "cohere",
         "family": "command-r-plus",
         "deprecated": False,
     },
-    r"^command-r$": {"provider": "cohere", "family": "command-r", "deprecated": False},
+    r"^command-r(?:-v\d+)?$": {
+        "provider": "cohere",
+        "family": "command-r",
+        "deprecated": False,
+    },
+    r"^command-light(?:-text)?(?:-v\d+)?$": {
+        "provider": "cohere",
+        "family": "command-light",
+        "deprecated": False,
+    },
+    r"^command(?:-text)?(?:-v\d+)?$": {
+        "provider": "cohere",
+        "family": "command",
+        "deprecated": False,
+    },
+    r"^embed-english(?:-light)?(?:-v\d+)?$": {
+        "provider": "cohere",
+        "family": "embed-english",
+        "deprecated": False,
+    },
+    r"^embed-multilingual(?:-light)?(?:-v\d+)?$": {
+        "provider": "cohere",
+        "family": "embed-multilingual",
+        "deprecated": False,
+    },
+    r"^nova-pro(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "nova-pro",
+        "deprecated": False,
+    },
+    r"^nova-lite(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "nova-lite",
+        "deprecated": False,
+    },
+    r"^nova-micro(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "nova-micro",
+        "deprecated": False,
+    },
+    r"^nova-canvas(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "nova-canvas",
+        "deprecated": False,
+    },
+    r"^nova-reel(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "nova-reel",
+        "deprecated": False,
+    },
+    r"^nova-sonic(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "nova-sonic",
+        "deprecated": False,
+    },
+    r"^titan-text-(?:express|lite|premier|agile)(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "titan-text",
+        "deprecated": False,
+    },
+    r"^titan-embed-text(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "titan-embed-text",
+        "deprecated": False,
+    },
+    r"^titan-embed-image(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "titan-embed-image",
+        "deprecated": False,
+    },
+    r"^titan-image-generator(?:-v\d+)?$": {
+        "provider": "amazon",
+        "family": "titan-image-generator",
+        "deprecated": False,
+    },
 }
 
 _COMPILED_REGISTRY: list[tuple[re.Pattern[str], dict[str, Any]]] = [
@@ -468,8 +708,40 @@ _PY_KWARG_RE = re.compile(
     re.MULTILINE,
 )
 
+# Module-level assignments whose *target* name is model-related.
+#
+# Two alternatives:
+#   1. Lowercase exact: ``model``, ``model_name``, ``model_id``, ``deployment_name``
+#   2. UPPER_SNAKE with a model suffix, optionally preceded by a namespace
+#      prefix (e.g. ``MODEL_ID``, ``BEDROCK_MODEL_ID``, ``CLAUDE_MODEL``,
+#      ``SONNET_MODEL_NAME``, ``OPENAI_DEPLOYMENT``, ``LLM_MODEL``).
+#
+# The value must be a quoted literal. Non-model UPPER_SNAKE vars (e.g.
+# ``LOG_LEVEL`` or ``API_URL``) do not match because they lack the suffix.
 _PY_ASSIGN_RE = re.compile(
-    r"(?m)^\s*(?:model|model_name|MODEL|MODEL_NAME|LLM_MODEL)\s*=\s*"
+    r"(?m)^\s*"
+    r"(?:"
+    r"model|model_name|model_id|deployment_name"
+    r"|"
+    r"(?:[A-Z][A-Z0-9_]*_)?(?:MODEL|MODEL_ID|MODEL_NAME|DEPLOYMENT|DEPLOYMENT_NAME|LLM_MODEL)"
+    r")"
+    r"\s*=\s*"
+    r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
+)
+
+# ``os.getenv(...)`` / ``os.environ.get(...)`` with a quoted default value
+# whose env var name looks model-related. Strands and similar agent
+# frameworks commonly read the deployed model ID from the environment with a
+# hard-coded literal fallback — that literal is the real model in practice.
+#
+# We constrain the env var name to model-suffixed identifiers so that calls
+# like ``os.getenv("LOG_LEVEL", "info")`` do not falsely register "info" as
+# a model ID.
+_PY_GETENV_WITH_DEFAULT_RE = re.compile(
+    r"(?:os\.)?(?:getenv|environ\.get)\s*\(\s*"
+    r"(?P<envq>[\"'])"
+    r"(?P<env>(?:[A-Z][A-Z0-9_]*_)?(?:MODEL|MODEL_ID|MODEL_NAME|DEPLOYMENT|DEPLOYMENT_NAME|LLM_MODEL))"
+    r"(?P=envq)\s*,\s*"
     r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
 )
 
@@ -478,6 +750,21 @@ _PY_CTOR_RE = re.compile(
     r"OpenAI|Anthropic|GenerativeModel)\s*\("
     r"[^)]*?\bmodel\s*=\s*(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
     re.DOTALL,
+)
+
+# Subscript assignments like ``agent.model.config['model_id'] = 'claude-3-5-...'``
+# or ``config["model_name"] = "gpt-4o"``. Strands and a few other agent
+# frameworks expose the active model through a ``config`` dict on the model
+# object, and the pattern is common enough in tutorials and tests that
+# missing it leaves real model identifiers out of the BOM.
+_PY_SUBSCRIPT_MODEL_RE = re.compile(
+    r"(?m)"
+    r"(?:[A-Za-z_][\w.]*)?"
+    r"\s*\[\s*(?P<kq>[\"'])"
+    r"(?P<key>model|model_id|model_name|deployment_name)"
+    r"(?P=kq)\s*\]"
+    r"\s*=\s*"
+    r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
 )
 
 _ENV_MODEL_RE = re.compile(
@@ -549,26 +836,110 @@ _registry_cache: dict[str, dict[str, Any] | None] = {}
 _SENTINEL = object()
 
 
-def _registry_lookup(model_id: str) -> Optional[dict[str, Any]]:
+def _builtin_regex_match_direct(key: str) -> Optional[dict[str, Any]]:
+    """Return the first BUILTIN_MODEL_REGISTRY match for ``key`` itself (no alias walk)."""
+    low = key.lower()
+    for pat, meta in _COMPILED_REGISTRY:
+        if pat.search(low):
+            return dict(meta)
+    return None
+
+
+def _builtin_regex_lookup(key: str) -> Optional[dict[str, Any]]:
+    """Return the first BUILTIN_MODEL_REGISTRY match for ``key`` or any alias.
+
+    HuggingFace-style ``org/name`` slugs are resolved via Tier 3 (HF Hub)
+    instead of alias-walking into this registry, which would incorrectly
+    match e.g. ``meta-llama/Llama-3.1-8B-Instruct`` against the generic
+    ``^llama[-_]3\\.1`` pattern and mask HF provenance.
+    """
+    direct = _builtin_regex_match_direct(key)
+    if direct:
+        return direct
+    if _is_hf_model_id(key):
+        return None
+    for alias in _model_alias_keys(key):
+        if alias == key.lower():
+            continue
+        for pat, meta in _COMPILED_REGISTRY:
+            if pat.search(alias):
+                return dict(meta)
+    return None
+
+
+def is_known_embedding_model_name(name: str) -> bool:
+    """Return True iff ``name`` is a known embedding model identifier.
+
+    Uses :func:`registry_lookup` as the single source of truth — which
+    consults the live LiteLLM catalog (where ``mode == "embedding"`` is
+    authoritative for thousands of entries), then the hand-curated
+    built-in registry (where ``family == "embedding"`` is set for the
+    well-known OpenAI ``text-embedding-*`` families), then HuggingFace.
+    Unknown strings return False.
+    """
+    if not name:
+        return False
+    cleaned = name.strip()
+    if not cleaned:
+        return False
+    meta = registry_lookup(cleaned)
+    if meta is None:
+        return False
+    if str(meta.get("mode", "")).lower() == "embedding":
+        return True
+    if str(meta.get("family", "")).lower().startswith("embed"):
+        return True
+    return False
+
+
+def registry_lookup(model_id: str) -> Optional[dict[str, Any]]:
     key = model_id.strip()
     cached = _registry_cache.get(key, _SENTINEL)
     if cached is not _SENTINEL:
         return dict(cached) if cached is not None else None
 
-    # Tier 1: LiteLLM commercial API catalog
+    # Tier 1: LiteLLM commercial API catalog. Walk alias forms (e.g.
+    # ``us.anthropic.claude-3-7-sonnet-...`` → ``claude-3-7-sonnet``) so
+    # inference-profile prefixes resolve against the flattened registry.
     live = _get_live_registry()
-    hit = live.get(key.lower())
-    if hit:
-        result = dict(hit)
+    live_hit: Optional[dict[str, Any]] = None
+    for candidate in [key.lower()] + [
+        a for a in _model_alias_keys(key) if a != key.lower()
+    ]:
+        hit = live.get(candidate)
+        if hit:
+            live_hit = hit
+            break
+
+    # Gateway override: when the input is a native shorthand (e.g.
+    # ``claude-3-5-sonnet``) the LiteLLM catalog may only know it via a
+    # cloud-gateway alias row (bedrock, vertex_ai, vercel_ai_gateway). Prefer
+    # the curated built-in regex, which has accurate native-provider
+    # attribution. We only apply this when the built-in regex matches the
+    # INPUT directly — otherwise a real Bedrock-formatted ID like
+    # ``anthropic.claude-3-5-sonnet-20241022-v2:0`` (whose alias walk also
+    # hits the builtin regex) would be misclassified as native ``anthropic``.
+    if live_hit and not _is_native_provider(live_hit.get("provider", "")):
+        direct_builtin = _builtin_regex_match_direct(key)
+        if direct_builtin and _is_native_provider(
+            direct_builtin.get("provider", "")
+        ):
+            result = dict(direct_builtin)
+            _registry_cache[key] = result
+            return result
+
+    if live_hit:
+        result = dict(live_hit)
         _registry_cache[key] = result
         return result
 
-    # Tier 2 (offline): builtin regex patterns
-    for pat, meta in _COMPILED_REGISTRY:
-        if pat.search(key):
-            result = dict(meta)
-            _registry_cache[key] = result
-            return result
+    # Tier 2 (offline): built-in regex patterns, including alias walk for
+    # inputs like ``us.anthropic.claude-3-7-sonnet-...`` when the live catalog
+    # is unavailable.
+    builtin_hit = _builtin_regex_lookup(key)
+    if builtin_hit:
+        _registry_cache[key] = builtin_hit
+        return dict(builtin_hit)
 
     # Tier 3: HuggingFace Hub for org/model-name slugs
     if _is_hf_model_id(key):
@@ -708,7 +1079,13 @@ def _extract_env_models(text: str) -> list[tuple[str, int]]:
 
 def _extract_python_models(text: str) -> list[tuple[str, int]]:
     found: list[tuple[str, int]] = []
-    for rx in (_PY_KWARG_RE, _PY_ASSIGN_RE, _PY_CTOR_RE):
+    for rx in (
+        _PY_KWARG_RE,
+        _PY_ASSIGN_RE,
+        _PY_CTOR_RE,
+        _PY_GETENV_WITH_DEFAULT_RE,
+        _PY_SUBSCRIPT_MODEL_RE,
+    ):
         for m in rx.finditer(text):
             raw = m.group("val")
             s = _normalize_candidate(raw)
@@ -769,7 +1146,7 @@ def _make_component(
         line_number=line_number,
         framework=provider,
         detection_source=src,
-        confidence=confidence,
+        heuristic_confidence=confidence,
         needs_agentic=needs_agentic,
         agentic_hint=f"'{model_name}' not found in model registry; may be private or misidentified" if needs_agentic else "",
         model_name=model_name,
@@ -825,7 +1202,7 @@ class ModelDetector(BaseScanner):
                 if key in seen:
                     continue
                 seen.add(key)
-                reg = _registry_lookup(model_name)
+                reg = registry_lookup(model_name)
                 components.append(
                     _make_component(model_name, fp_str, line_no, method, reg)
                 )

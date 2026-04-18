@@ -84,7 +84,7 @@ def _dep_component(
         line_number=line_number,
         framework="",
         detection_source=DetectionSource.DEPENDENCY_MANIFEST,
-        confidence=1.0,
+        heuristic_confidence=1.0,
         metadata={
             "local": True,
             "local_path": local_path,

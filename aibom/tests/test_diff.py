@@ -49,7 +49,7 @@ def test_identical_reports_no_changes() -> None:
             name="m1",
             component_type=AIComponentType.MODEL,
             file_path="a.py",
-            confidence=0.9,
+            heuristic_confidence=0.9,
             model_name="gpt-4",
             needs_agentic=False,
             framework="openai",
@@ -102,7 +102,7 @@ def test_changed_confidence_model_name_needs_agentic() -> None:
             name="m",
             component_type=AIComponentType.MODEL,
             file_path="f.py",
-            confidence=0.5,
+            heuristic_confidence=0.5,
             model_name="old-model",
             needs_agentic=False,
             framework="x",
@@ -113,7 +113,7 @@ def test_changed_confidence_model_name_needs_agentic() -> None:
             name="m",
             component_type=AIComponentType.MODEL,
             file_path="f.py",
-            confidence=0.99,
+            heuristic_confidence=0.99,
             model_name="new-model",
             needs_agentic=True,
             framework="x",
@@ -124,7 +124,7 @@ def test_changed_confidence_model_name_needs_agentic() -> None:
     assert d.removed == []
     assert len(d.changed) == 1
     ch = d.changed[0]
-    assert set(ch.changes) == {"confidence", "model_name", "needs_agentic"}
+    assert set(ch.changes) == {"heuristic_confidence", "model_name", "needs_agentic"}
     assert ch.before.model_name == "old-model"
     assert ch.after.model_name == "new-model"
 
@@ -153,12 +153,12 @@ def test_changed_framework_and_file_path() -> None:
 
 def test_mixed_add_remove_change() -> None:
     old = _scan([
-        AIComponent(name="keep", component_type=AIComponentType.MODEL, file_path="a.py", confidence=1.0),
+        AIComponent(name="keep", component_type=AIComponentType.MODEL, file_path="a.py", heuristic_confidence=1.0),
         AIComponent(name="remove-me", component_type=AIComponentType.PROMPT, file_path="b.py"),
         AIComponent(name="mutate", component_type=AIComponentType.AGENT, file_path="c.py", framework="a"),
     ])
     new = _scan([
-        AIComponent(name="keep", component_type=AIComponentType.MODEL, file_path="a.py", confidence=1.0),
+        AIComponent(name="keep", component_type=AIComponentType.MODEL, file_path="a.py", heuristic_confidence=1.0),
         AIComponent(name="mutate", component_type=AIComponentType.AGENT, file_path="c.py", framework="b"),
         AIComponent(name="fresh", component_type=AIComponentType.MODEL, file_path="d.py"),
     ])
@@ -180,7 +180,7 @@ def test_per_type_summary_accuracy() -> None:
     ])
     new = _scan([
         AIComponent(name="m1", component_type=AIComponentType.MODEL, file_path="1.py"),
-        AIComponent(name="m3", component_type=AIComponentType.MODEL, file_path="3.py", confidence=0.2),
+        AIComponent(name="m3", component_type=AIComponentType.MODEL, file_path="3.py", heuristic_confidence=0.2),
     ])
     d = diff_scan_results(old, new)
     bt = d.summary["by_type"]

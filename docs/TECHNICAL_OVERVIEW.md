@@ -9,7 +9,7 @@
 | **Knowledge Base Loader** | Resolves a local DuckDB catalog path (from env or manifest), verifies SHA-256, and returns the validated file path. |
 | **Source Resolver** | Distinguishes local paths, container images, and remote repos. For images, runs tiered container extraction (Docker/Podman/nerdctl/Buildah/Skopeo/Crane/tarball). For remote repos, clones via platform adapters (GitHub/GitLab/Bitbucket). |
 | **Scan Pipeline** | Four-stage orchestrator: Scan → Cross-Ref → Agentic → Assemble. Runs all registered scanners, resolves env-var references, classifies all candidates via the mandatory LLM agent, and applies filtering. |
-| **Scanners (21 built-in)** | Pluggable scanner registry with `__init_subclass__` auto-registration. Each scanner implements `scan(ctx) → (components, relationships)`. Covers models, dependencies, secrets, vulnerabilities, MCP, ML lifecycle, cloud, CI/CD, deployments, containers, data files, config, skills, workflows, and more. |
+| **Scanners (23 built-in)** | Pluggable scanner registry with `__init_subclass__` auto-registration. Each scanner implements `scan(ctx) → (components, relationships)`. Covers models, dependencies, secrets, vulnerabilities, MCP, A2A/remote agents, structural agent detection, ML lifecycle, cloud, CI/CD, deployments, containers, data files, config, skills, workflows, and more. |
 | **Cross-Reference Index** | Builds env-var and package indexes across all scanned files. Resolves env-var references to concrete values (model names, API keys, endpoints) by correlating source code with `.env`, `docker-compose.yaml`, Helm values, and Terraform files. |
 | **Agentic Layer** | Mandatory LLM-powered classification via Deep Agents + LangChain. Every scanner candidate is confirmed or rejected by the agent. Two-tier classification (simple/complex candidates), locality-aware batching, sub-agent dispatch, structured output parsing, content-hash caching, and circuit breaker. |
 | **Policy Engine** | YAML-driven pass/fail gates: max risk score, required/blocked component types, required fields, and custom rules. |
@@ -24,7 +24,7 @@
 4. **Source Acquisition** — For each source: detect container image vs local path vs remote repo. Extract container images via the tiered extractor. Clone remote repos via platform adapters.
 5. **Scan Pipeline Stage 1: Scan** — Run all registered scanners against the source files. Each scanner produces components and relationships. File I/O uses async caching for performance.
 6. **Scan Pipeline Stage 2: Cross-Ref** — Build env-var and package indexes. Resolve env-var references (`os.getenv("MODEL_NAME")`) to concrete values by correlating across files, `.env`, docker-compose, Helm, and Terraform.
-7. **Scan Pipeline Stage 3: Agentic** — Classify all candidates into simple/complex tiers. Run locality-aware batched LLM classification. The agent confirms, rejects, reclassifies, or enriches each candidate using tools (`read_file_lines`, `search_package_info`). Apply structured output (enrichments, new components, removals, risk findings). Cache results by content hash.
+7. **Scan Pipeline Stage 3: Agentic** — Classify all candidates into simple/complex tiers. Run locality-aware batched LLM classification. The agent confirms, rejects, reclassifies, or enriches each candidate using tools (`read_file_snippet`, `search_codebase`, `trace_data_flow`, `search_package_info`, `analyze_imports`, `lookup_model`, `resolve_env_var`). Apply structured output (enrichments, new components, removals, risk findings). Cache results by content hash.
 8. **Scan Pipeline Stage 4: Assemble** — Apply `--strict` filtering (drop `needs_agentic` items), collect counts and timing, build the final `PipelineResult`, and ensure final findings carry decision annotations.
 9. **Reporting** — Route `PipelineResult` to the selected reporter. Convert container temp paths to container-style paths. Build per-source summaries, schema version metadata, and run metadata.
 10. **Post-Processing** — Optionally POST the JSON report with retries or upload an already-generated JSON report, run policy checks, display compliance advisories, render Rich console summary.
@@ -55,6 +55,9 @@ BaseScanner
 ├── WorkflowScanner        — Workflow/call-graph context attachment
 ├── WorkspaceDepScanner    — Monorepo local path dependency detection
 ├── ShadowAIDetector       — Shadow AI / unmanaged AI usage patterns
+├── StructuralAgentScanner — CST-based agent instantiation detection (framework-agnostic)
+├── A2ADetector            — A2A Agent Card detection (agent.json / well-known endpoints)
+├── RemoteAgentResolver    — Phase-4 remote agent reference resolution (cross-file correlation)
 └── (Plugin scanners via entry point: aibom.scanners)
 ```
 
@@ -103,27 +106,32 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `repo_triage.py` | Agent-first repository triage — tool-using agent explores repos (directory tree, file reading, codebase search, package registry) to decide deep-scan vs skip. |
 | `report_sender.py` | POST JSON reports with retry/backoff. |
 | `workflow_analyzer.py` | AST-based function index and call graph for workflow context. |
-| `models/enums.py` | `AIComponentType` (24 types), `Severity`, `Confidence` enums. |
+| `models/enums.py` | `AIComponentType` (30 types), `Severity`, `Confidence` enums. |
 | `models/scan.py` | `AIComponent`, `ComponentRelationship`, `RiskFlag`, `ScanContext`, `ScanResult` dataclasses. |
 
 ## 5. Component Types
 
-The analyzer recognizes 24 AI component types:
+The analyzer recognizes 30 AI component types (defined in `models/enums.py::AIComponentType`):
 
 | Type | Description |
 |------|-------------|
 | `model` | AI/ML models (LLMs, embeddings, classifiers). |
+| `llm_endpoint` | Hosted LLM inference endpoints (OpenAI, Azure, Bedrock, vLLM, etc.). |
+| `model_endpoint` | Generic served-model endpoints (non-LLM inference services). |
 | `agent` | Autonomous AI agents. |
+| `agent_proxy` | Local code that invokes a remote A2A agent (wraps the agent, not itself an agent). |
 | `tool` | Tools available to agents. |
 | `mcp_server` | Model Context Protocol servers. |
 | `mcp_client` | Model Context Protocol clients. |
+| `mcp_gateway` | MCP gateways/multiplexers fronting one or more MCP servers. |
 | `embedding` | Embedding models and services. |
 | `vector_store` | Vector databases and stores. |
 | `dataset` | Datasets used in ML pipelines. |
-| `prompt` | Prompt templates and chains. |
-| `guardrail` | Safety and content filters. |
-| `memory` | Agent memory and state stores. |
 | `retriever` | RAG retrievers and search components. |
+| `knowledge_base` | Curated knowledge bases used for retrieval/grounding. |
+| `feature_store` | ML feature stores. |
+| `memory` | Agent memory and state stores. |
+| `prompt` | Prompt templates and chains. |
 | `training_run` | Model training/finetuning invocations. |
 | `hyperparameter` | ML hyperparameter configurations. |
 | `model_artifact` | Serialized model files. |
@@ -131,6 +139,7 @@ The analyzer recognizes 24 AI component types:
 | `model_registry` | Model registries and catalogs. |
 | `data_versioning` | Dataset versioning tools (DVC, etc.). |
 | `ml_pipeline` | ML pipeline orchestrators. |
+| `guardrail` | Safety and content filters. |
 | `skill` | AI skills and capabilities. |
 | `observability` | AI observability tools (LangSmith, Langfuse, etc.). |
 | `secret` | Hardcoded API keys, tokens, credentials. |
@@ -160,7 +169,7 @@ The agentic layer is the mandatory final classifier. Scanners generate candidate
 
 1. **Candidate triage** — All candidates are split into "simple" (registry-confirmable: known model IDs, manifest dependencies) and "complex" (ambiguous type, missing model name, multi-file reasoning needed).
 2. **Locality-aware batching** — Candidates are grouped by parent directory, then split into batches of configurable size (CLI default `5`). This provides coherent code context per batch.
-3. **Agent tools** — The agent uses `read_file_lines` (inspect source), `search_package_info` (query PyPI/npm/Go registries for dependency metadata), and code context to make decisions.
+3. **Agent tools** — The agent uses `read_file_snippet` (inspect source), `search_codebase` (regex-style search across the scanned tree), `trace_data_flow` (follow a symbol's assignments and call sites), `search_package_info` (query PyPI/npm/Go registries for dependency metadata), `analyze_imports` (parse a file's import graph), `lookup_model` (resolve a model identifier against the curated catalog), and `resolve_env_var` (resolve an env-var reference to its concrete value) to make decisions.
 4. **Structured output** — Each batch returns JSON with `enriched_components`, `new_components`, `remove_components`, and `risk_findings`. The agent must explicitly confirm or remove every candidate.
 5. **Content-hash caching** — Each component's cache key is derived from its file path, line number, name, type, and surrounding code content. Unchanged components reuse cached LLM results from the shared cache root.
 6. **Circuit breaker** — After N consecutive batch failures, remaining batches are skipped to prevent runaway costs.
@@ -182,7 +191,7 @@ Components referencing env vars (e.g., `os.getenv("MODEL_NAME")`) are resolved t
 - Catalog lookup uses suffix matching on fully qualified symbol names.
 - The KB is used for enrichment: matching detected symbols against known AI framework components to add category, framework, and metadata.
 - Custom entries from `.aibom.yaml` are merged with lowest precedence (DuckDB > supplemental > custom).
-- KB management via CLI: `kb download`, `kb check`, `kb info`, `kb verify`, `kb request`.
+- KB management via CLI: `kb download`, `kb check`, `kb info`, `kb verify`, `kb request`, `kb request-status`, `kb list-requests`.
 
 ## 10. Report Submission
 

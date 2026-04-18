@@ -64,7 +64,7 @@ def test_owasp4_high_confidence_secret_fails():
     sec = AIComponent(
         name="leak",
         component_type=AIComponentType.SECRET,
-        confidence=0.95,
+        heuristic_confidence=0.95,
         file_path="x.py",
     )
     r = evaluate_compliance(ScanResult(sources=[_src([sec])]), ComplianceFramework.OWASP_AGENTIC)

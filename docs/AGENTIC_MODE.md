@@ -20,13 +20,22 @@ Install the agentic extra plus the integration package for your LLM provider:
 
 ```bash
 # OpenAI / Azure OpenAI
-uv tool install "cisco-aibom[agentic,llm-openai]"
+uv tool install --python 3.13 "cisco-aibom[agentic,llm-openai]"
 
 # AWS Bedrock
-uv tool install "cisco-aibom[agentic,llm-aws]"
+uv tool install --python 3.13 "cisco-aibom[agentic,llm-aws]"
+
+# Anthropic Claude (direct API)
+uv tool install --python 3.13 "cisco-aibom[agentic,llm-anthropic]"
+
+# Google Gemini
+uv tool install --python 3.13 "cisco-aibom[agentic,llm-google]"
 
 # Ollama (no extra provider package needed)
-uv tool install "cisco-aibom[agentic]"
+uv tool install --python 3.13 "cisco-aibom[agentic]"
+
+# All providers at once
+uv tool install --python 3.13 "cisco-aibom[all]"
 ```
 
 ## Supported LLM Providers
@@ -134,7 +143,7 @@ Environment variables set in the shell take precedence over `.env` values.
 
 1. **Candidate triage** — After deterministic scanning, all candidates are split into "simple" (registry-confirmable, e.g. known model IDs, manifest dependencies) and "complex" (needs deeper reasoning) tiers.
 2. **Locality-aware batching** — Candidates are grouped by directory to provide better code context per batch.
-3. **Agent tools** — The agent has access to tools: `read_file_lines`, `search_package_info` (queries PyPI/npm/Go registries), and code context. It uses these to confirm or reject each candidate.
+3. **Agent tools** — The agent has access to tools: `read_file_snippet` (inspect source), `search_codebase` (regex-style search across the scanned tree), `trace_data_flow` (follow a symbol's assignments and call sites), `search_package_info` (queries PyPI/npm/Go registries), `analyze_imports`, `lookup_model`, and `resolve_env_var`. It uses these to confirm or reject each candidate.
 4. **Structured output** — Each batch returns a structured JSON response with confirmed components, removed false positives, reclassifications, relationships, and risk findings. Kept findings carry `decision_annotation` metadata with justification and evidence references. Raw code snippets are only included when `--include-code-snippets` is enabled.
 5. **Caching** — Results are cached by content hash at `~/.aibom/cache/agentic/`. Unchanged components reuse cached results on subsequent runs.
 

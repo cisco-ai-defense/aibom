@@ -660,7 +660,7 @@ def _regex_scan_file(
                 line_number=line,
                 framework=ecosystem,
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.85,
+                heuristic_confidence=0.85,
                 metadata={
                     "ecosystem": ecosystem,
                     "package": pkg,
@@ -682,7 +682,7 @@ def _regex_scan_file(
                 line_number=line,
                 framework=ecosystem,
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.75,
+                heuristic_confidence=0.75,
                 model_name=model_id,
                 metadata={"scanner": "multi_language_scanner"},
             )
@@ -701,7 +701,7 @@ def _regex_scan_file(
                 line_number=line,
                 framework=ecosystem,
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.7,
+                heuristic_confidence=0.7,
                 metadata={"scanner": "multi_language_scanner"},
             )
         )
@@ -719,7 +719,7 @@ def _regex_scan_file(
                 line_number=line,
                 framework=ecosystem,
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.65,
+                heuristic_confidence=0.65,
                 metadata={"scanner": "multi_language_scanner"},
             )
         )
@@ -780,7 +780,7 @@ def _regex_scan_file(
                                     line_number=ln,
                                     framework=ecosystem,
                                     detection_source=DetectionSource.CODE_ANALYSIS,
-                                    confidence=0.3,
+                                    heuristic_confidence=0.3,
                                     model_name=val,
                                     needs_agentic=True,
                                     agentic_hint=f"'model: {val}' without AI SDK imports in file",
@@ -804,7 +804,7 @@ def _regex_scan_file(
                         line_number=ln,
                         framework=ecosystem,
                         detection_source=DetectionSource.CODE_ANALYSIS,
-                        confidence=0.25,
+                        heuristic_confidence=0.25,
                         needs_agentic=True,
                         agentic_hint="'new Agent()' without AI SDK imports in file",
                         metadata={"scanner": "multi_language_scanner"},
@@ -828,7 +828,7 @@ def _regex_scan_file(
                             line_number=ln,
                             framework=ecosystem,
                             detection_source=DetectionSource.CODE_ANALYSIS,
-                            confidence=0.25,
+                            heuristic_confidence=0.25,
                             needs_agentic=True,
                             agentic_hint="Tool pattern without AI SDK imports in file",
                             metadata={"scanner": "multi_language_scanner"},

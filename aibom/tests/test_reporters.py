@@ -189,7 +189,7 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
     analysis = data["aibom_analysis"]
     assert analysis["metadata"]["analyzer_version"] == "2.0.0-test"
     assert analysis["metadata"]["run_id"] == "run-test-001"
-    assert analysis["metadata"]["report_schema_version"] == "1"
+    assert analysis["metadata"]["report_schema_version"] == "2"
     source_keys = set(analysis["sources"].keys())
     assert source_keys == {"alpha", "beta"}
     for src_path, src_data in analysis["sources"].items():
@@ -258,6 +258,96 @@ def test_json_reporter_disambiguates_colliding_source_names(sample_scan_result: 
     assert sources["dup"]["source_path"] == "/proj/src/alpha"
     assert sources["dup#2"]["source_name"] == "dup"
     assert sources["dup#2"]["source_path"] == "/proj/src/beta"
+
+
+def test_json_reporter_omits_component_summary_by_default(sample_scan_result: ScanResult):
+    buf = StringIO()
+    JsonReporter().render(sample_scan_result, buf)
+    data = json.loads(buf.getvalue())
+
+    assert "component_summary" not in data["aibom_analysis"]
+
+
+def test_json_reporter_emits_component_summary_when_enabled(sample_scan_result: ScanResult):
+    buf = StringIO()
+    JsonReporter(include_component_summary=True).render(sample_scan_result, buf)
+    data = json.loads(buf.getvalue())
+
+    analysis = data["aibom_analysis"]
+    assert "component_summary" in analysis
+    summary = analysis["component_summary"]
+
+    assert set(summary.keys()) == set(analysis["sources"].keys()) == {"alpha", "beta"}
+
+    alpha_entries = summary["alpha"]
+    assert alpha_entries == [
+        {
+            "component_type": "agent",
+            "name": "alpha-agent",
+            "file_path": "/proj/src/alpha",
+            "line_number": 20,
+        },
+        {
+            "component_type": "model",
+            "name": "alpha-model",
+            "file_path": "/proj/src/alpha",
+            "line_number": 10,
+        },
+        {
+            "component_type": "tool",
+            "name": "alpha-tool",
+            "file_path": "/proj/src/alpha",
+            "line_number": 30,
+        },
+    ]
+
+    assert [e["name"] for e in summary["beta"]] == [
+        "beta-agent",
+        "beta-model",
+        "beta-tool",
+    ]
+
+    keys = list(analysis.keys())
+    assert keys.index("component_summary") == keys.index("summary") + 1
+    assert keys.index("component_summary") < keys.index("risk")
+
+
+def test_json_reporter_component_summary_excludes_test_only():
+    real_agent = AIComponent(
+        name="router_agent",
+        component_type=AIComponentType.AGENT,
+        file_path="/proj/src/app.py",
+        line_number=12,
+    )
+    test_fixture_agent = AIComponent(
+        name="fixture_agent",
+        component_type=AIComponentType.AGENT,
+        file_path="/proj/tests/test_app.py",
+        line_number=7,
+        metadata={"test_only": True},
+    )
+    result = ScanResult(
+        metadata={"analyzer_version": "2.0.0-test", "run_id": "run-test-only"},
+        sources=[
+            SourceResult(
+                path="/proj/src",
+                components=[real_agent, test_fixture_agent],
+                relationships=[],
+            )
+        ],
+        risk=RiskScore(),
+    )
+
+    buf = StringIO()
+    JsonReporter(include_component_summary=True).render(result, buf)
+    data = json.loads(buf.getvalue())
+
+    src_entry = data["aibom_analysis"]["sources"]["src"]
+    agent_names_in_sources = {c["name"] for c in src_entry["components"]["agent"]}
+    assert agent_names_in_sources == {"router_agent", "fixture_agent"}
+
+    summary_entries = data["aibom_analysis"]["component_summary"]["src"]
+    assert [e["name"] for e in summary_entries] == ["router_agent"]
 
 
 def test_plaintext_reporter_render(sample_scan_result: ScanResult):

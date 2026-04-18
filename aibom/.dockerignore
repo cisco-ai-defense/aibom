@@ -35,7 +35,6 @@ Thumbs.db
 
 # Docker files (don't include in context)
 Dockerfile
-Dockerfile.agentic
 docker-compose.yml
 .dockerignore
 

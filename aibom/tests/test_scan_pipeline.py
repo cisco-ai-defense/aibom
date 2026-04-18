@@ -7,8 +7,13 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from aibom.agentic.agent import TokenUsage
 from aibom.models import AIComponent, AIComponentType
 from aibom.scan_pipeline import ScanPipeline, StageTiming
+
+
+def _stub_token_usage() -> TokenUsage:
+    return TokenUsage()
 
 
 class TestScanPipeline:
@@ -154,7 +159,7 @@ class TestAgenticScope:
         )
         with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
             with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
-                mock_enrich.return_value = ([], [], [])
+                mock_enrich.return_value = ([], [], [], _stub_token_usage())
                 result = pipeline.run()
         mock_enrich.assert_called_once()
 
@@ -171,7 +176,7 @@ class TestAgenticScope:
         )
         with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
             with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
-                mock_enrich.return_value = ([], [], [])
+                mock_enrich.return_value = ([], [], [], _stub_token_usage())
                 pipeline.run()
         assert mock_enrich.call_args.kwargs["cache_dir"] == agentic_cache_dir
 
@@ -187,7 +192,7 @@ class TestAgenticScope:
         )
         with patch("aibom.scan_pipeline.ensure_llm_runtime_available") as mock_runtime:
             with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
-                mock_enrich.return_value = ([], [], [])
+                mock_enrich.return_value = ([], [], [], _stub_token_usage())
                 pipeline.run()
         mock_runtime.assert_called_once()
         assert mock_enrich.call_args.kwargs["include_code_snippets"] is True
@@ -319,12 +324,12 @@ class TestFanoutAgenticResults:
             AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
         ]
         deduped, fanout = _dedup_for_agentic(comps)
-        rep = deduped[0].model_copy(update={"confidence": 0.95, "needs_agentic": False})
+        rep = deduped[0].model_copy(update={"heuristic_confidence": 0.95, "needs_agentic": False})
 
         result = _fanout_agentic_results([rep], fanout)
         assert len(result) == 2
         for c in result:
-            assert c.confidence == 0.95
+            assert c.heuristic_confidence == 0.95
             assert c.needs_agentic is False
 
     def test_fanout_propagates_removal(self):
@@ -348,7 +353,7 @@ class TestFanoutAgenticResults:
         deduped, fanout = _dedup_for_agentic(comps)
         rep = deduped[0].model_copy(update={
             "component_type": AIComponentType.MODEL_ENDPOINT,
-            "confidence": 0.9,
+            "heuristic_confidence": 0.9,
             "needs_agentic": False,
         })
 
@@ -402,6 +407,147 @@ class TestPropagateRemovals:
 
         assert [c.name for c in result] == ["gpt-5"]
 
+    def test_import_only_removal_does_not_kill_usage_sibling(self):
+        """Regression: LLM removing an import-line ``Agent`` must NOT cascade
+        to a usage-line ``agent = Agent(...)`` sibling that shares the same
+        canonical consolidation key.
+
+        ``kb_enrichment_scanner`` emits a weak, import-inferred Agent at
+        ``from strands import Agent`` lines (tagged with
+        ``metadata['import_statement']``). The LLM correctly removes those
+        import-only detections (imports alone are not agents).
+
+        However, ``_consolidation_key`` lowercases both names:
+          * import-line  name='Agent' -> canonical 'agent'
+          * usage-line   name='agent' -> canonical 'agent'  (from the
+            assignment target ``agent = Agent(...)``)
+
+        Before this fix, propagation killed the usage-line agent, wiping
+        every real Strands agent from the scan. The fix treats
+        import-only removals as weak: their removal propagates only to
+        other import-only siblings, never to usage/assignment lines.
+
+        Verified against scan cache on the AWS Strands sample repo where
+        0 agents survived until this propagation logic was corrected.
+        """
+        from aibom.scan_pipeline import _propagate_removals
+
+        import_agent = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="lab/async_example.py",
+            line_number=2,
+            framework="",
+            metadata={"import_statement": "from strands import Agent"},
+        )
+        usage_agent = AIComponent(
+            name="agent",
+            component_type=AIComponentType.AGENT,
+            file_path="lab/async_example.py",
+            line_number=6,
+            framework="strands",
+            metadata={
+                "call_pattern": "strands.Agent",
+                "assigned_to": "agent",
+            },
+        )
+
+        result = _propagate_removals(
+            sent=[import_agent, usage_agent],
+            received=[usage_agent],
+            pre_fanout_removed_ids={import_agent.instance_id},
+        )
+
+        names = [c.name for c in result]
+        assert "agent" in names, (
+            "usage-line 'agent = Agent(...)' must survive when only the "
+            "import-only Agent was removed by the LLM; got kept: "
+            f"{[(c.name, c.line_number, c.metadata.get('import_statement')) for c in result]}"
+        )
+        assert "Agent" not in names, (
+            "the import-only Agent should still be dropped by the LLM "
+            "verdict even though we no longer propagate that removal"
+        )
+
+    def test_import_only_removal_still_propagates_to_other_imports(self):
+        """Weak (import-only) removals must still take out other
+        import-only siblings sharing the same canonical key.
+
+        This preserves one side of the original deduplication intent:
+        the LLM only needs to reject an import-inferred agent once; every
+        other ``from X import Foo`` in the repo is also invalid evidence.
+        """
+        from aibom.scan_pipeline import _propagate_removals
+
+        import_a = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="lab/a.py",
+            line_number=2,
+            metadata={"import_statement": "from strands import Agent"},
+        )
+        import_b = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="lab/b.py",
+            line_number=3,
+            metadata={"import_statement": "from strands import Agent"},
+        )
+
+        result = _propagate_removals(
+            sent=[import_a, import_b],
+            received=[import_b],
+            pre_fanout_removed_ids={import_a.instance_id},
+        )
+
+        assert result == [], (
+            "both import-only Agent detections must be dropped when the "
+            "LLM removes either; got: "
+            f"{[(c.name, c.file_path) for c in result]}"
+        )
+
+    def test_substantive_removal_still_propagates_to_import_sibling(self):
+        """Original behaviour guard: a substantive (non-import) removal
+        must still cascade to weak, import-only siblings.
+
+        This is the scenario the propagation logic was designed for —
+        the LLM rejects a usage-line component after inspection; every
+        import referring to that same class must also be removed because
+        it was inferred from that rejected usage.
+        """
+        from aibom.scan_pipeline import _propagate_removals
+
+        usage_agent = AIComponent(
+            name="agent",
+            component_type=AIComponentType.AGENT,
+            file_path="lab/single_llm_call.py",
+            line_number=15,
+            framework="strands",
+            metadata={
+                "call_pattern": "strands.Agent",
+                "assigned_to": "agent",
+            },
+        )
+        import_agent = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="lab/single_llm_call.py",
+            line_number=1,
+            metadata={"import_statement": "from strands import Agent"},
+        )
+
+        result = _propagate_removals(
+            sent=[usage_agent, import_agent],
+            received=[import_agent],
+            pre_fanout_removed_ids={usage_agent.instance_id},
+        )
+
+        assert result == [], (
+            "when the LLM removes a usage-line agent the import-only "
+            "sibling must also be dropped; got: "
+            f"{[(c.name, c.metadata.get('import_statement')) for c in result]}"
+        )
+
 
 class TestDefaultBomScope:
     def test_stage_assemble_excludes_test_only_components(self):
@@ -410,7 +556,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.TOOL,
             file_path="repo/tests/test_agent.py",
             line_number=10,
-            confidence=0.8,
+            heuristic_confidence=0.8,
         )
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
@@ -425,7 +571,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.MODEL,
             file_path="repo/src/orchestrator/test_firewall_routing.py",
             line_number=14,
-            confidence=0.8,
+            heuristic_confidence=0.8,
         )
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
@@ -440,7 +586,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.MODEL,
             file_path="repo/src/orchestrator/firewall_routing_test.py",
             line_number=21,
-            confidence=0.8,
+            heuristic_confidence=0.8,
         )
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
@@ -455,7 +601,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.MODEL,
             file_path="repo/src/orchestrator/testimony_router.py",
             line_number=8,
-            confidence=0.8,
+            heuristic_confidence=0.8,
         )
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
@@ -469,7 +615,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.PROMPT,
             file_path="repo/fixtures/sample_prompt.py",
             line_number=4,
-            confidence=0.8,
+            heuristic_confidence=0.8,
         )
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
@@ -484,14 +630,14 @@ class TestDefaultBomScope:
             component_type=AIComponentType.MODEL,
             file_path="repo/app/service.py",
             line_number=12,
-            confidence=0.9,
+            heuristic_confidence=0.9,
         )
         test = AIComponent(
             name="gpt-4o",
             component_type=AIComponentType.MODEL,
             file_path="repo/tests/test_service.py",
             line_number=18,
-            confidence=0.7,
+            heuristic_confidence=0.7,
         )
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
@@ -507,7 +653,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.LLM_ENDPOINT,
             file_path="repo/.github/workflows/ai-review.yml",
             line_number=42,
-            confidence=0.8,
+            heuristic_confidence=0.8,
         )
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
@@ -525,7 +671,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.MODEL,
             file_path="repo/app/service.py",
             line_number=12,
-            confidence=0.9,
+            heuristic_confidence=0.9,
             needs_agentic=False,
         )
         test = AIComponent(
@@ -533,7 +679,7 @@ class TestDefaultBomScope:
             component_type=AIComponentType.TOOL,
             file_path="repo/tests/test_agent.py",
             line_number=10,
-            confidence=0.8,
+            heuristic_confidence=0.8,
             needs_agentic=False,
         )
         kept_rel = ComponentRelationship(
@@ -623,7 +769,7 @@ class TestDependencyPolicyScope:
             component_type=AIComponentType.MODEL,
             file_path="repo/app/service.py",
             line_number=12,
-            confidence=0.9,
+            heuristic_confidence=0.9,
             needs_agentic=False,
             model_name="gpt-4o",
         )
@@ -632,7 +778,7 @@ class TestDependencyPolicyScope:
             component_type=AIComponentType.TOOL,
             file_path="repo/tests/test_agent.py",
             line_number=10,
-            confidence=0.8,
+            heuristic_confidence=0.8,
             needs_agentic=False,
         )
         kept_rel = ComponentRelationship(
@@ -664,3 +810,443 @@ class TestDependencyPolicyScope:
 
         assert [c.name for c in result.components] == ["gpt-4o"]
         assert result.relationships == [kept_rel]
+
+
+class TestSymmetricEvidenceGate:
+    """Regression tests for the symmetric ``agent_evidence`` gate.
+
+    Historically ``_evidence_gate`` accepted any post-agentic
+    ``AGENT`` / ``AGENT_PROXY`` without rechecking the citation, which
+    meant structural-scanner emissions bypassed the same verification
+    the middleware applied to LLM verdicts. After the symmetric-gate
+    fix:
+
+    * Structural emissions must carry verifiable ``agent_evidence`` —
+      missing or invalid citations cause the component to be dropped.
+    * LLM type-flips to agent must also carry verifiable evidence
+      (belt-and-braces check; the middleware already enforces this
+      at Phase 6).
+    * KB / framework agents (no structural marker, no type flip) are
+      left alone — their authority comes from the framework match, not
+      from a code citation.
+    """
+
+    @staticmethod
+    def _make_class_file(
+        tmp_path: Path, filename: str, source: str
+    ) -> tuple[str, int, int]:
+        """Write *source* to *filename* under *tmp_path* and return
+        (absolute_path, class_start_line, class_end_line).
+        """
+        path = tmp_path / filename
+        path.write_text(source, encoding="utf-8")
+        lines = source.splitlines()
+        class_start = next(
+            i + 1 for i, line in enumerate(lines)
+            if line.lstrip().startswith("class ")
+        )
+        return str(path), class_start, len(lines)
+
+    def test_structural_emission_without_evidence_is_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        from aibom.scan_pipeline import _evidence_gate
+
+        source = (
+            "from openai import OpenAI\n"
+            "class TracedLoop:\n"
+            "    def run(self, x):\n"
+            "        return x\n"
+        )
+        file_path, class_start, class_end = self._make_class_file(
+            tmp_path, "traced.py", source
+        )
+        before = AIComponent(
+            name="TracedLoop",
+            component_type=AIComponentType.AGENT,
+            file_path=file_path,
+            line_number=class_start,
+            framework="unknown",
+            metadata={
+                "discovery": "structural_react_loop",
+                "class_start_line": class_start,
+                "class_end_line": class_end,
+            },
+        )
+        after = before.model_copy()
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert kept == [], (
+            "A structural agent emission without agent_evidence must "
+            "be dropped by the symmetric gate."
+        )
+
+    def test_structural_emission_with_valid_evidence_is_kept(
+        self, tmp_path: Path
+    ) -> None:
+        from aibom.scan_pipeline import _evidence_gate
+
+        source = (
+            "from openai import OpenAI\n"
+            "class TracedLoop:\n"
+            "    def run(self, x):\n"
+            "        return x\n"
+        )
+        file_path, class_start, class_end = self._make_class_file(
+            tmp_path, "traced.py", source
+        )
+        snippet = "\n".join(
+            source.splitlines()[class_start - 1:class_end]
+        )
+        before = AIComponent(
+            name="TracedLoop",
+            component_type=AIComponentType.AGENT,
+            file_path=file_path,
+            line_number=class_start,
+            framework="unknown",
+            metadata={
+                "discovery": "structural_react_loop",
+                "agent_evidence": {
+                    "pattern": "react_loop",
+                    "definition_file": file_path,
+                    "definition_start_line": class_start,
+                    "definition_end_line": class_end,
+                    "evidence_snippet": snippet,
+                    "justification": "structural",
+                },
+            },
+        )
+        after = before.model_copy()
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert len(kept) == 1
+        assert kept[0].name == "TracedLoop"
+
+    def test_structural_emission_with_stale_snippet_is_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """A citation whose snippet does not appear in the cited range
+        must be dropped — this is how the gate detects hallucinated or
+        stale evidence.
+        """
+        from aibom.scan_pipeline import _evidence_gate
+
+        source = (
+            "from openai import OpenAI\n"
+            "class TracedLoop:\n"
+            "    def run(self, x):\n"
+            "        return x\n"
+        )
+        file_path, class_start, class_end = self._make_class_file(
+            tmp_path, "traced.py", source
+        )
+        before = AIComponent(
+            name="TracedLoop",
+            component_type=AIComponentType.AGENT,
+            file_path=file_path,
+            line_number=class_start,
+            framework="unknown",
+            metadata={
+                "discovery": "structural_react_loop",
+                "agent_evidence": {
+                    "pattern": "react_loop",
+                    "definition_file": file_path,
+                    "definition_start_line": class_start,
+                    "definition_end_line": class_end,
+                    "evidence_snippet": "SNIPPET_THAT_IS_NOT_IN_FILE",
+                    "justification": "structural",
+                },
+            },
+        )
+        after = before.model_copy()
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert kept == []
+
+    def test_llm_type_flip_without_evidence_is_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """If the LLM reclassifies a non-agent component to AGENT but
+        the middleware somehow failed to attach evidence, the pipeline
+        gate must still drop it.
+        """
+        from aibom.scan_pipeline import _evidence_gate
+
+        source = (
+            "class Endpoint:\n"
+            "    def run(self, x):\n"
+            "        return x\n"
+        )
+        file_path, class_start, class_end = self._make_class_file(
+            tmp_path, "endpoint.py", source
+        )
+        before = AIComponent(
+            name="Endpoint",
+            component_type=AIComponentType.TOOL,
+            file_path=file_path,
+            line_number=class_start,
+        )
+        after = before.model_copy(
+            update={"component_type": AIComponentType.AGENT},
+        )
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert kept == []
+
+    def test_kb_agent_without_structural_marker_is_kept(
+        self, tmp_path: Path
+    ) -> None:
+        """An AGENT that did not come from the structural scanner and
+        was not reclassified by the LLM (type did not change) is left
+        alone by the symmetric gate — its authority comes from whichever
+        framework / KB scanner matched it, not from a code citation.
+        """
+        from aibom.scan_pipeline import _evidence_gate
+
+        source = "class FrameworkAgent:\n    pass\n"
+        file_path, class_start, _class_end = self._make_class_file(
+            tmp_path, "framework_agent.py", source
+        )
+        before = AIComponent(
+            name="FrameworkAgent",
+            component_type=AIComponentType.AGENT,
+            file_path=file_path,
+            line_number=class_start,
+            framework="langchain",
+        )
+        after = before.model_copy()
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert len(kept) == 1
+        assert kept[0].name == "FrameworkAgent"
+
+
+class TestCanonicalizeEnvVarNames:
+    """Regression tests for the env-var name canonicalizer.
+
+    Every env-var naming shape emitted by any scanner must canonicalize
+    to the resolved literal when ``model_name`` holds a concrete model id.
+    See :func:`aibom.scan_pipeline._canonicalize_env_var_names`.
+    """
+
+    def _make_component(
+        self,
+        *,
+        name: str,
+        model_name: str,
+        ctype: AIComponentType = AIComponentType.MODEL,
+        meta: dict[str, object] | None = None,
+    ) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=ctype,
+            file_path="/tmp/fixture/config",
+            line_number=1,
+            model_name=model_name,
+            metadata=dict(meta or {}),
+        )
+
+    def test_bare_env_var_name_canonicalizes(self) -> None:
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = self._make_component(
+            name="ANTHROPIC_MODEL",
+            model_name="claude-sonnet-4-20250514",
+            meta={"env_var": "ANTHROPIC_MODEL"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert len(out) == 1
+        assert out[0].name == "claude-sonnet-4-20250514"
+        assert out[0].metadata.get("env_var") == "ANTHROPIC_MODEL"
+
+    def test_env_colon_prefix_canonicalizes(self) -> None:
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = self._make_component(
+            name="env:OPENAI_MODEL",
+            model_name="gpt-5",
+            meta={"env_var": "OPENAI_MODEL"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "gpt-5"
+
+    def test_env_model_prefix_canonicalizes(self) -> None:
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = self._make_component(
+            name="env_model_ANTHROPIC_MODEL",
+            model_name="claude-sonnet-4-20250514",
+            meta={"env_var": "ANTHROPIC_MODEL", "config_kind": ".env"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "claude-sonnet-4-20250514"
+        assert out[0].metadata.get("env_var") == "ANTHROPIC_MODEL"
+        assert out[0].metadata.get("config_kind") == ".env"
+
+    def test_env_embedding_prefix_canonicalizes(self) -> None:
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = self._make_component(
+            name="env_embedding_EMBED_MODEL",
+            model_name="text-embedding-3-large",
+            ctype=AIComponentType.EMBEDDING,
+            meta={"env_var": "EMBED_MODEL", "config_kind": ".env"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "text-embedding-3-large"
+        assert out[0].component_type == AIComponentType.EMBEDDING
+
+    def test_dockerfile_env_prefix_with_env_metadata_key_canonicalizes(
+        self,
+    ) -> None:
+        """Dockerfile ENV uses ``metadata["env"]`` rather than ``env_var``.
+
+        The widened canonicalizer must accept either metadata key so
+        that Dockerfile-sourced MODEL components are promoted too.
+        """
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = self._make_component(
+            name="dockerfile_env_OPENAI_MODEL",
+            model_name="gpt-4o",
+            meta={"env": "OPENAI_MODEL", "config_kind": "Dockerfile"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "gpt-4o"
+
+    def test_skip_when_model_name_null(self) -> None:
+        """Components with no resolved literal must be left alone."""
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = AIComponent(
+            name="env_model_CODEX_MODEL",
+            component_type=AIComponentType.MODEL,
+            file_path="/tmp/fixture/config",
+            line_number=1,
+            model_name=None,
+            metadata={"env_var": "CODEX_MODEL"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "env_model_CODEX_MODEL"
+
+    def test_skip_endpoint_url_in_model_name(self) -> None:
+        """URLs stored in ``model_name`` must not become a MODEL name."""
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = self._make_component(
+            name="env_model_OPENAI_API_BASE",
+            model_name="https://api.openai.com",
+            meta={"env_var": "OPENAI_API_BASE"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "env_model_OPENAI_API_BASE"
+
+    def test_skip_unresolved_placeholder(self) -> None:
+        """``${VAR}`` placeholders must not be promoted to a name."""
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = self._make_component(
+            name="env_model_OPENAI_MODEL",
+            model_name="${OPENAI_MODEL}",
+            meta={"env_var": "OPENAI_MODEL"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "env_model_OPENAI_MODEL"
+
+    def test_endpoint_type_never_touched(self) -> None:
+        """LLM_ENDPOINT / MODEL_ENDPOINT components never promote — endpoints
+        keep their URL-or-``env:VAR`` shape decided by the endpoint owner."""
+        from aibom.scan_pipeline import _canonicalize_env_var_names
+
+        c = AIComponent(
+            name="env:AZURE_OPENAI_ENDPOINT",
+            component_type=AIComponentType.LLM_ENDPOINT,
+            file_path="/tmp/fixture/config",
+            line_number=1,
+            model_name="https://example.openai.azure.com/",
+            metadata={"env_var": "AZURE_OPENAI_ENDPOINT"},
+        )
+        out = _canonicalize_env_var_names([c])
+        assert out[0].name == "env:AZURE_OPENAI_ENDPOINT"
+
+
+class TestPipelineEnvPrefixInvariant:
+    """Pipeline-level invariant: no MODEL/EMBEDDING component with a
+    resolved literal ``model_name`` leaves the pipeline carrying an
+    ``env_*`` / ``dockerfile_env_*`` naming prefix.
+
+    This guards against the whole class of regressions where a scanner
+    emits a prefix-shaped name and later stages fail to promote it.
+    """
+
+    _FORBIDDEN_PREFIXES = ("env_model_", "env_embedding_", "dockerfile_env_")
+
+    def test_dotenv_model_does_not_leak_env_prefix(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".env").write_text(
+            "ANTHROPIC_MODEL=claude-sonnet-4-20250514\n"
+            "EMBED_MODEL=text-embedding-3-large\n"
+        )
+        (tmp_path / "app.py").write_text(
+            'import os\nfrom anthropic import Anthropic\n'
+            'client = Anthropic()\n'
+            'resp = client.messages.create(\n'
+            '    model=os.getenv("ANTHROPIC_MODEL"),\n'
+            '    messages=[]\n'
+            ')\n'
+        )
+        pipeline = ScanPipeline(scan_paths=[str(tmp_path)])
+        result = pipeline.run()
+
+        for c in result.components:
+            if c.component_type not in (
+                AIComponentType.MODEL, AIComponentType.EMBEDDING,
+            ):
+                continue
+            if not (isinstance(c.model_name, str) and c.model_name):
+                continue
+            for prefix in self._FORBIDDEN_PREFIXES:
+                assert not c.name.startswith(prefix), (
+                    f"env-var prefix leaked into final BOM: "
+                    f"name={c.name!r}, model_name={c.model_name!r}"
+                )
+
+    def test_dockerfile_env_model_does_not_leak_prefix(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "Dockerfile").write_text(
+            "FROM python:3.11-slim\n"
+            "ENV OPENAI_MODEL=gpt-4o\n"
+            "CMD [\"python\", \"app.py\"]\n"
+        )
+        pipeline = ScanPipeline(scan_paths=[str(tmp_path)])
+        result = pipeline.run()
+
+        for c in result.components:
+            if c.component_type not in (
+                AIComponentType.MODEL, AIComponentType.EMBEDDING,
+            ):
+                continue
+            if not (isinstance(c.model_name, str) and c.model_name):
+                continue
+            for prefix in self._FORBIDDEN_PREFIXES:
+                assert not c.name.startswith(prefix), (
+                    f"Dockerfile env prefix leaked into final BOM: "
+                    f"name={c.name!r}, model_name={c.model_name!r}"
+                )

@@ -38,6 +38,7 @@ _EXPECTED_AI_COMPONENT_TYPES: dict[str, str] = {
     "LLM_ENDPOINT": "llm_endpoint",
     "MODEL_ENDPOINT": "model_endpoint",
     "AGENT": "agent",
+    "AGENT_PROXY": "agent_proxy",
     "TOOL": "tool",
     "MCP_SERVER": "mcp_server",
     "MCP_CLIENT": "mcp_client",
@@ -128,7 +129,7 @@ def test_ai_component_optional_defaults():
     assert c.line_number == 0
     assert c.framework == ""
     assert c.detection_source == DetectionSource.CODE_ANALYSIS
-    assert c.confidence == 1.0
+    assert c.heuristic_confidence == 1.0
     assert c.model_name is None
     assert c.embedding_model is None
     assert c.description is None

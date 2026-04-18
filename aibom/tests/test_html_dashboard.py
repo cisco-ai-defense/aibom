@@ -53,7 +53,7 @@ def test_html_dashboard_with_graph_and_tables():
         component_type=AIComponentType.AGENT,
         file_path="/app/agent.py",
         line_number=1,
-        confidence=0.9,
+        heuristic_confidence=0.9,
     )
     tool = AIComponent(
         name="my-tool",
@@ -80,7 +80,7 @@ def test_html_dashboard_with_graph_and_tables():
         line_number=5,
         model_name="gpt-test",
         framework="openai",
-        confidence=0.95,
+        heuristic_confidence=0.95,
     )
     rels = [
         ComponentRelationship(

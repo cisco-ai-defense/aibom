@@ -321,7 +321,7 @@ def check_owasp_mcp_guardrails(scan: ScanResult, req: ComplianceRequirement) -> 
 def check_owasp_secret_management(scan: ScanResult, req: ComplianceRequirement) -> ComplianceCheckResult:
     secrets = [
         c for c in scan.all_components
-        if c.component_type == AIComponentType.SECRET and c.confidence >= _SECRET_HIGH_CONFIDENCE
+        if c.component_type == AIComponentType.SECRET and c.heuristic_confidence >= _SECRET_HIGH_CONFIDENCE
     ]
     if not secrets:
         return ComplianceCheckResult(

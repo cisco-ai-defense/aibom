@@ -36,6 +36,8 @@ _PROVIDER_IMPORT_HINTS: dict[str, tuple[str, str]] = {
     "openai": ("langchain_openai", 'cisco-aibom[agentic,llm-openai]'),
     "azure_openai": ("langchain_openai", 'cisco-aibom[agentic,llm-openai]'),
     "bedrock": ("langchain_aws", 'cisco-aibom[agentic,llm-aws]'),
+    "anthropic": ("langchain_anthropic", 'cisco-aibom[agentic,llm-anthropic]'),
+    "google_genai": ("langchain_google_genai", 'cisco-aibom[agentic,llm-google]'),
 }
 
 

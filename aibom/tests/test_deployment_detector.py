@@ -88,10 +88,11 @@ data:
       VECTOR_DB_TYPE: chroma
 """
         comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
-        matches = [c for c in comps if c.name == "env:WEAVIATE_ENDPOINT"]
+        matches = [c for c in comps if c.name == "http://vector.example.internal"]
         assert len(matches) == 1
         comp = matches[0]
         assert comp.component_type == AIComponentType.VECTOR_STORE
+        assert comp.metadata.get("env_var") == "WEAVIATE_ENDPOINT"
         assert comp.needs_agentic is True
         assert comp.metadata.get("store_technology") == "chromadb"
         assert "vector_db_type" in comp.agentic_hint.lower()
@@ -108,7 +109,7 @@ data:
         comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
         endpoint_url = "https://example.openai.azure.com/"
         assert any(
-            c.component_type == AIComponentType.MODEL_ENDPOINT
+            c.component_type == AIComponentType.LLM_ENDPOINT
             and c.metadata.get("endpoint_url") == endpoint_url
             for c in comps
         )
@@ -123,7 +124,7 @@ data:
             for c in comps
         )
 
-    def test_helm_endpoint_with_sibling_engine_is_model_endpoint(self, tmp_path: Path) -> None:
+    def test_helm_azure_endpoint_with_sibling_engine_is_llm_endpoint(self, tmp_path: Path) -> None:
         yml = """env:
   AZURE:
     CHAT_SERVICE:
@@ -133,17 +134,12 @@ data:
         comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
         endpoint_url = "https://example.openai.azure.com/"
         assert any(
-            c.component_type == AIComponentType.MODEL_ENDPOINT
-            and c.metadata.get("endpoint_url") == endpoint_url
-            for c in comps
-        )
-        assert not any(
             c.component_type == AIComponentType.LLM_ENDPOINT
             and c.metadata.get("endpoint_url") == endpoint_url
             for c in comps
         )
 
-    def test_helm_endpoint_with_sibling_model_name_is_model_endpoint(self, tmp_path: Path) -> None:
+    def test_helm_azure_endpoint_with_sibling_model_name_is_llm_endpoint(self, tmp_path: Path) -> None:
         yml = """env:
   CHAT_SERVICE:
     ENDPOINT: https://example.openai.azure.com/
@@ -152,11 +148,6 @@ data:
         comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
         endpoint_url = "https://example.openai.azure.com/"
         assert any(
-            c.component_type == AIComponentType.MODEL_ENDPOINT
-            and c.metadata.get("endpoint_url") == endpoint_url
-            for c in comps
-        )
-        assert not any(
             c.component_type == AIComponentType.LLM_ENDPOINT
             and c.metadata.get("endpoint_url") == endpoint_url
             for c in comps
@@ -488,3 +479,36 @@ data:
         ctx = ScanContext(paths=[str(tmp_path)])
         comps, _ = DeploymentDetector().scan(ctx)
         assert len(comps) == 0
+
+
+class TestObservabilityEndpointDetection:
+    """Fix 2: Helm keys matching observability platform tokens emit OBSERVABILITY."""
+
+    def test_langsmith_endpoint_classified_as_observability(self, tmp_path: Path) -> None:
+        yml = """env:
+  LANGSMITH:
+    API_ENDPOINT: https://tracing.example.com/api/v1
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        obs = [c for c in comps if c.component_type == AIComponentType.OBSERVABILITY]
+        assert len(obs) >= 1
+        assert any("tracing.example.com" in c.name for c in obs)
+
+    def test_mlflow_endpoint_classified_as_observability(self, tmp_path: Path) -> None:
+        yml = """env:
+  MLFLOW:
+    TRACKING_ENDPOINT: https://mlflow.internal.example.com
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        obs = [c for c in comps if c.component_type == AIComponentType.OBSERVABILITY]
+        assert len(obs) >= 1
+
+    def test_non_observability_key_not_affected(self, tmp_path: Path) -> None:
+        yml = """env:
+  AZURE:
+    CHAT_SERVICE:
+      ENDPOINT: https://example.openai.azure.com/
+"""
+        comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
+        obs = [c for c in comps if c.component_type == AIComponentType.OBSERVABILITY]
+        assert len(obs) == 0

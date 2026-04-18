@@ -26,7 +26,7 @@ import httpx
 import pytest
 import respx
 
-from aibom.kb.manager import DEFAULT_API_BASE, KBError, KBManager
+from aibom.kb.manager import KBError, KBManager
 from aibom.kb.manifest import KBManifest, KBManifestIndex
 
 HELLO_SHA256 = (
@@ -267,7 +267,7 @@ def test_kb_manager_request_build_calls_endpoint_and_payload():
     with patch("aibom.kb.manager.httpx.Client", return_value=mock_client):
         out = mgr.request_build("openai", "1.0", api_key="k", api_base="https://api.example")
 
-    expected_url = "https://api.example/api/v1/aibom/kb/requests"
+    expected_url = "https://api.example/api/ai-defense/v1/aibom/kb/requests"
     mock_client.post.assert_called_once()
     call_kw = mock_client.post.call_args
     assert call_kw[0][0] == expected_url
@@ -287,7 +287,44 @@ def test_kb_manager_request_build_missing_api_key_raises():
     env = {k: v for k, v in os.environ.items() if k != "CISCO_AI_DEFENSE_API_KEY"}
     with patch.dict(os.environ, env, clear=True):
         with pytest.raises(KBError, match="API key required"):
-            mgr.request_build("x", "1.0", api_key=None)
+            mgr.request_build(
+                "x",
+                "1.0",
+                api_key=None,
+                api_base="https://api.example",
+            )
+
+
+def test_kb_manager_request_build_missing_api_base_raises():
+    mgr = KBManager()
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"CISCO_AI_DEFENSE_API_BASE", "CISCO_AI_DEFENSE_API_KEY"}
+    }
+    with patch.dict(os.environ, env, clear=True):
+        with pytest.raises(KBError, match="API base URL required"):
+            mgr.request_build("x", "1.0", api_key="k")
+
+
+def test_kb_manager_download_missing_manifest_url_raises():
+    env = {
+        k: v for k, v in os.environ.items() if k != "CISCO_AIBOM_MANIFEST_URL"
+    }
+    with patch.dict(os.environ, env, clear=True):
+        mgr = KBManager()
+        with pytest.raises(KBError, match="KB manifest URL required"):
+            mgr.download()
+
+
+def test_kb_manager_check_missing_manifest_url_raises():
+    env = {
+        k: v for k, v in os.environ.items() if k != "CISCO_AIBOM_MANIFEST_URL"
+    }
+    with patch.dict(os.environ, env, clear=True):
+        mgr = KBManager()
+        with pytest.raises(KBError, match="KB manifest URL required"):
+            mgr.check()
 
 
 def test_kb_manager_request_status_calls_get_endpoint():
@@ -306,10 +343,13 @@ def test_kb_manager_request_status_calls_get_endpoint():
     mock_client.__exit__.return_value = None
 
     with patch("aibom.kb.manager.httpx.Client", return_value=mock_client):
-        out = mgr.request_status("rid", api_key="k")
+        out = mgr.request_status(
+            "rid",
+            api_key="k",
+            api_base="https://api.example",
+        )
 
-    base = DEFAULT_API_BASE.rstrip("/")
-    expected = f"{base}/api/v1/aibom/kb/requests/rid"
+    expected = "https://api.example/api/ai-defense/v1/aibom/kb/requests/rid"
     mock_client.get.assert_called_once_with(
         expected,
         headers={"x-cisco-ai-defense-tenant-api-key": "k"},
@@ -336,10 +376,9 @@ def test_kb_manager_list_requests_returns_list():
     mock_client.__exit__.return_value = None
 
     with patch("aibom.kb.manager.httpx.Client", return_value=mock_client):
-        items = mgr.list_requests(api_key="k")
+        items = mgr.list_requests(api_key="k", api_base="https://api.example")
 
-    base = DEFAULT_API_BASE.rstrip("/")
-    expected = f"{base}/api/v1/aibom/kb/requests"
+    expected = "https://api.example/api/ai-defense/v1/aibom/kb/requests"
     mock_client.get.assert_called_once_with(
         expected,
         headers={"x-cisco-ai-defense-tenant-api-key": "k"},
@@ -361,7 +400,7 @@ def test_kb_manager_list_requests_accepts_plain_list():
     mock_client.__exit__.return_value = None
 
     with patch("aibom.kb.manager.httpx.Client", return_value=mock_client):
-        items = mgr.list_requests(api_key="k")
+        items = mgr.list_requests(api_key="k", api_base="https://api.example")
     assert items == [{"r": 1}]
 
 

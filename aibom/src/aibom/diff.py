@@ -51,8 +51,8 @@ def _count_by_type(components: list[AIComponent]) -> dict[str, int]:
 
 def _collect_changes(before: AIComponent, after: AIComponent) -> list[str]:
     changes: list[str] = []
-    if before.confidence != after.confidence:
-        changes.append("confidence")
+    if before.heuristic_confidence != after.heuristic_confidence:
+        changes.append("heuristic_confidence")
     if before.model_name != after.model_name:
         changes.append("model_name")
     if before.needs_agentic != after.needs_agentic:

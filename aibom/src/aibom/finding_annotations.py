@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .models import (
     AIComponent,
+    AIComponentType,
     CodeSnippet,
     ComponentRelationship,
     DecisionAnnotation,
@@ -112,13 +113,28 @@ def _component_annotation(
         )
 
     evidence_locations = [primary_location] if primary_location is not None else []
-    annotation = DecisionAnnotation(
-        decision="confirmed",
-        justification=(
+
+    is_prompt_without_text = (
+        component.component_type == AIComponentType.PROMPT
+        and not component.text
+    )
+    if is_prompt_without_text:
+        justification = (
+            f"Prompt '{component.name}' detected but prompt text was not "
+            f"extracted; it may be loaded from a file at runtime."
+        )
+        evidence_kinds = ["code_context", "file_loaded_limitation"] if evidence_locations else ["file_loaded_limitation"]
+    else:
+        justification = (
             f"Kept in the final AIBOM because the scan identified "
             f"{component.component_type.value.replace('_', ' ')} '{component.name}'."
-        ),
-        evidence_kinds=["code_context"] if evidence_locations else ["scan_result"],
+        )
+        evidence_kinds = ["code_context"] if evidence_locations else ["scan_result"]
+
+    annotation = DecisionAnnotation(
+        decision="confirmed",
+        justification=justification,
+        evidence_kinds=evidence_kinds,
         evidence_locations=evidence_locations,
     )
     return _hydrate_annotation(

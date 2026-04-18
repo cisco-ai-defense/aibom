@@ -89,6 +89,7 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 | `--compliance` | Advisory compliance mapping: `eu-ai-act`, `owasp-agentic`, `nist-ai-rmf`, or `all`. |
 | `--cache-dir` | Shared cache root. Defaults to `~/.aibom/cache` and stores `scan`, `agentic`, `org`, `model`, and `packages` caches beneath it. |
 | `--include-code-snippets` / `--no-code-snippets` | Include raw code snippets in per-finding decision annotations. Off by default. |
+| `--component-summary` / `--no-component-summary` | When `--output-format=json`, include a flat `component_summary` key in the report listing each non-test component as `{component_type, name, file_path, line_number}`, grouped by source and sorted by `(component_type, name)`. Intended for quick human review and demos; the full structured output is unchanged. Off by default. |
 
 ### Examples
 
@@ -273,10 +274,10 @@ Manage the AIBOM knowledge base (DuckDB catalog).
 cisco-aibom kb download [OPTIONS]
 ```
 
-| Option | Description |
-|--------|-------------|
-| `--version`, `-v` | Specific KB version to download (latest if omitted). |
-| `--url` | Override the manifest URL. |
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--version`, `-v` | — | Specific KB version to download (latest if omitted). |
+| `--url` | `CISCO_AIBOM_MANIFEST_URL` | Manifest URL. Required: pass `--url` or set the env var. No default is shipped. |
 
 ### `kb check`
 
@@ -315,20 +316,35 @@ cisco-aibom kb request [OPTIONS]
 | `--sdk` | — | SDK name, e.g. `langchain`, `openai` (required). |
 | `--version`, `-v` | — | SDK version to request (required). |
 | `--language`, `-l` | — | Programming language (default `python`). |
-| `--api-key` | `CISCO_AI_DEFENSE_API_KEY` | Cisco AI Defense API key. |
-| `--api-base` | `CISCO_AI_DEFENSE_API_BASE` | Cisco AI Defense API base URL. |
+| `--api-key` | `CISCO_AI_DEFENSE_API_KEY` | Cisco AI Defense tenant API key (required). |
+| `--api-base` | `CISCO_AI_DEFENSE_API_BASE` | Regional Cisco AI Defense API host (required). Follows the same pattern as `AIBOM_POST_URL`: `https://api.security.cisco.com` (US), `https://api.eu.security.cisco.com` (EU), `https://api.apj.security.cisco.com` (APJ), `https://api.uae.security.cisco.com` (UAE). No default is shipped. |
 
 ### `kb request-status`
+
+Check the status of a KB build request previously submitted via `kb request`.
 
 ```bash
 cisco-aibom kb request-status REQUEST_ID [OPTIONS]
 ```
 
+| Argument / Option | Env Var | Description |
+|-------------------|---------|-------------|
+| `REQUEST_ID` | — | Request ID returned by `kb request` (required). |
+| `--api-key` | `CISCO_AI_DEFENSE_API_KEY` | Cisco AI Defense tenant API key (required). |
+| `--api-base` | `CISCO_AI_DEFENSE_API_BASE` | Regional Cisco AI Defense API host (required). Same regional hosts as `kb request` (e.g. `https://api.security.cisco.com`, `https://api.eu.security.cisco.com`). No default is shipped. |
+
 ### `kb list-requests`
+
+List all pending KB build requests for the authenticated tenant.
 
 ```bash
 cisco-aibom kb list-requests [OPTIONS]
 ```
+
+| Option | Env Var | Description |
+|--------|---------|-------------|
+| `--api-key` | `CISCO_AI_DEFENSE_API_KEY` | Cisco AI Defense tenant API key (required). |
+| `--api-base` | `CISCO_AI_DEFENSE_API_BASE` | Regional Cisco AI Defense API host (required). Same regional hosts as `kb request` (e.g. `https://api.security.cisco.com`, `https://api.eu.security.cisco.com`). No default is shipped. |
 
 ---
 
@@ -423,5 +439,6 @@ cisco-aibom plugin list
 | `AIBOM_DB_SHA256` | Expected SHA-256 checksum for the DuckDB catalog. |
 | `AIBOM_MANIFEST_PATH` | Override path to `manifest.json`. |
 | `CISCO_AI_DEFENSE_API_KEY` | API key for KB request commands. |
-| `CISCO_AI_DEFENSE_API_BASE` | API base URL for KB request commands. |
+| `CISCO_AI_DEFENSE_API_BASE` | Regional API base URL for KB request commands. Same regional hosts as `AIBOM_POST_URL` (e.g. `https://api.security.cisco.com`, `https://api.eu.security.cisco.com`). No default. |
+| `CISCO_AIBOM_MANIFEST_URL` | KB manifest URL for `kb download` / `kb check`. No default. |
 | `AZURE_SUBSCRIPTION_ID` | Azure subscription ID for cloud scanning. |

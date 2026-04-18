@@ -30,6 +30,7 @@ from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
 from .file_cache import read_text_cached
+from .kb_enrichment_scanner import OBSERVABILITY_PLATFORM_TOKENS as _OBSERVABILITY_PLATFORM_TOKENS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -129,8 +130,8 @@ def _is_known_model(value: str) -> bool:
     stripped = value.strip()
     if _NOT_MODEL_RE.search(stripped):
         return False
-    from .model_detector import _registry_lookup
-    return _registry_lookup(stripped) is not None
+    from .model_detector import registry_lookup
+    return registry_lookup(stripped) is not None
 
 _LLM_ENDPOINT_ENV_KEYS: frozenset[str] = frozenset({
     "AZURE_OPENAI_ENDPOINT", "OPENAI_API_BASE",
@@ -165,13 +166,7 @@ _EMBEDDING_HINTS: frozenset[str] = frozenset({
     "embedding", "embeddings", "embed", "embedder",
 })
 
-_MODEL_ENDPOINT_HINTS: frozenset[str] = frozenset({
-    "sagemaker", "inference", "serving", "vllm",
-})
 
-_MODEL_ENDPOINT_SELECTOR_HINTS: frozenset[str] = frozenset({
-    "engine", "deployment",
-})
 
 _SECRET_ENV_NAMES: frozenset[str] = frozenset({
     "OPENAI_API_KEY",
@@ -205,8 +200,8 @@ def _model_registry_entry(value: str) -> Optional[dict[str, Any]]:
     stripped = value.strip()
     if not stripped:
         return None
-    from .model_detector import _registry_lookup
-    return _registry_lookup(stripped)
+    from .model_detector import registry_lookup
+    return registry_lookup(stripped)
 
 
 def _is_embedding_model_value(value: str) -> bool:
@@ -257,29 +252,6 @@ def _explicit_vector_backend(
     return None, None
 
 
-def _has_model_endpoint_selector(
-    sibling_values: Optional[dict[str, Any]],
-) -> bool:
-    if sibling_values is None:
-        return False
-
-    for sibling_key, sibling_val in sibling_values.items():
-        if not isinstance(sibling_key, str) or not isinstance(sibling_val, str):
-            continue
-
-        stripped = sibling_val.strip()
-        if not stripped or stripped.startswith(("http://", "https://")):
-            continue
-
-        tokens = _key_tokens(sibling_key)
-        if tokens & _MODEL_ENDPOINT_SELECTOR_HINTS:
-            return True
-        if "model" in tokens and tokens & {"id", "name"}:
-            return True
-
-    return False
-
-
 def _endpoint_component_details(
     key_path: str,
     value: str,
@@ -299,24 +271,32 @@ def _endpoint_component_details(
     if hinted_technology is not None:
         return AIComponentType.VECTOR_STORE, hinted_technology, False, None
 
-    if _has_model_endpoint_selector(sibling_values):
-        return AIComponentType.MODEL_ENDPOINT, None, False, None
+    key_tokens = _key_tokens(key_path)
+    if key_tokens & _OBSERVABILITY_PLATFORM_TOKENS:
+        return AIComponentType.OBSERVABILITY, None, False, None
 
-    tokens = _key_tokens(key_path)
-    if sibling_values is not None:
-        parent_path = key_path.rsplit(".", 1)[0]
-        for sibling_key, sibling_val in sibling_values.items():
-            if not isinstance(sibling_key, str) or not isinstance(sibling_val, str):
+    from .endpoint_classifier import classify_endpoint
+    from .model_detector import registry_lookup
+
+    paired_model = ""
+    if sibling_values:
+        for sv in sibling_values.values():
+            if not isinstance(sv, str) or not sv.strip():
                 continue
-            sibling_path = f"{parent_path}.{sibling_key}" if parent_path else sibling_key
-            if _model_component_type_for_value(sibling_path, sibling_val) == AIComponentType.EMBEDDING:
-                return AIComponentType.MODEL_ENDPOINT, None, False, None
+            candidate = sv.strip()
+            if candidate.startswith(("http://", "https://")):
+                continue
+            if registry_lookup(candidate) is not None:
+                paired_model = candidate
+                break
 
-    if tokens & _EMBEDDING_HINTS:
-        return AIComponentType.MODEL_ENDPOINT, None, False, None
-    if tokens & _MODEL_ENDPOINT_HINTS:
-        return AIComponentType.MODEL_ENDPOINT, None, False, None
-    return AIComponentType.LLM_ENDPOINT, None, False, None
+    cls = classify_endpoint(value, context_key=key_path, paired_model=paired_model)
+    type_map = {
+        "llm_endpoint": AIComponentType.LLM_ENDPOINT,
+        "model_endpoint": AIComponentType.MODEL_ENDPOINT,
+        "vector_store": AIComponentType.VECTOR_STORE,
+    }
+    return type_map.get(cls, AIComponentType.LLM_ENDPOINT), None, False, None
 
 
 def _endpoint_component_type(
@@ -407,7 +387,7 @@ def _emit(
     model_name: str | None = None,
     description: str | None = None,
     metadata: dict[str, Any] | None = None,
-    confidence: float = 1.0,
+    heuristic_confidence: float = 1.0,
     needs_agentic: bool = False,
     agentic_hint: str = "",
 ) -> AIComponent:
@@ -421,7 +401,7 @@ def _emit(
         model_name=model_name,
         description=description,
         metadata=metadata or {},
-        confidence=confidence,
+        heuristic_confidence=heuristic_confidence,
         needs_agentic=needs_agentic,
         agentic_hint=agentic_hint,
     )
@@ -650,7 +630,7 @@ def _parse_k8s_yaml(
                             ln,
                             model_name=av.strip(),
                             metadata={"annotation": str(ak)},
-                            confidence=0.95,
+                            heuristic_confidence=0.95,
                         )
                     )
         return out
@@ -668,16 +648,25 @@ def _parse_k8s_yaml(
                 if ek in _AI_ENV_NAMES and isinstance(ev, str) and ev.strip():
                     ln = _line_for_needle(raw, ev) if raw else 1
                     comp_type = _classify_env(ek, ev)
+                    ev_stripped = ev.strip()
+                    is_ep = comp_type in (
+                        AIComponentType.LLM_ENDPOINT,
+                        AIComponentType.MODEL_ENDPOINT,
+                        AIComponentType.VECTOR_STORE,
+                    )
+                    is_ml = comp_type in (AIComponentType.MODEL, AIComponentType.EMBEDDING)
+                    cm_meta: dict[str, Any] = {"config_key": ek}
+                    if is_ep and ev_stripped:
+                        cm_meta["endpoint_url"] = ev_stripped
+                        cm_meta["env_var"] = ek
                     out.append(
                         _emit(
                             f"env:{ek}",
                             comp_type,
                             fp,
                             ln,
-                            model_name=ev.strip()
-                            if comp_type in (AIComponentType.MODEL, AIComponentType.EMBEDDING)
-                            else None,
-                            metadata={"config_key": ek},
+                            model_name=ev_stripped if (is_ml or is_ep) else None,
+                            metadata=cm_meta,
                         )
                     )
                 if isinstance(ev, str):
@@ -692,7 +681,7 @@ def _parse_k8s_yaml(
                                 ln,
                                 model_name=stripped,
                                 metadata={"config_key": ek},
-                                confidence=0.95,
+                                heuristic_confidence=0.95,
                             )
                         )
         return out
@@ -743,20 +732,29 @@ def _parse_k8s_yaml(
                 val = ent.get("value", "")
                 if not isinstance(val, str):
                     val = ""
-                comp_type = _classify_env(ename, val)
-                ln = _line_for_needle(raw, ename) if raw else 1
-                out.append(
-                    _emit(
-                        f"env:{ename}",
-                        comp_type,
-                        fp,
-                        ln,
-                        model_name=val.strip() or None
-                        if comp_type in (AIComponentType.MODEL, AIComponentType.EMBEDDING)
-                        else None,
-                        metadata={"env": ename},
+                    comp_type = _classify_env(ename, val)
+                    ln = _line_for_needle(raw, ename) if raw else 1
+                    stripped_val = val.strip() or None
+                    is_endpoint = comp_type in (
+                        AIComponentType.LLM_ENDPOINT,
+                        AIComponentType.MODEL_ENDPOINT,
+                        AIComponentType.VECTOR_STORE,
                     )
-                )
+                    is_model_like = comp_type in (AIComponentType.MODEL, AIComponentType.EMBEDDING)
+                    k8s_meta: dict[str, Any] = {"env": ename}
+                    if is_endpoint and stripped_val:
+                        k8s_meta["endpoint_url"] = stripped_val
+                        k8s_meta["env_var"] = ename
+                    out.append(
+                        _emit(
+                            f"env:{ename}",
+                            comp_type,
+                            fp,
+                            ln,
+                            model_name=stripped_val if (is_model_like or is_endpoint) else None,
+                            metadata=k8s_meta,
+                        )
+                    )
             limits_check = res.get("limits") or {}
             gpu = False
             for gk in limits_check:
@@ -777,6 +775,74 @@ def _parse_k8s_yaml(
                     )
 
     return out
+
+
+_HELM_TEMPLATE_ENV_RE = re.compile(
+    r"-\s*name:\s*(\S+)\s*\n\s*value:\s*.*?\.Values\.(\S+?)[\s\}]",
+)
+
+_helm_env_map_cache: dict[str, dict[str, str]] = {}
+
+
+def _build_helm_env_var_map(chart_dir: Path) -> dict[str, str]:
+    """Parse Helm deployment templates to map Values dot-paths to injected env var names.
+
+    Scans ``templates/**/*.yaml`` for patterns like::
+
+        - name: MY_LLM_ENDPOINT
+          value: {{ .Values.config.llm.ENDPOINT }}
+
+    Returns a dict mapping ``config.llm.ENDPOINT`` -> ``MY_LLM_ENDPOINT``.
+    """
+    cache_key = str(chart_dir)
+    if cache_key in _helm_env_map_cache:
+        return _helm_env_map_cache[cache_key]
+
+    result: dict[str, str] = {}
+    templates_dir = chart_dir / "templates"
+    if not templates_dir.is_dir():
+        _helm_env_map_cache[cache_key] = result
+        return result
+
+    for tmpl_path in templates_dir.rglob("*.yaml"):
+        try:
+            content = tmpl_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _HELM_TEMPLATE_ENV_RE.finditer(content):
+            env_name = m.group(1).strip('"').strip("'")
+            values_path = m.group(2).strip()
+            if values_path.endswith((" ", "}", "|")):
+                values_path = values_path.rstrip(" }|")
+            result[values_path] = env_name
+
+    _helm_env_map_cache[cache_key] = result
+    if result:
+        _LOGGER.debug(
+            "Helm env var map for %s: %d mappings", chart_dir.name, len(result),
+        )
+    return result
+
+
+def _resolve_helm_env_var(
+    values_file: Path, helm_dot_path: str, leaf_key: str,
+) -> str:
+    """Resolve the injected env var name for a Helm values dot-path.
+
+    Walks up from the values file to find the chart root (containing
+    ``Chart.yaml`` or ``templates/``), builds the env var map, and looks up
+    the dot-path.  Falls back to the leaf key if no mapping is found.
+    """
+    d = values_file.parent
+    for _ in range(5):
+        if (d / "Chart.yaml").exists() or (d / "templates").is_dir():
+            env_map = _build_helm_env_var_map(d)
+            return env_map.get(helm_dot_path, leaf_key)
+        parent = d.parent
+        if parent == d:
+            break
+        d = parent
+    return leaf_key
 
 
 def _walk_helm_values(
@@ -812,6 +878,10 @@ def _walk_helm_values(
                     )
                 elif _is_known_model(stripped):
                     comp_type = _model_component_type_for_value(sub, stripped)
+                    model_env = _resolve_helm_env_var(Path(file_path), sub, k)
+                    model_meta: dict[str, Any] = {"helm_key": sub}
+                    if model_env != k:
+                        model_meta["env_var"] = model_env
                     out.append(
                         _emit(
                             stripped[:120],
@@ -819,8 +889,8 @@ def _walk_helm_values(
                             file_path,
                             ln,
                             model_name=stripped,
-                            metadata={"helm_key": sub},
-                            confidence=0.95,
+                            metadata=model_meta,
+                            heuristic_confidence=0.95,
                         )
                     )
                 elif (
@@ -856,19 +926,23 @@ def _walk_helm_values(
                         )
                     else:
                         hint = ""
-                    metadata = {"helm_key": sub, "endpoint_url": stripped}
+                    resolved_env = _resolve_helm_env_var(
+                        Path(file_path), sub, k,
+                    )
+                    metadata = {"helm_key": sub, "endpoint_url": stripped, "env_var": resolved_env}
                     if store_technology is not None:
                         metadata["store_technology"] = store_technology
                     if selector_key is not None:
                         metadata["backend_selector_key"] = selector_key
                     out.append(
                         _emit(
-                            f"env:{k}",
+                            stripped,
                             comp_type,
                             file_path,
                             ln,
+                            model_name=None,
                             metadata=metadata,
-                            confidence=confidence,
+                            heuristic_confidence=confidence,
                             needs_agentic=needs_agentic,
                             agentic_hint=hint,
                         )
@@ -876,6 +950,10 @@ def _walk_helm_values(
                 elif _helm_key_suggests_model(sub) and stripped and len(stripped) < 120:
                     hint = _azure_deployment_hint(sub, stripped)
                     comp_type = _model_component_type_for_value(sub, stripped)
+                    suggest_env = _resolve_helm_env_var(Path(file_path), sub, k)
+                    suggest_meta: dict[str, Any] = {"helm_key": sub}
+                    if suggest_env != k:
+                        suggest_meta["env_var"] = suggest_env
                     out.append(
                         _emit(
                             stripped[:120],
@@ -883,8 +961,8 @@ def _walk_helm_values(
                             file_path,
                             ln,
                             model_name=stripped,
-                            metadata={"helm_key": sub},
-                            confidence=0.5,
+                            metadata=suggest_meta,
+                            heuristic_confidence=0.5,
                             needs_agentic=True,
                             agentic_hint=hint,
                         )
@@ -1003,7 +1081,7 @@ def _parse_terraform_locals(content: str, file_path: str) -> list[AIComponent]:
                         ln,
                         model_name=val.strip(),
                         metadata={"terraform_local": key},
-                        confidence=0.95,
+                        heuristic_confidence=0.95,
                     )
                 )
             if _image_matches_ai(val):
@@ -1047,7 +1125,7 @@ def _parse_terraform(file_path: Path, content: str) -> list[AIComponent]:
                     ln,
                     model_name=default_val.strip(),
                     metadata={"terraform_variable": var_name},
-                    confidence=0.95,
+                    heuristic_confidence=0.95,
                 )
             )
         if _image_matches_ai(default_val):
@@ -1159,7 +1237,7 @@ def _parse_cloudformation(file_path: Path, data: dict[str, Any]) -> list[AICompo
                             1,
                             model_name=default.strip(),
                             metadata={"cfn_parameter": str(pname)},
-                            confidence=0.95,
+                            heuristic_confidence=0.95,
                         )
                     )
     return out
@@ -1213,7 +1291,7 @@ def _parse_arm_template(file_path: Path, data: dict[str, Any]) -> list[AICompone
                                         1,
                                         model_name=mname.strip(),
                                         metadata={"arm_deployment": dep.get("name", "")},
-                                        confidence=0.95,
+                                        heuristic_confidence=0.95,
                                     )
                                 )
             if isinstance(props, dict):
@@ -1246,7 +1324,7 @@ def _parse_arm_template(file_path: Path, data: dict[str, Any]) -> list[AICompone
                         1,
                         model_name=default.strip(),
                         metadata={"arm_parameter": str(pname)},
-                        confidence=0.95,
+                        heuristic_confidence=0.95,
                     )
                 )
     return out
@@ -1282,7 +1360,7 @@ def _parse_bicep(file_path: Path, content: str) -> list[AIComponent]:
                     ln,
                     model_name=pval.strip(),
                     metadata={"bicep_param": pname},
-                    confidence=0.95,
+                    heuristic_confidence=0.95,
                 )
             )
     return out

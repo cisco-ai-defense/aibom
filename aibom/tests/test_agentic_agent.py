@@ -213,7 +213,7 @@ class TestRunAgenticEnrichment:
             "aibom.agentic.agent._default_agentic_cache_dir",
             side_effect=AssertionError("default cache dir should not be used"),
         ):
-            comps, rels, flags = run_agentic_enrichment(
+            comps, rels, flags, _usage = run_agentic_enrichment(
                 model_string="test-model",
                 deterministic_components=[],
                 deterministic_relationships=[],
@@ -262,7 +262,7 @@ class TestRunAgenticEnrichment:
                 line_number=1,
             )
         ]
-        comps, rels, flags = run_agentic_enrichment(
+        comps, rels, flags, _usage = run_agentic_enrichment(
             model_string="test-model",
             deterministic_components=det_comps,
             deterministic_relationships=[],
@@ -314,13 +314,13 @@ class TestRunAgenticEnrichment:
             "aibom.agentic.agent._default_agentic_cache_dir",
             return_value=tmp_path / "agentic-cache",
         ):
-            fresh, _, _ = run_agentic_enrichment(
+            fresh, _, _, _ = run_agentic_enrichment(
                 model_string="test-model",
                 deterministic_components=det_comps,
                 deterministic_relationships=[],
                 scan_paths=["/tmp"],
             )
-            cached, _, _ = run_agentic_enrichment(
+            cached, _, _, _ = run_agentic_enrichment(
                 model_string="test-model",
                 deterministic_components=det_comps,
                 deterministic_relationships=[],
@@ -407,14 +407,14 @@ class TestRunAgenticEnrichment:
         ]
         cache_dir = tmp_path / "agentic-cache"
 
-        fresh_components, fresh_rels, fresh_flags = run_agentic_enrichment(
+        fresh_components, fresh_rels, fresh_flags, _ = run_agentic_enrichment(
             model_string="test-model",
             deterministic_components=det_comps_first,
             deterministic_relationships=[],
             scan_paths=["/tmp"],
             cache_dir=cache_dir,
         )
-        cached_components, cached_rels, cached_flags = run_agentic_enrichment(
+        cached_components, cached_rels, cached_flags, _ = run_agentic_enrichment(
             model_string="test-model",
             deterministic_components=det_comps_second,
             deterministic_relationships=[],
@@ -551,7 +551,7 @@ class TestRunAgenticEnrichment:
             line_number=1,
             model_name="gpt-4o",
         )
-        comps, rels, flags = run_agentic_enrichment(
+        comps, rels, flags, _usage = run_agentic_enrichment(
             model_string="bad-model",
             deterministic_components=[comp],
             deterministic_relationships=[],
@@ -588,7 +588,7 @@ class TestRunAgenticEnrichment:
             )
             for i in range(32)
         ]
-        result_comps, _, _ = run_agentic_enrichment(
+        result_comps, _, _, _ = run_agentic_enrichment(
             model_string="test-model",
             deterministic_components=comps,
             deterministic_relationships=[],
@@ -802,7 +802,7 @@ class TestAgenticResultCache:
             description="legacy description",
             framework="legacy",
             metadata={"old": True},
-            confidence=0.2,
+            heuristic_confidence=0.2,
             agentic_hint="stale_hint",
         )
         after = before.model_copy(update={
@@ -810,7 +810,7 @@ class TestAgenticResultCache:
             "description": "",
             "framework": "openai",
             "metadata": {"verified": True},
-            "confidence": 0.97,
+            "heuristic_confidence": 0.97,
             "agentic_hint": "",
             "needs_agentic": False,
         })
@@ -834,7 +834,7 @@ class TestAgenticResultCache:
         assert enriched[0].description == ""
         assert enriched[0].framework == "openai"
         assert enriched[0].metadata == {"verified": True}
-        assert enriched[0].confidence == 0.97
+        assert enriched[0].heuristic_confidence == 0.97
         assert enriched[0].agentic_hint == ""
         assert enriched[0].needs_agentic is False
 
@@ -921,7 +921,7 @@ class TestRunTier:
             line_number=1,
             model_name="gpt-4o",
         )
-        cached = comp.model_copy(update={"confidence": 0.99, "needs_agentic": False})
+        cached = comp.model_copy(update={"heuristic_confidence": 0.99, "needs_agentic": False})
         cache = _AgenticResultCache(tmp_path / "cache")
         cache.put(_tier_cache_key([comp]), _build_tier_cache_payload([cached], [], [], []))
 
@@ -945,8 +945,8 @@ class TestRunTier:
         assert rels == []
         assert flags == []
         assert len(enriched) == 1
-        assert enriched[0].confidence == 0.99
-        assert memo.lookup(comp) == {"action": "keep", "confidence": 0.99}
+        assert enriched[0].heuristic_confidence == 0.99
+        assert memo.lookup(comp) == {"action": "keep", "heuristic_confidence": 0.99}
 
     def test_cache_only_fast_path_populates_memo(self, tmp_path):
         from aibom.agentic.agent import _AgenticResultCache, _DecisionMemo, _component_cache_key, _run_tier
@@ -960,7 +960,7 @@ class TestRunTier:
         )
         cached = comp.model_copy(update={
             "component_type": AIComponentType.MODEL_ENDPOINT,
-            "confidence": 0.91,
+            "heuristic_confidence": 0.91,
             "needs_agentic": False,
         })
         cache = _AgenticResultCache(tmp_path / "cache")
@@ -995,11 +995,11 @@ class TestRunTier:
         assert flags == []
         assert len(enriched) == 1
         assert enriched[0].component_type == AIComponentType.MODEL_ENDPOINT
-        assert enriched[0].confidence == 0.91
+        assert enriched[0].heuristic_confidence == 0.91
         assert memo.lookup(comp) == {
             "action": "reclassify",
             "new_type": "model_endpoint",
-            "confidence": 0.91,
+            "heuristic_confidence": 0.91,
         }
 
 
@@ -1037,13 +1037,13 @@ class TestDecisionMemo:
 
         memo = _DecisionMemo()
         before = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="req.txt", line_number=1)
-        after = before.model_copy(update={"confidence": 0.95, "needs_agentic": False})
+        after = before.model_copy(update={"heuristic_confidence": 0.95, "needs_agentic": False})
 
         memo.record(before, after)
         verdict = memo.lookup(before)
         assert verdict is not None
         assert verdict["action"] == "keep"
-        assert verdict["confidence"] == 0.95
+        assert verdict["heuristic_confidence"] == 0.95
 
     def test_record_and_lookup_remove(self):
         from aibom.agentic.agent import _DecisionMemo
@@ -1061,21 +1061,21 @@ class TestDecisionMemo:
 
         memo = _DecisionMemo()
         before = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="cfg.yaml", line_number=3)
-        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "confidence": 0.9})
+        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "heuristic_confidence": 0.9})
 
         memo.record(before, after)
         verdict = memo.lookup(before)
         assert verdict is not None
         assert verdict["action"] == "reclassify"
         assert verdict["new_type"] == "model_endpoint"
-        assert verdict["confidence"] == 0.9
+        assert verdict["heuristic_confidence"] == 0.9
 
     def test_partition_separates_hits_and_misses(self):
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
         c1 = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a.txt", line_number=1)
-        memo.record(c1, c1.model_copy(update={"confidence": 0.9, "needs_agentic": False}))
+        memo.record(c1, c1.model_copy(update={"heuristic_confidence": 0.9, "needs_agentic": False}))
 
         c1_dup = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="c.txt", line_number=3)
         c2 = AIComponent(name="flask", component_type=AIComponentType.DEPENDENCY, file_path="b.txt", line_number=2)
@@ -1090,11 +1090,11 @@ class TestDecisionMemo:
 
         memo = _DecisionMemo()
         c = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
-        memo.record(c, c.model_copy(update={"confidence": 0.95}))
+        memo.record(c, c.model_copy(update={"heuristic_confidence": 0.95}))
 
         result = memo.apply([c])
         assert len(result) == 1
-        assert result[0].confidence == 0.95
+        assert result[0].heuristic_confidence == 0.95
         assert result[0].needs_agentic is False
 
     def test_apply_removes(self):
@@ -1112,14 +1112,14 @@ class TestDecisionMemo:
 
         memo = _DecisionMemo()
         before = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="x.yaml", line_number=1)
-        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "confidence": 0.85})
+        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "heuristic_confidence": 0.85})
         memo.record(before, after)
 
         dup = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="y.yaml", line_number=5)
         result = memo.apply([dup])
         assert len(result) == 1
         assert result[0].component_type == AIComponentType.MODEL_ENDPOINT
-        assert result[0].confidence == 0.85
+        assert result[0].heuristic_confidence == 0.85
         assert result[0].needs_agentic is False
 
     def test_context_dependent_skips_memo(self):
@@ -1138,7 +1138,7 @@ class TestDecisionMemo:
         memo = _DecisionMemo()
         assert len(memo) == 0
         c = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
-        memo.record(c, c.model_copy(update={"confidence": 0.9}))
+        memo.record(c, c.model_copy(update={"heuristic_confidence": 0.9}))
         assert len(memo) == 1
 
 
@@ -1165,3 +1165,138 @@ class TestSubAgentGrouping:
         ]
         groups = _group_by_top_dir(comps, scan_paths=["/repo"])
         assert len(groups) == 1
+
+
+class TestAgentEvidence:
+    """Schema coverage for the :class:`AgentEvidence` model."""
+
+    def test_all_fields_have_defaults(self):
+        from aibom.agentic.agent import AgentEvidence
+
+        ev = AgentEvidence()
+        assert ev.pattern == "other"
+        assert ev.definition_file == ""
+        assert ev.definition_start_line == 0
+        assert ev.definition_end_line == 0
+        assert ev.evidence_snippet == ""
+        assert ev.justification == ""
+
+    def test_round_trip_preserves_fields(self):
+        from aibom.agentic.agent import AgentEvidence
+
+        ev = AgentEvidence(
+            pattern="react_loop",
+            definition_file="/repo/src/agent.py",
+            definition_start_line=10,
+            definition_end_line=42,
+            evidence_snippet="while not done:\n    tool = llm.invoke(...)",
+            justification="Explicit while loop with LLM and tool dispatch",
+        )
+        payload = ev.model_dump()
+        restored = AgentEvidence.model_validate(payload)
+        assert restored == ev
+
+    def test_rejects_unknown_pattern(self):
+        from pydantic import ValidationError
+
+        from aibom.agentic.agent import AgentEvidence
+
+        with pytest.raises(ValidationError):
+            AgentEvidence(pattern="not_a_real_pattern")
+
+    def test_all_patterns_accepted(self):
+        from aibom.agentic.agent import AgentEvidence
+
+        valid_patterns = (
+            "framework_agent",
+            "react_loop",
+            "framework_inheritance",
+            "a2a_server",
+            "remote_proxy",
+            "other",
+        )
+        for pat in valid_patterns:
+            ev = AgentEvidence(pattern=pat)
+            assert ev.pattern == pat
+
+
+class TestAgentEvidenceOnClassifications:
+    """``agent_evidence`` is an optional field on each classification schema."""
+
+    def test_enriched_component_agent_evidence_defaults_to_none(self):
+        from aibom.agentic.agent import _EnrichedComponent
+
+        ec = _EnrichedComponent(instance_id="x")
+        assert ec.agent_evidence is None
+
+    def test_enriched_component_accepts_agent_evidence(self):
+        from aibom.agentic.agent import AgentEvidence, _EnrichedComponent
+
+        ev = AgentEvidence(pattern="framework_agent", definition_file="a.py")
+        ec = _EnrichedComponent(instance_id="x", agent_evidence=ev)
+        assert ec.agent_evidence is not None
+        assert ec.agent_evidence.pattern == "framework_agent"
+
+    def test_new_component_accepts_agent_evidence(self):
+        from aibom.agentic.agent import AgentEvidence, _NewComponent
+
+        ev = AgentEvidence(pattern="a2a_server", definition_file="a2a.py")
+        nc = _NewComponent(
+            name="my-agent",
+            component_type="agent",
+            file_path="a2a.py",
+            line_number=1,
+            agent_evidence=ev,
+        )
+        assert nc.agent_evidence is not None
+        assert nc.agent_evidence.pattern == "a2a_server"
+
+    def test_reclassify_component_accepts_agent_evidence(self):
+        from aibom.agentic.agent import AgentEvidence, _ReclassifyComponent
+
+        ev = AgentEvidence(pattern="react_loop", definition_file="loop.py")
+        rc = _ReclassifyComponent(instance_id="y", new_type="agent", agent_evidence=ev)
+        assert rc.agent_evidence is not None
+        assert rc.agent_evidence.pattern == "react_loop"
+
+    def test_agent_response_full_round_trip_with_evidence(self):
+        from aibom.agentic.agent import AgentEvidence, AgentResponse
+
+        ev = AgentEvidence(
+            pattern="framework_inheritance",
+            definition_file="/repo/worker.py",
+            definition_start_line=1,
+            definition_end_line=50,
+            evidence_snippet="class MyAgent(LangChainAgent):\n    ...",
+            justification="Subclasses LangChain agent base class",
+        )
+        resp = AgentResponse(
+            reclassify_components=[
+                {"instance_id": "a", "new_type": "agent", "agent_evidence": ev.model_dump()},
+            ],
+        )
+        assert resp.reclassify_components[0].agent_evidence == ev
+
+        payload = resp.model_dump()
+        restored = AgentResponse.model_validate(payload)
+        assert restored.reclassify_components[0].agent_evidence == ev
+
+
+class TestA2ARelationshipTypes:
+    """The two A2A-specific relationship types exist and round-trip."""
+
+    def test_invokes_a2a_agent_exists(self):
+        from aibom.models import RelationshipType
+
+        assert RelationshipType.INVOKES_A2A_AGENT.value == "INVOKES_A2A_AGENT"
+
+    def test_exposes_a2a_agent_exists(self):
+        from aibom.models import RelationshipType
+
+        assert RelationshipType.EXPOSES_A2A_AGENT.value == "EXPOSES_A2A_AGENT"
+
+    def test_a2a_types_round_trip_via_string(self):
+        from aibom.models import RelationshipType
+
+        assert RelationshipType("INVOKES_A2A_AGENT") is RelationshipType.INVOKES_A2A_AGENT
+        assert RelationshipType("EXPOSES_A2A_AGENT") is RelationshipType.EXPOSES_A2A_AGENT

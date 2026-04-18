@@ -26,12 +26,38 @@ Stages:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
+_ENV_PLACEHOLDER_RE = re.compile(r"\$\{[^}]+\}")
+
+_ENV_NAME_PREFIXES: tuple[str, ...] = (
+    "env:",
+    "env_model_",
+    "env_embedding_",
+    "dockerfile_env_",
+)
+
+
+def _strip_env_prefix(name: str) -> str:
+    """Strip a known env-var naming prefix from a component ``name``.
+
+    Multiple scanners tag env-backed components with distinct naming
+    conventions (``env:VAR``, ``env_model_VAR``, ``env_embedding_VAR``,
+    ``dockerfile_env_VAR``). The canonicalizer uses this helper so a
+    single gate matches every shape and collapses them all to the
+    resolved literal model id when one is available.
+    """
+    for prefix in _ENV_NAME_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+from .agent_signatures import AgentSignatureCatalog, resolve_catalog
 from .cross_ref import (
     CrossRefIndex,
     ExternalRepoDep,
@@ -40,13 +66,15 @@ from .cross_ref import (
     detect_external_repo_deps,
     resolve_components,
 )
+from .custom_catalog import CustomCatalogConfig
 from .llm_factory import ensure_llm_runtime_available
 from .models import ScanContext
-from .models.enums import AIComponentType
+from .models.enums import AIComponentType, RelationshipType
 from .models.scan import AIComponent, ComponentRelationship
 from .scanners import run_scanners
 from .scanners.dependency_scanner import discover_ai_package_set, is_known_ai_package
 from .scanners.file_cache import cache_stats, clear_cache
+from .scanners.model_detector import is_known_embedding_model_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,6 +101,9 @@ class PipelineResult:
     external_deps: list[ExternalRepoDep] = field(default_factory=list)
     timings: list[StageTiming] = field(default_factory=list)
     total_elapsed_s: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 def _service_dir(file_path: str) -> str:
@@ -153,7 +184,8 @@ def _fanout_agentic_results(
             continue
         for sib in siblings:
             clone = sib.model_copy(deep=True)
-            clone.confidence = c.confidence
+            clone.heuristic_confidence = c.heuristic_confidence
+            clone.agentic_confidence = c.agentic_confidence
             clone.needs_agentic = c.needs_agentic
             if c.model_name:
                 clone.model_name = c.model_name
@@ -166,6 +198,23 @@ def _fanout_agentic_results(
     return result
 
 
+def _is_import_only_candidate(c: "AIComponent") -> bool:
+    """True when the component was emitted *only* from a bare ``from X import Y`` line.
+
+    ``kb_enrichment_scanner`` tags these weak, import-inferred detections
+    with ``metadata["import_statement"]`` and never sets ``call_pattern``
+    (which is the marker for a real callsite emission).
+
+    The distinction matters for :func:`_propagate_removals`: an LLM
+    removal of an import-inferred component is evidence that *the import
+    alone* is not an AI component — it is **not** evidence that the
+    usage-line sibling with the same lowercased canonical name (e.g.
+    ``agent = Agent(...)``) should also disappear.
+    """
+    md = c.metadata or {}
+    return bool(md.get("import_statement")) and not md.get("call_pattern")
+
+
 def _propagate_removals(
     sent: list["AIComponent"],
     received: list["AIComponent"],
@@ -173,12 +222,26 @@ def _propagate_removals(
     *,
     pre_fanout_removed_ids: set[str] | None = None,
 ) -> list["AIComponent"]:
-    """If the agent removed ANY instance of (name, type), remove ALL.
+    """If the agent removed ANY instance of (name, type), remove ALL — with
+    one asymmetry: import-only removals are *weak* and only cascade to
+    other import-only siblings.
 
     The agent processes each instance independently and sometimes makes
     inconsistent decisions (removes the usage at line 595 but keeps the
-    import at line 85).  This function treats a removal of *any* instance
-    as a removal of the logical component, keyed by consolidation key.
+    import at line 85).  This function treats a *substantive* removal of
+    any instance as a removal of the logical component, keyed by
+    consolidation key.
+
+    **Weak/strong distinction.** A removal is *weak* when the removed
+    component is an import-only detection (see
+    :func:`_is_import_only_candidate`).  Weak removals propagate only to
+    other import-only siblings sharing the same consolidation key; they
+    must never take out a usage-line sibling whose lowercased canonical
+    name happens to collide.  Without this guard, the LLM rejecting a
+    ``from strands import Agent`` line (correct — an import alone is
+    not an agent) would wipe out every real ``agent = Agent(...)``
+    because ``_consolidation_key`` lowercases both to ``("agent",
+    "agent")``.
 
     *all_candidates*, when provided, is the full pre-dedup component list.
     Removal keys are built from this wider set so that siblings that were
@@ -198,26 +261,35 @@ def _propagate_removals(
     if not removed_ids:
         return received
 
-    removed_keys: set[tuple] = set()
+    strong_keys: set[tuple] = set()
+    weak_keys: set[tuple] = set()
     for c in sent:
-        if c.instance_id in removed_ids:
-            removed_keys.add(_consolidation_key(c))
-    if not removed_keys:
+        if c.instance_id not in removed_ids:
+            continue
+        key = _consolidation_key(c)
+        if _is_import_only_candidate(c):
+            weak_keys.add(key)
+        else:
+            strong_keys.add(key)
+    if not strong_keys and not weak_keys:
         return received
 
     lookup_pool = all_candidates if all_candidates is not None else received
-    removed_iids = {c.instance_id for c in lookup_pool if _consolidation_key(c) in removed_keys}
-    result = [
-        c for c in lookup_pool
-        if _consolidation_key(c) not in removed_keys
-        and c.instance_id not in removed_iids
-    ]
+    drop_ids: set[str] = set()
+    for c in lookup_pool:
+        key = _consolidation_key(c)
+        if key in strong_keys:
+            drop_ids.add(c.instance_id)
+        elif key in weak_keys and _is_import_only_candidate(c):
+            drop_ids.add(c.instance_id)
+
+    result = [c for c in lookup_pool if c.instance_id not in drop_ids]
     dropped = len(lookup_pool) - len(result)
     if dropped:
         _LOGGER.info(
             "Removal propagation: dropped %d additional component(s) "
-            "matching %d removal key(s)",
-            dropped, len(removed_keys),
+            "(%d strong key(s), %d weak import-only key(s))",
+            dropped, len(strong_keys), len(weak_keys),
         )
     return result
 
@@ -225,10 +297,12 @@ def _propagate_removals(
 def _evidence_gate(
     before_agentic: list["AIComponent"],
     after_agentic: list["AIComponent"],
+    *,
+    scan_paths: list[str] | None = None,
 ) -> list["AIComponent"]:
     """Remove post-agentic components that lack hard evidence.
 
-    Two checks:
+    Three checks:
 
     1. **model + kb_enrichment**: If the name does not resolve in any model
        registry (LiteLLM, built-in regex, HuggingFace), auto-remove.  This
@@ -238,14 +312,34 @@ def _evidence_gate(
     2. **memory + kb_enrichment**: If the agent kept the component unchanged
        (no enrichment, no reclassification), auto-remove.  A genuine memory
        component should have been enriched with specifics.
+
+    3. **agent / agent_proxy symmetric check**: Any post-agentic AGENT or
+       AGENT_PROXY that originated from the structural scanner OR whose
+       type was flipped to agent by the LLM must carry a verifiable
+       ``agent_evidence`` payload in ``metadata``. The payload is
+       re-verified against the on-disk source using the same offline
+       gate that Phase 6 uses for LLM verdicts. This closes the
+       previous asymmetry where structural emissions could reach the
+       final SBOM without any citation check while LLM reclassifications
+       had to cite source lines. KB / framework scanner detections (no
+       type flip, no structural discovery marker) are left untouched —
+       their authority comes from the framework match itself.
     """
+    from .agentic.middleware import _verify_agent_evidence
     from .models.enums import DetectionSource
-    from .scanners.model_detector import _registry_lookup
+    from .scanners.model_detector import registry_lookup
 
     before_map: dict[str, "AIComponent"] = {c.instance_id: c for c in before_agentic}
+    allowed_roots = list(scan_paths or [])
+
+    _AGENT_TYPES: frozenset[AIComponentType] = frozenset({
+        AIComponentType.AGENT,
+        AIComponentType.AGENT_PROXY,
+    })
 
     result: list["AIComponent"] = []
     gate_removed = 0
+    agent_evidence_removed = 0
     for c in after_agentic:
         orig = before_map.get(c.instance_id)
         if orig is None:
@@ -255,7 +349,7 @@ def _evidence_gate(
         if (
             c.component_type == AIComponentType.MODEL
             and orig.detection_source == DetectionSource.KB_ENRICHMENT
-            and _registry_lookup(c.name) is None
+            and registry_lookup(c.name) is None
         ):
             _LOGGER.info(
                 "Evidence gate removed model '%s' (%s): "
@@ -280,10 +374,38 @@ def _evidence_gate(
             gate_removed += 1
             continue
 
+        if c.component_type in _AGENT_TYPES:
+            discovery = (c.metadata or {}).get("discovery")
+            is_structural = discovery == "structural_react_loop"
+            type_flipped = orig.component_type != c.component_type
+            if is_structural or type_flipped:
+                raw_evidence = (c.metadata or {}).get("agent_evidence")
+                ok, reason = _verify_agent_evidence(
+                    raw_evidence, allowed_roots=allowed_roots,
+                )
+                if not ok:
+                    _LOGGER.warning(
+                        "Evidence gate: dropping %s '%s' (%s) — %s "
+                        "(structural=%s, type_flipped=%s)",
+                        c.component_type.value,
+                        c.name,
+                        c.instance_id,
+                        reason,
+                        is_structural,
+                        type_flipped,
+                    )
+                    agent_evidence_removed += 1
+                    continue
+
         result.append(c)
 
-    if gate_removed:
-        _LOGGER.info("Evidence gate: removed %d component(s)", gate_removed)
+    total_removed = gate_removed + agent_evidence_removed
+    if total_removed:
+        _LOGGER.info(
+            "Evidence gate: removed %d component(s) "
+            "(%d model/memory, %d agent/agent_proxy)",
+            total_removed, gate_removed, agent_evidence_removed,
+        )
     return result
 
 
@@ -305,6 +427,23 @@ def _is_test_file(file_path: str) -> bool:
     return stem.startswith("test_") or stem.endswith("_test")
 
 
+def _has_instantiation_marker(c: "AIComponent") -> bool:
+    """True when the component was captured at an instantiation site.
+
+    Instantiation-site markers include ``call_pattern`` (e.g. ``strands.Agent``),
+    ``assigned_to`` / ``assigned_target`` (LHS of ``x = Agent()``), and
+    ``kb_id`` (observation matched a KB class entry). Invocation sites
+    (``x(...)``) and bare decorator/context uses generally lack these
+    markers, so preferring instantiation markers yields a richer
+    representative for consolidation collapses.
+    """
+    meta = c.metadata or {}
+    return any(
+        meta.get(key)
+        for key in ("call_pattern", "assigned_to", "assigned_target", "kb_id")
+    )
+
+
 def _consolidate_components(
     components: list["AIComponent"],
 ) -> list["AIComponent"]:
@@ -315,6 +454,10 @@ def _consolidate_components(
     in ``metadata["evidence"]`` with file, line, and service fields.
     Components where **every** occurrence is in a test file are tagged
     ``metadata["test_only"] = True``.
+
+    Representative selection prefers instantiation-site components
+    (``call_pattern`` / ``assigned_to`` / ``kb_id`` set) over invocation
+    sites so the consolidated row surfaces the richer signal.
     """
     from collections import OrderedDict
 
@@ -327,20 +470,32 @@ def _consolidate_components(
     for _key, group in groups.items():
         if len(group) == 1:
             c = group[0]
+            merged_meta = dict(c.metadata)
+            merged_meta.setdefault("evidence_count", 1)
+            merged_meta.setdefault("evidence_files", [c.file_path])
             if _is_test_file(c.file_path):
-                merged_meta = dict(c.metadata)
                 merged_meta["test_only"] = True
-                c = c.model_copy(update={"metadata": merged_meta})
+            c = c.model_copy(update={"metadata": merged_meta})
             result.append(c)
             continue
 
-        best = max(group, key=lambda c: (c.confidence, -c.line_number))
+        best = max(group, key=lambda c: (
+            c.heuristic_confidence,
+            1 if _has_instantiation_marker(c) else 0,
+            0 if _is_test_file(c.file_path) else 1,
+            -c.line_number,
+        ))
         evidence = []
+        evidence_files: list[str] = []
+        seen_files: set[str] = set()
         all_test = True
         for c in group:
             is_test = _is_test_file(c.file_path)
             if not is_test:
                 all_test = False
+            if c.file_path not in seen_files:
+                seen_files.add(c.file_path)
+                evidence_files.append(c.file_path)
             if c is not best:
                 evidence.append({
                     "file": c.file_path,
@@ -354,6 +509,8 @@ def _consolidate_components(
 
         merged_meta = dict(best.metadata)
         merged_meta["evidence"] = evidence
+        merged_meta["evidence_count"] = len(group)
+        merged_meta["evidence_files"] = evidence_files
         merged_meta["consolidated_count"] = len(group)
         if all_test:
             merged_meta["test_only"] = True
@@ -367,6 +524,97 @@ def _consolidate_components(
         result.append(merged)
 
     return result
+
+
+def _canonicalize_env_var_names(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Rename MODEL / EMBEDDING components whose ``name`` still carries the
+    env var label to the resolved literal model id.
+
+    Deterministic scanners (``env_var_resolver``, ``config_scanner``,
+    ``deployment_detector``) tag env-backed components with several
+    naming conventions:
+
+    - ``env:VAR``                 — env_var_resolver, config_scanner endpoint branch
+    - ``env_model_VAR``           — config_scanner ``.env`` model branch
+    - ``env_embedding_VAR``       — config_scanner ``.env`` embedding branch
+    - ``dockerfile_env_VAR``      — config_scanner Dockerfile ``ENV`` branch
+    - bare ``VAR``                — agentic stage and ``env_var_resolver`` post-resolve
+
+    The Dockerfile branch records the key under ``metadata["env"]``; all
+    other branches use ``metadata["env_var"]``. This gate accepts both
+    shapes and every known name prefix, so any scanner that correctly
+    pairs an env-var marker with a resolved literal in ``model_name``
+    gets promoted to the literal in a single pass.
+    """
+    out: list[AIComponent] = []
+    for c in components:
+        if c.component_type not in (
+            AIComponentType.MODEL, AIComponentType.EMBEDDING,
+        ):
+            out.append(c)
+            continue
+
+        meta = c.metadata or {}
+        env_var = meta.get("env_var") or meta.get("env")
+        model_name = c.model_name
+        if (
+            isinstance(env_var, str) and env_var
+            and _strip_env_prefix(c.name) == env_var
+            and isinstance(model_name, str) and model_name
+            and model_name != c.name
+            and not model_name.lower().startswith(("http://", "https://"))
+            and not _ENV_PLACEHOLDER_RE.search(model_name)
+        ):
+            canon_meta = dict(meta)
+            canon_meta.setdefault("env_var", env_var)
+            out.append(c.model_copy(update={
+                "name": model_name,
+                "metadata": canon_meta,
+            }))
+        else:
+            out.append(c)
+    return out
+
+
+def _dedup_mcp_clients(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Collapse MCP_CLIENT rows that point at the same ``(file, line)``.
+
+    Multiple scanners can emit an MCP client component for the same call
+    site — typically one from the MCP detector (basename-style name) and
+    one from KB enrichment (wrapper-variable name). When both land on the
+    same ``(file_path, line_number)`` we keep the richer representative:
+    prefer components whose name is not a bare basename (e.g.
+    ``mcp_integration_mcp_client`` beats ``stdio_client``) and whose
+    metadata carries ``call_pattern`` / ``assigned_to`` markers.
+    """
+    def _rank(c: "AIComponent") -> tuple[int, int, float]:
+        meta = c.metadata or {}
+        name = c.name or ""
+        basename_like = 1 if (
+            name.endswith("_client") and "_" in name
+        ) else 0
+        marker = 1 if _has_instantiation_marker(c) else 0
+        return (marker, basename_like, c.heuristic_confidence)
+
+    key_map: dict[tuple[str, int], int] = {}
+    kept: list[AIComponent] = []
+    for c in components:
+        if c.component_type != AIComponentType.MCP_CLIENT:
+            kept.append(c)
+            continue
+        key = (c.file_path, c.line_number)
+        idx = key_map.get(key)
+        if idx is None:
+            key_map[key] = len(kept)
+            kept.append(c)
+            continue
+        if _rank(c) > _rank(kept[idx]):
+            kept[idx] = c
+    return kept
 
 
 def _filter_default_bom_scope_components(
@@ -489,7 +737,11 @@ def _consolidate_vector_stores(
             merged.append(c.model_copy(update={"metadata": meta}))
             continue
 
-        best = max(group, key=lambda c: (c.confidence, -c.line_number))
+        best = max(group, key=lambda c: (
+            c.heuristic_confidence,
+            0 if _is_test_file(c.file_path) else 1,
+            -c.line_number,
+        ))
         seen: set[tuple[str, int]] = set()
         evidence: list[dict[str, Any]] = []
 
@@ -579,6 +831,64 @@ def _dedup_tool_vs_vector_store(
     return result
 
 
+def _resolve_relationship_types(
+    relationships: list[ComponentRelationship],
+    components: list[AIComponent],
+) -> list[ComponentRelationship]:
+    """Populate ``source_type``/``target_type`` from the component registry."""
+    name_to_type: dict[str, AIComponentType] = {}
+    for comp in components:
+        name_to_type[comp.name] = comp.component_type
+        if comp.model_name:
+            name_to_type[comp.model_name] = comp.component_type
+    result: list[ComponentRelationship] = []
+    for rel in relationships:
+        updates: dict[str, Any] = {}
+        if rel.source_type == AIComponentType.OTHER:
+            resolved = name_to_type.get(rel.source_name)
+            if resolved:
+                updates["source_type"] = resolved
+        if rel.target_type == AIComponentType.OTHER:
+            resolved = name_to_type.get(rel.target_name)
+            if resolved:
+                updates["target_type"] = resolved
+        result.append(rel.model_copy(update=updates) if updates else rel)
+    return result
+
+
+def _propagate_model_from_relationships(
+    components: list[AIComponent],
+    relationships: list[ComponentRelationship],
+) -> list[AIComponent]:
+    """For components with ``model_name=None``, resolve from relationships."""
+    model_targets: dict[str, str] = {}
+    for rel in relationships:
+        if rel.relationship_type in (
+            RelationshipType.USES_EMBEDDING,
+            RelationshipType.USES_MODEL,
+        ):
+            model_targets[rel.source_name] = rel.target_name
+    result: list[AIComponent] = []
+    for comp in components:
+        if comp.model_name is None and comp.name in model_targets:
+            result.append(comp.model_copy(update={"model_name": model_targets[comp.name]}))
+        else:
+            result.append(comp)
+    return result
+
+
+def _dedup_relationships(
+    relationships: list[ComponentRelationship],
+) -> list[ComponentRelationship]:
+    """Dedup by ``(source_name, target_name, relationship_type)``."""
+    seen: dict[tuple[str, str, str], ComponentRelationship] = {}
+    for rel in relationships:
+        key = (rel.source_name, rel.target_name, rel.relationship_type.value)
+        if key not in seen:
+            seen[key] = rel
+    return list(seen.values())
+
+
 class ScanPipeline:
     """Four-stage v2 scan pipeline wired into a single ``run()`` call."""
 
@@ -602,6 +912,7 @@ class ScanPipeline:
         agentic_cache_dir: str | Path | None = None,
         include_code_snippets: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        custom_catalog: CustomCatalogConfig | None = None,
     ) -> None:
         self.scan_paths = scan_paths
         self.output_format = output_format
@@ -624,6 +935,7 @@ class ScanPipeline:
         )
         self.include_code_snippets = include_code_snippets
         self.progress_callback = progress_callback
+        self.custom_catalog = custom_catalog
 
     def _emit_progress(self, event: str, **payload: Any) -> None:
         """Send a best-effort progress event to the CLI."""
@@ -720,6 +1032,9 @@ class ScanPipeline:
             elapsed_s=elapsed,
             detail=timings[-1].detail,
         )
+        relationships = _resolve_relationship_types(relationships, components)
+        components = _propagate_model_from_relationships(components, relationships)
+        relationships = _dedup_relationships(relationships)
         relationships = _filter_relationships_for_components(
             relationships, components
         )
@@ -727,6 +1042,7 @@ class ScanPipeline:
 
         total_elapsed = time.monotonic() - pipeline_start
 
+        tu = getattr(self, "_agentic_token_usage", None)
         return PipelineResult(
             components=components,
             relationships=relationships,
@@ -737,6 +1053,9 @@ class ScanPipeline:
             external_deps=ext_deps,
             timings=timings,
             total_elapsed_s=total_elapsed,
+            prompt_tokens=tu.prompt_tokens if tu else 0,
+            completion_tokens=tu.completion_tokens if tu else 0,
+            total_tokens=tu.total_tokens if tu else 0,
         )
 
     # ------------------------------------------------------------------
@@ -873,7 +1192,21 @@ class ScanPipeline:
                 )
 
             model_str = self.llm_config["model"]
-            enriched, agentic_rels, agentic_flags = run_agentic_enrichment(
+            user_sigs: AgentSignatureCatalog | None = (
+                self.custom_catalog.agent_signatures
+                if self.custom_catalog is not None
+                else None
+            )
+            agent_catalog: AgentSignatureCatalog = resolve_catalog(user_sigs)
+            if user_sigs is not None and not user_sigs.is_empty:
+                _LOGGER.info(
+                    "Agentic: merged user agent_signatures "
+                    "(frameworks=%d, protocols=%d, anti_patterns=%d)",
+                    len(user_sigs.frameworks),
+                    len(user_sigs.protocols),
+                    len(user_sigs.anti_patterns),
+                )
+            enriched, agentic_rels, agentic_flags, agentic_token_usage = run_agentic_enrichment(
                 model_string=model_str,
                 deterministic_components=deduped,
                 deterministic_relationships=relationships,
@@ -885,6 +1218,7 @@ class ScanPipeline:
                 timeout_s=self.agentic_timeout,
                 cache_dir=self.agentic_cache_dir,
                 include_code_snippets=self.include_code_snippets,
+                agent_signature_catalog=agent_catalog,
             )
             deduped_ids = {c.instance_id for c in deduped}
             enriched_deduped_ids = {c.instance_id for c in enriched if c.instance_id in deduped_ids}
@@ -896,11 +1230,23 @@ class ScanPipeline:
                 deduped, enriched, all_candidates=components,
                 pre_fanout_removed_ids=pre_fanout_removed,
             )
-            enriched = _evidence_gate(components, enriched)
+            enriched = _evidence_gate(
+                components, enriched, scan_paths=self.scan_paths,
+            )
             if new_components:
                 enriched = enriched + new_components
-            relationships = relationships + agentic_rels
-            return enriched, relationships, agentic_flags
+
+            from .agentic.middleware import (
+                _drop_env_placeholder_identifiers,
+                _reject_class_name_models,
+                _remove_unresolved_embedders,
+            )
+            enriched = _reject_class_name_models(enriched)
+            all_rels = relationships + agentic_rels
+            enriched = _remove_unresolved_embedders(enriched, all_rels)
+            enriched = _drop_env_placeholder_identifiers(enriched)
+            self._agentic_token_usage = agentic_token_usage
+            return enriched, all_rels, agentic_flags
 
         except ImportError:
             raise
@@ -917,6 +1263,43 @@ class ScanPipeline:
         self, components: list[AIComponent]
     ) -> tuple[list[AIComponent], int]:
         _LOGGER.info("Stage 4/4 — assembling results")
+
+        before_canon = len(components)
+        components = _canonicalize_env_var_names(components)
+        if before_canon:
+            _LOGGER.debug(
+                "Env-var canonicalization applied to %d components", before_canon,
+            )
+
+        before_mcp = len(components)
+        components = _dedup_mcp_clients(components)
+        if before_mcp != len(components):
+            _LOGGER.info(
+                "MCP client dedup: %d → %d components (-%d)",
+                before_mcp, len(components), before_mcp - len(components),
+            )
+
+        # Normalize MODEL → EMBEDDING for components whose name is a
+        # registry-known embedding identifier (e.g. ``text-embedding-3-large``
+        # is labelled ``mode=embedding`` in LiteLLM). This happens BEFORE
+        # consolidation so duplicates produced by scanners that disagreed on
+        # type (one said MODEL, another said EMBEDDING) collapse into a single
+        # consolidation key ``(name, EMBEDDING)``. Authority: the model
+        # registry. See :func:`is_known_embedding_model_name`.
+        reclassified = 0
+        for component in components:
+            if (
+                component.component_type == AIComponentType.MODEL
+                and is_known_embedding_model_name(component.name)
+            ):
+                component.component_type = AIComponentType.EMBEDDING
+                reclassified += 1
+        if reclassified:
+            _LOGGER.info(
+                "Embedding reclassification: %d model(s) relabeled as embedding "
+                "via registry (mode=embedding)",
+                reclassified,
+            )
 
         before = len(components)
         components = _consolidate_components(components)

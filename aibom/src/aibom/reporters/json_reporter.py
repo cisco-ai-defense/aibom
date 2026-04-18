@@ -30,7 +30,7 @@ from .base import BaseReporter
 _LOGGER = logging.getLogger(__name__)
 
 _REMOTE_ORG_REPO_RE = re.compile(r"[/:]([^/]+)/([^/]+?)(?:\.git)?$")
-REPORT_SCHEMA_VERSION = "1"
+REPORT_SCHEMA_VERSION = "2"
 
 
 def _friendly_source_name(path: str) -> str:
@@ -59,7 +59,13 @@ def _components_by_type(components: Iterable[AIComponent]) -> dict[str, list[dic
     grouped: dict[str, list[dict[str, Any]]] = {}
     for comp in components:
         key = comp.component_type.value
-        grouped.setdefault(key, []).append(comp.model_dump(mode="json"))
+        d = comp.model_dump(mode="json")
+        d["confidence"] = (
+            comp.agentic_confidence
+            if comp.agentic_confidence is not None
+            else comp.heuristic_confidence
+        )
+        grouped.setdefault(key, []).append(d)
     return grouped
 
 
@@ -71,13 +77,47 @@ def _disambiguate_source_key(source_name: str, seen: dict[str, int]) -> str:
     return f"{source_name}#{count}"
 
 
-def _aibom_payload(result: ScanResult) -> dict[str, Any]:
+def _component_summary(
+    components_by_source: dict[str, list[AIComponent]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build a flat, human-readable view of detected components per source.
+
+    Each entry is ``{component_type, name, file_path, line_number}``, sorted
+    by ``(component_type, name)`` for stable, grouped output. Components
+    marked ``metadata["test_only"]`` are excluded so the summary mirrors the
+    ``total_components`` accounting in ``ScanResult.summary``.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for source_key, comps in components_by_source.items():
+        entries: list[dict[str, Any]] = []
+        for c in comps:
+            if c.metadata.get("test_only"):
+                continue
+            entries.append(
+                {
+                    "component_type": c.component_type.value,
+                    "name": c.name,
+                    "file_path": c.file_path,
+                    "line_number": c.line_number,
+                }
+            )
+        entries.sort(key=lambda e: (e["component_type"], e["name"]))
+        out[source_key] = entries
+    return out
+
+
+def _aibom_payload(
+    result: ScanResult,
+    *,
+    include_component_summary: bool = False,
+) -> dict[str, Any]:
     base = result.model_dump(mode="json")
     raw_metadata = dict(base["metadata"])
     source_outcomes = raw_metadata.pop("source_outcomes", {})
     source_details = raw_metadata.pop("_report_source_details", {})
     raw_metadata.setdefault("report_schema_version", REPORT_SCHEMA_VERSION)
     sources_out: dict[str, dict[str, Any]] = {}
+    components_by_source: dict[str, list[AIComponent]] = {}
     seen_source_names: dict[str, int] = {}
     for src in result.sources:
         comps = _components_by_type(src.components)
@@ -87,6 +127,11 @@ def _aibom_payload(result: ScanResult) -> dict[str, Any]:
         source_key = _disambiguate_source_key(source_name, seen_source_names)
         source_path = detail.get("source_path") or src.path
         source_kind = detail.get("source_kind") or "local-path"
+        per_source_meta: dict[str, Any] = {}
+        for mk in ("elapsed_s", "prompt_tokens", "completion_tokens", "total_tokens"):
+            val = detail.get(mk)
+            if val is not None:
+                per_source_meta[mk] = val
         sources_out[source_key] = {
             "source_name": source_name,
             "source_path": source_path,
@@ -101,24 +146,48 @@ def _aibom_payload(result: ScanResult) -> dict[str, Any]:
                     or raw_metadata.get("completed_at")
                 ),
             },
+            **({"metadata": per_source_meta} if per_source_meta else {}),
         }
-    return {
-        "aibom_analysis": {
-            "metadata": raw_metadata,
-            "sources": sources_out,
-            "summary": result.summary,
-            "risk": base["risk"],
-            "errors": base["errors"],
-        }
+        components_by_source[source_key] = list(src.components)
+    cross_repo_links_out = [
+        link.model_dump(mode="json")
+        for link in result.cross_repo_links
+    ]
+    analysis: dict[str, Any] = {
+        "metadata": raw_metadata,
+        "sources": sources_out,
+        "summary": result.summary,
     }
+    if include_component_summary:
+        analysis["component_summary"] = _component_summary(components_by_source)
+    analysis["risk"] = base["risk"]
+    analysis["errors"] = base["errors"]
+    if cross_repo_links_out:
+        analysis["cross_repo_links"] = cross_repo_links_out
+    return {"aibom_analysis": analysis}
 
 
 class JsonReporter(BaseReporter):
     name = "json"
     file_extension = ".json"
 
+    def __init__(self, include_component_summary: bool = False) -> None:
+        """Create a JSON reporter.
+
+        Args:
+            include_component_summary: When ``True``, the rendered report
+                includes a flat ``component_summary`` key (grouped by source)
+                listing each non-test component as
+                ``{component_type, name, file_path, line_number}``. Off by
+                default so existing consumers see an unchanged payload.
+        """
+        self.include_component_summary = include_component_summary
+
     def render(self, result: ScanResult, output: IO[str]) -> None:
-        payload = _aibom_payload(result)
+        payload = _aibom_payload(
+            result,
+            include_component_summary=self.include_component_summary,
+        )
         json.dump(payload, output, indent=2)
         output.write("\n")
 
