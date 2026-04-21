@@ -831,6 +831,24 @@ def _dedup_tool_vs_vector_store(
     return result
 
 
+def _rel_endpoint_key(instance_id: str, name: str) -> str:
+    """Return a hybrid dedup key for one endpoint of a relationship.
+
+    Scanner-produced edges populate ``instance_id``; LLM-produced edges
+    (:mod:`aibom.agentic.middleware`, :mod:`aibom.agentic.agent`) leave it
+    blank and only set ``name``. Using ``instance_id`` when present lets
+    us distinguish identically-named components in different files, while
+    the ``"name:"`` prefix on the fallback keeps the two key-spaces
+    disjoint so a scanner edge cannot collide with an LLM edge that
+    happens to reference the same literal name.
+    """
+    if instance_id:
+        return f"id:{instance_id}"
+    if name:
+        return f"name:{name}"
+    return ""
+
+
 def _resolve_relationship_types(
     relationships: list[ComponentRelationship],
     components: list[AIComponent],
@@ -839,7 +857,7 @@ def _resolve_relationship_types(
     name_to_type: dict[str, AIComponentType] = {}
     for comp in components:
         name_to_type[comp.name] = comp.component_type
-        if comp.model_name:
+        if comp.model_name and comp.component_type.is_model_related:
             name_to_type[comp.model_name] = comp.component_type
     result: list[ComponentRelationship] = []
     for rel in relationships:
@@ -860,30 +878,51 @@ def _propagate_model_from_relationships(
     components: list[AIComponent],
     relationships: list[ComponentRelationship],
 ) -> list[AIComponent]:
-    """For components with ``model_name=None``, resolve from relationships."""
+    """For components with ``model_name=None``, resolve from relationships.
+
+    Keys the lookup on ``source_instance_id`` when available (falling back
+    to a ``"name:"``-prefixed name for LLM-produced edges with blank
+    instance ids) so two identically-named components in different files
+    don't all inherit the same ``model_name``.
+    """
     model_targets: dict[str, str] = {}
     for rel in relationships:
         if rel.relationship_type in (
             RelationshipType.USES_EMBEDDING,
             RelationshipType.USES_MODEL,
         ):
-            model_targets[rel.source_name] = rel.target_name
+            key = _rel_endpoint_key(rel.source_instance_id, rel.source_name)
+            if key:
+                model_targets[key] = rel.target_name
     result: list[AIComponent] = []
     for comp in components:
-        if comp.model_name is None and comp.name in model_targets:
-            result.append(comp.model_copy(update={"model_name": model_targets[comp.name]}))
-        else:
-            result.append(comp)
+        if comp.model_name is None:
+            target = model_targets.get(f"id:{comp.instance_id}") if comp.instance_id else None
+            if target is None:
+                target = model_targets.get(f"name:{comp.name}") if comp.name else None
+            if target is not None:
+                result.append(comp.model_copy(update={"model_name": target}))
+                continue
+        result.append(comp)
     return result
 
 
 def _dedup_relationships(
     relationships: list[ComponentRelationship],
 ) -> list[ComponentRelationship]:
-    """Dedup by ``(source_name, target_name, relationship_type)``."""
+    """Dedup by ``(source_endpoint, target_endpoint, relationship_type)``.
+
+    The endpoint key prefers ``instance_id`` over ``name`` so two
+    identically-named components in different files are treated as
+    distinct endpoints. See :func:`_rel_endpoint_key`.
+    """
     seen: dict[tuple[str, str, str], ComponentRelationship] = {}
     for rel in relationships:
-        key = (rel.source_name, rel.target_name, rel.relationship_type.value)
+        key = (
+            _rel_endpoint_key(rel.source_instance_id, rel.source_name),
+            _rel_endpoint_key(rel.target_instance_id, rel.target_name),
+            rel.relationship_type.value,
+        )
         if key not in seen:
             seen[key] = rel
     return list(seen.values())
