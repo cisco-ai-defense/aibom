@@ -275,7 +275,7 @@ def _components_from_python(path: Path) -> list[AIComponent]:
                     line_number=_line_for_match(text, mdec.start()),
                     framework="mcp",
                     detection_source=DetectionSource.CODE_ANALYSIS,
-                    confidence=0.3,
+                    heuristic_confidence=0.3,
                     needs_agentic=True,
                     agentic_hint="@tool decorator without MCP imports in file",
                     metadata={"mcp_decorators": True},

@@ -119,6 +119,69 @@ class TestPythonEnvVarExtraction:
         assert len(comps) == 1
 
 
+class TestAWSCredentialEnvVars:
+    """AWS static-credential env vars must classify as SECRET in source code.
+
+    The AWS credential trio is the canonical way to authenticate Bedrock /
+    boto3 agents (including AWS Strands agents) and must be surfaced as
+    secrets even when referenced outside an AI kwarg, since a boto3 session
+    often consumes them implicitly.
+    """
+
+    def test_aws_access_key_id_in_environ_is_secret(self, tmp_path: Path) -> None:
+        (tmp_path / "creds.py").write_text(
+            'import os\n'
+            'access = os.environ["AWS_ACCESS_KEY_ID"]\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        assert len(comps) == 1
+        assert comps[0].component_type == AIComponentType.SECRET
+        assert comps[0].metadata["env"] == "AWS_ACCESS_KEY_ID"
+        assert comps[0].metadata["env_context"] == "api_key_envname"
+
+    def test_aws_secret_access_key_is_secret(self, tmp_path: Path) -> None:
+        (tmp_path / "creds.py").write_text(
+            'secret = os.getenv("AWS_SECRET_ACCESS_KEY")\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        assert len(comps) == 1
+        assert comps[0].component_type == AIComponentType.SECRET
+        assert comps[0].metadata["env"] == "AWS_SECRET_ACCESS_KEY"
+
+    def test_aws_session_token_is_secret(self, tmp_path: Path) -> None:
+        (tmp_path / "creds.py").write_text(
+            'token = os.environ.get("AWS_SESSION_TOKEN")\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        assert len(comps) == 1
+        assert comps[0].component_type == AIComponentType.SECRET
+        assert comps[0].metadata["env"] == "AWS_SESSION_TOKEN"
+
+    def test_aws_profile_is_not_emitted_as_secret(self, tmp_path: Path) -> None:
+        """AWS_PROFILE and AWS_REGION are NOT credentials and must not be
+        misclassified. They should be silently ignored by env_var_resolver
+        (just like any other non-AI env var)."""
+        (tmp_path / "region.py").write_text(
+            'import os\n'
+            'profile = os.environ["AWS_PROFILE"]\n'
+            'region = os.getenv("AWS_REGION", "us-west-2")\n'
+            'default_region = os.getenv("AWS_DEFAULT_REGION")\n'
+        )
+        scanner = EnvVarResolver()
+        comps, _ = scanner.scan(_make_ctx(tmp_path))
+        secret_names = {
+            c.metadata.get("env")
+            for c in comps
+            if c.component_type == AIComponentType.SECRET
+        }
+        assert "AWS_PROFILE" not in secret_names
+        assert "AWS_REGION" not in secret_names
+        assert "AWS_DEFAULT_REGION" not in secret_names
+
+
 class TestJavaScriptEnvVarExtraction:
     def test_process_env_dot(self, tmp_path: Path) -> None:
         (tmp_path / "app.ts").write_text(

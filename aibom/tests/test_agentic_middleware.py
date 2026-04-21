@@ -181,6 +181,14 @@ class TestExtractFindings:
                         "file_path": str(source),
                         "line_number": 2,
                         "framework": "custom",
+                        "agent_evidence": {
+                            "pattern": "framework_agent",
+                            "definition_file": str(source),
+                            "definition_start_line": 2,
+                            "definition_end_line": 3,
+                            "evidence_snippet": "line 2",
+                            "justification": "Test fixture",
+                        },
                         "decision_annotation": {
                             "decision": "added",
                             "justification": "The code declares and uses a request routing agent.",
@@ -420,6 +428,116 @@ class TestReclassifyComponents:
         assert result[0].name == "fix"
         assert result[0].component_type == AIComponentType.RETRIEVER
         assert result[1].name == "keep"
+
+
+class TestOutOfBatchVerdicts:
+    """Verdicts referencing instance_ids that are not in the current
+    batch must be dropped with a WARNING.
+
+    The agent sees ``other_detected_components`` for context but is not
+    authorized to act on them. Without this guard, verdicts for
+    out-of-batch ids silently evaporate because the apply loop only
+    walks the current batch, which produced the bug where
+    ``DuoAssistantAPI``'s reclassify-to-``tool`` was logged but never
+    applied.
+    """
+
+    def test_out_of_batch_remove_is_dropped(self, mw, caplog):
+        existing = [
+            AIComponent(
+                name="keep", component_type=AIComponentType.TOOL,
+                file_path="a.py", line_number=1, instance_id="keep_a.py_1",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {"instance_id": "not_in_batch_a.py_99", "reason": "x"}
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+        assert len(result) == 1
+        assert result[0].name == "keep"
+        assert any(
+            "out-of-batch remove" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_out_of_batch_reclassify_is_dropped(self, mw, caplog):
+        existing = [
+            AIComponent(
+                name="keep", component_type=AIComponentType.TOOL,
+                file_path="a.py", line_number=1, instance_id="keep_a.py_1",
+            ),
+        ]
+        output = json.dumps({
+            "reclassify_components": [
+                {
+                    "instance_id": "not_in_batch_a.py_99",
+                    "new_type": "tool",
+                    "reason": "x",
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+        assert len(result) == 1
+        assert result[0].component_type == AIComponentType.TOOL
+        assert any(
+            "out-of-batch reclassify" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_out_of_batch_enrichment_is_dropped(self, mw, caplog):
+        existing = [
+            AIComponent(
+                name="keep", component_type=AIComponentType.TOOL,
+                file_path="a.py", line_number=1, instance_id="keep_a.py_1",
+            ),
+        ]
+        output = json.dumps({
+            "enriched_components": [
+                {
+                    "instance_id": "not_in_batch_a.py_99",
+                    "updates": {"model_name": "gpt-5"},
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+        assert len(result) == 1
+        assert result[0].metadata == {}
+        assert any(
+            "out-of-batch enrichment" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+
+class TestReclassifyWiring:
+    """Applied reclassify verdicts must leave the component in a state
+    that downstream post-agentic gates can recognise as 'agent touched'.
+
+    Specifically: ``agentic_confidence`` must be set, ``needs_agentic``
+    must flip to False, and any ``agent_evidence`` supplied by the LLM
+    must land in ``metadata`` for the symmetric gate to consume.
+    """
+
+    def test_reclassify_sets_agentic_confidence(self, mw):
+        existing = [
+            AIComponent(
+                name="Foo", component_type=AIComponentType.MODEL,
+                file_path="a.py", line_number=1, instance_id="Foo_a.py_1",
+            ),
+        ]
+        output = json.dumps({
+            "reclassify_components": [
+                {"instance_id": "Foo_a.py_1", "new_type": "tool", "reason": "x"}
+            ],
+        })
+        result = mw.apply_enrichments(existing, output)
+        assert result[0].component_type == AIComponentType.TOOL
+        assert result[0].agentic_confidence == 0.8
+        assert result[0].needs_agentic is False
 
 
 class TestParseJson:

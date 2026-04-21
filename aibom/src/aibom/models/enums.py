@@ -40,6 +40,10 @@ class AIComponentType(str, Enum):
 
     # Agentic
     AGENT = "agent"
+    # Local code that invokes a *remote* A2A agent. The proxy is not
+    # itself an agent — it wraps one. Paired with ``INVOKES_A2A_AGENT``
+    # relationships and ``A2A_AGENT_CLIENT_SERVER`` cross-repo links.
+    AGENT_PROXY = "agent_proxy"
     TOOL = "tool"
     MCP_SERVER = "mcp_server"
     MCP_CLIENT = "mcp_client"
@@ -133,6 +137,18 @@ class DetectionSource(str, Enum):
     API = "api"
 
 
+class CrossRepoLinkType(str, Enum):
+    """Types of cross-repository links in a multi-repo scan."""
+
+    ENV_VAR_BINDING = "ENV_VAR_BINDING"
+    SHARED_MODEL = "SHARED_MODEL"
+    SHARED_DEPENDENCY = "SHARED_DEPENDENCY"
+    MCP_SERVER_CLIENT = "MCP_SERVER_CLIENT"
+    A2A_AGENT_CLIENT_SERVER = "A2A_AGENT_CLIENT_SERVER"
+    SHARED_LIBRARY = "SHARED_LIBRARY"
+    CUSTOM = "CUSTOM"
+
+
 class RelationshipType(str, Enum):
     """Recognized relationships between AI components."""
 
@@ -153,6 +169,12 @@ class RelationshipType(str, Enum):
     LOGS_TO = "LOGS_TO"
     USES_GUARDRAIL = "USES_GUARDRAIL"
     OBSERVES = "OBSERVES"
+    OBSERVED_BY = "OBSERVED_BY"
+    EXPOSES_TOOL = "EXPOSES_TOOL"
+    USES_MCP_CLIENT = "USES_MCP_CLIENT"
+    HOSTS_MODEL = "HOSTS_MODEL"
+    INVOKES_A2A_AGENT = "INVOKES_A2A_AGENT"
+    EXPOSES_A2A_AGENT = "EXPOSES_A2A_AGENT"
     CUSTOM = "CUSTOM"
 
 

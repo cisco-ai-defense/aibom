@@ -342,7 +342,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
             <td>{{ m.model_name }}</td>
             <td>{{ m.framework }}</td>
             <td><code>{{ m.file_path }}</code></td>
-            <td>{{ m.confidence }}</td>
+            <td>{{ m.heuristic_confidence }}</td>
           </tr>
           {% endfor %}
         {% else %}
@@ -502,7 +502,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   var idToNode = {};
   nodes.forEach(function(n) { idToNode[n.id] = n; });
   function radiusFor(n) {
-    var c = typeof n.confidence === 'number' ? n.confidence : 1;
+    var c = typeof n.heuristic_confidence === 'number' ? n.heuristic_confidence : 1;
     c = Math.max(0.15, Math.min(1, c));
     return 6 + c * 14;
   }
@@ -541,7 +541,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     }
     addLine(n.name, 'tt-name');
     addLine(n.type, 'tt-muted');
-    addLine('confidence: ' + String(n.confidence));
+    addLine('heuristic confidence: ' + String(n.heuristic_confidence));
     if (n.file_path) addLine(n.file_path + ':' + String(n.line_number), 'tt-muted');
     if (n.model_name) addLine('model: ' + n.model_name);
     if (n.framework) addLine('framework: ' + n.framework);
@@ -686,7 +686,7 @@ def _graph_payload(
             "id": c.instance_id,
             "name": c.name,
             "type": c.component_type.value,
-            "confidence": c.confidence,
+            "heuristic_confidence": c.heuristic_confidence,
             "file_path": c.file_path,
             "line_number": c.line_number,
             "model_name": c.model_name or "",
@@ -725,7 +725,7 @@ def _model_inventory_rows(components: list[AIComponent]) -> list[dict[str, Any]]
                 "model_name": c.model_name or "—",
                 "framework": c.framework or "—",
                 "file_path": c.file_path or "—",
-                "confidence": c.confidence,
+                "heuristic_confidence": c.heuristic_confidence,
             }
         )
     return sorted(rows, key=lambda x: (x["file_path"], x["name"]))

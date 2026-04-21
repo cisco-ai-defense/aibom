@@ -21,14 +21,59 @@ from typing import Any, Dict, List, Optional, Union
 from .structures import (
     AssignmentObservation,
     CallObservation,
+    ClassBodyFactsObservation,
     ClassDefObservation,
     CodeAnalysisResult,
     ContextManagerObservation,
+    ControlFlowObservation,
     DecoratorObservation,
     FunctionAnnotationObservation,
+    MethodBodyShapeObservation,
+    StringLiteralObservation,
     TypeAnnotationObservation,
 )
 from .custom_catalog import parse_inline_annotation
+
+
+_MAX_INTERESTING_STRING_LEN = 500
+
+
+def _looks_like_jsonrpc_method(s: str) -> bool:
+    """True if *s* matches ``namespace/method`` — e.g. ``message/send``.
+
+    The namespace must be an identifier, and the method may contain dots
+    (for sub-methods like ``tasks/messageId/cancel``).
+    """
+    if "/" not in s:
+        return False
+    ns, _, method = s.partition("/")
+    if not ns or not method:
+        return False
+    if not (ns[0] == "_" or ns[0].isalpha()):
+        return False
+    if not all(c.isalnum() or c == "_" for c in ns):
+        return False
+    if not (method[0] == "_" or method[0].isalpha()):
+        return False
+    if not all(c.isalnum() or c in ("_", ".") for c in method):
+        return False
+    return True
+
+
+def _is_protocol_relevant_string(value: str) -> bool:
+    """True if *value* looks like a URL, HTTP/filesystem path, or JSON-RPC method."""
+    if not value or len(value) > _MAX_INTERESTING_STRING_LEN:
+        return False
+    s = value.strip()
+    if not s:
+        return False
+    if s.startswith(("http://", "https://", "ws://", "wss://")):
+        return True
+    if s.startswith("/") and "/" in s[1:]:
+        return True
+    if _looks_like_jsonrpc_method(s):
+        return True
+    return False
 
 
 def _format_attribute_name(node: cst.Attribute) -> str:
@@ -123,6 +168,75 @@ class SymbolVisitor(cst.CSTVisitor):
         self.file_path = file_path
         self.source_code = source_code
         self.result = CodeAnalysisResult(file_path=self.file_path)
+        self._scope_stack: List[Dict[str, Any]] = []
+
+    def _current_function_frame(self) -> Optional[Dict[str, Any]]:
+        """Return the innermost ``function`` frame, or ``None`` if a lambda or
+        class body lies between us and any enclosing function."""
+        for frame in reversed(self._scope_stack):
+            kind = frame["kind"]
+            if kind == "function":
+                return frame
+            if kind in ("lambda", "class"):
+                return None
+        return None
+
+    def _innermost_class_name(self) -> Optional[str]:
+        for frame in reversed(self._scope_stack):
+            if frame["kind"] == "class":
+                return frame["class_name"]
+        return None
+
+    def _attribute_call(self, qname: str) -> None:
+        """Attribute a call to the innermost function and any enclosing loops.
+
+        Loop frames are transparent for function attribution; lambda and
+        class frames block attribution entirely so nested helpers do not
+        inflate an outer function's counters.
+        """
+        loops: List[Dict[str, Any]] = []
+        for frame in reversed(self._scope_stack):
+            kind = frame["kind"]
+            if kind == "loop":
+                loops.append(frame)
+                continue
+            if kind == "function":
+                frame["call_count"] += 1
+                if qname not in frame["called_qualified_names"]:
+                    frame["called_qualified_names"].append(qname)
+                for loop in loops:
+                    # Only count calls that appear inside the loop body, not
+                    # inside its iter (e.g. ``range(10)``) or test expression
+                    # (e.g. ``while done():``). Otherwise the ReAct-loop
+                    # detector would treat ``range`` as a distinct callee.
+                    #
+                    # Duplicates are retained so the matcher can see both the
+                    # total call count (e.g. two ``llm.invoke`` calls in a
+                    # loop body) and the distinct-callee count.
+                    if not loop.get("in_body", False):
+                        continue
+                    loop["body_call_qualified_names"].append(qname)
+                return
+            return
+
+    def _attribute_loop(self) -> None:
+        for frame in reversed(self._scope_stack):
+            kind = frame["kind"]
+            if kind == "function":
+                frame["loop_count"] += 1
+                return
+            if kind in ("lambda", "class"):
+                return
+
+    def _attribute_branch(self) -> None:
+        frame = self._current_function_frame()
+        if frame is not None:
+            frame["branch_count"] += 1
+
+    def _attribute_return(self) -> None:
+        frame = self._current_function_frame()
+        if frame is not None:
+            frame["return_count"] += 1
 
     def _unwrap_call_expression(self, node: cst.BaseExpression) -> Optional[cst.Call]:
         """Return the underlying Call node, unwrapping Await expressions when needed."""
@@ -236,7 +350,15 @@ class SymbolVisitor(cst.CSTVisitor):
             line = 0
         for alias in original_node.names:
             if isinstance(alias, cst.ImportAlias):
-                import_name = alias.name.value if isinstance(alias.name, cst.Name) else str(alias.name)
+                if isinstance(alias.name, cst.Name):
+                    import_name = alias.name.value
+                elif isinstance(alias.name, cst.Attribute):
+                    # Dotted imports such as ``import langchain.agents`` come
+                    # through as Attribute nodes. Flatten to dotted text so
+                    # downstream substring matchers see ``langchain.agents``.
+                    import_name = _format_attribute_name(alias.name)
+                else:
+                    import_name = str(alias.name)
                 import_stmt = f"import {import_name}"
                 if alias.asname:
                     import_stmt += f" as {alias.asname.name.value}"
@@ -257,7 +379,12 @@ class SymbolVisitor(cst.CSTVisitor):
                 imported_items = []
                 for alias in original_node.names:
                     if isinstance(alias, cst.ImportAlias):
-                        item_name = alias.name.value if isinstance(alias.name, cst.Name) else str(alias.name)
+                        if isinstance(alias.name, cst.Name):
+                            item_name = alias.name.value
+                        elif isinstance(alias.name, cst.Attribute):
+                            item_name = _format_attribute_name(alias.name)
+                        else:
+                            item_name = str(alias.name)
                         if alias.asname:
                             item_name += f" as {alias.asname.name.value}"
                         imported_items.append(item_name)
@@ -283,7 +410,27 @@ class SymbolVisitor(cst.CSTVisitor):
         return result
 
     def leave_Call(self, original_node: cst.Call) -> None:
-        """Captures standalone calls that are not part of an assignment."""
+        """Captures standalone calls that are not part of an assignment.
+
+        Attribution (for :class:`MethodBodyShapeObservation` and
+        :class:`ControlFlowObservation`) is best-effort and also covers
+        bare unresolved names like ``done()`` — the structural matchers
+        care about "what is called inside this function body", even when
+        the symbol has no binding in the local module.
+
+        ``result.calls`` keeps the stricter behavior of the original
+        visitor: only calls whose target resolves to a qualified or
+        attribute name are recorded.
+        """
+        attribution_name = self._get_qualified_name_for_node(original_node.func)
+        if not attribution_name and isinstance(original_node.func, cst.Attribute):
+            attribution_name = _format_attribute_name(original_node.func)
+        if not attribution_name and isinstance(original_node.func, cst.Name):
+            attribution_name = original_node.func.value
+
+        if attribution_name:
+            self._attribute_call(attribution_name)
+
         try:
             parent = self.get_metadata(cst.metadata.ParentNodeProvider, original_node)
             if isinstance(parent, cst.Assign):
@@ -307,8 +454,37 @@ class SymbolVisitor(cst.CSTVisitor):
         )
         self.result.calls.append(call_obs)
 
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        """Push a class scope frame so nested calls/loops are attributed correctly."""
+        class_name = node.name.value
+        qname = self._get_qualified_name_for_node(node.name)
+        try:
+            pos = self.get_metadata(cst.metadata.PositionProvider, node)
+            start_line = pos.start.line
+            end_line = pos.end.line
+        except (KeyError, AttributeError):
+            start_line = 0
+            end_line = 0
+        self._scope_stack.append(
+            {
+                "kind": "class",
+                "class_name": class_name,
+                "qname": qname,
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+        )
+
     def leave_ClassDef(self, original_node: cst.ClassDef) -> None:
-        """Capture class definitions: base classes and ``# aibom:`` annotations."""
+        """Capture class definitions: base classes and ``# aibom:`` annotations.
+
+        Also emits a :class:`ClassBodyFactsObservation` that carries the
+        entire class source so downstream consumers (evidence builder,
+        LLM prompt) do not need to re-read the file from disk.
+        """
+        if self._scope_stack and self._scope_stack[-1].get("kind") == "class":
+            self._scope_stack.pop()
+
         class_name = original_node.name.value
 
         qualified_name = self._get_qualified_name_for_node(original_node.name)
@@ -327,11 +503,12 @@ class SymbolVisitor(cst.CSTVisitor):
         annotation = self._extract_aibom_annotation(original_node)
 
         try:
-            line_number = self.get_metadata(
-                cst.metadata.PositionProvider, original_node
-            ).start.line
+            pos = self.get_metadata(cst.metadata.PositionProvider, original_node)
+            line_number = pos.start.line
+            end_line = pos.end.line
         except (KeyError, AttributeError):
             line_number = 0
+            end_line = 0
 
         obs = ClassDefObservation(
             class_name=class_name,
@@ -342,9 +519,110 @@ class SymbolVisitor(cst.CSTVisitor):
         )
         self.result.class_defs.append(obs)
 
+        method_names: List[str] = []
+        body = getattr(original_node, "body", None)
+        body_stmts = getattr(body, "body", []) or []
+        for stmt in body_stmts:
+            if isinstance(stmt, cst.FunctionDef):
+                method_names.append(stmt.name.value)
+
+        body_source = self._extract_raw_code(original_node)
+
+        class_decorator_names: List[str] = []
+        for decorator_node in original_node.decorators:
+            decorator_expr: cst.CSTNode = decorator_node.decorator
+            decorator_name = self._get_qualified_name_for_node(decorator_expr)
+            if not decorator_name and isinstance(decorator_expr, cst.Call):
+                decorator_name = self._get_qualified_name_for_node(decorator_expr.func)
+            if not decorator_name:
+                target_expr = (
+                    decorator_expr.func
+                    if isinstance(decorator_expr, cst.Call)
+                    else decorator_expr
+                )
+                if isinstance(target_expr, cst.Attribute):
+                    decorator_name = _format_attribute_name(target_expr)
+                elif isinstance(target_expr, cst.Name):
+                    decorator_name = target_expr.value
+            if decorator_name:
+                class_decorator_names.append(decorator_name)
+
+        self.result.class_bodies.append(
+            ClassBodyFactsObservation(
+                class_name=class_name,
+                qualified_name=qualified_name,
+                start_line=line_number,
+                end_line=end_line,
+                base_classes=list(base_classes),
+                method_names=method_names,
+                body_source=body_source,
+                class_decorators=class_decorator_names,
+            )
+        )
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+        """Push a function scope frame so we can aggregate structural counts.
+
+        Both ``def`` and ``async def`` are represented by
+        :class:`cst.FunctionDef` (async is expressed via the ``asynchronous``
+        field), so a single visitor handles both.
+        """
+        method_name = node.name.value
+        qname = self._get_qualified_name_for_node(node.name)
+        class_name = self._innermost_class_name()
+        try:
+            pos = self.get_metadata(cst.metadata.PositionProvider, node)
+            start_line = pos.start.line
+            end_line = pos.end.line
+        except (KeyError, AttributeError):
+            start_line = 0
+            end_line = 0
+        self._scope_stack.append(
+            {
+                "kind": "function",
+                "class_name": class_name,
+                "method_name": method_name,
+                "qname": qname,
+                "start_line": start_line,
+                "end_line": end_line,
+                "call_count": 0,
+                "loop_count": 0,
+                "branch_count": 0,
+                "return_count": 0,
+                "called_qualified_names": [],
+            }
+        )
+
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:
-        """Captures functions that have decorators and/or ``# aibom:`` annotations."""
-        # Check for inline aibom annotation
+        """Captures functions that have decorators and/or ``# aibom:`` annotations.
+
+        Also pops the scope frame and emits a
+        :class:`MethodBodyShapeObservation` summarizing the function body.
+        """
+        frame: Optional[Dict[str, Any]] = None
+        if self._scope_stack and self._scope_stack[-1].get("kind") == "function":
+            frame = self._scope_stack.pop()
+
+        if frame is not None:
+            body = getattr(original_node, "body", None)
+            body_stmts = getattr(body, "body", []) or []
+            statement_count = len(body_stmts) if isinstance(body_stmts, (list, tuple)) else 0
+            self.result.method_shapes.append(
+                MethodBodyShapeObservation(
+                    owner_qualified_name=frame["qname"],
+                    owner_class_name=frame["class_name"],
+                    method_name=frame["method_name"],
+                    start_line=frame["start_line"],
+                    end_line=frame["end_line"],
+                    statement_count=statement_count,
+                    call_count=frame["call_count"],
+                    loop_count=frame["loop_count"],
+                    branch_count=frame["branch_count"],
+                    return_count=frame["return_count"],
+                    called_qualified_names=list(frame["called_qualified_names"]),
+                )
+            )
+
         annotation = self._extract_aibom_annotation(original_node)
         if annotation:
             func_name = original_node.name.value
@@ -510,6 +788,160 @@ class SymbolVisitor(cst.CSTVisitor):
 
     def leave_AsyncWith(self, original_node) -> None:
         self._handle_with_items(original_node.items)
+
+    def _push_loop_frame(self, node: cst.CSTNode, loop_kind: str) -> None:
+        owner = self._current_function_frame()
+        try:
+            pos = self.get_metadata(cst.metadata.PositionProvider, node)
+            start_line = pos.start.line
+            end_line = pos.end.line
+        except (KeyError, AttributeError):
+            start_line = 0
+            end_line = 0
+        branch_at_entry = 0
+        if owner is not None:
+            branch_at_entry = owner.get("branch_count", 0)
+        self._scope_stack.append(
+            {
+                "kind": "loop",
+                "loop_kind": loop_kind,
+                "start_line": start_line,
+                "end_line": end_line,
+                "owner": owner,
+                "branch_at_entry": branch_at_entry,
+                "body_call_qualified_names": [],
+                # Flipped on by ``visit_<For|While>_body`` and off again by
+                # the matching ``leave`` hook so iter/test expressions don't
+                # contribute to the loop's body-call set.
+                "in_body": False,
+            }
+        )
+
+    def _pop_loop_frame(self) -> None:
+        """Pop a loop frame and emit an observation only if the loop has an
+        owning function.
+
+        Module-level loops (e.g. CLI scripts or top-level ``while True``
+        daemons) are intentionally ignored: the matcher consumes
+        ``ControlFlowObservation`` to identify ReAct-style orchestration
+        loops inside methods, and attaching that signal to a ``None``
+        owner would both dilute precision and complicate attribution.
+        """
+        if not self._scope_stack or self._scope_stack[-1].get("kind") != "loop":
+            return
+        frame = self._scope_stack.pop()
+        owner = frame.get("owner")
+        if owner is None:
+            return
+        has_branch = owner.get("branch_count", 0) > frame.get("branch_at_entry", 0)
+        self.result.control_flows.append(
+            ControlFlowObservation(
+                owner_qualified_name=owner.get("qname"),
+                owner_class_name=owner.get("class_name"),
+                owner_method_name=owner.get("method_name"),
+                loop_kind=frame["loop_kind"],
+                start_line=frame["start_line"],
+                end_line=frame["end_line"],
+                body_call_qualified_names=list(frame["body_call_qualified_names"]),
+                has_branch=has_branch,
+            )
+        )
+
+    def visit_While(self, node: cst.While) -> None:
+        self._attribute_loop()
+        self._push_loop_frame(node, "while")
+
+    def visit_While_body(self, node: cst.While) -> None:
+        self._mark_loop_body(True)
+
+    def leave_While_body(self, original_node: cst.While) -> None:
+        self._mark_loop_body(False)
+
+    def leave_While(self, original_node: cst.While) -> None:
+        self._pop_loop_frame()
+
+    def visit_For(self, node: cst.For) -> None:
+        self._attribute_loop()
+        kind = "async for" if getattr(node, "asynchronous", None) is not None else "for"
+        self._push_loop_frame(node, kind)
+
+    def visit_For_body(self, node: cst.For) -> None:
+        self._mark_loop_body(True)
+
+    def leave_For_body(self, original_node: cst.For) -> None:
+        self._mark_loop_body(False)
+
+    def leave_For(self, original_node: cst.For) -> None:
+        self._pop_loop_frame()
+
+    def _mark_loop_body(self, in_body: bool) -> None:
+        """Toggle the ``in_body`` flag on the innermost active loop frame.
+
+        No-op if no loop frame is on the stack (e.g. if libcst ever delivers
+        a body visit without a matching loop frame, which should not happen).
+        """
+        for frame in reversed(self._scope_stack):
+            if frame.get("kind") == "loop":
+                frame["in_body"] = in_body
+                return
+
+    def visit_Lambda(self, node: cst.Lambda) -> None:
+        self._scope_stack.append({"kind": "lambda"})
+
+    def leave_Lambda(self, original_node: cst.Lambda) -> None:
+        if self._scope_stack and self._scope_stack[-1].get("kind") == "lambda":
+            self._scope_stack.pop()
+
+    def leave_If(self, original_node: cst.If) -> None:
+        self._attribute_branch()
+
+    def leave_IfExp(self, original_node: cst.IfExp) -> None:
+        self._attribute_branch()
+
+    def leave_Return(self, original_node: cst.Return) -> None:
+        self._attribute_return()
+
+    def leave_SimpleString(self, original_node: cst.SimpleString) -> None:
+        """Emit a :class:`StringLiteralObservation` for protocol-relevant literals
+        that appear inside a class body (including methods).
+
+        A literal is attributed to its innermost enclosing function when one
+        exists (so ``owner_method_name`` names the method). If the literal
+        lives directly in the class body — e.g. ``card_path = "/.well-known/
+        agent.json"`` as a class attribute — it is still captured, with
+        ``owner_method_name = None`` and ``owner_class_name`` set to the
+        enclosing class. Strings at pure module scope are ignored.
+        """
+        fn_frame = self._current_function_frame()
+        class_name = self._innermost_class_name()
+        if fn_frame is None and class_name is None:
+            return
+        try:
+            value = ast.literal_eval(original_node.value)
+        except (ValueError, SyntaxError):
+            return
+        if not isinstance(value, str):
+            return
+        if not _is_protocol_relevant_string(value):
+            return
+        try:
+            line = self.get_metadata(cst.metadata.PositionProvider, original_node).start.line
+        except (KeyError, AttributeError):
+            line = 0
+        if fn_frame is not None:
+            owner_class = fn_frame.get("class_name")
+            owner_method = fn_frame.get("method_name")
+        else:
+            owner_class = class_name
+            owner_method = None
+        self.result.protocol_strings.append(
+            StringLiteralObservation(
+                owner_class_name=owner_class,
+                owner_method_name=owner_method,
+                line_number=line,
+                value=value,
+            )
+        )
 
 def parse_source_code(file_path: str, source_code: str) -> CodeAnalysisResult:
     """

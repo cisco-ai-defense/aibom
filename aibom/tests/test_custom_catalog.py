@@ -400,3 +400,76 @@ class TestCatalogDBCustomEntries:
         module_entries = [r for r in results if r["id"] == "torch.nn.Module"]
         assert len(module_entries) == 1
         assert module_entries[0]["concept"] == "model"  # DB value wins
+
+
+# ─── agent_signatures section routing ───────────────────────────────────
+
+
+class TestCustomCatalogAgentSignatures:
+    """The loader must pass the ``agent_signatures:`` section through to
+    :func:`parse_user_signatures` and expose it on ``CustomCatalogConfig``.
+    """
+
+    def test_agent_signatures_are_loaded(self, tmp_path: Path):
+        yaml_content = textwrap.dedent("""\
+            agent_signatures:
+              frameworks:
+                - id: myorg.InternalAgent
+                  framework: myorg
+                  evidence_pattern: framework_inheritance
+                  base_class_names: [InternalAgentBase]
+                  import_substrings: [myorg.agents]
+              protocols:
+                - id: myorg.remote
+                  protocol: remote_http
+                  evidence_pattern: remote_proxy
+                  role: client
+                  qualified_name_substrings: [myorg.remote.Client]
+              anti_patterns:
+                - id: myorg.cron
+                  label: cron_job
+                  base_class_names: [CronJob]
+              verification_policy:
+                require_evidence_for_agent: false
+                min_react_loop_call_count: 5
+        """)
+        config_file = tmp_path / ".aibom.yaml"
+        config_file.write_text(yaml_content)
+
+        config = load_custom_catalog(config_file)
+
+        assert len(config.agent_signatures.frameworks) == 1
+        assert config.agent_signatures.frameworks[0].id == "myorg.InternalAgent"
+        assert len(config.agent_signatures.protocols) == 1
+        assert config.agent_signatures.protocols[0].id == "myorg.remote"
+        assert len(config.agent_signatures.anti_patterns) == 1
+        assert config.agent_signatures.anti_patterns[0].id == "myorg.cron"
+        assert config.agent_signatures.verification_policy.require_evidence_for_agent is False
+        assert config.agent_signatures.verification_policy.min_react_loop_call_count == 5
+
+    def test_agent_signatures_absent_yields_empty_catalog(self, tmp_path: Path):
+        yaml_content = textwrap.dedent("""\
+            components:
+              - id: MyLLMWrapper
+                concept: model
+        """)
+        config_file = tmp_path / ".aibom.yaml"
+        config_file.write_text(yaml_content)
+
+        config = load_custom_catalog(config_file)
+        assert config.agent_signatures.is_empty is True
+
+    def test_is_empty_accounts_for_agent_signatures(self, tmp_path: Path):
+        yaml_content = textwrap.dedent("""\
+            agent_signatures:
+              frameworks:
+                - id: myorg.X
+                  framework: myorg
+                  evidence_pattern: framework_agent
+                  entrypoint_qualified_names: [myorg.X]
+        """)
+        config_file = tmp_path / ".aibom.yaml"
+        config_file.write_text(yaml_content)
+
+        config = load_custom_catalog(config_file)
+        assert config.is_empty is False

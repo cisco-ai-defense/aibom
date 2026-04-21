@@ -33,9 +33,15 @@ from .manifest import KBManifest, KBManifestIndex
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_MANIFEST_URL = "https://aibom-kb.cisco.com/manifest.json"
-DEFAULT_API_BASE = "https://api.ai-defense.cisco.com"
+DEFAULT_MANIFEST_URL: str | None = None
+DEFAULT_API_BASE: str | None = None
 HTTP_TIMEOUT = httpx.Timeout(120.0)
+
+_REGIONAL_ENDPOINT_HINT = (
+    "Regional API hosts follow the same pattern as AIBOM_POST_URL — "
+    "api.security.cisco.com (US), api.eu.security.cisco.com (EU), "
+    "api.apj.security.cisco.com (APJ), api.uae.security.cisco.com (UAE)."
+)
 
 
 class KBError(Exception):
@@ -44,7 +50,21 @@ class KBError(Exception):
 
 class KBManager:
     def __init__(self, *, manifest_url: str | None = None) -> None:
-        self._default_manifest_url = manifest_url or DEFAULT_MANIFEST_URL
+        self._default_manifest_url = (
+            manifest_url
+            or os.environ.get("CISCO_AIBOM_MANIFEST_URL")
+            or DEFAULT_MANIFEST_URL
+        )
+
+    def _resolve_manifest_url(self, url: str | None) -> str:
+        resolved = url or self._default_manifest_url
+        if not resolved:
+            raise KBError(
+                "KB manifest URL required: pass --url, set "
+                "CISCO_AIBOM_MANIFEST_URL, or construct KBManager(manifest_url=...). "
+                + _REGIONAL_ENDPOINT_HINT
+            )
+        return resolved
 
     def _user_root(self) -> Path:
         return Path(platformdirs.user_data_dir("aibom"))
@@ -96,6 +116,11 @@ class KBManager:
 
     def _resolve_api_base(self, api_base: str | None) -> str:
         base = api_base or os.environ.get("CISCO_AI_DEFENSE_API_BASE") or DEFAULT_API_BASE
+        if not base:
+            raise KBError(
+                "API base URL required: pass --api-base or set "
+                "CISCO_AI_DEFENSE_API_BASE. " + _REGIONAL_ENDPOINT_HINT
+            )
         return base.rstrip("/")
 
     def _select_manifest(self, index: KBManifestIndex, version: str | None) -> KBManifest:
@@ -122,7 +147,7 @@ class KBManager:
             return latest != current
 
     def download(self, version: str | None = None, url: str | None = None) -> Path:
-        manifest_url = url or self._default_manifest_url
+        manifest_url = self._resolve_manifest_url(url)
         raw = self._get_manifest(manifest_url)
         try:
             index = KBManifestIndex.model_validate(raw)
@@ -173,7 +198,7 @@ class KBManager:
         return dest
 
     def check(self) -> dict[str, Any]:
-        manifest_url = self._default_manifest_url
+        manifest_url = self._resolve_manifest_url(None)
         raw = self._get_manifest(manifest_url)
         try:
             index = KBManifestIndex.model_validate(raw)
@@ -278,7 +303,7 @@ class KBManager:
     ) -> dict[str, Any]:
         base = self._resolve_api_base(api_base)
         key = self._resolve_api_key(api_key)
-        endpoint = f"{base}/api/v1/aibom/kb/requests"
+        endpoint = f"{base}/api/ai-defense/v1/aibom/kb/requests"
         payload = {"sdk": sdk, "version": version, "language": language}
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT) as client:
@@ -310,7 +335,7 @@ class KBManager:
     ) -> dict[str, Any]:
         base = self._resolve_api_base(api_base)
         key = self._resolve_api_key(api_key)
-        endpoint = f"{base}/api/v1/aibom/kb/requests/{request_id}"
+        endpoint = f"{base}/api/ai-defense/v1/aibom/kb/requests/{request_id}"
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT) as client:
                 resp = client.get(endpoint, headers=self._api_headers(key))
@@ -335,7 +360,7 @@ class KBManager:
     ) -> list[dict[str, Any]]:
         base = self._resolve_api_base(api_base)
         key = self._resolve_api_key(api_key)
-        endpoint = f"{base}/api/v1/aibom/kb/requests"
+        endpoint = f"{base}/api/ai-defense/v1/aibom/kb/requests"
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT) as client:
                 resp = client.get(endpoint, headers=self._api_headers(key))

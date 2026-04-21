@@ -189,3 +189,35 @@ class TestDependencyScanner:
         assert "google-genai" in names
         assert "openai-agents" in names
         assert "llmetry" in names
+
+    def test_recognizes_strands_packages(self, tmp_path: Path) -> None:
+        """AWS Strands agent framework packages must be detected.
+
+        Covers both bare names and extras syntax (``strands-agents[otel]``)
+        since Strands docs frequently recommend the OpenTelemetry extra.
+        """
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "requirements.txt": (
+                    "strands-agents>=1.0\n"
+                    "strands-agents-tools>=1.0\n"
+                    "mcp-proxy-for-aws>=0.1\n"
+                ),
+            },
+        )
+        names = {c.name for c in comps}
+        assert "strands-agents" in names
+        assert "strands-agents-tools" in names
+        assert "mcp-proxy-for-aws" in names
+
+    def test_recognizes_strands_with_extras(self, tmp_path: Path) -> None:
+        """``strands-agents[otel]`` normalises to ``strands-agents``."""
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {"requirements.txt": "strands-agents[otel]>=1.0\n"},
+        )
+        names = {c.name for c in comps}
+        assert "strands-agents" in names

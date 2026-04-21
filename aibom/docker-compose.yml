@@ -1,24 +1,16 @@
-# docker-compose.yml — local dev/testing for cisco-aibom Docker images.
+# docker-compose.yml — local dev/testing for the cisco-aibom Docker image.
 # NOT for production. Images are NOT pushed from here.
 #
 # Usage:
-#   docker compose build              # build both variants
-#   docker compose run base analyze /workspace -o json
-#   docker compose run agentic analyze /workspace --llm-model anthropic/claude-sonnet-4-20250514
+#   docker compose build
+#   docker compose run aibom analyze /workspace -o json -O /workspace/report.json \
+#     --llm-model anthropic/claude-sonnet-4-20250514
 
 services:
-  base:
+  aibom:
     build:
       context: .
       dockerfile: Dockerfile
-    volumes:
-      - ${SCAN_DIR:-.}:/workspace:ro
-    working_dir: /workspace
-
-  agentic:
-    build:
-      context: .
-      dockerfile: Dockerfile.agentic
     volumes:
       - ${SCAN_DIR:-.}:/workspace:ro
     working_dir: /workspace

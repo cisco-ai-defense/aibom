@@ -27,12 +27,13 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
+from ..agent_signatures import AgentSignatureCatalog
 from ..cache_paths import cache_read_dirs, ensure_cache_dir
 from ..models import (
     AIComponent,
@@ -44,6 +45,7 @@ from ..models import (
     ScanResult,
     SourceResult,
 )
+from .evidence_injection import DossierIndex, build_dossier_index
 from .middleware import AIBOMScannerMiddleware
 from .prompts import AIBOM_AGENT_SYSTEM_PROMPT
 
@@ -52,6 +54,43 @@ _IID_DESC = (
     "copy it verbatim including underscores, full absolute paths, "
     "and trailing line numbers. Do NOT shorten, reformat, or omit any part."
 )
+
+
+@dataclass
+class TokenUsage:
+    """Aggregated LLM token counts across batches."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, other: "TokenUsage") -> None:
+        self.prompt_tokens += other.prompt_tokens
+        self.completion_tokens += other.completion_tokens
+        self.total_tokens += other.total_tokens
+
+
+_token_accumulator = TokenUsage()
+
+
+def _reset_token_usage() -> None:
+    global _token_accumulator
+    _token_accumulator = TokenUsage()
+
+
+def get_token_usage() -> TokenUsage:
+    return _token_accumulator
+
+
+def _accumulate_token_usage(result: Any) -> None:
+    """Sum ``usage_metadata`` from all AI messages in a LangGraph result."""
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    for msg in messages:
+        um = getattr(msg, "usage_metadata", None)
+        if um and isinstance(um, dict):
+            _token_accumulator.prompt_tokens += um.get("input_tokens", 0)
+            _token_accumulator.completion_tokens += um.get("output_tokens", 0)
+            _token_accumulator.total_tokens += um.get("total_tokens", 0)
 
 
 class _EvidenceLocation(BaseModel):
@@ -68,10 +107,59 @@ class _DecisionAnnotation(BaseModel):
     evidence_locations: list[_EvidenceLocation] = Field(default_factory=list)
 
 
+class AgentEvidence(BaseModel):
+    """Structured evidence that a component is truly an agent.
+
+    Every classification that results in ``component_type == "agent"`` MUST
+    populate this. The verification gate in
+    :class:`aibom.agentic.middleware.AIBOMScannerMiddleware` checks that the
+    claimed evidence actually exists in the scanned source code (file path
+    resolves, the line range contains ``evidence_snippet`` after whitespace
+    normalization, and ``pattern`` is one of the accepted values).
+
+    Patterns
+    --------
+    framework_agent
+        Direct use of a known agent-framework entrypoint — e.g. LangChain
+        ``AgentExecutor``, LangGraph ``create_react_agent``, AutoGen
+        ``AssistantAgent``, CrewAI ``Agent``.
+    react_loop
+        An explicit reasoning loop: ``while``/``for`` body that calls an LLM
+        and dispatches to tools based on the LLM's structured output.
+    framework_inheritance
+        Subclasses a known agent base class (e.g. ``BaseSingleActionAgent``,
+        LlamaIndex ``BaseAgent``) and implements agent methods.
+    a2a_server
+        Registered as an A2A agent — serves an Agent Card at
+        ``/.well-known/agent.json`` or instantiates ``A2AServer``.
+    remote_proxy
+        Thin client invoking a remote agent, where the remote side has been
+        independently verified (A2A Agent Card found, OpenAI Assistants API
+        used, or cross-repo resolution matched a verified agent).
+    other
+        Custom pattern — ``justification`` must explain why.
+    """
+
+    pattern: Literal[
+        "framework_agent",
+        "react_loop",
+        "framework_inheritance",
+        "a2a_server",
+        "remote_proxy",
+        "other",
+    ] = "other"
+    definition_file: str = ""
+    definition_start_line: int = 0
+    definition_end_line: int = 0
+    evidence_snippet: str = ""
+    justification: str = ""
+
+
 class _EnrichedComponent(BaseModel):
     instance_id: str = Field(default="", description=_IID_DESC)
     updates: dict[str, Any] = Field(default_factory=dict)
     decision_annotation: _DecisionAnnotation | None = None
+    agent_evidence: AgentEvidence | None = None
 
 
 class _NewComponent(BaseModel):
@@ -83,6 +171,7 @@ class _NewComponent(BaseModel):
     model_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     decision_annotation: _DecisionAnnotation | None = None
+    agent_evidence: AgentEvidence | None = None
 
 
 class _RemoveComponent(BaseModel):
@@ -94,12 +183,15 @@ class _ReclassifyComponent(BaseModel):
     instance_id: str = Field(default="", description=_IID_DESC)
     new_type: str = ""
     reason: str = ""
+    agent_evidence: AgentEvidence | None = None
 
 
 class _Relationship(BaseModel):
     source_name: str = ""
     target_name: str = ""
     relationship_type: str = ""
+    source_type: str = ""
+    target_type: str = ""
     decision_annotation: _DecisionAnnotation | None = None
 
 
@@ -680,12 +772,12 @@ class _DecisionMemo:
             self._verdicts[k] = {
                 "action": "reclassify",
                 "new_type": c_after.component_type.value,
-                "confidence": c_after.confidence,
+                "heuristic_confidence": c_after.heuristic_confidence,
             }
         else:
             self._verdicts[k] = {
                 "action": "keep",
-                "confidence": c_after.confidence,
+                "heuristic_confidence": c_after.heuristic_confidence,
             }
 
     def lookup(self, c: AIComponent) -> dict[str, Any] | None:
@@ -724,12 +816,12 @@ class _DecisionMemo:
                     continue
                 result.append(c.model_copy(update={
                     "component_type": new_type,
-                    "confidence": verdict.get("confidence", c.confidence),
+                    "heuristic_confidence": verdict.get("heuristic_confidence", c.heuristic_confidence),
                     "needs_agentic": False,
                 }))
             else:
                 result.append(c.model_copy(update={
-                    "confidence": verdict.get("confidence", c.confidence),
+                    "heuristic_confidence": verdict.get("heuristic_confidence", c.heuristic_confidence),
                     "needs_agentic": False,
                 }))
         return result
@@ -764,6 +856,7 @@ def _run_batch(
     all_components: list[AIComponent] | None = None,
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
+    dossier_index: DossierIndex | None = None,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag], bool]:
     """Invoke the agent on a single batch and return parsed results."""
     from .tools import _reset_tool_stats, get_tool_stats
@@ -775,7 +868,9 @@ def _run_batch(
         ", ".join(c.name for c in batch),
     )
     summary = _build_context_message(
-        batch, relationships, scan_paths, all_components=all_components,
+        batch, relationships, scan_paths,
+        all_components=all_components,
+        dossier_index=dossier_index,
     )
     t0 = time.monotonic()
 
@@ -811,6 +906,7 @@ def _run_batch(
             batch_num, elapsed, exc, json.dumps(stats),
         )
         if result is not None:
+            _accumulate_token_usage(result)
             data = _extract_structured_response(result)
             if data:
                 _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
@@ -820,6 +916,7 @@ def _run_batch(
         enriched = _degraded_batch_components(batch, hint="batch_recursion_limit")
         return enriched, [], [], [], True
 
+    _accumulate_token_usage(result)
     elapsed = time.monotonic() - t0
     stats = get_tool_stats()
     total_tool_calls = sum(s["calls"] for s in stats.values())
@@ -852,6 +949,7 @@ async def _run_batch_async(
     all_components: list[AIComponent] | None = None,
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
+    dossier_index: DossierIndex | None = None,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag], bool]:
     """Async version of _run_batch using agent.ainvoke()."""
     from .tools import _reset_tool_stats, get_tool_stats
@@ -863,7 +961,9 @@ async def _run_batch_async(
         ", ".join(c.name for c in batch),
     )
     summary = _build_context_message(
-        batch, relationships, scan_paths, all_components=all_components,
+        batch, relationships, scan_paths,
+        all_components=all_components,
+        dossier_index=dossier_index,
     )
     t0 = time.monotonic()
 
@@ -893,6 +993,7 @@ async def _run_batch_async(
             batch_num, elapsed, exc, json.dumps(stats),
         )
         if result is not None:
+            _accumulate_token_usage(result)
             data = _extract_structured_response(result)
             if data:
                 _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
@@ -902,6 +1003,7 @@ async def _run_batch_async(
         enriched = _degraded_batch_components(batch, hint="batch_recursion_limit")
         return enriched, [], [], [], True
 
+    _accumulate_token_usage(result)
     elapsed = time.monotonic() - t0
     stats = get_tool_stats()
     total_tool_calls = sum(s["calls"] for s in stats.values())
@@ -934,6 +1036,7 @@ async def _run_batches_parallel(
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    dossier_index: DossierIndex | None = None,
 ) -> tuple[
     list[AIComponent],
     list[AIComponent],
@@ -975,6 +1078,7 @@ async def _run_batches_parallel(
                     idx, total,
                     all_components=all_components,
                     timeout_s=timeout_s,
+                    dossier_index=dossier_index,
                 )
                 return idx, batch, enriched, new, rels, flags, failed
             except Exception as exc:
@@ -1043,6 +1147,7 @@ def _run_tier(
     memo: _DecisionMemo | None = None,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    dossier_index: DossierIndex | None = None,
 ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Execute a single tier (simple or complex) with caching and parallel batches."""
     tier_enriched: list[AIComponent] = []
@@ -1109,6 +1214,7 @@ def _run_tier(
                 max_concurrent=max_concurrent,
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
+                dossier_index=dossier_index,
             )
         )
     else:
@@ -1134,6 +1240,7 @@ def _run_tier(
                 idx, len(batches),
                 all_components=all_components,
                 timeout_s=timeout_s,
+                dossier_index=dossier_index,
             )
             enriched.extend(e)
             new.extend(n)
@@ -1188,6 +1295,7 @@ def _run_tier(
                 idx, len(retry_batches),
                 all_components=all_components,
                 timeout_s=timeout_s,
+                dossier_index=dossier_index,
             )
             retry_enriched.extend(e)
             retry_new.extend(n)
@@ -1307,7 +1415,8 @@ def run_agentic_enrichment(
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
     cache_dir: Path | None = None,
     include_code_snippets: bool = False,
-) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    agent_signature_catalog: AgentSignatureCatalog | None = None,
+) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag], TokenUsage]:
     """Run the full agentic enrichment pipeline.
 
     Features:
@@ -1315,6 +1424,9 @@ def run_agentic_enrichment(
       - Configurable parallel batches via *max_concurrent*
       - Content-hash result caching across re-runs
       - Sub-agent dispatch for large repos (>50 candidates per scan root)
+      - Agent-evidence dossier injection: every ENRICH target that is an
+        AGENT / AGENT_PROXY / MCP_SERVER / MCP_CLIENT candidate is shown the
+        verbatim class body plus a CST-derived evidence dossier
 
     Parameters
     ----------
@@ -1338,14 +1450,19 @@ def run_agentic_enrichment(
     cache_dir:
         Optional on-disk cache directory override. When not provided, the
         default agentic cache location is used.
+    agent_signature_catalog:
+        Optional merged agent-signature catalog (built-ins + user
+        overrides). When omitted, :func:`aibom.agent_signatures.resolve_catalog`
+        is used to pick up built-in defaults.
 
     Returns
     -------
-    Tuple of (enriched_components, new_relationships, risk_flags).
+    Tuple of (enriched_components, new_relationships, risk_flags, token_usage).
     """
     from .tools import set_allowed_search_roots
 
     set_allowed_search_roots([str(Path(p).resolve()) for p in scan_paths])
+    _reset_token_usage()
 
     simple, complex_ = _classify_candidates(deterministic_components)
 
@@ -1357,6 +1474,16 @@ def run_agentic_enrichment(
         len(deterministic_relationships),
         max_concurrent,
     )
+
+    dossier_index: DossierIndex = build_dossier_index(
+        deterministic_components,
+        catalog=agent_signature_catalog,
+    )
+    if dossier_index:
+        _LOGGER.info(
+            "Built agent-evidence dossier index with %d class entries",
+            len(dossier_index),
+        )
 
     resolved_cache_dir = cache_dir if cache_dir is not None else _default_agentic_cache_dir()
     fallback_dirs: list[Path] = []
@@ -1399,6 +1526,7 @@ def run_agentic_enrichment(
                 memo=memo,
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
+                dossier_index=dossier_index,
             )
             all_enriched.extend(e)
             all_new.extend(n)
@@ -1431,6 +1559,7 @@ def run_agentic_enrichment(
                         memo=memo,
                         timeout_s=timeout_s,
                         max_consecutive_failures=max_consecutive_failures,
+                        dossier_index=dossier_index,
                     )
                     all_enriched.extend(e)
                     all_new.extend(n)
@@ -1449,6 +1578,7 @@ def run_agentic_enrichment(
                     memo=memo,
                     timeout_s=timeout_s,
                     max_consecutive_failures=max_consecutive_failures,
+                    dossier_index=dossier_index,
                 )
                 all_enriched.extend(e)
                 all_new.extend(n)
@@ -1459,16 +1589,20 @@ def run_agentic_enrichment(
 
     all_components = all_enriched + all_new
 
+    usage = get_token_usage()
     _LOGGER.info(
         "Agentic enrichment complete: %d enriched, %d new components, "
-        "%d new relationships, %d risk flags",
+        "%d new relationships, %d risk flags, tokens=%d (prompt=%d, completion=%d)",
         len(all_enriched),
         len(all_new),
         len(all_rels),
         len(all_flags),
+        usage.total_tokens,
+        usage.prompt_tokens,
+        usage.completion_tokens,
     )
 
-    return all_components, all_rels, all_flags
+    return all_components, all_rels, all_flags, usage
 
 
 _CODE_CONTEXT_RADIUS = 15
@@ -1491,13 +1625,35 @@ def _read_code_window(file_path: str, line: int) -> str | None:
     return "\n".join(numbered)
 
 
+_MAX_CLASS_BODY_CHARS = 8000
+
+
+def _truncate_class_body(body: str) -> tuple[str, bool]:
+    """Cap *body* at :data:`_MAX_CLASS_BODY_CHARS`. Returns (text, truncated?)."""
+    if len(body) <= _MAX_CLASS_BODY_CHARS:
+        return body, False
+    head = body[: _MAX_CLASS_BODY_CHARS]
+    return head, True
+
+
 def _component_to_summary(
     c: AIComponent,
     *,
     include_code: bool = False,
     enrich_target: bool = False,
+    dossier_index: "DossierIndex | None" = None,
 ) -> dict[str, Any]:
-    """Serialize a single component for the agent prompt."""
+    """Serialize a single component for the agent prompt.
+
+    When ``dossier_index`` is provided and the component is an
+    ENRICH target that covers a class captured by the evidence
+    builder, the returned summary also contains:
+
+    * ``class_body_source`` — the verbatim class body (truncated to
+      :data:`_MAX_CLASS_BODY_CHARS` characters).
+    * ``agent_evidence_dossier`` — the structured matches produced by
+      :mod:`aibom.scanners.agent_evidence_builder`.
+    """
     entry: dict[str, Any] = {
         "instance_id": c.instance_id,
         "name": c.name,
@@ -1520,6 +1676,19 @@ def _component_to_summary(
         if snippet:
             entry["code_context"] = snippet
 
+    if enrich_target and dossier_index:
+        from .evidence_injection import lookup_dossier
+        from ..scanners.agent_evidence_builder import render_dossier_for_prompt
+
+        dossier = lookup_dossier(c, dossier_index)
+        if dossier is not None:
+            if dossier.class_body_source:
+                body, truncated = _truncate_class_body(dossier.class_body_source)
+                entry["class_body_source"] = body
+                if truncated:
+                    entry["class_body_truncated"] = True
+            entry["agent_evidence_dossier"] = render_dossier_for_prompt(dossier)
+
     return entry
 
 
@@ -1528,17 +1697,27 @@ def _build_context_message(
     relationships: list[ComponentRelationship],
     scan_paths: list[str],
     all_components: list[AIComponent] | None = None,
+    dossier_index: "DossierIndex | None" = None,
 ) -> str:
     """Build the user message that seeds the agent with deterministic results.
 
-    *batch* — components the agent must enrich (with code context).
+    *batch* — components the agent must enrich (with code context and,
+    when available, the CST-derived agent evidence dossier).
     *all_components* — full scan results for situational awareness (without
     code context, to keep the prompt compact).
+    *dossier_index* — optional map from ``(file_path, class_start_line)`` to
+    :class:`AgentEvidenceDossier`; produced by
+    :func:`aibom.agentic.evidence_injection.build_dossier_index`.
     """
     batch_ids = {c.instance_id for c in batch}
 
     enrich_summaries = [
-        _component_to_summary(c, include_code=True, enrich_target=True)
+        _component_to_summary(
+            c,
+            include_code=True,
+            enrich_target=True,
+            dossier_index=dossier_index,
+        )
         for c in batch
     ]
 
@@ -1568,10 +1747,13 @@ def _build_context_message(
 
     return (
         "Below are the deterministic scan results. Components in "
-        "`enrich_these` (marked ENRICH=true) need your analysis — each "
-        "includes a code_context window. `other_detected_components` shows "
-        "everything else already found; use it to discover relationships and "
-        "missing components but do NOT re-enrich those.\n\n"
+        "`enrich_these` (marked ENRICH=true) need your analysis. Each "
+        "includes a `code_context` window; agent / MCP / agent_proxy "
+        "candidates also include `class_body_source` (verbatim class body) "
+        "and `agent_evidence_dossier` (structured CST-derived evidence). "
+        "`other_detected_components` shows everything else already found; "
+        "use it to discover relationships and missing components but do "
+        "NOT re-enrich those.\n\n"
         f"```json\n{json.dumps(context, indent=2)}\n```"
     )
 
@@ -1644,15 +1826,49 @@ The orientation summary contains:
 - **unresolved_env_var_refs** — Env var names referenced in code but not
   defined in any scanned config file.
 
+## Cross-repo patterns to trace
+
+For EVERY relationship you emit, you MUST specify ``source_repo`` and
+``target_repo`` — the repo where the source and target live respectively.
+These must be different repos; same-repo relationships are already captured
+in per-repo scans.
+
+Trace these general patterns across repositories:
+
+- **Agent -> Model (via deployment config)**: Application code in repo A
+  uses an agent/orchestrator that consumes a model. Repo B's Helm values
+  or deployment templates define that model ID (via ENGINE, MODEL_NAME,
+  or similar keys). Emit ``USES_MODEL`` with source_repo=A, target_repo=B.
+- **Code -> LLM Endpoint (via env var)**: Repo A code reads an env var
+  whose value is an LLM endpoint URL. Repo B's Helm chart or deployment
+  config defines that env var. Emit ``USES_LLM_ENDPOINT`` with
+  source_repo=A, target_repo=B.
+- **Code -> Vector Store (via env var)**: Repo A code reads an env var
+  pointing to a vector store endpoint (Weaviate, Pinecone, Qdrant, etc.).
+  Repo B deploys that vector store. Emit ``USES_VECTOR_STORE``.
+- **MCP client -> MCP server**: Repo A instantiates an MCP client
+  connecting to an endpoint URL. Repo B deploys the MCP server at that
+  endpoint. Emit ``USES_MCP_SERVER``.
+- **Endpoint -> Model (transitive)**: Repo B's deployment config maps an
+  endpoint URL to a model engine/deployment name. Repo A's code consumes
+  that endpoint. The transitive chain is Agent(A) -> Endpoint(B) ->
+  Model(B). Emit both links.
+- **Shared model IDs alone are NOT cross-repo relationships**. The same
+  model ID appearing in both repos is already captured deterministically
+  as ``SHARED_MODEL``. Only emit a relationship when you can trace a
+  specific component-to-component dependency.
+
 ## Workflow
 
 1. Read the orientation summary. Note which repos share env vars, packages,
    or have unresolved references.
 2. Call `get_repo_components` for each repo to get full component details.
-3. Cross-reference: match components across repos by model name, env var,
-   endpoint URL, or service name. Use `resolve_env_var` or `resolve_iac_ref`
-   for any references not already pre-resolved.
-4. Identify relationships: which components in different repos are connected?
+3. Cross-reference: for each agent/orchestrator in repo A, check if it
+   reads env vars that are defined in repo B (Helm values, deployment
+   templates). Use `resolve_env_var` or `resolve_iac_ref` for references
+   not already pre-resolved.
+4. Identify relationships using the patterns above. Every relationship
+   MUST cross repo boundaries (source_repo != target_repo).
 5. Flag risks: mismatched model versions, env vars with different values
    across repos, unresolved references, or missing configurations.
 6. Output your JSON — then STOP.
@@ -1675,8 +1891,10 @@ Return a SINGLE JSON object:
   "new_relationships": [
     {
       "source_name": "...",
+      "source_repo": "repo-path-or-name (REQUIRED)",
       "target_name": "...",
-      "relationship_type": "USES_MODEL|DEPENDS_ON|CALLS_SERVICE|..."
+      "target_repo": "repo-path-or-name (REQUIRED)",
+      "relationship_type": "USES_MODEL|USES_LLM_ENDPOINT|USES_VECTOR_STORE|USES_EMBEDDING|USES_MCP_SERVER|HOSTS_MODEL|OBSERVED_BY|CUSTOM"
     }
   ],
   "risk_findings": [
@@ -1694,7 +1912,14 @@ Return a SINGLE JSON object:
 1. Do NOT hallucinate. Every finding must be backed by tool results or the
    orientation data.
 2. Pre-resolved env vars are confirmed facts — use them, do not re-resolve.
-3. Your FINAL message must be valid JSON and nothing else. No preamble,
+3. Every ``new_relationships`` entry MUST have ``source_repo`` and
+   ``target_repo`` set to a repo name or path from the orientation summary.
+   They MUST be different repos. Omitting them or setting them to the same
+   repo renders the link unusable.
+4. Do NOT emit ``SHARED_MODEL`` relationships — those are already detected
+   deterministically. Only emit relationships that trace a specific
+   component-to-component cross-repo dependency.
+5. Your FINAL message must be valid JSON and nothing else. No preamble,
    no markdown fences, no explanation. First character `{`, last character `}`.
 """
 
@@ -1845,6 +2070,8 @@ def run_cross_repo_coordination(
             source_name=item.get("source_name", ""),
             target_name=item.get("target_name", ""),
             relationship_type=rel_type,
+            source_repo=item.get("source_repo", ""),
+            target_repo=item.get("target_repo", ""),
         ))
 
     from ..models import Severity as Sev

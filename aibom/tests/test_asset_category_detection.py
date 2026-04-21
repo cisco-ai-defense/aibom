@@ -464,7 +464,7 @@ class TestConsolidation:
             component_type=AIComponentType.VECTOR_STORE,
             file_path="/svc/a/one.py",
             line_number=10,
-            confidence=0.8,
+            heuristic_confidence=0.8,
         )
         dups = [
             base.model_copy(update={"file_path": f"/svc/a/{f}.py", "line_number": n})
@@ -480,11 +480,11 @@ class TestConsolidation:
 
         a = AIComponent(
             name="gpt-4", component_type=AIComponentType.MODEL,
-            file_path="/svc/a/x.py", line_number=1, confidence=0.9,
+            file_path="/svc/a/x.py", line_number=1, heuristic_confidence=0.9,
         )
         b = AIComponent(
             name="gpt-4", component_type=AIComponentType.SECRET,
-            file_path="/svc/a/y.py", line_number=5, confidence=0.6,
+            file_path="/svc/a/y.py", line_number=5, heuristic_confidence=0.6,
         )
         result = _consolidate_components([a, b])
         assert len(result) == 2
@@ -502,11 +502,11 @@ class TestConsolidation:
 
         a = AIComponent(
             name="gpt-4", component_type=AIComponentType.MODEL,
-            file_path=str(svc1 / "x.py"), line_number=1, confidence=0.9,
+            file_path=str(svc1 / "x.py"), line_number=1, heuristic_confidence=0.9,
         )
         b = AIComponent(
             name="gpt-4", component_type=AIComponentType.MODEL,
-            file_path=str(svc2 / "y.py"), line_number=5, confidence=0.9,
+            file_path=str(svc2 / "y.py"), line_number=5, heuristic_confidence=0.9,
         )
         result = _consolidate_components([a, b])
         assert len(result) == 1
@@ -519,22 +519,22 @@ class TestConsolidation:
 
         low = AIComponent(
             name="Agent", component_type=AIComponentType.AGENT,
-            file_path="/svc/a/low.py", line_number=5, confidence=0.3,
+            file_path="/svc/a/low.py", line_number=5, heuristic_confidence=0.3,
         )
         high = AIComponent(
             name="Agent", component_type=AIComponentType.AGENT,
-            file_path="/svc/a/high.py", line_number=10, confidence=0.9,
+            file_path="/svc/a/high.py", line_number=10, heuristic_confidence=0.9,
         )
         result = _consolidate_components([low, high])
         assert len(result) == 1
-        assert result[0].confidence == 0.9
+        assert result[0].heuristic_confidence == 0.9
 
     def test_singleton_left_alone(self):
         from aibom.scan_pipeline import _consolidate_components
 
         c = AIComponent(
             name="redis", component_type=AIComponentType.MEMORY,
-            file_path="/svc/a/mem.py", line_number=1, confidence=0.8,
+            file_path="/svc/a/mem.py", line_number=1, heuristic_confidence=0.8,
         )
         result = _consolidate_components([c])
         assert len(result) == 1
@@ -762,7 +762,7 @@ class TestCloudMLDetection:
         comps, _ = scanner.scan(ctx)
         training = [c for c in comps if c.component_type == AIComponentType.TRAINING_RUN]
         for c in training:
-            assert c.confidence >= 0.8
+            assert c.heuristic_confidence >= 0.8
             assert c.needs_agentic is False
 
 
@@ -785,16 +785,16 @@ class TestRepoLevelConsolidation:
         comps = [
             AIComponent(
                 name="gpt-4", component_type=AIComponentType.MODEL,
-                file_path=str(svc1 / "a.py"), line_number=1, confidence=0.9,
+                file_path=str(svc1 / "a.py"), line_number=1, heuristic_confidence=0.9,
             ),
             AIComponent(
                 name="gpt-4", component_type=AIComponentType.MODEL,
-                file_path=str(svc2 / "b.py"), line_number=5, confidence=0.7,
+                file_path=str(svc2 / "b.py"), line_number=5, heuristic_confidence=0.7,
             ),
         ]
         result = _consolidate_components(comps)
         assert len(result) == 1
-        assert result[0].confidence == 0.9
+        assert result[0].heuristic_confidence == 0.9
         ev = result[0].metadata["evidence"]
         assert len(ev) == 1
         assert "service" in ev[0]
@@ -805,11 +805,11 @@ class TestRepoLevelConsolidation:
         comps = [
             AIComponent(
                 name="Weaviate", component_type=AIComponentType.VECTOR_STORE,
-                file_path=str(tmp_path / "a.py"), line_number=1, confidence=0.9,
+                file_path=str(tmp_path / "a.py"), line_number=1, heuristic_confidence=0.9,
             ),
             AIComponent(
                 name="Weaviate", component_type=AIComponentType.VECTOR_STORE,
-                file_path=str(tmp_path / "b.py"), line_number=10, confidence=0.7,
+                file_path=str(tmp_path / "b.py"), line_number=10, heuristic_confidence=0.7,
             ),
         ]
         result = _consolidate_components(comps)
@@ -830,12 +830,12 @@ class TestTestFileTagging:
         comps = [
             AIComponent(
                 name="fake-agent", component_type=AIComponentType.AGENT,
-                file_path="/repo/tests/test_agent.py", line_number=5, confidence=0.8,
+                file_path="/repo/tests/test_agent.py", line_number=5, heuristic_confidence=0.8,
             ),
             AIComponent(
                 name="fake-agent", component_type=AIComponentType.AGENT,
                 file_path="/repo/tests/integration/test_flow.py", line_number=10,
-                confidence=0.6,
+                heuristic_confidence=0.6,
             ),
         ]
         result = _consolidate_components(comps)
@@ -848,12 +848,12 @@ class TestTestFileTagging:
         comps = [
             AIComponent(
                 name="agent", component_type=AIComponentType.AGENT,
-                file_path="/repo/src/agent.py", line_number=5, confidence=0.9,
+                file_path="/repo/src/agent.py", line_number=5, heuristic_confidence=0.9,
             ),
             AIComponent(
                 name="agent", component_type=AIComponentType.AGENT,
                 file_path="/repo/tests/test_agent.py", line_number=10,
-                confidence=0.6,
+                heuristic_confidence=0.6,
             ),
         ]
         result = _consolidate_components(comps)
@@ -866,7 +866,7 @@ class TestTestFileTagging:
         comps = [
             AIComponent(
                 name="mock-model", component_type=AIComponentType.MODEL,
-                file_path="/repo/tests/conftest.py", line_number=1, confidence=0.5,
+                file_path="/repo/tests/conftest.py", line_number=1, heuristic_confidence=0.5,
             ),
         ]
         result = _consolidate_components(comps)
@@ -879,11 +879,11 @@ class TestTestFileTagging:
         comps = [
             AIComponent(
                 name="real-model", component_type=AIComponentType.MODEL,
-                file_path="/repo/src/m.py", line_number=1, confidence=0.9,
+                file_path="/repo/src/m.py", line_number=1, heuristic_confidence=0.9,
             ),
             AIComponent(
                 name="test-model", component_type=AIComponentType.MODEL,
-                file_path="/repo/tests/t.py", line_number=1, confidence=0.5,
+                file_path="/repo/tests/t.py", line_number=1, heuristic_confidence=0.5,
                 metadata={"test_only": True},
             ),
         ]
@@ -895,6 +895,52 @@ class TestTestFileTagging:
         assert summary["total_components"] == 1
         assert summary["test_only_components"] == 1
         assert summary["component_types"]["model"] == 1
+
+
+class TestConsolidationPrefersProdFile:
+    """Fix 5: When confidence ties, prefer non-test file as primary."""
+
+    def test_production_file_wins_over_test_file(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        test_comp = AIComponent(
+            name="AgentRouter",
+            component_type=AIComponentType.AGENT,
+            file_path="/repo/tests/test_agent.py",
+            line_number=5,
+            heuristic_confidence=0.8,
+        )
+        prod_comp = AIComponent(
+            name="AgentRouter",
+            component_type=AIComponentType.AGENT,
+            file_path="/repo/src/agent.py",
+            line_number=20,
+            heuristic_confidence=0.8,
+        )
+        result = _consolidate_components([test_comp, prod_comp])
+        assert len(result) == 1
+        assert result[0].file_path == "/repo/src/agent.py"
+
+    def test_higher_confidence_still_wins(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        test_comp = AIComponent(
+            name="AgentRouter",
+            component_type=AIComponentType.AGENT,
+            file_path="/repo/tests/test_agent.py",
+            line_number=5,
+            heuristic_confidence=0.95,
+        )
+        prod_comp = AIComponent(
+            name="AgentRouter",
+            component_type=AIComponentType.AGENT,
+            file_path="/repo/src/agent.py",
+            line_number=20,
+            heuristic_confidence=0.8,
+        )
+        result = _consolidate_components([test_comp, prod_comp])
+        assert len(result) == 1
+        assert result[0].heuristic_confidence == 0.95
 
 
 # ---------------------------------------------------------------------------

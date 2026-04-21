@@ -94,6 +94,51 @@ class TestToolSchemaDetection:
         comps = _detect_tool_schemas(result)
         assert any(c.component_type == AIComponentType.TOOL for c in comps)
 
+    def test_bare_tool_decorator_from_strands(self, tmp_path: Path):
+        """Strands uses ``from strands import tool`` + bare ``@tool`` (no
+        parens). The KB scanner must recognise this decorator-framework pair
+        so user-defined ``@tool``-decorated functions surface deterministically
+        without requiring the LLM to re-propose them."""
+        (tmp_path / "tools_module.py").write_text(
+            "from strands import Agent, tool\n"
+            "\n"
+            "@tool\n"
+            "def fetch_page(url: str) -> str:\n"
+            '    """Fetch a URL and return the body."""\n'
+            "    return url\n"
+        )
+        from aibom.scanners.kb_enrichment_scanner import _detect_tool_schemas
+        from aibom.cst_parser import parse_source_code
+
+        source = (tmp_path / "tools_module.py").read_text()
+        result = parse_source_code(str(tmp_path / "tools_module.py"), source)
+        comps = _detect_tool_schemas(result)
+        tool_comps = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert any(c.name == "fetch_page" for c in tool_comps), (
+            f"Expected 'fetch_page' in tool_comps, got: {[c.name for c in tool_comps]}"
+        )
+
+    def test_tool_decorator_with_parens_from_strands(self, tmp_path: Path):
+        """Same as above but with ``@tool()`` paren form — both shapes must
+        work, since Strands supports either."""
+        (tmp_path / "http_client.py").write_text(
+            "from strands import tool\n"
+            "\n"
+            "@tool()\n"
+            "def http_get(url: str) -> str:\n"
+            "    return url\n"
+        )
+        from aibom.scanners.kb_enrichment_scanner import _detect_tool_schemas
+        from aibom.cst_parser import parse_source_code
+
+        source = (tmp_path / "http_client.py").read_text()
+        result = parse_source_code(str(tmp_path / "http_client.py"), source)
+        comps = _detect_tool_schemas(result)
+        tool_comps = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert any(c.name == "http_get" for c in tool_comps), (
+            f"Expected 'http_get' in tool_comps, got: {[c.name for c in tool_comps]}"
+        )
+
 
 class TestPromptDetection:
     """6.0c: Prompt detection via call context."""

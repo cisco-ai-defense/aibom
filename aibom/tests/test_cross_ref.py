@@ -289,10 +289,101 @@ class TestResolveComponents:
             name="env:LLM_MODEL",
             component_type=AIComponentType.MODEL,
             detection_source=DetectionSource.CODE_ANALYSIS,
-            confidence=0.3,
+            heuristic_confidence=0.3,
             needs_agentic=True,
             model_name=None,
             metadata={"env": "LLM_MODEL", "env_context": "model_kwarg"},
         )
         out = resolve_components([comp], idx)
-        assert out[0].confidence >= 0.5
+        assert out[0].heuristic_confidence >= 0.5
+
+
+class TestNameCanonicalization:
+    """``env:<VAR>`` placeholder names must be canonicalized to the resolved
+    literal model string so downstream consumers (component_summary, SBOM
+    artifacts) show actual model IDs instead of opaque env-var placeholders.
+    """
+
+    def test_env_placeholder_name_is_canonicalized_to_literal(self, tmp_path: Path) -> None:
+        (tmp_path / ".env").write_text(
+            "BEDROCK_MODEL_ID=us.anthropic.claude-3-5-sonnet-20241022-v2:0\n",
+            encoding="utf-8",
+        )
+        idx = build_env_index([str(tmp_path)])
+        comp = AIComponent(
+            name="env:BEDROCK_MODEL_ID",
+            component_type=AIComponentType.MODEL,
+            detection_source=DetectionSource.CODE_ANALYSIS,
+            model_name=None,
+            needs_agentic=True,
+            metadata={"env": "BEDROCK_MODEL_ID", "env_context": "model_kwarg"},
+        )
+        out = resolve_components([comp], idx)
+        assert out[0].name == "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        assert out[0].model_name == "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        assert out[0].metadata.get("env_var") == "BEDROCK_MODEL_ID"
+
+    def test_canonicalization_skipped_for_endpoint_urls(self, tmp_path: Path) -> None:
+        """Endpoint components already have meaningful names; URLs in
+        ``model_name`` must not overwrite them."""
+        (tmp_path / ".env").write_text(
+            "AZURE_OPENAI_ENDPOINT=https://my.openai.azure.com\n",
+            encoding="utf-8",
+        )
+        idx = build_env_index([str(tmp_path)])
+        comp = AIComponent(
+            name="env:AZURE_OPENAI_ENDPOINT",
+            component_type=AIComponentType.LLM_ENDPOINT,
+            detection_source=DetectionSource.CODE_ANALYSIS,
+            model_name=None,
+            needs_agentic=True,
+            metadata={"env": "AZURE_OPENAI_ENDPOINT", "env_context": "endpoint_kwarg"},
+        )
+        out = resolve_components([comp], idx)
+        assert out[0].name == "env:AZURE_OPENAI_ENDPOINT"
+
+    def test_canonicalization_skipped_when_not_env_placeholder(self, tmp_path: Path) -> None:
+        """Components whose name doesn't start with ``env:`` (already a
+        canonical literal) must not be touched."""
+        (tmp_path / ".env").write_text("MODEL_NAME=gpt-4o\n", encoding="utf-8")
+        idx = build_env_index([str(tmp_path)])
+        comp = AIComponent(
+            name="gpt-3.5-turbo",
+            component_type=AIComponentType.MODEL,
+            detection_source=DetectionSource.CODE_ANALYSIS,
+            model_name="gpt-3.5-turbo",
+            metadata={"env": "MODEL_NAME"},
+        )
+        out = resolve_components([comp], idx)
+        assert out[0].name == "gpt-3.5-turbo"
+
+    def test_canonicalization_skipped_when_unresolved(self) -> None:
+        """If the env var cannot be resolved, leave the placeholder alone."""
+        idx = CrossRefIndex()
+        comp = AIComponent(
+            name="env:MISSING_MODEL",
+            component_type=AIComponentType.MODEL,
+            detection_source=DetectionSource.CODE_ANALYSIS,
+            model_name=None,
+            needs_agentic=True,
+            metadata={"env": "MISSING_MODEL", "env_context": "model_kwarg"},
+        )
+        out = resolve_components([comp], idx)
+        assert out[0].name == "env:MISSING_MODEL"
+
+    def test_canonicalization_applies_to_embedding(self, tmp_path: Path) -> None:
+        (tmp_path / ".env").write_text(
+            "EMBED_MODEL=text-embedding-3-large\n", encoding="utf-8"
+        )
+        idx = build_env_index([str(tmp_path)])
+        comp = AIComponent(
+            name="env:EMBED_MODEL",
+            component_type=AIComponentType.EMBEDDING,
+            detection_source=DetectionSource.CODE_ANALYSIS,
+            model_name=None,
+            needs_agentic=True,
+            metadata={"env": "EMBED_MODEL", "env_context": "model_kwarg"},
+        )
+        out = resolve_components([comp], idx)
+        assert out[0].name == "text-embedding-3-large"
+        assert out[0].metadata.get("env_var") == "EMBED_MODEL"

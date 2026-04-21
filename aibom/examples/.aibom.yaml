@@ -55,7 +55,7 @@ components:
     metadata:
       owner: ml-team
       version: "2.1"
-      docs: https://wiki.internal/ml/llm-wrapper
+      docs: https://example.com/internal/ml/llm-wrapper
 
   # A custom tool with a fully qualified name
   - id: myproject.tools.SearchTool
@@ -176,3 +176,61 @@ custom_relationships:
     source_categories: [evaluator]
     target_categories: [model, agent]
     argument_hints: [evaluates, target, subject]
+
+
+# ─── 6. Agent-Signature Extensions ──────────────────────────────────────
+#
+# Extend the built-in agent-detection catalog with project-specific
+# framework entrypoints, protocol signals, or anti-patterns. The built-in
+# catalog (LangChain, LangGraph, AutoGen, CrewAI, LlamaIndex, A2A, MCP,
+# OpenAI Assistants, Temporal, Celery, Airflow, FastAPI, Pydantic) is
+# always applied; this section ADDS to it. If an entry here has the same
+# ``id`` as a built-in, the user entry REPLACES the built-in.
+#
+# Sub-sections:
+#   frameworks       Positive agent evidence — a framework whose use
+#                    indicates an agent (framework_agent / framework_inheritance).
+#   protocols        Protocol signals — A2A server / client, MCP (informational),
+#                    OpenAI Assistants, etc. (a2a_server / remote_proxy / other).
+#   anti_patterns    Excludes — code that looks agent-like but is not
+#                    (Temporal workflows, Celery tasks, FastAPI endpoints).
+#   verification_policy
+#                    Tuning knobs for the evidence-verification gate.
+#
+# Every framework / protocol entry MUST declare an ``evidence_pattern``
+# from the allowed set: ``framework_agent``, ``framework_inheritance``,
+# ``react_loop``, ``a2a_server``, ``remote_proxy``, ``other``.
+#
+# agent_signatures:
+#   frameworks:
+#     - id: myorg.InternalAgentBase
+#       framework: myorg
+#       evidence_pattern: framework_inheritance
+#       base_class_names: [InternalAgentBase, myorg.agents.InternalAgentBase]
+#       import_substrings: [myorg.agents]
+#       description: Internal agent base class used across our services.
+#
+#   protocols:
+#     - id: myorg.remote_agent
+#       protocol: remote_http
+#       evidence_pattern: remote_proxy
+#       role: client
+#       qualified_name_substrings: [myorg.remote.AgentClient]
+#       description: Thin HTTP client for our remote agent gateway.
+#
+#   anti_patterns:
+#     - id: myorg.scheduled_job
+#       label: scheduled_job
+#       base_class_names: [ScheduledJob, myorg.jobs.ScheduledJob]
+#       description: Scheduled batch — not an agent.
+#
+#   verification_policy:
+#     # Reject any "agent" verdict unless the LLM cited specific source
+#     # lines that the gate can verify. Default: true.
+#     require_evidence_for_agent: true
+#     # Allow remote_proxy classifications even when cross-repo resolution
+#     # did not confirm the remote end is an agent. Default: false.
+#     allow_remote_proxy_without_cross_repo: false
+#     # Structural ReAct-loop thresholds.
+#     min_react_loop_call_count: 2
+#     min_react_loop_distinct_callees: 2

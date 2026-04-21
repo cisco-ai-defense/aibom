@@ -84,7 +84,7 @@ class DataFileScanner(BaseScanner):
                                         name=dp.name,
                                         file_path=str(dp),
                                         line_number=0,
-                                        confidence=0.9,
+                                        heuristic_confidence=0.9,
                                         format_name="lmdb",
                                         size_bytes=st.st_size,
                                     )
@@ -104,7 +104,7 @@ def _dataset_component(
     name: str,
     file_path: str,
     line_number: int,
-    confidence: float,
+    heuristic_confidence: float,
     format_name: str,
     size_bytes: int,
 ) -> AIComponent:
@@ -115,7 +115,7 @@ def _dataset_component(
         line_number=line_number,
         framework="",
         detection_source=DetectionSource.CODE_ANALYSIS,
-        confidence=confidence,
+        heuristic_confidence=heuristic_confidence,
         metadata={
             "format": format_name,
             "size_bytes": size_bytes,
@@ -138,7 +138,7 @@ def _analyze_data_file(path: Path, ext: str) -> AIComponent | None:
             name=name,
             file_path=str(path),
             line_number=0,
-            confidence=0.9,
+            heuristic_confidence=0.9,
             format_name="parquet",
             size_bytes=size_bytes,
         )
@@ -151,7 +151,7 @@ def _analyze_data_file(path: Path, ext: str) -> AIComponent | None:
             name=name,
             file_path=str(path),
             line_number=0,
-            confidence=0.9,
+            heuristic_confidence=0.9,
             format_name=fmt,
             size_bytes=size_bytes,
         )
@@ -163,7 +163,7 @@ def _analyze_data_file(path: Path, ext: str) -> AIComponent | None:
             name=name,
             file_path=str(path),
             line_number=0,
-            confidence=0.9,
+            heuristic_confidence=0.9,
             format_name="csv",
             size_bytes=size_bytes,
         )
@@ -175,7 +175,7 @@ def _analyze_data_file(path: Path, ext: str) -> AIComponent | None:
             name=name,
             file_path=str(path),
             line_number=0,
-            confidence=0.9,
+            heuristic_confidence=0.9,
             format_name="tsv",
             size_bytes=size_bytes,
         )
@@ -188,7 +188,7 @@ def _analyze_data_file(path: Path, ext: str) -> AIComponent | None:
             name=name,
             file_path=str(path),
             line_number=0,
-            confidence=0.9,
+            heuristic_confidence=0.9,
             format_name=fmt,
             size_bytes=size_bytes,
         )
@@ -198,7 +198,7 @@ def _analyze_data_file(path: Path, ext: str) -> AIComponent | None:
             name=name,
             file_path=str(path),
             line_number=0,
-            confidence=0.7,
+            heuristic_confidence=0.7,
             format_name="tfrecord",
             size_bytes=size_bytes,
         )

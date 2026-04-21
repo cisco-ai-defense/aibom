@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 import pytest
 
-from aibom.scanners.model_detector import ModelDetector, _model_alias_keys, _registry_cache
+from aibom.scanners.model_detector import (
+    ModelDetector,
+    _model_alias_keys,
+    _registry_cache,
+    is_known_embedding_model_name,
+)
 
 from .conftest import run_scanner
 
@@ -90,7 +95,7 @@ class TestModelDetector:
         )
         assert len(comps) == 1
         assert comps[0].model_name == "gpt-4o"
-        assert comps[0].confidence == 1.0
+        assert comps[0].heuristic_confidence == 1.0
         assert comps[0].metadata.get("provider") == "openai"
 
     def test_detects_model_in_env_file(self, tmp_path: Path) -> None:
@@ -121,7 +126,7 @@ class TestModelDetector:
         )
         assert len(comps) == 1
         assert comps[0].model_name == "totally-unknown-custom-llm-id"
-        assert comps[0].confidence == 0.4
+        assert comps[0].heuristic_confidence == 0.4
         assert comps[0].needs_agentic is True
         assert comps[0].metadata.get("provider") == "unknown"
 
@@ -162,7 +167,7 @@ class TestModelDetector:
                 {"app.py": 'x = chat(model="brand-new-model-2026")\n'},
             )
         assert len(comps) == 1
-        assert comps[0].confidence == 1.0
+        assert comps[0].heuristic_confidence == 1.0
         assert comps[0].metadata["provider"] == "newco"
 
     def test_builtin_fallback_when_live_empty(self, tmp_path: Path) -> None:
@@ -197,7 +202,7 @@ class TestModelDetector:
                 {"app.py": 'model="meta-llama/Llama-3.1-8B-Instruct"\n'},
             )
         assert len(comps) == 1
-        assert comps[0].confidence == 1.0
+        assert comps[0].heuristic_confidence == 1.0
         assert comps[0].metadata["registry_source"] == "huggingface"
         assert comps[0].metadata["hf_id"] == "meta-llama/Llama-3.1-8B-Instruct"
         assert comps[0].metadata["model_card_url"] == "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct"
@@ -226,7 +231,7 @@ class TestModelDetector:
                 {"app.py": 'model="someorg/nonexistent-model"\n'},
             )
         assert len(comps) == 1
-        assert comps[0].confidence == 0.4
+        assert comps[0].heuristic_confidence == 0.4
         assert comps[0].needs_agentic is True
         assert comps[0].metadata["registry_source"] == "none"
 
@@ -245,7 +250,7 @@ class TestModelDetector:
                 {"app.py": 'model="anthropic.claude-3-5-sonnet-20241022-v2:0"\n'},
             )
         assert len(comps) == 1
-        assert comps[0].confidence == 1.0
+        assert comps[0].heuristic_confidence == 1.0
         assert comps[0].metadata["registry_source"] == "model_catalog"
 
     def test_shorthand_resolves_via_alias(self, tmp_path: Path) -> None:
@@ -261,7 +266,7 @@ class TestModelDetector:
                 {".env": "MODEL=claude-3-5-sonnet\n"},
             )
         assert len(comps) == 1
-        assert comps[0].confidence == 1.0
+        assert comps[0].heuristic_confidence == 1.0
         assert comps[0].metadata["registry_source"] == "model_catalog"
 
     def test_azure_prefixed_model_resolves(self, tmp_path: Path) -> None:
@@ -278,4 +283,229 @@ class TestModelDetector:
                 {"config.yaml": "model: gpt-4o\n"},
             )
         assert len(comps) == 1
-        assert comps[0].confidence == 1.0
+        assert comps[0].heuristic_confidence == 1.0
+
+    @pytest.mark.parametrize(
+        "source_line",
+        [
+            # Prefixed UPPER_SNAKE with model-related suffix
+            'BEDROCK_MODEL_ID = "gpt-4o"\n',
+            'CLAUDE_MODEL = "gpt-4o"\n',
+            'SONNET_MODEL_NAME = "gpt-4o"\n',
+            'ANTHROPIC_MODEL_ID = "gpt-4o"\n',
+            'OPENAI_DEPLOYMENT = "gpt-4o"\n',
+            # Bare UPPER_SNAKE model-related identifiers
+            'MODEL = "gpt-4o"\n',
+            'MODEL_ID = "gpt-4o"\n',
+            'MODEL_NAME = "gpt-4o"\n',
+            'DEPLOYMENT = "gpt-4o"\n',
+            'DEPLOYMENT_NAME = "gpt-4o"\n',
+            'LLM_MODEL = "gpt-4o"\n',
+            # Lowercase identifiers
+            'model = "gpt-4o"\n',
+            'model_name = "gpt-4o"\n',
+            'model_id = "gpt-4o"\n',
+            'deployment_name = "gpt-4o"\n',
+        ],
+    )
+    def test_py_assign_captures_model_suffixed_identifiers(
+        self, tmp_path: Path, source_line: str
+    ) -> None:
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source_line})
+        assert len(comps) == 1, f"did not capture {source_line!r}"
+        assert comps[0].model_name == "gpt-4o"
+        assert comps[0].metadata["provider"] == "openai"
+
+    @pytest.mark.parametrize(
+        "non_model_line",
+        [
+            'LOG_LEVEL = "info"\n',
+            'API_URL = "https://example.com"\n',
+            'TIMEOUT = "30s"\n',
+            'FOO_BAR = "baz"\n',
+        ],
+    )
+    def test_py_assign_ignores_unrelated_identifiers(
+        self, tmp_path: Path, non_model_line: str
+    ) -> None:
+        """UPPER_SNAKE identifiers without a model-related suffix must not match.
+
+        Guards against the suffix-based widening of ``_PY_ASSIGN_RE`` turning
+        every caps constant assignment into a model candidate.
+        """
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": non_model_line})
+        assert comps == [], f"false positive on {non_model_line!r}"
+
+    @pytest.mark.parametrize(
+        "source_line",
+        [
+            # os.getenv with quoted default
+            'MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "gpt-4o")\n',
+            'MODEL_ID = os.getenv("CLAUDE_MODEL", "gpt-4o")\n',
+            # os.environ.get variant
+            'MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "gpt-4o")\n',
+            # unqualified getenv (common after ``from os import getenv``)
+            'MODEL_ID = getenv("BEDROCK_MODEL_ID", "gpt-4o")\n',
+            # inside function call arg
+            'Agent(model=os.getenv("MY_MODEL_ID", "gpt-4o"))\n',
+        ],
+    )
+    def test_py_getenv_default_captures_literal_fallback(
+        self, tmp_path: Path, source_line: str
+    ) -> None:
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source_line})
+        # A single literal "gpt-4o" should be detected; the kwarg/assign regex
+        # may also see it but dedup happens via the canonical value.
+        assert any(c.model_name == "gpt-4o" for c in comps), (
+            f"did not capture literal default from {source_line!r}: {[c.model_name for c in comps]}"
+        )
+        gpt4o = next(c for c in comps if c.model_name == "gpt-4o")
+        assert gpt4o.metadata["provider"] == "openai"
+
+    def test_py_getenv_default_ignores_non_model_env_vars(
+        self, tmp_path: Path
+    ) -> None:
+        """``os.getenv("LOG_LEVEL", "info")`` must not register "info" as a model."""
+        comps, _ = run_scanner(
+            ModelDetector,
+            tmp_path,
+            {"app.py": 'level = os.getenv("LOG_LEVEL", "info")\n'},
+        )
+        assert comps == []
+
+    @pytest.mark.parametrize(
+        "model_id, expected_provider, expected_family",
+        [
+            # Claude 3.7 Sonnet (both hyphen-before-minor and version-first naming)
+            ("claude-3-7-sonnet", "anthropic", "claude-3-7-sonnet"),
+            ("claude-sonnet-4", "anthropic", "claude-sonnet-4"),
+            ("claude-opus-4", "anthropic", "claude-opus-4"),
+            ("claude-haiku-4", "anthropic", "claude-haiku-4"),
+            # Bedrock-prefixed variants resolve via builtin alias walk
+            ("us.anthropic.claude-3-7-sonnet-20250219-v1:0", "anthropic", "claude-3-7-sonnet"),
+            ("us.anthropic.claude-sonnet-4-20250514-v1:0", "anthropic", "claude-sonnet-4"),
+            # Amazon Nova family
+            ("amazon.nova-pro-v1:0", "amazon", "nova-pro"),
+            ("amazon.nova-lite-v1:0", "amazon", "nova-lite"),
+            ("amazon.nova-micro-v1:0", "amazon", "nova-micro"),
+            ("amazon.nova-canvas-v1:0", "amazon", "nova-canvas"),
+            # Amazon Titan
+            ("amazon.titan-text-express-v1", "amazon", "titan-text"),
+            ("amazon.titan-embed-text-v2:0", "amazon", "titan-embed-text"),
+            # Meta Llama on Bedrock (no separator between "llama" and the version)
+            ("meta.llama3-70b-instruct-v1:0", "meta", "llama-3"),
+            ("us.meta.llama3-1-70b-instruct-v1:0", "meta", "llama-3.1"),
+            ("meta.llama3-2-11b-instruct-v1:0", "meta", "llama-3.2"),
+            ("meta.llama3-3-70b-instruct-v1:0", "meta", "llama-3.3"),
+            ("us.meta.llama4-maverick-17b-instruct-v1:0", "meta", "llama-4"),
+            # Cohere on Bedrock
+            ("cohere.command-r-plus-v1:0", "cohere", "command-r-plus"),
+            ("cohere.command-r-v1:0", "cohere", "command-r"),
+            ("cohere.command-text-v14", "cohere", "command"),
+            ("cohere.embed-english-v3", "cohere", "embed-english"),
+            ("cohere.embed-multilingual-v3", "cohere", "embed-multilingual"),
+            # Mistral on Bedrock
+            ("mistral.mistral-large-2402-v1:0", "mistral", "mistral-large"),
+            ("mistral.mixtral-8x7b-instruct-v0:1", "mistral", "mixtral"),
+        ],
+    )
+    def test_builtin_registry_covers_bedrock_ids_when_live_empty(
+        self,
+        tmp_path: Path,
+        model_id: str,
+        expected_provider: str,
+        expected_family: str,
+    ) -> None:
+        """Bedrock-formatted IDs must resolve via the builtin regex when the live
+        catalog is unavailable (offline mode / fetch failure)."""
+        with patch("aibom.scanners.model_detector._get_live_registry", return_value={}):
+            comps, _ = run_scanner(
+                ModelDetector,
+                tmp_path,
+                {"app.py": f'model="{model_id}"\n'},
+            )
+        assert len(comps) == 1, f"{model_id} did not resolve"
+        assert comps[0].metadata["provider"] == expected_provider, (
+            f"{model_id}: provider={comps[0].metadata.get('provider')!r}"
+        )
+        assert comps[0].metadata["family"] == expected_family, (
+            f"{model_id}: family={comps[0].metadata.get('family')!r}"
+        )
+        assert comps[0].metadata["registry_source"] == "builtin"
+
+
+class TestIsKnownEmbeddingModelName:
+    """Unit tests for is_known_embedding_model_name.
+
+    The helper must defer to the model registry (LiteLLM ``mode`` field or
+    builtin ``family`` annotation) and never apply standalone regex.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # LiteLLM mode=embedding (commercial catalog)
+            "text-embedding-3-large",
+            "text-embedding-3-small",
+            "text-embedding-ada-002",
+            "voyage-3-large",
+            "cohere.embed-english-v3",
+        ],
+    )
+    def test_embeddings_return_true(self, name: str) -> None:
+        """Known embedding model identifiers must return True."""
+        assert is_known_embedding_model_name(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # Chat models (mode=chat in LiteLLM)
+            "gpt-4o",
+            "gpt-4-turbo",
+            "claude-3-5-sonnet-20241022",
+            # Not a model at all
+            "random-nonsense-xyz-not-a-model",
+            "",
+            "   ",
+        ],
+    )
+    def test_non_embeddings_return_false(self, name: str) -> None:
+        """Non-embedding models and junk strings must return False."""
+        assert is_known_embedding_model_name(name) is False
+
+
+class TestStagedEmbeddingReclassification:
+    """End-to-end: the scan pipeline must reclassify MODEL→EMBEDDING and
+    then collapse duplicates so ``text-embedding-3-large`` never appears
+    twice (once as ``model``, once as ``embedding``)."""
+
+    def test_mixed_type_same_name_dedupes_to_single_embedding(
+        self, tmp_path: Path
+    ) -> None:
+        """Two components with the same name but different types (MODEL,
+        EMBEDDING) must consolidate into a single EMBEDDING entry."""
+        from aibom.models import AIComponent, AIComponentType
+        from aibom.scan_pipeline import ScanPipeline
+
+        pipeline = ScanPipeline(scan_paths=[str(tmp_path)])
+        components = [
+            AIComponent(
+                name="text-embedding-3-large",
+                component_type=AIComponentType.MODEL,
+                file_path="a.py",
+                line_number=1,
+            ),
+            AIComponent(
+                name="text-embedding-3-large",
+                component_type=AIComponentType.EMBEDDING,
+                file_path="b.py",
+                line_number=1,
+            ),
+        ]
+        out, _ = pipeline._stage_assemble(components)
+
+        names = [(c.name, c.component_type.value) for c in out]
+        assert ("text-embedding-3-large", "embedding") in names
+        assert ("text-embedding-3-large", "model") not in names
+        # Exactly one entry for this name across all types.
+        assert sum(1 for n, _ in names if n == "text-embedding-3-large") == 1

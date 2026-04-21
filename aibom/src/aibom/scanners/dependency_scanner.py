@@ -130,6 +130,10 @@ KNOWN_AI_PACKAGES: dict[str, set[str]] = {
         "cisco-aidefense-sdk",
         # MCP clients
         "mcp-client",
+        # AWS Strands agent framework
+        "strands-agents",
+        "strands-agents-tools",
+        "mcp-proxy-for-aws",
     },
     "npm": {
         "openai",

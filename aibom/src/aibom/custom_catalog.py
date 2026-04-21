@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from .agent_signatures import AgentSignatureCatalog, parse_user_signatures
+
 LOGGER = logging.getLogger(__name__)
 
 _CONFIG_FILENAMES = (".aibom.yaml", ".aibom.yml", ".aibom.json")
@@ -86,6 +88,7 @@ class CustomCatalogConfig:
     excludes: List[str] = field(default_factory=list)
     relationship_hints: Dict[str, List[str]] = field(default_factory=dict)
     custom_relationships: List[CustomRelationshipDef] = field(default_factory=list)
+    agent_signatures: AgentSignatureCatalog = field(default_factory=AgentSignatureCatalog)
     source_path: Optional[str] = None
 
     @property
@@ -96,6 +99,7 @@ class CustomCatalogConfig:
             and not self.excludes
             and not self.relationship_hints
             and not self.custom_relationships
+            and self.agent_signatures.is_empty
         )
 
 
@@ -328,6 +332,14 @@ def _build_config(data: Dict[str, Any], source_path: str = "") -> CustomCatalogC
                 if rel_def:
                     config.custom_relationships.append(rel_def)
 
+    # -- agent_signatures --
+    # Parsed only if the user supplies the section. The built-in catalog
+    # of framework/protocol/anti-pattern signatures lives in
+    # aibom.agent_signatures and is merged on top of this user catalog by
+    # the evidence builder, not here.
+    if "agent_signatures" in data:
+        config.agent_signatures = parse_user_signatures(data.get("agent_signatures"))
+
     n_items = (
         len(config.components)
         + len(config.base_class_rules)
@@ -335,15 +347,28 @@ def _build_config(data: Dict[str, Any], source_path: str = "") -> CustomCatalogC
         + len(config.custom_relationships)
         + sum(len(v) for v in config.relationship_hints.values())
     )
-    if n_items:
+    sigs = config.agent_signatures
+    n_sigs = (
+        len(sigs.frameworks)
+        + len(sigs.protocols)
+        + len(sigs.anti_patterns)
+        + len(sigs.remote_agent_sdks)
+    )
+    if n_items or n_sigs:
         LOGGER.info(
             "Loaded custom catalog from %s: %d component(s), %d base-class rule(s), "
-            "%d exclude(s), %d custom relationship(s).",
+            "%d exclude(s), %d custom relationship(s), "
+            "%d framework sig(s), %d protocol sig(s), %d anti-pattern(s), "
+            "%d remote agent SDK sig(s).",
             source_path,
             len(config.components),
             len(config.base_class_rules),
             len(config.excludes),
             len(config.custom_relationships),
+            len(sigs.frameworks),
+            len(sigs.protocols),
+            len(sigs.anti_patterns),
+            len(sigs.remote_agent_sdks),
         )
 
     return config

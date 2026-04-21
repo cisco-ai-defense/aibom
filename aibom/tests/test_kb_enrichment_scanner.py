@@ -35,8 +35,12 @@ from aibom.models import AIComponentType, DetectionSource, ScanContext
 from aibom.scanners.kb_enrichment_scanner import (
     ALLOWED_CONCEPTS,
     KBEnrichmentScanner,
+    _AGENT_FRAMEWORK_PREFIXES,
+    _BARE_CLIENT_HINTS,
+    _KNOWN_AI_CLIENT_CLASSES,
     _MatchResult,
     _build_kb_patterns,
+    _detect_model_kwargs,
     _emit_suggestive_candidates,
     _extract_class_segment,
     _extract_leaf_class,
@@ -553,7 +557,7 @@ class TestEmitSuggestiveCandidates:
         assert len(candidates) == 1
         assert candidates[0].component_type == AIComponentType.AGENT
         assert candidates[0].needs_agentic is True
-        assert candidates[0].confidence == 0.2
+        assert candidates[0].heuristic_confidence == 0.2
         assert "suggestive_signal" in candidates[0].metadata
 
     def test_skips_generic_class(self, tmp_path: Path):
@@ -628,3 +632,228 @@ class TestKBEnrichmentScannerNoKB:
             comps, rels = KBEnrichmentScanner().scan(ctx)
             assert comps == []
             assert rels == []
+
+
+@pytest.mark.skipif(not _kb_available(), reason="No KB DuckDB installed")
+class TestAgentSpecificHint:
+    """Fix 3d: Import-inferred agents get a specialized hint.
+
+    Requires the live DuckDB KB (``~/.aibom/catalogs/``) because
+    ``KBEnrichmentScanner.scan`` short-circuits to ``[], []`` when no
+    KB path is resolvable. Marked as integration to keep CI hermetic;
+    matches the convention used by ``TestBuildKBPatterns`` and others
+    above.
+    """
+
+    def test_agent_hint_mentions_three_conditions(self, tmp_path: Path):
+        (tmp_path / "router.py").write_text(
+            "from agents.security_agent import SecurityAgent\n"
+            "agent = SecurityAgent()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert len(agents) >= 1
+        hint = agents[0].agentic_hint
+        assert "LLM-driven control flow" in hint
+        assert "iterative loop" in hint
+        assert "read_file_snippet" in hint
+
+    def test_non_agent_hint_unchanged(self, tmp_path: Path):
+        (tmp_path / "app.py").write_text(
+            "from stores.vector_store import VectorStore\n"
+            "vs = VectorStore()\n"
+        )
+        ctx = ScanContext(paths=[str(tmp_path)])
+        comps, _ = KBEnrichmentScanner().scan(ctx)
+        stores = [
+            c for c in comps
+            if c.component_type == AIComponentType.VECTOR_STORE
+        ]
+        if stores:
+            hint = stores[0].agentic_hint
+            assert "REMOVE unless surrounding code proves" in hint
+
+
+# ---------------------------------------------------------------------------
+# Strands provider-class coverage (kb_enrichment_scanner._KNOWN_AI_CLIENT_CLASSES)
+# ---------------------------------------------------------------------------
+
+
+_STRANDS_MODEL_CLASSES = (
+    "BedrockModel",
+    "AnthropicModel",
+    "OpenAIModel",
+    "OllamaModel",
+    "LiteLLMModel",
+    "GeminiModel",
+    "MistralModel",
+    "SageMakerModel",
+    "LlamaAPIModel",
+    "WriterModel",
+    "LlamaCppModel",
+    "CohereModel",
+)
+
+
+class TestStrandsProviderClassCoverage:
+    """All Strands built-in model providers must be recognised.
+
+    The agentic Strands framework (``strands.models.*``) exposes one class
+    per provider. Each is the canonical construction point for a deployed
+    model, so they must appear in ``_KNOWN_AI_CLIENT_CLASSES`` and have a
+    matching bare-client hint so that ``_detect_model_kwargs`` can surface
+    both resolved and unresolved instantiations.
+    """
+
+    @pytest.mark.parametrize("class_name", _STRANDS_MODEL_CLASSES)
+    def test_strands_class_is_registered(self, class_name: str) -> None:
+        assert class_name in _KNOWN_AI_CLIENT_CLASSES, (
+            f"{class_name} missing from _KNOWN_AI_CLIENT_CLASSES"
+        )
+
+    @pytest.mark.parametrize("class_name", _STRANDS_MODEL_CLASSES)
+    def test_strands_class_has_bare_client_hint(self, class_name: str) -> None:
+        assert class_name in _BARE_CLIENT_HINTS, (
+            f"{class_name} missing from _BARE_CLIENT_HINTS"
+        )
+        hint = _BARE_CLIENT_HINTS[class_name]
+        assert "Remove" in hint, (
+            f"{class_name} bare-client hint must mention removal: {hint!r}"
+        )
+
+    def test_bedrock_model_resolves_model_id_kwarg(self, tmp_path: Path) -> None:
+        """``BedrockModel(model_id="...")`` should yield a MODEL asset with
+        the resolved model name and full (1.0) heuristic confidence, not a
+        low-confidence bare-client placeholder."""
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models import BedrockModel\n"
+            'model = BedrockModel(model_id="us.anthropic.claude-sonnet-4-20250514-v1:0")\n'
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_model_kwargs(result)
+        models = [c for c in comps if c.component_type == AIComponentType.MODEL]
+        assert len(models) == 1
+        assert (
+            models[0].name == "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        ), f"unexpected model name: {models[0].name!r}"
+        assert models[0].heuristic_confidence == 1.0
+        assert models[0].metadata["constructor"] == "BedrockModel"
+        assert models[0].metadata["extracted_from_kwarg"] == "model_id"
+        assert (
+            models[0].metadata.get("detection_method") != "bare_provider_client"
+        )
+
+    def test_bare_bedrock_model_emits_agentic_candidate(self, tmp_path: Path) -> None:
+        """``BedrockModel()`` with no model_id is a bare client, so we emit a
+        needs_agentic MODEL so the agentic layer can resolve or prune it."""
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models import BedrockModel\n"
+            "model = BedrockModel()\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_model_kwargs(result)
+        models = [c for c in comps if c.component_type == AIComponentType.MODEL]
+        assert len(models) == 1
+        assert models[0].name == "BedrockModel"
+        assert models[0].needs_agentic is True
+        assert models[0].heuristic_confidence == 0.3
+        assert models[0].metadata["detection_method"] == "bare_provider_client"
+        assert "BEDROCK_MODEL_ID" in models[0].agentic_hint
+
+    def test_anthropic_model_resolves_model_id_kwarg(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.anthropic import AnthropicModel\n"
+            'model = AnthropicModel(model_id="claude-sonnet-4-20250514")\n'
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_model_kwargs(result)
+        models = [c for c in comps if c.component_type == AIComponentType.MODEL]
+        assert len(models) == 1
+        assert models[0].name == "claude-sonnet-4-20250514"
+        assert models[0].metadata["provider"] == "anthropic"
+
+    def test_openai_model_resolves_model_id_kwarg(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.openai import OpenAIModel\n"
+            'model = OpenAIModel(model_id="gpt-4o")\n'
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_model_kwargs(result)
+        models = [c for c in comps if c.component_type == AIComponentType.MODEL]
+        assert len(models) == 1
+        assert models[0].name == "gpt-4o"
+        assert models[0].metadata["provider"] == "openai"
+
+
+class TestStrandsAgentFrameworkPrefix:
+    """Module-level ``agent = Agent(...)`` from Strands must become an AGENT.
+
+    ``_AGENT_FRAMEWORK_PREFIXES`` gates the call-pattern tier of agent
+    emission. Without ``"strands"`` in the set, a script-style Strands
+    agent (no surrounding class) is silently dropped even though it uses
+    the canonical ``Agent`` entrypoint. These tests lock in the prefix
+    and guard against regressions — a ground-truth scan on a published
+    open-source Strands sample repository failed on exactly this gap.
+    """
+
+    def test_strands_is_registered_framework_prefix(self) -> None:
+        assert "strands" in _AGENT_FRAMEWORK_PREFIXES, (
+            "strands must be a recognised agent framework prefix so that "
+            "module-level ``Agent(...)`` calls are classified."
+        )
+
+    def test_module_level_agent_call_is_detected(self, tmp_path: Path) -> None:
+        """``agent = Agent(model=...)`` must emit exactly one AGENT component.
+
+        The component's ``name`` is the assignment target (``"agent"``) by
+        design of the assignment branch of ``_process_file_with_cache``;
+        the call pattern (``Agent`` / ``strands.Agent``) is recorded in
+        ``metadata['call_pattern']`` and is the stable signal to assert
+        on for the framework routing.
+        """
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands import Agent\n"
+            "from strands.models import BedrockModel\n"
+            "\n"
+            'model = BedrockModel(model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0")\n'
+            "agent = Agent(model=model)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _process_file_with_cache(result, kb_by_id={})
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert len(agents) == 1, (
+            f"expected exactly one Strands agent; got: "
+            f"{[(c.name, c.component_type) for c in comps]}"
+        )
+        agent = agents[0]
+        assert agent.detection_source == DetectionSource.CODE_ANALYSIS
+        call_pattern = agent.metadata.get("call_pattern", "")
+        assert call_pattern.endswith("Agent"), (
+            f"call_pattern should end with 'Agent', got {call_pattern!r}"
+        )
+
+    def test_non_strands_non_framework_call_is_not_detected(
+        self, tmp_path: Path
+    ) -> None:
+        """Adding ``strands`` must not also let a stray ``Agent(...)`` from
+        an unrelated module register as an agent. This proves the prefix
+        still gates the match (framework check > creation-pattern check).
+        """
+        src = tmp_path / "random.py"
+        src.write_text(
+            "from some_unrelated_module import Agent\n"
+            "agent = Agent(name='not really an agent')\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _process_file_with_cache(result, kb_by_id={})
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert agents == [], (
+            f"stray Agent() call from unknown framework should NOT be "
+            f"promoted; got {[(c.name, c.framework) for c in agents]}"
+        )

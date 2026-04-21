@@ -43,7 +43,7 @@ class TestAgenticTimeout:
             file_path="b.py",
             line_number=1,
         )
-        comps, _, _ = run_agentic_enrichment(
+        comps, _, _, _ = run_agentic_enrichment(
             model_string="m",
             deterministic_components=[comp],
             deterministic_relationships=[],
@@ -76,7 +76,7 @@ class TestAgenticCircuitBreaker:
             )
             for i in range(4)
         ]
-        comps, _, _ = run_agentic_enrichment(
+        comps, _, _, _ = run_agentic_enrichment(
             model_string="m",
             deterministic_components=comps_in,
             deterministic_relationships=[],
@@ -130,7 +130,7 @@ class TestAgenticCircuitBreaker:
             )
             for i in range(5)
         ]
-        out, _, _ = run_agentic_enrichment(
+        out, _, _, _ = run_agentic_enrichment(
             model_string="m",
             deterministic_components=comps_in,
             deterministic_relationships=[],

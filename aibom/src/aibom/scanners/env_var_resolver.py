@@ -126,6 +126,12 @@ _AI_KEY_ENV_RE = re.compile(
     re.IGNORECASE,
 )
 
+_AWS_SECRET_ENV_NAMES: frozenset[str] = frozenset({
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+})
+
 _ASSIGN_LHS_RE = re.compile(
     r"""(?:^|\n)\s*(?:(?:const|let|var|final)\s+)?"""
     r"""([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*""",
@@ -376,12 +382,14 @@ class EnvVarResolver(BaseScanner):
                     ctx = _classify_kwarg(text, match_start)
                     if ctx is None:
                         ctx = _classify_assignment(text, match_start)
+                    env_upper = env_name.upper()
                     if ctx is None and _AI_KEY_ENV_RE.match(env_name):
+                        ctx = "api_key_envname"
+                    if ctx is None and env_upper in _AWS_SECRET_ENV_NAMES:
                         ctx = "api_key_envname"
                     if ctx is None:
                         continue
 
-                    env_upper = env_name.upper()
                     if any(env_upper.startswith(p) for p in _INFRA_ENV_PREFIXES):
                         continue
 
@@ -401,7 +409,7 @@ class EnvVarResolver(BaseScanner):
                         framework="",
                         detection_source=DetectionSource.CODE_ANALYSIS,
                         model_name=None,
-                        confidence=0.3,
+                        heuristic_confidence=0.3,
                         needs_agentic=True,
                         agentic_hint=(
                             f"env var {env_name} used as {ctx}; "
@@ -465,7 +473,7 @@ class EnvVarResolver(BaseScanner):
                     file_path=fp_str,
                     line_number=line_no,
                     detection_source=DetectionSource.CODE_ANALYSIS,
-                    confidence=conf,
+                    heuristic_confidence=conf,
                     needs_agentic=conf < 0.6,
                     agentic_hint=(
                         "Secret fetched via vault/secret-manager SDK; "
@@ -491,7 +499,7 @@ class EnvVarResolver(BaseScanner):
                         file_path=fp_str,
                         line_number=line_no,
                         detection_source=DetectionSource.CODE_ANALYSIS,
-                        confidence=0.3,
+                        heuristic_confidence=0.3,
                         needs_agentic=True,
                         agentic_hint=(
                             "vault_secret_pattern: File imports a vault/secret-manager "
@@ -519,7 +527,7 @@ class EnvVarResolver(BaseScanner):
                     file_path=fp_str,
                     line_number=line_no,
                     detection_source=DetectionSource.CODE_ANALYSIS,
-                    confidence=0.5 if has_vault_import else 0.3,
+                    heuristic_confidence=0.5 if has_vault_import else 0.3,
                     needs_agentic=True,
                     agentic_hint=(
                         "vault_secret_pattern: String literal references a "

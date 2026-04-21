@@ -29,11 +29,11 @@ Cisco AI BOM scans codebases, container images, and cloud environments to produc
 ## Features
 
 - **Multi-language analysis** — Python (LibCST), JavaScript/TypeScript, Java, Go, Rust, Ruby, C#, PHP (tree-sitter).
-- **21 built-in scanners** — model detection, dependency analysis, secret detection, vulnerability scanning (OSV.dev), MCP server/client detection, ML lifecycle detection, cloud resource scanning, CI/CD pipeline analysis, deployment detection, container scanning, data-file scanning, environment variable resolution, KB enrichment, and more.
-- **24 AI component types** — `model`, `agent`, `tool`, `mcp_server`, `mcp_client`, `embedding`, `vector_store`, `dataset`, `prompt`, `guardrail`, `memory`, `retriever`, `training_run`, `hyperparameter`, `model_artifact`, `experiment_tracker`, `model_registry`, `data_versioning`, `ml_pipeline`, `skill`, `observability`, `secret`, `dependency`, `other`.
+- **23 built-in scanners** — model detection, dependency analysis, secret detection, vulnerability scanning (OSV.dev), MCP server/client detection, A2A/remote agent resolution, structural agent detection, ML lifecycle detection, cloud resource scanning, CI/CD pipeline analysis, deployment detection, container scanning, data-file scanning, environment variable resolution, KB enrichment, and more.
+- **30 AI component types** — `model`, `llm_endpoint`, `model_endpoint`, `agent`, `agent_proxy`, `tool`, `mcp_server`, `mcp_client`, `mcp_gateway`, `embedding`, `vector_store`, `dataset`, `retriever`, `knowledge_base`, `feature_store`, `memory`, `prompt`, `training_run`, `hyperparameter`, `model_artifact`, `experiment_tracker`, `model_registry`, `data_versioning`, `ml_pipeline`, `guardrail`, `skill`, `observability`, `secret`, `dependency`, `other`.
 - **Three-tier detection** — Tier 1 (deterministic high-confidence), Tier 2 (cross-reference resolution), Tier 3 (agentic LLM reasoning).
 - **10 output formats** — Plaintext, JSON, CycloneDX, SARIF, SPDX, HTML dashboard, Markdown, CSV, JUnit, and a live API server.
-- **Container image scanning** — Extract and analyze application source code from Docker, Podman, nerdctl, Buildah, Skopeo, Crane, or Undock images, with Anchore Syft for SBOM metadata.
+- **Container image scanning** — Extract and analyze application source code from Docker, Podman, nerdctl, Buildah, Skopeo, or Crane images, with Anchore Syft for SBOM metadata.
 - **Cross-repo and org-level scanning** — Scan multiple local repos, GitHub orgs, GitLab groups, or Bitbucket projects, with incremental caching.
 - **Agentic classification** — LLM agent (via Deep Agents + LangChain) classifies every scanner candidate, eliminating false positives and enriching confirmed components with concrete identifiers.
 - **Policy engine** — YAML-driven pass/fail gates for CI/CD integration (max-risk, required fields, blocked/required component types).
@@ -107,13 +107,24 @@ cisco-aibom --help
 
 When working from source, you can also use `uv run cisco-aibom ...` or `uv run python -m aibom ...`.
 
-### Optional extras
+### Extras
+
+The `analyze` command always runs the agentic pipeline, so it requires the `agentic` extra **plus at least one LLM provider extra**. The simplest install is `cisco-aibom[all]`; otherwise pick the provider you plan to use.
+
+**Required for `analyze`:**
 
 | Extra | Installs | Purpose |
 |-------|----------|---------|
-| `agentic` | Deep Agents, LangChain | LLM-powered agentic enrichment |
+| `agentic` | Deep Agents, LangChain | LLM-powered agentic enrichment (mandatory for `analyze`) |
 | `llm-openai` | `langchain-openai` | OpenAI / Azure OpenAI provider |
 | `llm-aws` | `langchain-aws` | AWS Bedrock provider |
+| `llm-anthropic` | `langchain-anthropic` | Anthropic Claude provider |
+| `llm-google` | `langchain-google-genai` | Google Gemini provider |
+
+**Optional (degrade gracefully if missing):**
+
+| Extra | Installs | Purpose |
+|-------|----------|---------|
 | `analysis` | `detect-secrets`, `tree-sitter` | Secret detection, multi-language parsing |
 | `security` | `cisco-ai-mcp-scanner`, `cisco-ai-skill-scanner` | Cisco security tool integration |
 | `cloud` | `boto3`, `google-cloud-aiplatform`, `azure-*` | Cloud resource scanning |
@@ -159,6 +170,8 @@ All LLM options can be set via environment variables (`AIBOM_LLM_MODEL`, `AIBOM_
 | `kb info` | Display info about the locally installed KB. |
 | `kb verify` | Verify KB integrity (SHA-256 checksum). |
 | `kb request` | Request a KB build for a specific SDK version. |
+| `kb request-status` | Check the status of a KB build request. |
+| `kb list-requests` | List all pending KB build requests. |
 | `cache clear` | Remove cached scan results and agentic cache. |
 | `cache list` | List cached entries by cache type. |
 | `cache get` | Inspect a specific cache entry. |
@@ -386,10 +399,10 @@ cisco-aibom kb verify
 cisco-aibom kb info
 ```
 
-Manual download from GitHub Releases:
+Manual download from GitHub Releases (replace `<VERSION>` with the desired KB version, e.g. the latest tag from [Releases](https://github.com/cisco-ai-defense/aibom/releases)):
 
 ```bash
-VERSION="0.5.1"
+VERSION="<VERSION>"
 mkdir -p "${HOME}/.aibom/catalogs"
 gh release download "${VERSION}" \
   --repo cisco-ai-defense/aibom \
@@ -412,7 +425,12 @@ All CLI options with an `envvar` binding can be set via environment variables or
 | `AIBOM_LLM_API_BASE` | `--llm-api-base` | LLM API base URL. |
 | `AIBOM_LLM_API_VERSION` | `--llm-api-version` | API version (Azure OpenAI). |
 | `AIBOM_POST_URL` | `--post-url` | HTTP endpoint to POST the report to. |
-| `AI_DEFENSE_API_KEY` | `--ai-defense-api-key` | Cisco AI Defense API key. |
+| `AIBOM_POST_TIMEOUT` | `--post-timeout` | Timeout in seconds for POSTing the report (default `30`). |
+| `AIBOM_POST_VERIFY_TLS` | `--post-verify-tls` | Verify TLS certificates when POSTing (`true`/`false`). |
+| `AI_DEFENSE_API_KEY` | `--ai-defense-api-key` | Cisco AI Defense tenant API key (sent as `x-cisco-ai-defense-tenant-api-key`). |
+| `CISCO_AI_DEFENSE_API_KEY` | `--api-key` (kb commands) | Cisco AI Defense tenant API key for `kb request`, `kb request-status`, and `kb list-requests`. |
+| `CISCO_AI_DEFENSE_API_BASE` | `--api-base` (kb commands) | Regional Cisco AI Defense API host for `kb request*` commands (e.g. `https://api.security.cisco.com`, `https://api.eu.security.cisco.com`). No default. |
+| `CISCO_AIBOM_MANIFEST_URL` | `--url` (`kb download`) | KB manifest URL for `kb download` / `kb check`. No default. |
 | `AIBOM_GITHUB_ORG` | `--github-org` | GitHub org for repo discovery. |
 | `AIBOM_GITLAB_GROUP` | `--gitlab-group` | GitLab group for repo discovery. |
 | `AIBOM_BITBUCKET_PROJECT` | `--bitbucket-project` | Bitbucket project for repo discovery. |
@@ -424,26 +442,23 @@ All CLI options with an `envvar` binding can be set via environment variables or
 
 ## Docker
 
-Two Dockerfiles are provided:
-
-| Image | Dockerfile | Extras | Size |
-|-------|-----------|--------|------|
-| `cisco-aibom` | `Dockerfile` | `analysis`, `security` | ~200 MB |
-| `cisco-aibom-agentic` | `Dockerfile.agentic` | All (`analysis`, `security`, `agentic`, `cloud`) | ~800 MB |
+A single multi-stage Dockerfile is provided. It installs the `all` extra (which expands to `analysis`, `security`, `agentic`, `llm-openai`, `llm-aws`, `llm-anthropic`, `llm-google`, `cloud`) because the `analyze` command requires the agentic pipeline plus at least one LLM provider. Image size is ~800 MB.
 
 ```bash
 cd aibom
 
-# Build the deterministic image
+# Build
 docker build -t cisco-aibom .
 
-# Build the full agentic image
-docker build -f Dockerfile.agentic -t cisco-aibom-agentic .
-
 # Run
-docker run --rm -v /path/to/project:/workspace cisco-aibom-agentic \
+docker run --rm -v /path/to/project:/workspace cisco-aibom \
   analyze /workspace -o json -O /workspace/report.json \
   --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
+
+# Or via docker compose (see aibom/docker-compose.yml for env var forwarding)
+SCAN_DIR=/path/to/project docker compose run aibom \
+  analyze /workspace -o json -O /workspace/report.json \
+  --llm-model gpt-5.4
 ```
 
 ## Testing
@@ -459,7 +474,7 @@ uv run pytest tests -v
 - [Agentic Mode Guide](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md) — LLM enrichment setup, providers, and tuning.
 - [Container Scanning Guide](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CONTAINER_SCANNING.md) — Extraction tiers, Syft, and runtime support.
 - [API Server](https://github.com/cisco-ai-defense/aibom/blob/main/docs/API_SERVER_README.md) — FastAPI endpoint details for `--output-format api`.
-- [Technical Overview](https://github.com/cisco-ai-defense/aibom/blob/main/aibom/docs/TECHNICAL_OVERVIEW.md) — Architecture, pipeline stages, and scanner design.
+- [Technical Overview](https://github.com/cisco-ai-defense/aibom/blob/main/docs/TECHNICAL_OVERVIEW.md) — Architecture, pipeline stages, and scanner design.
 
 ## Troubleshooting
 

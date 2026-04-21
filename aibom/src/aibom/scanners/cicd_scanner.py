@@ -76,6 +76,10 @@ _SECRET_AI_KEYS = re.compile(
     r"WANDB_API_KEY|MLFLOW_TRACKING_TOKEN)\b",
 )
 
+_GHA_SECRET_WITH_DEFAULT = re.compile(
+    r"\$\{\{\s*secrets\.(\w+)\s*\|\|\s*'([^']+)'\s*\}\}",
+)
+
 
 class CICDScanner(BaseScanner):
     name = "cicd_scanner"
@@ -245,12 +249,45 @@ def _scan_gha_step(
                     line_number=0,
                     model_name=val,
                     detection_source=DetectionSource.CONFIG_FILE,
-                    confidence=0.5,
+                    heuristic_confidence=0.5,
                     needs_agentic=True,
                     agentic_hint=f"Model reference '{val}' in CI/CD step — verify it is an AI model",
                     metadata={"cicd_type": "github_actions", "job": job_name},
                 )
             )
+
+    step_env = step.get("env", {})
+    if isinstance(step_env, dict):
+        for env_key, env_val in step_env.items():
+            if not isinstance(env_val, str):
+                continue
+            sm = _GHA_SECRET_WITH_DEFAULT.search(env_val)
+            if sm:
+                secret_name, default_val = sm.group(1), sm.group(2)
+                default_val = default_val.strip()
+                if default_val and len(default_val) >= 3:
+                    from .model_detector import registry_lookup
+
+                    if registry_lookup(default_val) is not None:
+                        components.append(
+                            AIComponent(
+                                name=default_val,
+                                component_type=AIComponentType.MODEL,
+                                file_path=str(wf),
+                                line_number=0,
+                                model_name=default_val,
+                                detection_source=DetectionSource.CONFIG_FILE,
+                                heuristic_confidence=0.7,
+                                needs_agentic=True,
+                                agentic_hint=f"Default value for ${{{{ secrets.{secret_name} }}}}",
+                                metadata={
+                                    "cicd_type": "github_actions",
+                                    "job": job_name,
+                                    "env_var": env_key,
+                                    "secret_name": secret_name,
+                                },
+                            )
+                        )
 
 
 def _scan_gitlab_ci(

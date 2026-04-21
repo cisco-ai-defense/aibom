@@ -107,8 +107,8 @@ def _model_registry_entry(value: str) -> Optional[dict[str, Any]]:
     stripped = value.strip()
     if not stripped:
         return None
-    from .model_detector import _registry_lookup
-    return _registry_lookup(stripped)
+    from .model_detector import registry_lookup
+    return registry_lookup(stripped)
 
 
 def _is_embedding_model_value(value: str) -> bool:
@@ -254,8 +254,8 @@ def _looks_like_model_name(value: str) -> bool:
     if not v or len(v) > 256:
         return False
     try:
-        from .model_detector import _registry_lookup
-        if _registry_lookup(v) is not None:
+        from .model_detector import registry_lookup
+        if registry_lookup(v) is not None:
             return True
     except ImportError:
         pass
@@ -277,6 +277,13 @@ def _provider_from_env_key(key: str) -> Optional[str]:
         if ku.startswith(pref):
             return name
     return None
+
+
+_AWS_SECRET_ENV_NAMES: frozenset[str] = frozenset({
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+})
 
 
 def _docker_image_is_ai(image: str) -> bool:
@@ -571,7 +578,20 @@ def _parse_env(
         value = next(g for g in m.groups()[1:] if g is not None)
         ku = key.upper()
 
-        if ku.endswith("_API_KEY"):
+        if ku.endswith("_API_KEY") or ku in _AWS_SECRET_ENV_NAMES:
+            is_aws = ku in _AWS_SECRET_ENV_NAMES
+            desc = (
+                f"AWS credential `{key}` present (value redacted)"
+                if is_aws
+                else f"API key variable `{key}` present (value redacted)"
+            )
+            metadata: dict[str, object] = {
+                "env_var": key,
+                "redacted": True,
+                "config_kind": ".env",
+            }
+            if is_aws:
+                metadata["provider"] = "aws"
             out.append(
                 AIComponent(
                     name=f"env_secret_{key}",
@@ -579,13 +599,10 @@ def _parse_env(
                     file_path=str(path.resolve()),
                     line_number=i,
                     detection_source=DetectionSource.CONFIG_FILE,
-                    description=f"API key variable `{key}` present (value redacted)",
+                    description=desc,
                     text=None,
-                    metadata={
-                        "env_var": key,
-                        "redacted": True,
-                        "config_kind": ".env",
-                    },
+                    framework="aws" if is_aws else "",
+                    metadata=metadata,
                 ),
             )
             continue
@@ -599,6 +616,7 @@ def _parse_env(
         if is_endpoint_key and is_url:
             ctype = _env_endpoint_component_type(key, value)
             prov = _provider_from_env_key(key)
+            url_val = value.strip().strip("\"'")
             out.append(
                 AIComponent(
                     name=f"env:{key}",
@@ -606,12 +624,13 @@ def _parse_env(
                     file_path=str(path.resolve()),
                     line_number=i,
                     detection_source=DetectionSource.CONFIG_FILE,
-                    description=f"Endpoint URL from `{key}` (value redacted)",
+                    description=f"Endpoint URL from `{key}`",
+                    model_name=url_val,
                     text=None,
                     framework=prov or "",
                     metadata={
                         "env_var": key,
-                        "redacted": True,
+                        "endpoint_url": url_val,
                         "config_kind": ".env",
                     },
                 ),

@@ -75,6 +75,131 @@ def test_analyze_defaults_cache_root_for_scan_and_agentic(tmp_path):
     assert seen["agentic_cache_dir"] == shared_root / "agentic"
 
 
+def test_analyze_component_summary_flag_adds_key_to_json_report(tmp_path):
+    from aibom.models import AIComponent, AIComponentType
+
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    report = tmp_path / "report.json"
+
+    detected = [
+        AIComponent(
+            name="router_agent",
+            component_type=AIComponentType.AGENT,
+            file_path=str(source_dir / "app.py"),
+            line_number=12,
+        ),
+        AIComponent(
+            name="calc_tool",
+            component_type=AIComponentType.TOOL,
+            file_path=str(source_dir / "app.py"),
+            line_number=25,
+        ),
+    ]
+
+    def fake_pipeline_run(self):
+        return PipelineResult(
+            components=list(detected),
+            relationships=[],
+            agentic_risk_flags=[],
+            agentic_candidate_count=0,
+            external_deps=[],
+            timings=[],
+            total_elapsed_s=0.0,
+        )
+
+    with patch("aibom.cli.ensure_llm_runtime_available"):
+        with patch("aibom.scan_cache.load_cached", return_value=None):
+            with patch("aibom.scan_cache.save_cached"):
+                with patch("aibom.scan_pipeline.ScanPipeline.run", fake_pipeline_run):
+                    result = runner.invoke(
+                        app,
+                        [
+                            "analyze",
+                            str(source_dir),
+                            "--output-format",
+                            "json",
+                            "--output-file",
+                            str(report),
+                            "--component-summary",
+                            "--llm-model",
+                            "test-model",
+                        ],
+                    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(report.read_text())
+    analysis = data["aibom_analysis"]
+    assert "component_summary" in analysis
+    source_summaries = analysis["component_summary"]
+    assert len(source_summaries) == 1
+    entries = next(iter(source_summaries.values()))
+    assert entries == [
+        {
+            "component_type": "agent",
+            "name": "router_agent",
+            "file_path": str(source_dir / "app.py"),
+            "line_number": 12,
+        },
+        {
+            "component_type": "tool",
+            "name": "calc_tool",
+            "file_path": str(source_dir / "app.py"),
+            "line_number": 25,
+        },
+    ]
+
+
+def test_analyze_without_component_summary_flag_omits_key(tmp_path):
+    from aibom.models import AIComponent, AIComponentType
+
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    report = tmp_path / "report.json"
+
+    def fake_pipeline_run(self):
+        return PipelineResult(
+            components=[
+                AIComponent(
+                    name="router_agent",
+                    component_type=AIComponentType.AGENT,
+                    file_path=str(source_dir / "app.py"),
+                    line_number=12,
+                )
+            ],
+            relationships=[],
+            agentic_risk_flags=[],
+            agentic_candidate_count=0,
+            external_deps=[],
+            timings=[],
+            total_elapsed_s=0.0,
+        )
+
+    with patch("aibom.cli.ensure_llm_runtime_available"):
+        with patch("aibom.scan_cache.load_cached", return_value=None):
+            with patch("aibom.scan_cache.save_cached"):
+                with patch("aibom.scan_pipeline.ScanPipeline.run", fake_pipeline_run):
+                    result = runner.invoke(
+                        app,
+                        [
+                            "analyze",
+                            str(source_dir),
+                            "--output-format",
+                            "json",
+                            "--output-file",
+                            str(report),
+                            "--llm-model",
+                            "test-model",
+                        ],
+                    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(report.read_text())
+    assert "component_summary" not in data["aibom_analysis"]
+
+
 @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
 @patch("aibom.multi_repo.is_git_url", return_value=True)
 @patch("aibom.multi_repo.ClonedRepo")

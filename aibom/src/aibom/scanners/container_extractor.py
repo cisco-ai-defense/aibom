@@ -21,8 +21,8 @@ Replaces the legacy ``container_utils.extract_app_from_docker`` which ran
 process; it uses ``create``+``cp`` or direct tarball/mount access instead.
 
 Supports multiple container runtimes (Docker, Podman, nerdctl, Buildah,
-Skopeo, Crane, Undock) with a pure-Python tarball fallback requiring zero
-external binaries.
+Skopeo, Crane) plus Anchore Syft for SBOM metadata, with a pure-Python
+tarball fallback requiring zero external binaries.
 """
 
 from __future__ import annotations

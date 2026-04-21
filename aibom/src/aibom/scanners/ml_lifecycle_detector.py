@@ -366,7 +366,7 @@ def _emit(
     hyperparameters: Optional[dict[str, Any]] = None,
     storage_uri: Optional[str] = None,
     text: Optional[str] = None,
-    confidence: float = 0.85,
+    heuristic_confidence: float = 0.85,
     needs_agentic: bool = False,
     agentic_hint: str = "",
 ) -> AIComponent:
@@ -381,7 +381,7 @@ def _emit(
         line_number=line_number,
         framework=framework,
         detection_source=detection_source,
-        confidence=confidence,
+        heuristic_confidence=heuristic_confidence,
         needs_agentic=needs_agentic,
         agentic_hint=agentic_hint,
         description=description,
@@ -596,7 +596,7 @@ class MLLifecycleDetector(BaseScanner):
                                 line_no,
                                 hyperparameters={hp_key: val},
                                 text=stripped[:200],
-                                confidence=hp_conf,
+                                heuristic_confidence=hp_conf,
                                 needs_agentic=hp_agentic,
                                 agentic_hint=f"'{hp_key}' kwarg without ML imports in file" if hp_agentic else "",
                             )
@@ -649,7 +649,7 @@ class MLLifecycleDetector(BaseScanner):
                                     line_no,
                                     storage_uri=uri,
                                     text=stripped[:200],
-                                    confidence=ctx_conf,
+                                    heuristic_confidence=ctx_conf,
                                     needs_agentic=ctx_agentic,
                                     agentic_hint=ctx_hint,
                                 )

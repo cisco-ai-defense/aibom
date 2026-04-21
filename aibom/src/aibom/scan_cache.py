@@ -16,8 +16,13 @@
 
 """Optional on-disk cache for scan results.
 
-Keyed by ``repo_url@commit_sha`` or ``path@mtime_hash`` so repeated scans
-of the same codebase at the same revision can skip the full pipeline.
+Keyed by ``repo_url@commit_sha:relpath`` or ``path@mtime_hash`` so
+repeated scans of the same codebase at the same revision can skip the
+full pipeline. The ``relpath`` component is the scan target's path
+relative to the git top-level, which ensures that two sibling
+subdirectories (or individual files) inside the *same* repository
+produce distinct cache keys. For a scan whose target is the repo root
+itself, the relpath is ``"."``.
 """
 
 from __future__ import annotations
@@ -32,27 +37,57 @@ from typing import Any, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 
 
-def _git_info(path: str) -> tuple[str, str] | None:
-    """Return (remote_url, commit_sha) if *path* is inside a git repo."""
+def _git_info(path: str) -> tuple[str, str, str] | None:
+    """Return ``(remote_url, commit_sha, relpath_from_toplevel)`` if *path*
+    is inside a git repo, else ``None``.
+
+    *path* may point at a directory (scan of a sub-tree), a single file
+    (file-level scan), or the repo root (full-repo scan). The returned
+    ``relpath`` is computed with :meth:`pathlib.Path.resolve` on both
+    ends so symlinked checkouts resolve identically on each side.
+    When the target is the repo root, the relpath is ``"."`` rather
+    than an empty string so the downstream cache-key format never loses
+    its separator.
+    """
+    try:
+        target = Path(path)
+    except (TypeError, ValueError):
+        return None
+    if not target.exists():
+        return None
+    cwd = str(target if target.is_dir() else target.parent)
     try:
         sha = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
-            cwd=path,
+            cwd=cwd,
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
         url = subprocess.check_output(
             ["git", "config", "--get", "remote.origin.url"],
-            cwd=path,
+            cwd=cwd,
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-        return url, sha
+        toplevel_raw = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
+    if not toplevel_raw:
+        return None
+    try:
+        rel = target.resolve().relative_to(Path(toplevel_raw).resolve())
+    except (OSError, ValueError):
+        return None
+    relpath = rel.as_posix() or "."
+    return url, sha, relpath
 
 
 def _mtime_hash(path: str) -> str:
@@ -93,8 +128,8 @@ def cache_key(scan_paths: list[str], settings: dict[str, Any] | None = None) -> 
     for p in sorted(scan_paths):
         info = _git_info(p)
         if info:
-            url, sha = info
-            parts.append(f"{url}@{sha}")
+            url, sha, relpath = info
+            parts.append(f"{url}@{sha}:{relpath}")
         else:
             parts.append(f"{p}@{_mtime_hash(p)}")
     combined = json.dumps(

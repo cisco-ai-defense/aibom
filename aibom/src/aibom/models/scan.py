@@ -21,7 +21,13 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from .enums import AIComponentType, DetectionSource, RelationshipType, Severity
+from .enums import (
+    AIComponentType,
+    CrossRepoLinkType,
+    DetectionSource,
+    RelationshipType,
+    Severity,
+)
 
 
 class EvidenceLocation(BaseModel):
@@ -62,7 +68,8 @@ class AIComponent(BaseModel):
     line_number: int = 0
     framework: str = ""
     detection_source: DetectionSource = DetectionSource.CODE_ANALYSIS
-    confidence: float = 1.0
+    heuristic_confidence: float = 1.0
+    agentic_confidence: float | None = None
     needs_agentic: bool = True
     agentic_hint: str = ""
 
@@ -104,6 +111,8 @@ class ComponentRelationship(BaseModel):
     target_name: str = ""
     source_type: AIComponentType = AIComponentType.OTHER
     target_type: AIComponentType = AIComponentType.OTHER
+    source_repo: str = ""
+    target_repo: str = ""
     decision_annotation: DecisionAnnotation | None = None
 
     def model_post_init(self, __context: Any) -> None:
@@ -236,11 +245,34 @@ class _IndexedFile:
         self.root = root
 
 
+class RepoOccurrence(BaseModel):
+    """A reference to a component in a specific repository for cross-repo links."""
+
+    repo_path: str
+    component_name: str = ""
+    component_instance_id: str = ""
+    file_path: str = ""
+    line_number: int = 0
+    role: str = ""
+
+
+class CrossRepoLink(BaseModel):
+    """A typed link connecting components or references across repositories."""
+
+    link_type: CrossRepoLinkType
+    identifier: str
+    resolved_value: str = ""
+    occurrences: list[RepoOccurrence] = Field(default_factory=list)
+    evidence: str = ""
+    decision_annotation: DecisionAnnotation | None = None
+
+
 class ScanResult(BaseModel):
     """Unified output from a complete scan run. All reporters consume this."""
 
     metadata: dict[str, Any] = Field(default_factory=dict)
     sources: list[SourceResult] = Field(default_factory=list)
+    cross_repo_links: list[CrossRepoLink] = Field(default_factory=list)
     risk: RiskScore = Field(default_factory=RiskScore)
     errors: list[str] = Field(default_factory=list)
 

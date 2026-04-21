@@ -251,7 +251,7 @@ def _regex_scan_line(
             file_path=file_path,
             line_number=line_number,
             detection_source=DetectionSource.CODE_ANALYSIS,
-            confidence=pat.confidence,
+            heuristic_confidence=pat.confidence,
             needs_agentic=is_low_confidence,
             agentic_hint=f"Generic hex pattern for {pat.name}; needs context verification" if is_low_confidence else "",
             description=f"Potential {pat.name} detected",
@@ -267,7 +267,7 @@ def _regex_scan_line(
 def _merge_component(bucket: dict[tuple[str, int], AIComponent], comp: AIComponent) -> None:
     key = (comp.file_path, comp.line_number)
     prev = bucket.get(key)
-    if prev is None or comp.confidence > prev.confidence:
+    if prev is None or comp.heuristic_confidence > prev.heuristic_confidence:
         bucket[key] = comp
 
 
@@ -285,7 +285,7 @@ def _detect_secrets_scan_file(abs_path: Path, out: dict[tuple[str, int], AICompo
                 file_path=file_path,
                 line_number=line_no,
                 detection_source=DetectionSource.CODE_ANALYSIS,
-                confidence=0.72,
+                heuristic_confidence=0.72,
                 description=f"Potential {stype} detected",
                 text=None,
                 metadata={
@@ -366,7 +366,7 @@ def _run_gitleaks(source: Path, out: dict[tuple[str, int], AIComponent]) -> None
             file_path=abs_path,
             line_number=line_no,
             detection_source=DetectionSource.CODE_ANALYSIS,
-            confidence=0.65,
+            heuristic_confidence=0.65,
             description=f"Potential {stype} detected",
             text=None,
             metadata={
@@ -432,7 +432,7 @@ def _run_trufflehog(source: Path, out: dict[tuple[str, int], AIComponent]) -> No
             file_path=abs_path,
             line_number=ln,
             detection_source=DetectionSource.CODE_ANALYSIS,
-            confidence=0.65,
+            heuristic_confidence=0.65,
             description=f"Potential {stype} detected",
             text=None,
             metadata={
