@@ -49,7 +49,7 @@ BaseScanner
 ├── DataFileScanner        — Model files (.safetensors, .gguf, .onnx) and dataset files (.parquet, .arrow)
 ├── ModelFileScanner       — Model artifact files on disk
 ├── ConfigScanner          — Framework config files (LangGraph JSON, pyproject.toml AI sections)
-├── MultiLanguageScanner   — JS/TS, Java, Go, Rust, Ruby, C#, PHP (via tree-sitter)
+├── MultiLanguageScanner   — JS/TS, Java, Go, Rust, Ruby, C# (via tree-sitter)
 ├── EnvVarResolver         — Environment variable extraction from source code
 ├── KBEnrichmentScanner    — DuckDB knowledge base symbol matching and enrichment
 ├── WorkflowScanner        — Workflow/call-graph context attachment
@@ -74,7 +74,7 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `cache_paths.py` | Shared cache-root resolution for `scan`, `agentic`, `org`, `model`, and `packages` caches. |
 | `cross_ref.py` | Env-var and package index builder, component resolver, external repo dep detection. |
 | `cst_parser.py` | LibCST-based Python parser for assignments, decorators, annotations, imports, class definitions, and inline annotations. |
-| `scanners/multi_language_scanner.py` | Tree-sitter-based parser for JS/TS, Java, Go, Rust, Ruby, C#, PHP. |
+| `scanners/multi_language_scanner.py` | Tree-sitter-based parser for JS/TS, Java, Go, Rust, Ruby, C#. |
 | `custom_catalog.py` | `.aibom.yaml` loader — custom entries, base-class rules, excludes, relationship hints. |
 | `catalog_db.py` | DuckDB access layer for catalog lookup with custom entry merging. |
 | `db_loader.py` | Manifest/env path resolution and SHA-256 verification. |
@@ -87,10 +87,10 @@ Each scanner receives a `ScanContext` with paths, config, and shared state. Scan
 | `llm_client.py` | Lightweight LLM client for semantic parsing (model name extraction). |
 | `scanners/container_extractor.py` | Tiered container source extraction (Docker/Podman/nerdctl/Buildah/Skopeo/Crane/tarball). |
 | `scanners/model_detector.py` | Model detection via LiteLLM catalog, HuggingFace Hub, and import context. |
-| `scanners/dependency_scanner.py` | Multi-format dependency parsing (pip, npm, Maven, Go, Rust, Ruby, C#, PHP). Emits all manifest packages as candidates; `KNOWN_AI_PACKAGES` is a hint, not a gate. |
+| `scanners/dependency_scanner.py` | Multi-format dependency parsing (pip, npm, Maven, Go, Rust, Ruby, C#). Emits all manifest packages as candidates; `KNOWN_AI_PACKAGES` is a hint, not a gate. |
 | `scanners/secret_detector.py` | Secret detection via Yelp `detect-secrets` integration. |
 | `scanners/vuln_scanner.py` | Vulnerability scanning via OSV.dev API. |
-| `scanners/env_var_resolver.py` | Multi-language env-var extraction (Python, JS/TS, Go, Java, Ruby, C#, Rust, PHP). |
+| `scanners/env_var_resolver.py` | Multi-language env-var extraction (Python, JS/TS, Go, Java, Ruby). |
 | `scanners/deployment_detector.py` | IaC detection (Terraform, CloudFormation, Azure ARM/Bicep, Helm, K8s manifests). |
 | `policy.py` | YAML policy engine — pass/fail gates for CI/CD. |
 | `compliance.py` | EU AI Act, OWASP Agentic, NIST AI RMF compliance mappings. |
@@ -207,3 +207,36 @@ Plugins are discovered via Python entry points:
 - `aibom.reporters` — Custom reporter classes (must subclass `BaseReporter`).
 
 The `plugin list` command shows all discovered plugins.
+
+## 12. Language Coverage
+
+AI BOM's analysis depth varies by language. Python gets a full CST pipeline; other languages get a focused tree-sitter scanner plus ecosystem-specific manifest parsing.
+
+### Detection matrix
+
+| Capability | Python | JS/TS | Java | Go | Rust | Ruby | C# |
+|---|---|---|---|---|---|---|---|
+| Dependency manifest parsing | yes | yes | yes | yes | yes | yes | yes |
+| Code-level import detection | all imports | allowlist | allowlist | allowlist | allowlist | allowlist | allowlist |
+| Model literal detection (`model="..."`) | yes | yes | yes | yes | yes | yes | yes |
+| Agent / tool instantiation (`new Agent(...)`, `@tool`) | CST | regex | regex | regex | regex | regex | regex |
+| Env-var resolver (`os.getenv`, `process.env`, …) | yes | yes | yes | yes | no | yes | no |
+| Class / decorator / annotation observations | yes | no | no | no | no | no | no |
+| Method body shape, control-flow loops (ReAct detection) | yes | no | no | no | no | no | no |
+| KB symbol enrichment (DuckDB catalog) | yes | no | no | no | no | no | no |
+| Structural agent scanner | yes | no | no | no | no | no | no |
+| A2A agent detection from code (agent-card JSON is language-agnostic) | yes | no | no | no | no | no | no |
+| MCP server/client code-level detection | yes | no | no | no | no | no | no |
+| ML-lifecycle detection (training runs, hyperparameters) | yes | no | no | no | no | no | no |
+| Jupyter notebook (`.ipynb`) | yes | — | — | — | — | — | — |
+| Tier 3 agentic classification | yes | yes | yes | yes | yes | yes | yes |
+
+### Why Python is deeper
+
+`cst_parser.py` produces a typed observation graph (`CodeAnalysisResult`) covering calls, assignments, decorators, type annotations, context managers, class/function definitions, control-flow loops, per-method body shape, protocol-relevant string literals, class-body source, and inline `# aibom:` annotations. Multiple downstream scanners (`structural_agent_scanner`, `a2a_detector`, `kb_enrichment_scanner`, `remote_agent_resolver`, `ml_lifecycle_detector`) consume this graph and match qualified names against the DuckDB KB.
+
+`multi_language_scanner.py` uses tree-sitter grammars for JS/TS, Java, Go, Rust, Ruby, and C#. Its walkers extract imports matching small per-ecosystem allowlists (~2–10 packages each). Agent/tool/model detection is regex-based. Qualified names, call-site argument extraction, class definitions, and decorators are not produced for non-Python languages today.
+
+### Practical implication
+
+For non-Python code, deterministic (Tier 1) output is limited to dependency imports and inline model literals. Agents, tools, MCP patterns, and RAG components are surfaced largely by the Tier 3 agentic LLM pass. Running without `--llm-model` is not supported by `analyze`, so in practice Tier 3 is always available to compensate — but scans of predominantly non-Python repos will make heavier use of the agentic budget.

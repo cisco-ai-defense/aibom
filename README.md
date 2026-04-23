@@ -4,7 +4,7 @@
 [![Cisco AI Defense](https://img.shields.io/badge/Cisco-AI%20Defense-049fd9?logo=cisco&logoColor=white)](https://www.cisco.com/site/us/en/products/security/ai-defense/index.html)
 [![AI Security and Safety Framework](https://img.shields.io/badge/AI%20Security-Framework-orange)](https://learn-cloudsecurity.cisco.com/ai-security-framework)
 
-Cisco AI BOM scans codebases, container images, and cloud environments to produce an AI Bill of Materials — a structured inventory of models, agents, tools, MCP servers/clients, datasets, prompts, guardrails, secrets, and other AI assets used in your software. It supports Python, JavaScript/TypeScript, Java, Go, Rust, Ruby, C#, and PHP, with deterministic candidate detection, cross-reference resolution, and LLM-powered agentic classification.
+Cisco AI BOM scans codebases, container images, and cloud environments to produce an AI Bill of Materials — a structured inventory of models, agents, tools, MCP servers/clients, datasets, prompts, guardrails, secrets, and other AI assets used in your software. It supports Python, JavaScript/TypeScript, Java, Go, Rust, Ruby, and C#, with deterministic candidate detection, cross-reference resolution, and LLM-powered agentic classification.
 
 ## Table of Contents
 
@@ -28,10 +28,10 @@ Cisco AI BOM scans codebases, container images, and cloud environments to produc
 
 ## Features
 
-- **Multi-language analysis** — Python (LibCST), JavaScript/TypeScript, Java, Go, Rust, Ruby, C#, PHP (tree-sitter).
+- **Multi-language analysis** — Python (LibCST), JavaScript/TypeScript, Java, Go, Rust, Ruby, C# (tree-sitter).
 - **23 built-in scanners** — model detection, dependency analysis, secret detection, vulnerability scanning (OSV.dev), MCP server/client detection, A2A/remote agent resolution, structural agent detection, ML lifecycle detection, cloud resource scanning, CI/CD pipeline analysis, deployment detection, container scanning, data-file scanning, environment variable resolution, KB enrichment, and more.
 - **30 AI component types** — `model`, `llm_endpoint`, `model_endpoint`, `agent`, `agent_proxy`, `tool`, `mcp_server`, `mcp_client`, `mcp_gateway`, `embedding`, `vector_store`, `dataset`, `retriever`, `knowledge_base`, `feature_store`, `memory`, `prompt`, `training_run`, `hyperparameter`, `model_artifact`, `experiment_tracker`, `model_registry`, `data_versioning`, `ml_pipeline`, `guardrail`, `skill`, `observability`, `secret`, `dependency`, `other`.
-- **Three-tier detection** — Tier 1 (deterministic high-confidence), Tier 2 (cross-reference resolution), Tier 3 (agentic LLM reasoning).
+- **Three-tier detection** — Tier 1 (deterministic high-confidence), Tier 2 (cross-reference resolution), Tier 3 (agentic LLM reasoning). Tier 1 code-level detection is deepest for Python (LibCST); other languages extract imports and literal patterns via tree-sitter and lean more on Tier 3 for confirmation.
 - **10 output formats** — Plaintext, JSON, CycloneDX, SARIF, SPDX, HTML dashboard, Markdown, CSV, JUnit, and a live API server.
 - **Container image scanning** — Extract and analyze application source code from Docker, Podman, nerdctl, Buildah, Skopeo, or Crane images, with Anchore Syft for SBOM metadata.
 - **Cross-repo and org-level scanning** — Scan multiple local repos, GitHub orgs, GitLab groups, or Bitbucket projects, with incremental caching.
@@ -46,6 +46,20 @@ Cisco AI BOM scans codebases, container images, and cloud environments to produc
 - **Plugin system** — Extend with custom scanners and reporters via Python entry points.
 - **Custom catalog** — Register custom AI components, base-class rules, excludes, and relationships via `.aibom.yaml`.
 - **Knowledge base** — Curated DuckDB catalog of AI framework symbols with download, verification, and versioned updates.
+
+### Language coverage at a glance
+
+| Language | Dep manifests | Code-level detection | Env-var resolver | Structural / KB / MCP / A2A scanners |
+|---|---|---|---|---|
+| Python | pip, Poetry, uv, setuptools | LibCST (full) | yes | yes |
+| JavaScript / TypeScript | npm, yarn, pnpm | tree-sitter (imports + literals) | yes | no |
+| Java | Maven, Gradle | tree-sitter (imports + literals) | yes | no |
+| Go | go.mod | tree-sitter (imports + literals) | yes | no |
+| Rust | Cargo | tree-sitter (imports + literals) | no | no |
+| Ruby | Gemfile | tree-sitter (imports + literals) | yes | no |
+| C# | `*.csproj` | tree-sitter (imports + literals) | no | no |
+
+Non-Python code-level detection is focused on dependency imports (matched against a curated allowlist) and inline `model: "..."` literals. Deeper structural signals — agent instantiations, MCP/A2A detection, ReAct-style loops, KB symbol enrichment — are Python-only today. For non-Python code, Tier 3 agentic classification fills most of the gap. See [docs/TECHNICAL_OVERVIEW.md §12](docs/TECHNICAL_OVERVIEW.md#12-language-coverage) for details.
 
 ## Repository Layout
 
