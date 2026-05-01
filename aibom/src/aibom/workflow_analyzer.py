@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -182,7 +183,12 @@ def build_workflow_index(python_files: List[Path]) -> WorkflowIndex:
         try:
             source = Path(file_path)
             text = source.read_text(encoding="utf-8")
-            tree = ast.parse(text, filename=str(file_path))
+            # Suppress SyntaxWarning from scanned third-party source (e.g.,
+            # invalid escape sequences in regex strings). Real SyntaxError is
+            # still caught below.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(text, filename=str(file_path))
         except Exception as exc:  # pragma: no cover - parsing best-effort
             _LOGGER.debug("Skipping %s during workflow index build: %s", file_path, exc)
             continue

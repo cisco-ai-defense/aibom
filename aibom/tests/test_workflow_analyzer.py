@@ -15,6 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import tempfile
+import warnings
 from pathlib import Path
 import unittest
 
@@ -88,6 +89,40 @@ class TestWorkflowAnalyzer(unittest.TestCase):
             empty.write_text("", encoding="utf-8")
             index = build_workflow_index([empty])
             assert index.get_workflow_context(str(empty), 1) == []
+
+    def test_build_workflow_index_suppresses_syntax_warning_from_target_source(self):
+        """Regression: parsing third-party Python source that contains an
+        invalid escape sequence (e.g. ``"\\s"`` in a regex string) used to leak
+        ``SyntaxWarning`` to the operator's terminal. The workflow indexer
+        must silence those — they are noise about *scanned* code.
+        """
+        noisy = (
+            "import re\n"
+            "PATTERN = re.compile(\"\\sfoo\")\n"
+            "DOC = \"\"\"matches \\d+ digits and \\swhitespace\"\"\"\n"
+            "def workflow():\n"
+            "    return PATTERN\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "noisy.py"
+            path.write_text(noisy, encoding="utf-8")
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                build_workflow_index([path])
+
+            syntax_warnings = [
+                w for w in caught if issubclass(w.category, SyntaxWarning)
+            ]
+            self.assertEqual(
+                syntax_warnings,
+                [],
+                msg=(
+                    "build_workflow_index leaked SyntaxWarning(s) from scanned "
+                    f"source: {[str(w.message) for w in syntax_warnings]}"
+                ),
+            )
 
 
 if __name__ == "__main__":
