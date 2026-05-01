@@ -265,6 +265,61 @@ class TestApplyEnrichments:
         assert enriched[0].metadata["existing_key"] == "keep_me"
         assert enriched[0].metadata["license"] == "proprietary"
 
+    def test_preserves_scanner_set_metadata_keys(self, mw, caplog):
+        """Regression: keys produced by deterministic scanners
+        (``ecosystem``, ``manifest``, ``known_ai_package``,
+        ``vulnerabilities``, ``risk_flag``) must NOT be stripped by
+        ``_sanitize_metadata`` and must NOT trigger the
+        ``"Stripped unknown metadata key"`` WARNING. They are not LLM
+        hallucinations — the LLM is permitted to echo them."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="aibom.agentic.middleware")
+        existing = [
+            AIComponent(
+                name="openai",
+                component_type=AIComponentType.MODEL,
+                file_path="app.py",
+                line_number=10,
+                instance_id="openai_app.py_10",
+            )
+        ]
+        output = json.dumps(
+            {
+                "enriched_components": [
+                    {
+                        "instance_id": "openai_app.py_10",
+                        "updates": {
+                            "metadata": {
+                                "ecosystem": "pypi",
+                                "manifest": "requirements.txt",
+                                "known_ai_package": True,
+                                "vulnerabilities": [{"id": "GHSA-xxxx"}],
+                                "risk_flag": {"level": "medium"},
+                            }
+                        },
+                    }
+                ]
+            }
+        )
+
+        enriched = mw.apply_enrichments(existing, output)
+
+        assert enriched[0].metadata["ecosystem"] == "pypi"
+        assert enriched[0].metadata["manifest"] == "requirements.txt"
+        assert enriched[0].metadata["known_ai_package"] is True
+        assert enriched[0].metadata["vulnerabilities"] == [{"id": "GHSA-xxxx"}]
+        assert enriched[0].metadata["risk_flag"] == {"level": "medium"}
+
+        offending = [
+            r.getMessage()
+            for r in caplog.records
+            if "Stripped unknown metadata key" in r.getMessage()
+        ]
+        assert offending == [], (
+            f"middleware stripped scanner-set metadata keys: {offending}"
+        )
+
     def test_no_enrichments_returns_copy(self, mw):
         existing = [
             AIComponent(
