@@ -231,3 +231,67 @@ def test_analyze_records_clone_failures_in_json_output(mock_cloned_repo, _mock_i
     assert analysis["metadata"]["sources_with_errors"] == 1
     assert analysis["metadata"]["status"] == "failed"
     assert analysis["errors"] == ["Clone failed: network down"]
+
+
+def test_analyze_scan_cache_hit_finalizes_per_source_status(tmp_path):
+    """Regression: a scan_cache hit must mark the per-source ``summary.status``
+    as a terminal value (``completed``).
+
+    Previously the cache-hit branch in ``aibom.cli.analyze`` ``continue``-d
+    out of the scan loop without updating ``source_summary``, so the source
+    landed in the report with ``status="in_progress"`` even though the run
+    overall had ``status="completed"``. That violates the producer contract
+    that every per-source status must be terminal at submission time.
+    """
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    report = tmp_path / "report.json"
+    cached_payload = {
+        "_v2": True,
+        "components": [],
+        "relationships": [],
+        "_agentic_risk_flags": [],
+        "_agentic_candidate_count": 0,
+    }
+
+    def _explode(self):
+        raise AssertionError(
+            "scan_cache hit must short-circuit ScanPipeline.run; pipeline ran"
+        )
+
+    with patch("aibom.cli.ensure_llm_runtime_available"):
+        with patch("aibom.scan_cache.load_cached", return_value=cached_payload):
+            with patch("aibom.scan_cache.save_cached"):
+                with patch("aibom.scan_pipeline.ScanPipeline.run", _explode):
+                    result = runner.invoke(
+                        app,
+                        [
+                            "analyze",
+                            str(source_dir),
+                            "--output-format",
+                            "json",
+                            "--output-file",
+                            str(report),
+                            "--llm-model",
+                            "test-model",
+                        ],
+                    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(report.read_text(encoding="utf-8"))
+    sources = data["aibom_analysis"]["sources"]
+    assert sources, "expected at least one source in report"
+    terminal = {"completed", "completed_with_errors", "failed", "skipped"}
+    for src_key, src in sources.items():
+        status = src["summary"]["status"]
+        assert status in terminal, (
+            f"source {src_key!r} status={status!r} is not terminal "
+            "after scan_cache hit"
+        )
+        assert status == "completed", (
+            f"expected completed after scan_cache hit, got {status!r}"
+        )
+        assert src["summary"]["last_generated_at"], (
+            f"source {src_key!r} missing last_generated_at after cache hit"
+        )
