@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -38,13 +39,14 @@ from .file_cache import read_text_cached
 _LOGGER = logging.getLogger(__name__)
 
 try:
-    from detect_secrets import settings as _detect_secrets_settings  # noqa: F401
     from detect_secrets.core.scan import scan_file as _ds_scan_file
+    from detect_secrets.settings import default_settings as _ds_default_settings
 
     _HAS_DETECT_SECRETS = True
 except ImportError:
     _HAS_DETECT_SECRETS = False
     _ds_scan_file = None  # type: ignore[assignment]
+    _ds_default_settings = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -455,21 +457,31 @@ class SecretDetector(BaseScanner):
         bucket: dict[tuple[str, int], AIComponent] = {}
         seen_files: set[Path] = set()
 
-        for file_path, _root in _iter_scan_files(context):
-            resolved = file_path.resolve()
-            if resolved in seen_files:
-                continue
-            seen_files.add(resolved)
-            fp_str = str(resolved)
+        # detect_secrets ships with a global Settings singleton that defaults to
+        # an empty plugin list; scanning without configuring plugins logs
+        # "No plugins to scan with!" once per file. Activate the bundled
+        # default plugin set for the duration of this scan.
+        ds_ctx: Any = (
+            _ds_default_settings()
+            if _HAS_DETECT_SECRETS and _ds_default_settings is not None
+            else nullcontext()
+        )
+        with ds_ctx:
+            for file_path, _root in _iter_scan_files(context):
+                resolved = file_path.resolve()
+                if resolved in seen_files:
+                    continue
+                seen_files.add(resolved)
+                fp_str = str(resolved)
 
-            lines = _read_text_lines(resolved)
-            if lines is None:
-                continue
-            for i, line in enumerate(lines, start=1):
-                _regex_scan_line(line, i, fp_str, bucket)
+                lines = _read_text_lines(resolved)
+                if lines is None:
+                    continue
+                for i, line in enumerate(lines, start=1):
+                    _regex_scan_line(line, i, fp_str, bucket)
 
-            if _HAS_DETECT_SECRETS:
-                _detect_secrets_scan_file(resolved, bucket)
+                if _HAS_DETECT_SECRETS:
+                    _detect_secrets_scan_file(resolved, bucket)
 
         for root_str in context.paths:
             src = Path(root_str).resolve()
