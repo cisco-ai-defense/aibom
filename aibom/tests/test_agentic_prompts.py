@@ -140,3 +140,100 @@ class TestAgenticPromptHardening:
         assert (
             "only ids that appear in `enrich_these` are valid targets"
         ) in prompt
+
+    def test_model_section_has_value_literal_removal_rule(self) -> None:
+        """Fix 10: section 4 (Model verification) must enumerate the
+        deployment-artifact value forms that should always be removed,
+        even when ``lookup_model`` returns ``found: true``. Mirrors the
+        existing dependency-version rule for the model class.
+        """
+        prompt = _normalized_aibom_prompt()
+        for needle in [
+            "value-literal removal",
+            "pure version literal",
+            "pure numeric token",
+            "ipv4 literal",
+            "bare environment marker",
+            ".image_tag",
+            "_threshold",
+            "env.environment",
+        ]:
+            assert needle in prompt, (
+                f"Fix 10 prompt vocabulary missing: {needle!r}"
+            )
+
+    def test_model_section_acknowledges_lookup_model_can_lie(self) -> None:
+        """Fix 10: the load-bearing instruction is that a registry hit
+        does not override the value-literal removal rule. Without this
+        line the agent would defer to ``lookup_model`` and keep
+        ``3.10.2``-style garbage.
+        """
+        prompt = _normalized_aibom_prompt()
+        assert "even if ``lookup_model`` reports" in prompt or (
+            "even if ``lookup_model`` returns" in prompt
+        ) or (
+            "even if `lookup_model` reports" in prompt
+        ), (
+            "model section must contain the 'even if lookup_model …' "
+            "override clause that justifies removing registry-known "
+            "values when they're deployment artifacts"
+        )
+
+    def test_iid_verbatim_rule_forbids_invented_line_numbers(self) -> None:
+        """Fix 13: an agent that picks a "likely" line number — e.g.
+        the start of a class body it just read via ``read_file_snippet``
+        — silently breaks downstream removal. Rule 4 in ABSOLUTE RULES
+        must spell out that line numbers are the exact scanner-emitted
+        source line, copied character-for-character from
+        ``enrich_these``.
+        """
+        prompt = _normalized_aibom_prompt()
+        for needle in [
+            "never invent or guess a line number",
+            "scanner emitted the candidate",
+            "do not pick \"a likely line\"",
+            "verified the candidate at via `read_file_snippet`",
+            "copy it character-for-character",
+        ]:
+            assert needle in prompt, (
+                f"Fix 13 iid-verbatim vocabulary missing: {needle!r}"
+            )
+
+    def test_iid_verbatim_rule_forbids_fabricated_paths(self) -> None:
+        """Fix 13: when the same logical concept appears in many
+        ``values*.yaml`` files, the agent must not synthesise a
+        per-file ``instance_id`` — the orchestrator already fans out a
+        single removal via the consolidation key. Cite the multi-file
+        ``values*.yaml`` case so the rule generalises beyond Python
+        sources.
+        """
+        prompt = _normalized_aibom_prompt()
+        for needle in [
+            "never fabricate a path",
+            "values*.yaml",
+            "consolidation key",
+            "you do not need to (and must not) emit a separate verdict for each file",
+        ]:
+            assert needle in prompt, (
+                f"Fix 13 path-fabrication vocabulary missing: {needle!r}"
+            )
+
+    def test_iid_verbatim_rule_directs_other_detected_to_no_op(self) -> None:
+        """Fix 13: if the agent looks at ``other_detected_components``
+        and concludes "this should be removed", the right action is to
+        do nothing in the current batch — the orchestrator schedules
+        each candidate in its own batch where it will appear in
+        ``enrich_these``. The middleware redirect via consolidation key
+        is a safety net for the agent's mistakes; the prompt must not
+        encourage the agent to lean on it.
+        """
+        prompt = _normalized_aibom_prompt()
+        assert (
+            "if you believe a candidate should be removed but it is in "
+            "`other_detected_components` (not `enrich_these`), do not emit a "
+            "verdict for it"
+        ) in prompt, (
+            "Fix 13 must instruct the agent to no-op on "
+            "other_detected_components rather than risk emitting a "
+            "fabricated iid"
+        )

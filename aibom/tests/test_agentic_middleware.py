@@ -568,6 +568,186 @@ class TestOutOfBatchVerdicts:
         )
 
 
+class TestOutOfBatchRemoveRedirect:
+    """Fix 14: an out-of-batch ``remove_components`` verdict whose iid
+    does not appear in ``existing`` is no longer dropped silently. The
+    middleware parses the ``name`` prefix from the iid, looks for an
+    in-batch sibling whose canonical ``(name, type)`` matches, and
+    redirects the removal to that sibling's consolidation key. The
+    scan-pipeline-level :func:`_propagate_removals` then fans the
+    decision out to every other instance of the same logical asset.
+
+    Without this redirect, an agent that emits a removal for the same
+    logical concept it sees in ``other_detected_components`` (or one
+    that invents a line number for a candidate it just verified) would
+    have its decision silently evaporate.
+    """
+
+    @pytest.fixture
+    def mw(self):
+        return AIBOMScannerMiddleware()
+
+    def test_out_of_batch_remove_redirects_to_in_batch_sibling(
+        self, mw, caplog,
+    ):
+        in_batch = AIComponent(
+            name="dev", component_type=AIComponentType.MODEL,
+            file_path="/repo/charts/svc-a/values.yaml", line_number=10,
+            instance_id="dev_/repo/charts/svc-a/values.yaml_10",
+        )
+        existing = [
+            in_batch,
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="/repo/app.py", line_number=42,
+                instance_id="gpt-4o_/repo/app.py_42",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "dev_/repo/charts/svc-b/values.yaml_77",
+                    "reason": "bare environment marker, not a model",
+                }
+            ],
+        })
+        with caplog.at_level("INFO"):
+            result = mw.apply_enrichments(existing, output)
+
+        names = {c.name for c in result}
+        assert "dev" not in names, (
+            "Out-of-batch remove of 'dev' should have been redirected "
+            "to the in-batch 'dev' sibling and removed via consolidation key"
+        )
+        assert names == {"gpt-4o"}
+        assert any(
+            "remove redirected" in rec.getMessage().lower()
+            for rec in caplog.records
+        ), "redirect must be logged at INFO level"
+
+    def test_out_of_batch_remove_with_no_sibling_is_dropped(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="/repo/app.py", line_number=42,
+                instance_id="gpt-4o_/repo/app.py_42",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "ghost_/repo/missing.py_99",
+                    "reason": "agent hallucinated this iid",
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert len(result) == 1
+        assert result[0].name == "gpt-4o"
+        assert any(
+            "no in-batch sibling has canonical name 'ghost'"
+            in rec.getMessage()
+            for rec in caplog.records
+        ), "truly hallucinated iids must still be dropped with a warning"
+
+    def test_out_of_batch_remove_with_unparseable_iid_is_dropped(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="/repo/app.py", line_number=42,
+                instance_id="gpt-4o_/repo/app.py_42",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "not_in_canonical_format_at_all",
+                    "reason": "agent garbled the iid",
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert len(result) == 1
+        assert any(
+            "unparseable out-of-batch remove" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_out_of_batch_remove_ambiguous_across_types_is_dropped(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="orchestrator", component_type=AIComponentType.AGENT,
+                file_path="/repo/a.py", line_number=10,
+                instance_id="orchestrator_/repo/a.py_10",
+            ),
+            AIComponent(
+                name="orchestrator", component_type=AIComponentType.TOOL,
+                file_path="/repo/b.py", line_number=20,
+                instance_id="orchestrator_/repo/b.py_20",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "orchestrator_/repo/elsewhere.py_99",
+                    "reason": "...",
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert len(result) == 2
+        assert any(
+            "is ambiguous across types" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_in_batch_remove_still_applied_directly(self, mw, caplog):
+        existing = [
+            AIComponent(
+                name="bogus", component_type=AIComponentType.MODEL,
+                file_path="/repo/x.py", line_number=1,
+                instance_id="bogus_/repo/x.py_1",
+            ),
+            AIComponent(
+                name="keep", component_type=AIComponentType.TOOL,
+                file_path="/repo/y.py", line_number=2,
+                instance_id="keep_/repo/y.py_2",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "bogus_/repo/x.py_1",
+                    "reason": "false positive",
+                }
+            ],
+        })
+        with caplog.at_level("INFO"):
+            result = mw.apply_enrichments(existing, output)
+        assert {c.name for c in result} == {"keep"}
+        assert any(
+            "Agent removed component bogus_/repo/x.py_1"
+            in rec.getMessage()
+            for rec in caplog.records
+        )
+        assert not any(
+            "remove redirected" in rec.getMessage().lower()
+            for rec in caplog.records
+        ), "in-batch removes must NOT route through the redirect path"
+
+
 class TestReclassifyWiring:
     """Applied reclassify verdicts must leave the component in a state
     that downstream post-agentic gates can recognise as 'agent touched'.

@@ -314,15 +314,21 @@ def _evidence_gate(
        component should have been enriched with specifics.
 
     3. **agent / agent_proxy symmetric check**: Any post-agentic AGENT or
-       AGENT_PROXY that originated from the structural scanner OR whose
-       type was flipped to agent by the LLM must carry a verifiable
-       ``agent_evidence`` payload in ``metadata``. The payload is
-       re-verified against the on-disk source using the same offline
-       gate that Phase 6 uses for LLM verdicts. This closes the
-       previous asymmetry where structural emissions could reach the
-       final SBOM without any citation check while LLM reclassifications
-       had to cite source lines. KB / framework scanner detections (no
-       type flip, no structural discovery marker) are left untouched —
+       AGENT_PROXY must carry a verifiable ``agent_evidence`` payload in
+       ``metadata`` when ANY of the following is true:
+
+       * Structural origin (``discovery == "structural_react_loop"``).
+       * Type was flipped to agent/agent_proxy by the LLM
+         (``orig.component_type != c.component_type``).
+       * Import-only candidate from ``kb_enrichment_scanner``
+         (``metadata.import_statement`` is set and ``metadata.call_pattern``
+         is not). These are weak class-name matches that need evidence
+         the import is actually exercised as an LLM-driven loop.
+
+       The payload is re-verified against the on-disk source using the
+       same offline gate that Phase 6 uses for LLM verdicts. KB /
+       framework scanner detections that come from real callsite
+       emissions (``metadata.call_pattern`` set) are left untouched —
        their authority comes from the framework match itself.
     """
     from .agentic.middleware import _verify_agent_evidence
@@ -378,7 +384,8 @@ def _evidence_gate(
             discovery = (c.metadata or {}).get("discovery")
             is_structural = discovery == "structural_react_loop"
             type_flipped = orig.component_type != c.component_type
-            if is_structural or type_flipped:
+            import_only = _is_import_only_candidate(c)
+            if is_structural or type_flipped or import_only:
                 raw_evidence = (c.metadata or {}).get("agent_evidence")
                 ok, reason = _verify_agent_evidence(
                     raw_evidence, allowed_roots=allowed_roots,
@@ -386,13 +393,14 @@ def _evidence_gate(
                 if not ok:
                     _LOGGER.warning(
                         "Evidence gate: dropping %s '%s' (%s) — %s "
-                        "(structural=%s, type_flipped=%s)",
+                        "(structural=%s, type_flipped=%s, import_only=%s)",
                         c.component_type.value,
                         c.name,
                         c.instance_id,
                         reason,
                         is_structural,
                         type_flipped,
+                        import_only,
                     )
                     agent_evidence_removed += 1
                     continue

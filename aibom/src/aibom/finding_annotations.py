@@ -10,6 +10,7 @@ from .models import (
     DecisionAnnotation,
     EvidenceLocation,
 )
+from .models.enums import DetectionSource
 from .models.scan import RiskFlag
 
 
@@ -124,10 +125,22 @@ def _component_annotation(
             f"extracted; it may be loaded from a file at runtime."
         )
         evidence_kinds = ["code_context", "file_loaded_limitation"] if evidence_locations else ["file_loaded_limitation"]
-    else:
+    elif component.detection_source == DetectionSource.AGENTIC:
         justification = (
-            f"Kept in the final AIBOM because the scan identified "
-            f"{component.component_type.value.replace('_', ' ')} '{component.name}'."
+            f"{component.component_type.value.replace('_', ' ').capitalize()} "
+            f"'{component.name}' was created by agentic enrichment."
+        )
+        evidence_kinds = ["code_context", "agentic_enrichment"] if evidence_locations else ["agentic_enrichment"]
+    else:
+        detector = (
+            component.detection_source.value
+            if component.detection_source
+            else "scan"
+        )
+        justification = (
+            f"{component.component_type.value.replace('_', ' ').capitalize()} "
+            f"'{component.name}' detected by {detector}; no explicit "
+            f"agentic verdict was attached to this finding."
         )
         evidence_kinds = ["code_context"] if evidence_locations else ["scan_result"]
 
