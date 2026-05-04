@@ -22,7 +22,10 @@ import json
 
 import pytest
 
-from aibom.agentic.middleware import AIBOMScannerMiddleware
+from aibom.agentic.middleware import (
+    AIBOMScannerMiddleware,
+    _parse_iid_name_prefix,
+)
 from aibom.models import AIComponent, AIComponentType, DetectionSource
 
 
@@ -653,6 +656,50 @@ class TestOutOfBatchRemoveRedirect:
             in rec.getMessage()
             for rec in caplog.records
         ), "truly hallucinated iids must still be dropped with a warning"
+
+    def test_out_of_batch_remove_redirects_relative_path_iid(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="src/app.ts", line_number=12,
+                instance_id="gpt-4o_src/app.ts_12",
+            ),
+            AIComponent(
+                name="keep", component_type=AIComponentType.TOOL,
+                file_path="src/tool.ts", line_number=7,
+                instance_id="keep_src/tool.ts_7",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "gpt-4o_src/other_app.ts_99",
+                    "reason": "same model candidate in another relative path",
+                }
+            ],
+        })
+        with caplog.at_level("INFO"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert {c.name for c in result} == {"keep"}
+        assert any(
+            "remove redirected" in rec.getMessage().lower()
+            for rec in caplog.records
+        ), "relative-path out-of-batch iids must redirect via sibling name"
+
+    def test_parse_iid_name_prefix_uses_longest_relative_sibling_name(self):
+        assert _parse_iid_name_prefix(
+            "simple_skills_re_src/foo_bar.ts_12",
+            ["simple", "simple_skills", "simple_skills_re"],
+        ) == "simple_skills_re"
+
+    def test_parse_iid_name_prefix_keeps_unknown_relative_iid_unparseable(self):
+        assert _parse_iid_name_prefix(
+            "unknown_src/foo_bar.ts_12",
+            ["gpt-4o", "claude-3"],
+        ) is None
 
     def test_out_of_batch_remove_with_unparseable_iid_is_dropped(
         self, mw, caplog,

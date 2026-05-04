@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -55,23 +56,31 @@ def _ckey(c: AIComponent) -> tuple[str, str]:
 _IID_TRAILING_LINE_RE = re.compile(r"^(?P<head>.+)_(?P<line>\d+)$")
 
 
-def _parse_iid_name_prefix(iid: str) -> str | None:
+def _parse_iid_name_prefix(
+    iid: str,
+    candidate_names: Iterable[str] | None = None,
+) -> str | None:
     """Extract the ``name`` prefix from an instance_id of the canonical form
     ``"<name>_<absolute_path>_<line>"``.
 
     ``AIComponent.instance_id`` is built as
     ``f"{name}_{file_path}_{line_number}"`` (see
-    ``aibom.models.scan.AIComponent.model_post_init``). ``file_path`` is
-    always an absolute POSIX path that begins with ``/``, so the last
-    occurrence of ``"_/"`` in ``iid`` (after stripping the trailing
-    ``_<digits>``) is a reliable boundary between name and path even
-    when the name itself contains underscores or the path contains
-    underscores. Naive ``rsplit("_", 1)`` would mis-split paths that
-    contain ``_`` (e.g. ``foo_bar.py``).
+    ``aibom.models.scan.AIComponent.model_post_init``). Most scanners pass an
+    absolute POSIX path that begins with ``/``, so the last occurrence of
+    ``"_/"`` in ``iid`` (after stripping the trailing ``_<digits>``) is a
+    reliable boundary between name and path even when the name itself contains
+    underscores or the path contains underscores. Naive ``rsplit("_", 1)``
+    would mis-split paths that contain ``_`` (e.g. ``foo_bar.py``).
+
+    Some scanner families intentionally store relative paths. For those IDs,
+    there is no delimiter that is intrinsically safe when both component names
+    and paths may contain underscores, so callers can provide the names of
+    in-batch siblings. We then parse by longest matching sibling-name prefix
+    and leave genuinely ambiguous or unknown IDs unparseable.
 
     Returns ``None`` when ``iid`` does not match the canonical format
-    (no trailing line number or no embedded absolute path); callers must
-    treat that as "unparseable, drop".
+    (no trailing line number, no embedded absolute path, and no unique
+    sibling-name prefix); callers must treat that as "unparseable, drop".
     """
     if not iid:
         return None
@@ -80,9 +89,25 @@ def _parse_iid_name_prefix(iid: str) -> str | None:
         return None
     head = m.group("head")
     sep_idx = head.rfind("_/")
-    if sep_idx < 0:
+    if sep_idx >= 0:
+        return head[:sep_idx]
+
+    names = {
+        name.strip()
+        for name in (candidate_names or [])
+        if name and name.strip()
+    }
+    matches = sorted(
+        (name for name in names if head.startswith(f"{name}_")),
+        key=len,
+        reverse=True,
+    )
+    if not matches:
         return None
-    return head[:sep_idx]
+    longest = matches[0]
+    if len(matches) > 1 and len(matches[1]) == len(longest):
+        return None
+    return longest
 
 
 _CLASS_NAME_RE = re.compile(
@@ -1094,7 +1119,12 @@ class AIBOMScannerMiddleware:
                 )
                 continue
 
-            name_prefix = _parse_iid_name_prefix(iid)
+            sibling_names: list[str] = []
+            for c in existing:
+                sibling_names.append(c.name)
+                if c.model_name:
+                    sibling_names.append(c.model_name)
+            name_prefix = _parse_iid_name_prefix(iid, sibling_names)
             if not name_prefix:
                 _LOGGER.warning(
                     "Dropping unparseable out-of-batch remove for %s "
@@ -1105,7 +1135,10 @@ class AIBOMScannerMiddleware:
             wanted = name_prefix.lower().strip()
             matches = [
                 c for c in existing
-                if (c.model_name or c.name).lower().strip() == wanted
+                if wanted in {
+                    c.name.lower().strip(),
+                    (c.model_name or c.name).lower().strip(),
+                }
             ]
             if not matches:
                 _LOGGER.warning(

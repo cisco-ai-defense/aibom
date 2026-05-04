@@ -384,7 +384,7 @@ def _evidence_gate(
             discovery = (c.metadata or {}).get("discovery")
             is_structural = discovery == "structural_react_loop"
             type_flipped = orig.component_type != c.component_type
-            import_only = _is_import_only_candidate(c)
+            import_only = _is_import_only_candidate(orig)
             if is_structural or type_flipped or import_only:
                 raw_evidence = (c.metadata or {}).get("agent_evidence")
                 ok, reason = _verify_agent_evidence(

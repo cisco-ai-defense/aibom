@@ -1081,6 +1081,58 @@ class TestSymmetricEvidenceGate:
             "tautological 'agent confirmed' rows reach the report."
         )
 
+    def test_import_only_agent_gate_uses_original_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        """Agent-added metadata must not let an import-only candidate bypass
+        the evidence gate.
+
+        The gate runs after agentic enrichment, so the post-agentic component
+        may contain echoed or invented ``call_pattern`` metadata. Import-only
+        status is a scanner-origin property and must be computed from the
+        immutable ``before`` component, while evidence is still read from the
+        post-agentic component.
+        """
+        from aibom.scan_pipeline import _evidence_gate
+
+        path = tmp_path / "uses_client.py"
+        path.write_text(
+            "from third_party.deepagent import DeepAgentClient\n"
+            "client = DeepAgentClient(url=URL)\n",
+            encoding="utf-8",
+        )
+        before = AIComponent(
+            name="DeepAgentClient",
+            component_type=AIComponentType.AGENT,
+            file_path=str(path),
+            line_number=1,
+            framework="kb_enrichment",
+            heuristic_confidence=0.35,
+            metadata={
+                "import_statement": (
+                    "from third_party.deepagent import DeepAgentClient"
+                ),
+            },
+        )
+        after = before.model_copy(
+            deep=True,
+            update={
+                "metadata": {
+                    **before.metadata,
+                    "call_pattern": "third_party.deepagent.DeepAgentClient",
+                },
+            },
+        )
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert kept == [], (
+            "Import-only status must be based on the original scanner "
+            "component; post-agentic call_pattern metadata is not evidence."
+        )
+
     def test_import_only_agent_with_verified_evidence_is_kept(
         self, tmp_path: Path
     ) -> None:
