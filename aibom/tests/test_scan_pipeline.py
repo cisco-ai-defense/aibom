@@ -1035,6 +1035,155 @@ class TestSymmetricEvidenceGate:
         assert len(kept) == 1
         assert kept[0].name == "FrameworkAgent"
 
+    def test_import_only_agent_without_evidence_is_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """Fix 7: import-only AGENT/AGENT_PROXY candidates from the
+        kb_enrichment scanner (``import_statement`` set, ``call_pattern``
+        unset) must produce verifiable on-disk loop evidence to survive.
+
+        These are weak class-name matches inferred from a bare ``from x
+        import Y`` line; the LLM is supposed to verify the import is
+        actually exercised as an LLM-driven loop. Without that evidence
+        the symmetric gate must drop them, instead of letting them
+        rubber-stamp through ``_component_annotation``.
+        """
+        from aibom.scan_pipeline import _evidence_gate
+
+        path = tmp_path / "uses_client.py"
+        path.write_text(
+            "from third_party.deepagent import DeepAgentClient\n"
+            "client = DeepAgentClient(url=URL)\n",
+            encoding="utf-8",
+        )
+        before = AIComponent(
+            name="DeepAgentClient",
+            component_type=AIComponentType.AGENT,
+            file_path=str(path),
+            line_number=1,
+            framework="kb_enrichment",
+            heuristic_confidence=0.35,
+            metadata={
+                "import_statement": (
+                    "from third_party.deepagent import DeepAgentClient"
+                ),
+            },
+        )
+        after = before.model_copy()
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert kept == [], (
+            "Import-only agent candidate without agent_evidence must be "
+            "dropped — Fix 7 closes the kb_enrichment loophole that let "
+            "tautological 'agent confirmed' rows reach the report."
+        )
+
+    def test_import_only_agent_gate_uses_original_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        """Agent-added metadata must not let an import-only candidate bypass
+        the evidence gate.
+
+        The gate runs after agentic enrichment, so the post-agentic component
+        may contain echoed or invented ``call_pattern`` metadata. Import-only
+        status is a scanner-origin property and must be computed from the
+        immutable ``before`` component, while evidence is still read from the
+        post-agentic component.
+        """
+        from aibom.scan_pipeline import _evidence_gate
+
+        path = tmp_path / "uses_client.py"
+        path.write_text(
+            "from third_party.deepagent import DeepAgentClient\n"
+            "client = DeepAgentClient(url=URL)\n",
+            encoding="utf-8",
+        )
+        before = AIComponent(
+            name="DeepAgentClient",
+            component_type=AIComponentType.AGENT,
+            file_path=str(path),
+            line_number=1,
+            framework="kb_enrichment",
+            heuristic_confidence=0.35,
+            metadata={
+                "import_statement": (
+                    "from third_party.deepagent import DeepAgentClient"
+                ),
+            },
+        )
+        after = before.model_copy(
+            deep=True,
+            update={
+                "metadata": {
+                    **before.metadata,
+                    "call_pattern": "third_party.deepagent.DeepAgentClient",
+                },
+            },
+        )
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert kept == [], (
+            "Import-only status must be based on the original scanner "
+            "component; post-agentic call_pattern metadata is not evidence."
+        )
+
+    def test_import_only_agent_with_verified_evidence_is_kept(
+        self, tmp_path: Path
+    ) -> None:
+        """Fix 7 regression guard: when the LLM does attach valid
+        ``agent_evidence`` (a real react loop in the same source tree),
+        the symmetric gate must keep the component.
+        """
+        from aibom.scan_pipeline import _evidence_gate
+
+        source = (
+            "from openai import OpenAI\n"
+            "class DeepAgentLoop:\n"
+            "    def step(self, state):\n"
+            "        return self._tools(state)\n"
+        )
+        file_path, class_start, class_end = self._make_class_file(
+            tmp_path, "deep_agent_loop.py", source
+        )
+        snippet = "\n".join(
+            source.splitlines()[class_start - 1:class_end]
+        )
+        before = AIComponent(
+            name="DeepAgentLoop",
+            component_type=AIComponentType.AGENT,
+            file_path=file_path,
+            line_number=class_start,
+            framework="kb_enrichment",
+            heuristic_confidence=0.35,
+            metadata={
+                "import_statement": (
+                    "from local.deep import DeepAgentLoop"
+                ),
+                "agent_evidence": {
+                    "pattern": "react_loop",
+                    "definition_file": file_path,
+                    "definition_start_line": class_start,
+                    "definition_end_line": class_end,
+                    "evidence_snippet": snippet,
+                    "justification": "verified",
+                },
+            },
+        )
+        after = before.model_copy()
+
+        kept = _evidence_gate(
+            [before], [after], scan_paths=[str(tmp_path)]
+        )
+
+        assert len(kept) == 1
+        assert kept[0].name == "DeepAgentLoop"
+
 
 class TestCanonicalizeEnvVarNames:
     """Regression tests for the env-var name canonicalizer.

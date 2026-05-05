@@ -362,6 +362,30 @@ def _helm_key_suggests_model(key_path: str) -> bool:
     return any(p in _MODEL_KEY_HINTS for p in parts)
 
 
+_NOT_MODEL_KEY_RE = re.compile(
+    r"(?ix)"
+    r"(^|\.)tag$|"                # *.tag (image tags, model serving tags, etc.)
+    r"(^|\.)image_tag$|"          # *.image_tag (explicit image tag fields)
+    r"(^|\.)version$|"            # *.version (sops, chart, schema, etc.)
+    r"_threshold$|"               # *_threshold (numeric tuning knobs)
+    r"_timeout$|"                 # *_timeout (numeric latency knobs)
+    r"_ip$|_host$|_port$|_url$|"  # endpoint coordinates, not model identifiers
+    r"\.environment$"             # env.ENVIRONMENT (dev/staging/prod marker)
+)
+
+
+def _helm_key_is_definitely_not_model(key_path: str) -> bool:
+    """Helm leaves whose semantic role rules out a model regardless of value.
+
+    Used to gate the high-confidence ``_is_known_model`` branch in the helm
+    walker. Even when the registry happens to alias-match the literal value
+    (e.g. ``image.tag: "release-0.3.1"`` would otherwise look like an OpenAI
+    family hit), the key-path semantics make it impossible for the value to
+    be a real model identifier.
+    """
+    return bool(_NOT_MODEL_KEY_RE.search(key_path))
+
+
 _AZURE_DEPLOY_KEY_RE = re.compile(r"(?i)azure", re.IGNORECASE)
 _AZURE_ENGINE_TAIL_RE = re.compile(r"(?i)\.(engine|deployment|deployment_name)$")
 
@@ -876,7 +900,10 @@ def _walk_helm_values(
                             metadata={"helm_key": sub, "image": v},
                         )
                     )
-                elif _is_known_model(stripped):
+                elif (
+                    not _helm_key_is_definitely_not_model(sub)
+                    and _is_known_model(stripped)
+                ):
                     comp_type = _model_component_type_for_value(sub, stripped)
                     model_env = _resolve_helm_env_var(Path(file_path), sub, k)
                     model_meta: dict[str, Any] = {"helm_key": sub}
@@ -891,6 +918,17 @@ def _walk_helm_values(
                             model_name=stripped,
                             metadata=model_meta,
                             heuristic_confidence=0.95,
+                            needs_agentic=True,
+                            agentic_hint=(
+                                f"Helm key '{sub}' resolved to a "
+                                f"registry-known model identifier "
+                                f"'{stripped}'. Verify the value is a real "
+                                f"model and not a deployment artifact "
+                                f"(image tag, version literal, IP, "
+                                f"threshold, environment marker) per the "
+                                f"section 4 value-literal rules. REMOVE if "
+                                f"it is a deployment artifact."
+                            ),
                         )
                     )
                 elif (

@@ -512,3 +512,141 @@ class TestObservabilityEndpointDetection:
         comps, _ = run_scanner(DeploymentDetector, tmp_path, {"values.yaml": yml})
         obs = [c for c in comps if c.component_type == AIComponentType.OBSERVABILITY]
         assert len(obs) == 0
+
+
+class TestHelmKeyPathGate:
+    """Fix 6: ``_helm_key_is_definitely_not_model`` and walker integration."""
+
+    def test_helm_key_gate_blocks_tag_version_threshold_ip_keys(self) -> None:
+        from aibom.scanners.deployment_detector import (
+            _helm_key_is_definitely_not_model,
+        )
+
+        deny = [
+            "image.tag",
+            "sops.version",
+            "runbook.image.tag",
+            "widget_mcp_server.env.CONFIDENCE_SCHEMA_MISMATCH_THRESHOLD",
+            "aigateway.env.MY_NODE_IP",
+            "env.ENVIRONMENT",
+            "orchestrator.image.tag",
+            "servingEngineSpec.defaultModelConfig.tag",
+            "servingEngineSpec.modelSpec.0.tag",
+            "meraki_mcp_server.image.tag",
+            "widget_mcp_server.image.tag",
+            "sample.config.image_tag",
+            "foo.bar_url",
+            "cache.redis_host",
+            "service.api_port",
+        ]
+        for key in deny:
+            assert _helm_key_is_definitely_not_model(key), (
+                f"key-path gate must reject {key!r}"
+            )
+
+        allow = [
+            "env.TASK_CLASSIFIER.LLM_MODEL_NAME",
+            "env.AZURE.GPT4o.ENGINE",
+            "widget_mcp_server.env.MODEL_NAME",
+            "lapse.env.LAPSE_LLM_MODEL_NAME",
+            "servingEngineSpec.modelSpec.0.annotations.model",
+        ]
+        for key in allow:
+            assert not _helm_key_is_definitely_not_model(key), (
+                f"key-path gate must NOT reject {key!r}"
+            )
+
+    def test_helm_walker_drops_garbage_models_at_tag_version_keys(
+        self, tmp_path: Path,
+    ) -> None:
+        yml = """sops:
+  version: "3.10.2"
+image:
+  tag: "release-0.3.1"
+aigateway:
+  env:
+    MY_NODE_IP: "127.0.0.1"
+widget_mcp_server:
+  image:
+    tag: "2.0.6"
+  env:
+    CONFIDENCE_SCHEMA_MISMATCH_THRESHOLD: "0.5"
+orchestrator:
+  image:
+    tag: "1.1.1"
+servingEngineSpec:
+  defaultModelConfig:
+    tag: "1.1"
+  modelSpec:
+    - tag: "v4.5.4"
+meraki_mcp_server:
+  image:
+    tag: "v1.6"
+runbook:
+  image:
+    tag: "3.2.2"
+env:
+  ENVIRONMENT: "dev"
+"""
+        comps, _ = run_scanner(
+            DeploymentDetector, tmp_path, {"values.yaml": yml},
+        )
+        models = [c for c in comps if c.component_type == AIComponentType.MODEL]
+        assert models == [], (
+            "garbage values at non-model helm key paths must not produce "
+            f"MODEL components; got {[c.model_name for c in models]}"
+        )
+
+    def test_helm_walker_keeps_real_models_at_model_keys(
+        self, tmp_path: Path,
+    ) -> None:
+        yml = """env:
+  TASK_CLASSIFIER:
+    LLM_MODEL_NAME: "gpt-4o"
+  AZURE:
+    GPT4o:
+      ENGINE: "gpt-4o"
+widget_mcp_server:
+  env:
+    MODEL_NAME: "anthropic/claude-3-5-sonnet"
+"""
+        comps, _ = run_scanner(
+            DeploymentDetector, tmp_path, {"values.yaml": yml},
+        )
+        models = [c for c in comps if c.component_type == AIComponentType.MODEL]
+        names = {c.model_name for c in models}
+        assert "gpt-4o" in names
+        assert "anthropic/claude-3-5-sonnet" in names
+        for c in models:
+            assert "helm_key" in (c.metadata or {}), (
+                f"helm-walker MODEL component must carry helm_key metadata; "
+                f"got {c.metadata!r}"
+            )
+
+    def test_helm_walker_high_conf_model_routes_through_agent(
+        self, tmp_path: Path,
+    ) -> None:
+        """Fix 11: high-conf helm model branch must go through the agent."""
+        yml = """env:
+  MODEL_NAME: "gpt-4o"
+"""
+        comps, _ = run_scanner(
+            DeploymentDetector, tmp_path, {"values.yaml": yml},
+        )
+        models = [
+            c
+            for c in comps
+            if c.component_type == AIComponentType.MODEL
+            and c.model_name == "gpt-4o"
+        ]
+        assert models, "expected gpt-4o MODEL component from env.MODEL_NAME"
+        c = models[0]
+        assert c.needs_agentic is True, (
+            "high-confidence helm-walker model emission must route through "
+            "the agent so the value-literal prompt rule has a chance to fire"
+        )
+        hint = c.agentic_hint or ""
+        assert "deployment artifact" in hint.lower(), (
+            f"agentic_hint must reference the deployment-artifact escape "
+            f"clause from prompt section 4; got {hint!r}"
+        )

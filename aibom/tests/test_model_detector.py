@@ -509,3 +509,86 @@ class TestStagedEmbeddingReclassification:
         assert ("text-embedding-3-large", "model") not in names
         # Exactly one entry for this name across all types.
         assert sum(1 for n, _ in names if n == "text-embedding-3-large") == 1
+
+
+class TestRegistryLookupValueLiteralGuard:
+    """Fix 8: ``registry_lookup`` must refuse pure deployment-artifact literals."""
+
+    @pytest.mark.parametrize(
+        "garbage_input",
+        [
+            # Pure version literals.
+            "3.10.2",
+            "v4.5.4",
+            "0.59b0",
+            "1.0.0-rc1",
+            "2.0.6",
+            "3.0.1",
+            "3.2.2",
+            "1.1.1",
+            "v1.6",
+            # Trivial numerics — these used to alias-flatten to family rows
+            # like Gemini 1.5, GPT-3.5, Claude-2.
+            "0.5",
+            "1.1",
+            "1.5",
+            "2.0",
+            "3.5",
+            "4.0",
+            "42",
+            # IPv4 literals.
+            "127.0.0.1",
+            "0.0.0.0",
+            "10.0.0.5",
+        ],
+    )
+    def test_registry_lookup_refuses_value_literals(
+        self, garbage_input: str,
+    ) -> None:
+        from aibom.scanners.model_detector import registry_lookup
+
+        result = registry_lookup(garbage_input)
+        assert result is None, (
+            f"registry_lookup({garbage_input!r}) must return None — these "
+            f"are deployment artifacts (versions, IPs, thresholds), not "
+            f"model identifiers. Got {result!r}."
+        )
+
+    @pytest.mark.parametrize(
+        "real_model",
+        [
+            "gpt-4o",
+            "gpt-4-32k",
+            "gpt-4.1",
+            "claude-3-5-sonnet",
+            "gemini-1.5-pro",
+            "text-embedding-ada-002",
+            "o1",
+            "o1-preview",
+            "o1-mini",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ],
+    )
+    def test_registry_lookup_keeps_real_models(self, real_model: str) -> None:
+        from aibom.scanners.model_detector import registry_lookup
+
+        result = registry_lookup(real_model)
+        assert result is not None, (
+            f"registry_lookup({real_model!r}) must still resolve — "
+            f"regression guard for the value-literal prefilter."
+        )
+
+    def test_is_known_model_combined_behavior(self) -> None:
+        from aibom.scanners.deployment_detector import _is_known_model
+
+        garbage = ["3.10.2", "127.0.0.1", "0.5", "1.1", "v4.5.4"]
+        for v in garbage:
+            assert not _is_known_model(v), (
+                f"_is_known_model({v!r}) must be False after Fix 8"
+            )
+
+        real = ["gpt-4o", "claude-3-5-sonnet", "gemini-1.5-pro"]
+        for v in real:
+            assert _is_known_model(v), (
+                f"_is_known_model({v!r}) must remain True (regression guard)"
+            )

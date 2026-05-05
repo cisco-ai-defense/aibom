@@ -15,6 +15,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
+import warnings
+
 import libcst as cst
 from typing import Any, Dict, List, Optional, Union
 
@@ -954,14 +956,22 @@ def parse_source_code(file_path: str, source_code: str) -> CodeAnalysisResult:
     Returns:
         A CodeAnalysisResult object containing all observations from the file.
     """
-    try:
-        tree = cst.parse_module(source_code)
-    except cst.ParserSyntaxError:
-        # If there's a syntax error, return an empty result for this file.
-        return CodeAnalysisResult(file_path=file_path)
+    # libcst's parser and metadata visitors invoke Python's tokenizer/parser
+    # internally, which emits SyntaxWarning for invalid escape sequences
+    # (e.g. "\s") in scanned third-party source. The warnings refer to
+    # scanned code, not aibom, and previously leaked to the operator's
+    # terminal as `WARNING <unknown>:1: SyntaxWarning ...`. Suppress them
+    # for the duration of parse + metadata visit. Real parse errors are
+    # still raised as ParserSyntaxError below.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        try:
+            tree = cst.parse_module(source_code)
+        except cst.ParserSyntaxError:
+            return CodeAnalysisResult(file_path=file_path)
 
-    wrapper = cst.metadata.MetadataWrapper(tree)
-    visitor = SymbolVisitor(file_path=file_path, source_code=source_code)
-    wrapper.visit(visitor)
+        wrapper = cst.metadata.MetadataWrapper(tree)
+        visitor = SymbolVisitor(file_path=file_path, source_code=source_code)
+        wrapper.visit(visitor)
 
     return visitor.result

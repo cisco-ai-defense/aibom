@@ -836,6 +836,14 @@ _registry_cache: dict[str, dict[str, Any] | None] = {}
 _SENTINEL = object()
 
 
+_BARE_VERSION_RE = re.compile(
+    r"^v?\d+(\.\d+)+([a-z]\d*)?(-[a-z0-9.+]+)?$",
+    re.IGNORECASE,
+)
+_TRIVIAL_NUMERIC_RE = re.compile(r"^\d+(\.\d+)?$")
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+
 def _builtin_regex_match_direct(key: str) -> Optional[dict[str, Any]]:
     """Return the first BUILTIN_MODEL_REGISTRY match for ``key`` itself (no alias walk)."""
     low = key.lower()
@@ -893,7 +901,18 @@ def is_known_embedding_model_name(name: str) -> bool:
 
 
 def registry_lookup(model_id: str) -> Optional[dict[str, Any]]:
-    key = model_id.strip()
+    key = (model_id or "").strip()
+    if not key:
+        return None
+    # Refuse pure deployment-artifact literals (image tags, IP addresses,
+    # threshold values, sops versions, etc.) before they alias-walk into
+    # spurious provider hits like ``3.10.2`` → deepseek family ``2``.
+    if (
+        _BARE_VERSION_RE.match(key)
+        or _TRIVIAL_NUMERIC_RE.match(key)
+        or _IPV4_RE.match(key)
+    ):
+        return None
     cached = _registry_cache.get(key, _SENTINEL)
     if cached is not _SENTINEL:
         return dict(cached) if cached is not None else None

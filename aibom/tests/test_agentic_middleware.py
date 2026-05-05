@@ -22,7 +22,10 @@ import json
 
 import pytest
 
-from aibom.agentic.middleware import AIBOMScannerMiddleware
+from aibom.agentic.middleware import (
+    AIBOMScannerMiddleware,
+    _parse_iid_name_prefix,
+)
 from aibom.models import AIComponent, AIComponentType, DetectionSource
 
 
@@ -264,6 +267,61 @@ class TestApplyEnrichments:
         enriched = mw.apply_enrichments(existing, SAMPLE_AGENT_OUTPUT)
         assert enriched[0].metadata["existing_key"] == "keep_me"
         assert enriched[0].metadata["license"] == "proprietary"
+
+    def test_preserves_scanner_set_metadata_keys(self, mw, caplog):
+        """Regression: keys produced by deterministic scanners
+        (``ecosystem``, ``manifest``, ``known_ai_package``,
+        ``vulnerabilities``, ``risk_flag``) must NOT be stripped by
+        ``_sanitize_metadata`` and must NOT trigger the
+        ``"Stripped unknown metadata key"`` WARNING. They are not LLM
+        hallucinations — the LLM is permitted to echo them."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="aibom.agentic.middleware")
+        existing = [
+            AIComponent(
+                name="openai",
+                component_type=AIComponentType.MODEL,
+                file_path="app.py",
+                line_number=10,
+                instance_id="openai_app.py_10",
+            )
+        ]
+        output = json.dumps(
+            {
+                "enriched_components": [
+                    {
+                        "instance_id": "openai_app.py_10",
+                        "updates": {
+                            "metadata": {
+                                "ecosystem": "pypi",
+                                "manifest": "requirements.txt",
+                                "known_ai_package": True,
+                                "vulnerabilities": [{"id": "GHSA-xxxx"}],
+                                "risk_flag": {"level": "medium"},
+                            }
+                        },
+                    }
+                ]
+            }
+        )
+
+        enriched = mw.apply_enrichments(existing, output)
+
+        assert enriched[0].metadata["ecosystem"] == "pypi"
+        assert enriched[0].metadata["manifest"] == "requirements.txt"
+        assert enriched[0].metadata["known_ai_package"] is True
+        assert enriched[0].metadata["vulnerabilities"] == [{"id": "GHSA-xxxx"}]
+        assert enriched[0].metadata["risk_flag"] == {"level": "medium"}
+
+        offending = [
+            r.getMessage()
+            for r in caplog.records
+            if "Stripped unknown metadata key" in r.getMessage()
+        ]
+        assert offending == [], (
+            f"middleware stripped scanner-set metadata keys: {offending}"
+        )
 
     def test_no_enrichments_returns_copy(self, mw):
         existing = [
@@ -511,6 +569,230 @@ class TestOutOfBatchVerdicts:
             "out-of-batch enrichment" in rec.getMessage()
             for rec in caplog.records
         )
+
+
+class TestOutOfBatchRemoveRedirect:
+    """Fix 14: an out-of-batch ``remove_components`` verdict whose iid
+    does not appear in ``existing`` is no longer dropped silently. The
+    middleware parses the ``name`` prefix from the iid, looks for an
+    in-batch sibling whose canonical ``(name, type)`` matches, and
+    redirects the removal to that sibling's consolidation key. The
+    scan-pipeline-level :func:`_propagate_removals` then fans the
+    decision out to every other instance of the same logical asset.
+
+    Without this redirect, an agent that emits a removal for the same
+    logical concept it sees in ``other_detected_components`` (or one
+    that invents a line number for a candidate it just verified) would
+    have its decision silently evaporate.
+    """
+
+    @pytest.fixture
+    def mw(self):
+        return AIBOMScannerMiddleware()
+
+    def test_out_of_batch_remove_redirects_to_in_batch_sibling(
+        self, mw, caplog,
+    ):
+        in_batch = AIComponent(
+            name="dev", component_type=AIComponentType.MODEL,
+            file_path="/repo/charts/svc-a/values.yaml", line_number=10,
+            instance_id="dev_/repo/charts/svc-a/values.yaml_10",
+        )
+        existing = [
+            in_batch,
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="/repo/app.py", line_number=42,
+                instance_id="gpt-4o_/repo/app.py_42",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "dev_/repo/charts/svc-b/values.yaml_77",
+                    "reason": "bare environment marker, not a model",
+                }
+            ],
+        })
+        with caplog.at_level("INFO"):
+            result = mw.apply_enrichments(existing, output)
+
+        names = {c.name for c in result}
+        assert "dev" not in names, (
+            "Out-of-batch remove of 'dev' should have been redirected "
+            "to the in-batch 'dev' sibling and removed via consolidation key"
+        )
+        assert names == {"gpt-4o"}
+        assert any(
+            "remove redirected" in rec.getMessage().lower()
+            for rec in caplog.records
+        ), "redirect must be logged at INFO level"
+
+    def test_out_of_batch_remove_with_no_sibling_is_dropped(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="/repo/app.py", line_number=42,
+                instance_id="gpt-4o_/repo/app.py_42",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "ghost_/repo/missing.py_99",
+                    "reason": "agent hallucinated this iid",
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert len(result) == 1
+        assert result[0].name == "gpt-4o"
+        assert any(
+            "no in-batch sibling has canonical name 'ghost'"
+            in rec.getMessage()
+            for rec in caplog.records
+        ), "truly hallucinated iids must still be dropped with a warning"
+
+    def test_out_of_batch_remove_redirects_relative_path_iid(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="src/app.ts", line_number=12,
+                instance_id="gpt-4o_src/app.ts_12",
+            ),
+            AIComponent(
+                name="keep", component_type=AIComponentType.TOOL,
+                file_path="src/tool.ts", line_number=7,
+                instance_id="keep_src/tool.ts_7",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "gpt-4o_src/other_app.ts_99",
+                    "reason": "same model candidate in another relative path",
+                }
+            ],
+        })
+        with caplog.at_level("INFO"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert {c.name for c in result} == {"keep"}
+        assert any(
+            "remove redirected" in rec.getMessage().lower()
+            for rec in caplog.records
+        ), "relative-path out-of-batch iids must redirect via sibling name"
+
+    def test_parse_iid_name_prefix_uses_longest_relative_sibling_name(self):
+        assert _parse_iid_name_prefix(
+            "simple_skills_re_src/foo_bar.ts_12",
+            ["simple", "simple_skills", "simple_skills_re"],
+        ) == "simple_skills_re"
+
+    def test_parse_iid_name_prefix_keeps_unknown_relative_iid_unparseable(self):
+        assert _parse_iid_name_prefix(
+            "unknown_src/foo_bar.ts_12",
+            ["gpt-4o", "claude-3"],
+        ) is None
+
+    def test_out_of_batch_remove_with_unparseable_iid_is_dropped(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="gpt-4o", component_type=AIComponentType.MODEL,
+                file_path="/repo/app.py", line_number=42,
+                instance_id="gpt-4o_/repo/app.py_42",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "not_in_canonical_format_at_all",
+                    "reason": "agent garbled the iid",
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert len(result) == 1
+        assert any(
+            "unparseable out-of-batch remove" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_out_of_batch_remove_ambiguous_across_types_is_dropped(
+        self, mw, caplog,
+    ):
+        existing = [
+            AIComponent(
+                name="orchestrator", component_type=AIComponentType.AGENT,
+                file_path="/repo/a.py", line_number=10,
+                instance_id="orchestrator_/repo/a.py_10",
+            ),
+            AIComponent(
+                name="orchestrator", component_type=AIComponentType.TOOL,
+                file_path="/repo/b.py", line_number=20,
+                instance_id="orchestrator_/repo/b.py_20",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "orchestrator_/repo/elsewhere.py_99",
+                    "reason": "...",
+                }
+            ],
+        })
+        with caplog.at_level("WARNING"):
+            result = mw.apply_enrichments(existing, output)
+
+        assert len(result) == 2
+        assert any(
+            "is ambiguous across types" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_in_batch_remove_still_applied_directly(self, mw, caplog):
+        existing = [
+            AIComponent(
+                name="bogus", component_type=AIComponentType.MODEL,
+                file_path="/repo/x.py", line_number=1,
+                instance_id="bogus_/repo/x.py_1",
+            ),
+            AIComponent(
+                name="keep", component_type=AIComponentType.TOOL,
+                file_path="/repo/y.py", line_number=2,
+                instance_id="keep_/repo/y.py_2",
+            ),
+        ]
+        output = json.dumps({
+            "remove_components": [
+                {
+                    "instance_id": "bogus_/repo/x.py_1",
+                    "reason": "false positive",
+                }
+            ],
+        })
+        with caplog.at_level("INFO"):
+            result = mw.apply_enrichments(existing, output)
+        assert {c.name for c in result} == {"keep"}
+        assert any(
+            "Agent removed component bogus_/repo/x.py_1"
+            in rec.getMessage()
+            for rec in caplog.records
+        )
+        assert not any(
+            "remove redirected" in rec.getMessage().lower()
+            for rec in caplog.records
+        ), "in-batch removes must NOT route through the redirect path"
 
 
 class TestReclassifyWiring:

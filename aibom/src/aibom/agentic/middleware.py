@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,63 @@ def _ckey(c: AIComponent) -> tuple[str, str]:
     """Consolidation key matching ``scan_pipeline._consolidation_key``."""
     canonical = (c.model_name or c.name).lower().strip()
     return (canonical, c.component_type.value)
+
+
+_IID_TRAILING_LINE_RE = re.compile(r"^(?P<head>.+)_(?P<line>\d+)$")
+
+
+def _parse_iid_name_prefix(
+    iid: str,
+    candidate_names: Iterable[str] | None = None,
+) -> str | None:
+    """Extract the ``name`` prefix from an instance_id of the canonical form
+    ``"<name>_<absolute_path>_<line>"``.
+
+    ``AIComponent.instance_id`` is built as
+    ``f"{name}_{file_path}_{line_number}"`` (see
+    ``aibom.models.scan.AIComponent.model_post_init``). Most scanners pass an
+    absolute POSIX path that begins with ``/``, so the last occurrence of
+    ``"_/"`` in ``iid`` (after stripping the trailing ``_<digits>``) is a
+    reliable boundary between name and path even when the name itself contains
+    underscores or the path contains underscores. Naive ``rsplit("_", 1)``
+    would mis-split paths that contain ``_`` (e.g. ``foo_bar.py``).
+
+    Some scanner families intentionally store relative paths. For those IDs,
+    there is no delimiter that is intrinsically safe when both component names
+    and paths may contain underscores, so callers can provide the names of
+    in-batch siblings. We then parse by longest matching sibling-name prefix
+    and leave genuinely ambiguous or unknown IDs unparseable.
+
+    Returns ``None`` when ``iid`` does not match the canonical format
+    (no trailing line number, no embedded absolute path, and no unique
+    sibling-name prefix); callers must treat that as "unparseable, drop".
+    """
+    if not iid:
+        return None
+    m = _IID_TRAILING_LINE_RE.match(iid)
+    if not m:
+        return None
+    head = m.group("head")
+    sep_idx = head.rfind("_/")
+    if sep_idx >= 0:
+        return head[:sep_idx]
+
+    names = {
+        name.strip()
+        for name in (candidate_names or [])
+        if name and name.strip()
+    }
+    matches = sorted(
+        (name for name in names if head.startswith(f"{name}_")),
+        key=len,
+        reverse=True,
+    )
+    if not matches:
+        return None
+    longest = matches[0]
+    if len(matches) > 1 and len(matches[1]) == len(longest):
+        return None
+    return longest
 
 
 _CLASS_NAME_RE = re.compile(
@@ -112,7 +170,10 @@ _ALLOWED_METADATA_KEYS: frozenset[str] = frozenset({
     # Provenance / config source
     "env_var",
     "env",
+    "env_context",
+    "env_value",
     "config_kind",
+    "config_key",
     "source",
     "source_file",
     "resolved_value",
@@ -120,10 +181,14 @@ _ALLOWED_METADATA_KEYS: frozenset[str] = frozenset({
     "file_loaded_limitation",
     "redacted",
     "section",
+    "scanner",
     # Model registry enrichment
     "model_family",
     "model_provider",
+    "model_name",
+    "resolved_model",
     "provider",
+    "provider_name",
     "family",
     "mode",
     "license",
@@ -134,6 +199,7 @@ _ALLOWED_METADATA_KEYS: frozenset[str] = frozenset({
     "detection_method",
     # Endpoint-specific
     "endpoint_url",
+    "endpoint_status",
     "provider_domain",
     "region",
     "deployment_id",
@@ -152,23 +218,66 @@ _ALLOWED_METADATA_KEYS: frozenset[str] = frozenset({
     "task_name",
     "tool_name",
     "agent",
+    "job",
+    "action",
     # Docker / K8s
     "image",
+    "container_image",
+    "kind",
+    "annotation",
+    # Cloud / IaC
+    "cloud_provider",
+    "instance_type",
+    "gpu_count",
+    "logical_id",
+    "resource_name",
+    "location",
+    "creation_time",
+    "size_bytes",
+    "format",
+    "field",
+    "arm_deployment",
+    "arm_parameter",
+    "arm_sku",
+    "arm_type",
+    "bicep_param",
+    "bicep_type",
+    "cfn_parameter",
+    "cfn_property",
+    "cfn_type",
+    "terraform_local",
+    "terraform_variable",
+    "cicd_type",
     # Agent / MCP
     "agent_card",
     "agent_evidence",
     "skills",
     "remote_verification",
     "mcp_tool_name",
+    "mcp_decorators",
     "qualified_name",
     "protocol_match_count",
     "class_name",
     "constructor",
-    # Dependency
+    "patterns",
+    # Dependency / package
+    "ecosystem",
+    "manifest",
+    "package",
+    "package_type",
     "package_summary",
     "package_keywords",
     "package_classifiers",
     "version_spec",
+    "known_ai_package",
+    "installed_path",
+    "local",
+    "local_path",
+    "declared_in_manifests",
+    "import_found",
+    # Vulnerability scanner enrichment
+    "vulnerabilities",
+    "risk_flag",
     # Call-pattern / KB provenance (LLM may echo these from deterministic rows)
     "call_pattern",
     "tool_kwarg",
@@ -188,9 +297,13 @@ _ALLOWED_METADATA_KEYS: frozenset[str] = frozenset({
     "parent_dir",
     "cache_ai_co_occurrence",
     "cache_library",
+    "shadow_ai",
     # Secret detector
     "secret_source",
     "secret_path",
+    "secret_name",
+    "secret_ref",
+    "secret_type",
     "has_vault_import",
     # Deployment detector
     "store_technology",
@@ -951,13 +1064,27 @@ class AIBOMScannerMiddleware:
 
         Verdict scope
         -------------
-        Verdicts that reference an ``instance_id`` not present in
-        *existing* are dropped with a warning. The agent is told via
-        the prompt that it must only emit verdicts for components in
-        ``enrich_these``; ``other_detected_components`` is context
-        only. Without this filter, verdicts for IDs that live in a
-        different batch silently evaporate because the loop that
-        applies them only iterates over the current batch.
+        ``enriched_components`` and ``reclassify_components`` verdicts
+        whose ``instance_id`` is not present in *existing* are dropped
+        with a warning. They mutate per-component fields (``name``,
+        ``component_type``, ``metadata``) and have no safe in-batch
+        sibling to fall back on.
+
+        ``remove_components`` is treated more leniently. The agent
+        sometimes invents a line number or picks an out-of-batch sibling
+        when expressing "this candidate is not a real AI component".
+        Dropping those silently is a correctness bug because the
+        downstream consolidation key fanout never gets a chance to run.
+        Instead, when ``instance_id`` is unknown to the current batch
+        we parse the ``name`` prefix from the iid (see
+        :func:`_parse_iid_name_prefix`) and look for an in-batch
+        sibling whose canonical name matches; if exactly one matches we
+        redirect the removal to that sibling's consolidation key. The
+        scan-pipeline-level :func:`_propagate_removals` then fans the
+        decision out to every other instance sharing the same
+        ``(name, type)`` key. Truly hallucinated iids (no in-batch
+        sibling matches the parsed name) are still dropped with a
+        warning.
         """
 
         batch_ids: set[str] = {c.instance_id for c in existing if c.instance_id}
@@ -971,30 +1098,82 @@ class AIBOMScannerMiddleware:
             iid = item.get("instance_id", "")
             if not iid:
                 continue
-            if iid not in batch_ids:
-                _LOGGER.warning(
-                    "Dropping out-of-batch remove for %s: not in enrich_these "
-                    "(reason: %s)",
-                    iid, item.get("reason", ""),
+            reason_text = item.get("reason", "")
+            if iid in batch_ids:
+                candidate = by_id.get(iid)
+                if candidate is not None:
+                    protect, why = _should_protect_deterministic_model_removal(
+                        candidate, reason_text
+                    )
+                    if protect:
+                        _LOGGER.warning(
+                            "Rejected agent removal of deterministic model %s: "
+                            "%s (agent reason: %s)",
+                            iid, why, reason_text,
+                        )
+                        continue
+                remove_ids.add(iid)
+                _LOGGER.info(
+                    "Agent removed component %s: %s",
+                    iid, reason_text,
                 )
                 continue
-            reason_text = item.get("reason", "")
-            candidate = by_id.get(iid)
-            if candidate is not None:
-                protect, why = _should_protect_deterministic_model_removal(
-                    candidate, reason_text
+
+            sibling_names: list[str] = []
+            for c in existing:
+                sibling_names.append(c.name)
+                if c.model_name:
+                    sibling_names.append(c.model_name)
+            name_prefix = _parse_iid_name_prefix(iid, sibling_names)
+            if not name_prefix:
+                _LOGGER.warning(
+                    "Dropping unparseable out-of-batch remove for %s "
+                    "(reason: %s)",
+                    iid, reason_text,
                 )
-                if protect:
-                    _LOGGER.warning(
-                        "Rejected agent removal of deterministic model %s: "
-                        "%s (agent reason: %s)",
-                        iid, why, reason_text,
-                    )
-                    continue
-            remove_ids.add(iid)
+                continue
+            wanted = name_prefix.lower().strip()
+            matches = [
+                c for c in existing
+                if wanted in {
+                    c.name.lower().strip(),
+                    (c.model_name or c.name).lower().strip(),
+                }
+            ]
+            if not matches:
+                _LOGGER.warning(
+                    "Dropping out-of-batch remove for %s: no in-batch "
+                    "sibling has canonical name '%s' (reason: %s)",
+                    iid, wanted, reason_text,
+                )
+                continue
+            if len({_ckey(c) for c in matches}) > 1:
+                _LOGGER.warning(
+                    "Dropping out-of-batch remove for %s: parsed name '%s' "
+                    "is ambiguous across types %s (reason: %s)",
+                    iid, wanted,
+                    sorted({c.component_type.value for c in matches}),
+                    reason_text,
+                )
+                continue
+            sibling = matches[0]
+            protect, why = _should_protect_deterministic_model_removal(
+                sibling, reason_text
+            )
+            if protect:
+                _LOGGER.warning(
+                    "Rejected redirected removal of deterministic model %s "
+                    "(out-of-batch iid %s): %s (agent reason: %s)",
+                    sibling.instance_id, iid, why, reason_text,
+                )
+                continue
+            ck = _ckey(sibling)
+            remove_keys.add(ck)
             _LOGGER.info(
-                "Agent removed component %s: %s",
-                iid, reason_text,
+                "Agent remove redirected via consolidation key: "
+                "out-of-batch iid %s → in-batch sibling %s "
+                "(consolidation_key=%s, reason: %s)",
+                iid, sibling.instance_id, ck, reason_text,
             )
 
         reclassify_map: dict[str, str] = {}
@@ -1078,23 +1257,6 @@ class AIBOMScannerMiddleware:
             )
             if annotation is not None:
                 annotations_by_id[iid] = annotation
-
-        existing_ids = batch_ids
-        unmatched_remove_ids = remove_ids - existing_ids
-        if unmatched_remove_ids:
-            id_to_key = {c.instance_id: _ckey(c) for c in existing}
-            for bad_id in unmatched_remove_ids:
-                name_part = bad_id.rsplit("_", 1)[0].rsplit("_", 1)[0] if "_" in bad_id else bad_id
-                for comp in existing:
-                    ck = id_to_key[comp.instance_id]
-                    if ck[0] == name_part.lower().strip():
-                        remove_keys.add(ck)
-                        _LOGGER.warning(
-                            "Removal fallback: agent returned unmatched id '%s'; "
-                            "matched consolidation key %s via component %s",
-                            bad_id, ck, comp.instance_id,
-                        )
-                        break
 
         result: list[AIComponent] = []
         for comp in existing:

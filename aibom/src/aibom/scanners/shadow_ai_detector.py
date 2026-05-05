@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import re
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -230,7 +231,13 @@ def _collect_py_imports(path: Path) -> list[tuple[int, str, str]]:
         return []
     lines = raw.splitlines()
     try:
-        tree = ast.parse(raw, filename=str(path))
+        # Scanned source frequently contains literals like "\s" or "\d" inside
+        # docstrings/strings that are valid Python but emit a SyntaxWarning at
+        # parse time. Suppress those — we are inspecting third-party source,
+        # not authoring it, and the warnings are not actionable for aibom users.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(raw, filename=str(path))
     except SyntaxError:
         tree = None
     hits: list[tuple[int, str, str]] = []

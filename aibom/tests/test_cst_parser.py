@@ -15,6 +15,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+import warnings
+
 import libcst as cst
 
 from aibom.cst_parser import parse_source_code, _extract_argument_value
@@ -143,6 +145,37 @@ class TestCstParser(unittest.TestCase):
         self.assertEqual(cls.class_name, 'MyModel')
         self.assertIsNotNone(cls.aibom_annotation)
         self.assertEqual(cls.aibom_annotation['concept'], 'model')
+
+    def test_parse_source_code_suppresses_syntax_warning_from_target_source(self):
+        """Regression: ``cst.parse_module`` invokes Python's parser, which
+        emits ``SyntaxWarning`` for invalid escape sequences (e.g. ``"\\s"``)
+        in scanned third-party source. Those warnings refer to *scanned*
+        code -- not aibom -- and were leaking to the operator's terminal as
+        ``WARNING <unknown>:1: SyntaxWarning: invalid escape sequence '\\s'``.
+        """
+        noisy = (
+            "import re\n"
+            "PATTERN = re.compile(\"\\sfoo\")\n"
+            "DOC = \"\"\"matches \\d+ digits and \\swhitespace\"\"\"\n"
+            "from my_lib import MyClass\n"
+            "x = MyClass(name='test')\n"
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            parse_source_code('noisy.py', noisy)
+
+        syntax_warnings = [
+            w for w in caught if issubclass(w.category, SyntaxWarning)
+        ]
+        self.assertEqual(
+            syntax_warnings,
+            [],
+            msg=(
+                "parse_source_code leaked SyntaxWarning(s) from scanned "
+                f"source: {[str(w.message) for w in syntax_warnings]}"
+            ),
+        )
 
 if __name__ == '__main__':
     unittest.main()

@@ -1664,6 +1664,10 @@ def analyze(
                 _scan_cache_hit = True
                 console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
                 all_analysis_outputs[source] = cached
+                source_summary["assets_discovered"] = len(cached.get("components", []))
+                source_summary["last_generated_at"] = _utcnow_iso()
+                if source_summary["status"] == "in_progress":
+                    source_summary["status"] = "completed"
                 if temp_dir:
                     shutil.rmtree(temp_dir)
                 continue

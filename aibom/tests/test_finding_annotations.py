@@ -8,6 +8,7 @@ from aibom.models import (
     DecisionAnnotation,
     RelationshipType,
 )
+from aibom.models.enums import DetectionSource
 from aibom.models.scan import RiskFlag
 
 
@@ -128,5 +129,81 @@ def test_snippet_blocked_for_out_of_repo_path(tmp_path) -> None:
 
     assert components[0].decision_annotation.code_snippet is not None
     assert "RouterAgent" in components[0].decision_annotation.code_snippet.text
-
     assert components[1].decision_annotation.code_snippet is None
+
+
+def test_fall_through_justification_does_not_falsely_claim_agentic_confirmation(
+    tmp_path,
+) -> None:
+    """Fix 9: when no decision_annotation was set by the agent, the
+    fall-through must NOT pretend the row was confirmed by agentic
+    review. ``decision`` stays ``"confirmed"`` (no JSON contract change),
+    but the justification text must name the deterministic detector and
+    explicitly note that no agentic verdict was attached.
+    """
+    src = tmp_path / "deployment.py"
+    src.write_text("agent = SomeAgent()\n", encoding="utf-8")
+
+    component = AIComponent(
+        name="some_agent",
+        component_type=AIComponentType.AGENT,
+        file_path=str(src),
+        line_number=1,
+        instance_id="a-fallback",
+        detection_source=DetectionSource.CODE_ANALYSIS,
+    )
+
+    components, _, _ = annotate_findings(
+        [component], [], [], include_code_snippets=False,
+    )
+
+    annotation = components[0].decision_annotation
+    assert annotation is not None
+    assert annotation.decision == "confirmed", (
+        "Fix 9 keeps the JSON contract: decision stays 'confirmed'."
+    )
+    j = annotation.justification.lower()
+    assert "detected by code_analysis" in j, (
+        f"justification must name the deterministic detector; got "
+        f"{annotation.justification!r}"
+    )
+    assert "no explicit agentic verdict" in j, (
+        f"justification must signal the absence of an agent verdict; got "
+        f"{annotation.justification!r}"
+    )
+    assert "because the scan identified" not in annotation.justification, (
+        "the old rubber-stamp phrasing must not reappear; got "
+        f"{annotation.justification!r}"
+    )
+
+
+def test_fall_through_justification_for_agentic_origin(tmp_path) -> None:
+    """Fix 9: when the component was created by the agentic pass itself
+    (``detection_source=AGENTIC``) but no decision_annotation was set, the
+    fall-through must record the agentic provenance honestly and tag the
+    evidence with ``agentic_enrichment``.
+    """
+    src = tmp_path / "agent_birth.py"
+    src.write_text("# inferred by the LLM enrichment phase\n", encoding="utf-8")
+
+    component = AIComponent(
+        name="planner_agent",
+        component_type=AIComponentType.AGENT,
+        file_path=str(src),
+        line_number=1,
+        instance_id="a-agentic",
+        detection_source=DetectionSource.AGENTIC,
+    )
+
+    components, _, _ = annotate_findings(
+        [component], [], [], include_code_snippets=False,
+    )
+
+    annotation = components[0].decision_annotation
+    assert annotation is not None
+    assert annotation.decision == "confirmed"
+    assert "agentic enrichment" in annotation.justification.lower()
+    assert "agentic_enrichment" in (annotation.evidence_kinds or []), (
+        f"evidence_kinds must include 'agentic_enrichment' so consumers "
+        f"can distinguish agent-born rows; got {annotation.evidence_kinds!r}"
+    )

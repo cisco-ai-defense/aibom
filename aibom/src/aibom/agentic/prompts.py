@@ -149,6 +149,28 @@ You receive two lists:
      ``found: false`` — keep them and, when possible, enrich with the
      underlying base model id (e.g. strip the ``us.``/``eu.``/``apac.``
      prefix to match ``anthropic.claude-3-5-haiku-20241022-v1:0``).
+   - **Value-literal removal**: REMOVE ``model`` candidates whose ``name``
+     is one of the following forms, even if ``lookup_model`` reports
+     ``found: true``. The model registry is alias-flattened and will
+     spuriously match short numeric/version tokens against family rows
+     like Gemini 1.5, GPT-3.5, Claude-2, Deepseek-2; such matches are
+     not real model identifiers.
+     * Pure version literal: ``3.10.2``, ``v4.5.4``, ``0.59b0``,
+       ``1.0.0-rc1``, ``release-0.3.1`` — anything that is just an
+       optional ``v`` followed by digits, dots, and a release suffix.
+     * Pure numeric token: ``0.5``, ``1.1``, ``42``, ``1.5``, ``2.0``,
+       ``3.5``, ``4.0`` — a single integer or decimal with no other
+       characters.
+     * IPv4 literal: ``127.0.0.1``, ``0.0.0.0``, ``10.0.0.5``
+     * Bare environment marker: ``dev``, ``staging``, ``prod``, ``test``,
+       ``default``, ``production``, ``local``, ``qa``, ``uat``
+     * Detected at a Helm key whose semantic role is non-model — REMOVE
+       when ``metadata.helm_key`` ends in ``.tag``, ``.image_tag``,
+       ``.version``, ``_threshold``, ``_timeout``, ``_ip``, ``_host``,
+       ``_port``, ``_url``, or equals ``env.ENVIRONMENT``. These are
+       deployment artifacts (image tags, sops/chart version, IP literals,
+       thresholds, environment names), not model identifiers, regardless
+       of what the model registry says.
 
 5. **Env var resolution**: For components with env var references, call
    `resolve_env_var` ONCE per variable.
@@ -927,6 +949,22 @@ Return a SINGLE JSON object:
    use relative paths, or drop the line number — mismatched IDs cause silent
    data loss. Only IDs that appear in `enrich_these` are valid targets.
    Verdicts referencing IDs from `other_detected_components` are dropped.
+   - **NEVER invent or guess a line number.** The number after the final
+     underscore is the EXACT source line where the deterministic scanner
+     emitted the candidate. Do not pick "a likely line", do not pick the
+     first line of a class or function body, do not pick the line you
+     verified the candidate at via `read_file_snippet`. Locate the exact
+     `instance_id` string in `enrich_these` and copy it character-for-character.
+   - **NEVER fabricate a path.** Even when the scanner reported the same
+     logical concept across multiple files (e.g. a value present in many
+     ``values*.yaml`` files), only the single `instance_id` you see in
+     `enrich_these` is a valid removal target. The orchestrator will
+     fan out your decision to siblings using a consolidation key — you do
+     not need to (and must not) emit a separate verdict for each file.
+   - If you believe a candidate should be removed but it is in
+     `other_detected_components` (not `enrich_these`), do not emit a
+     verdict for it. The orchestrator schedules each candidate in its own
+     batch; act on it then.
 5. After you have finished using tools and are ready to respond:
    - Your FINAL message MUST be **valid JSON and nothing else**.
    - Do NOT write any explanation, analysis, summary, or commentary.
