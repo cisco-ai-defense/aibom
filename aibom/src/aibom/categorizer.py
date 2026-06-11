@@ -14,28 +14,28 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional, Set, Tuple
-from collections import defaultdict
 import logging
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .structures import (
-    CodeAnalysisResult,
-    AssignmentObservation,
-    CallObservation,
-    ClassDefObservation,
-    DecoratorObservation,
-    FunctionAnnotationObservation,
-    ComponentRelationship,
-    CategorizationOutput,
-)
 from .catalog_db import CatalogDB, is_excluded
 from .custom_catalog import CustomCatalogConfig
 from .llm_client import LLMClient
+from .structures import (
+    AssignmentObservation,
+    CallObservation,
+    CategorizationOutput,
+    ClassDefObservation,
+    CodeAnalysisResult,
+    ComponentRelationship,
+    DecoratorObservation,
+    FunctionAnnotationObservation,
+)
 from .workflow_analyzer import WorkflowIndex
-
 
 AGENT_CATEGORY_HINTS = {"agent"}
 TOOL_CATEGORY_HINTS = {"tool"}
+SKILL_CATEGORY_HINTS = {"skill"}
 LLM_CATEGORY_HINTS = {"llm", "model"}
 MEMORY_CATEGORY_HINTS = {"memory"}
 RETRIEVER_CATEGORY_HINTS = {"retriever"}
@@ -46,13 +46,32 @@ TOOL_ARGUMENT_HINTS = {"tool", "tools", "skills", "abilities"}
 LLM_ARGUMENT_HINTS = {"llm", "language_model", "chat_model", "model"}
 MEMORY_ARGUMENT_HINTS = {"memory", "checkpointer", "store", "saver", "chat_history"}
 RETRIEVER_ARGUMENT_HINTS = {"retriever", "retrievers", "search", "search_kwargs"}
-EMBEDDING_ARGUMENT_HINTS = {"embedding", "embeddings", "embedding_function", "embed", "embed_model"}
+EMBEDDING_ARGUMENT_HINTS = {
+    "embedding",
+    "embeddings",
+    "embedding_function",
+    "embed",
+    "embed_model",
+}
+# An agent referencing other agents (sub-agents, delegation, handoffs).
+AGENT_ARGUMENT_HINTS = {
+    "agent",
+    "agents",
+    "sub_agents",
+    "subagents",
+    "handoffs",
+    "delegates",
+}
+# An agent referencing skills (Semantic Kernel / Copilot-style plugins/skills).
+SKILL_ARGUMENT_HINTS = {"skill", "skills", "plugins", "abilities"}
 
 RELATIONSHIP_LABEL_TOOL = "USES_TOOL"
 RELATIONSHIP_LABEL_LLM = "USES_LLM"
 RELATIONSHIP_LABEL_MEMORY = "USES_MEMORY"
 RELATIONSHIP_LABEL_RETRIEVER = "USES_RETRIEVER"
 RELATIONSHIP_LABEL_EMBEDDING = "USES_EMBEDDING"
+RELATIONSHIP_LABEL_AGENT = "USES_AGENT"
+RELATIONSHIP_LABEL_SKILL = "USES_SKILL"
 
 
 _is_excluded = is_excluded  # re-export for backward compatibility
@@ -106,12 +125,14 @@ def categorize_symbols(
     for result in analysis_results:
         for assignment in result.assignments:
             if assignment.target_qualified_name and assignment.call.qualified_name:
-                variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
+                variable_map[assignment.target_qualified_name] = (
+                    assignment.call.qualified_name
+                )
 
     # Collect all observations with enhanced tracking
     all_observations = []
     symbols_to_find = set()
-    
+
     for result in analysis_results:
         for obs_type in ["assignments", "decorators", "calls"]:
             for obs in getattr(result, obs_type):
@@ -123,13 +144,21 @@ def categorize_symbols(
                     original_name = obs.call.qualified_name
 
                 reconstructed_name = original_name
-                instance_variable = getattr(obs, 'instance_variable', None)
+                instance_variable = getattr(obs, "instance_variable", None)
                 if obs_type == "decorators" and instance_variable:
                     if instance_variable in variable_map:
                         base_class = variable_map[instance_variable]
-                        attribute = original_name.split('.', 1)[-1] if '.' in original_name else original_name
+                        attribute = (
+                            original_name.split(".", 1)[-1]
+                            if "." in original_name
+                            else original_name
+                        )
                         reconstructed_name = f"{base_class}.{attribute}"
-                        logging.debug("Reconstructed decorator: %s -> %s", original_name, reconstructed_name)
+                        logging.debug(
+                            "Reconstructed decorator: %s -> %s",
+                            original_name,
+                            reconstructed_name,
+                        )
 
                 # Method-chain resolution: e.g. "builder.compile" -> "langgraph.graph.StateGraph.compile"
                 if "." in reconstructed_name:
@@ -140,17 +169,23 @@ def categorize_symbols(
                         resolved_base = variable_map[local_var]
                         candidate = f"{resolved_base}.{attr_tail}"
                         reconstructed_name = candidate
-                        logging.debug("Method-chain resolved: %s -> %s", original_name, reconstructed_name)
+                        logging.debug(
+                            "Method-chain resolved: %s -> %s",
+                            original_name,
+                            reconstructed_name,
+                        )
 
                 if obs_type == "calls":
                     obs_arguments = obs.arguments
                     obs_raw_code = obs.raw_code
                 elif obs_type == "assignments":
                     obs_arguments = obs.call.arguments
-                    obs_raw_code = getattr(obs, 'raw_code', '') or getattr(obs.call, 'raw_code', '')
+                    obs_raw_code = getattr(obs, "raw_code", "") or getattr(
+                        obs.call, "raw_code", ""
+                    )
                 else:
                     obs_arguments = {}
-                    obs_raw_code = getattr(obs, 'raw_code', '')
+                    obs_raw_code = getattr(obs, "raw_code", "")
 
                 observation = {
                     "parser_name": reconstructed_name,
@@ -158,14 +193,22 @@ def categorize_symbols(
                     "file_path": result.file_path,
                     "line_number": obs.line_number,
                     "arguments": obs_arguments,
-                    "decorated_name": obs.decorated_function_name if obs_type == "decorators" else None,
+                    "decorated_name": (
+                        obs.decorated_function_name
+                        if obs_type == "decorators"
+                        else None
+                    ),
                     "type": obs_type[:-1] if obs_type != "calls" else "call",
                     "raw_code": obs_raw_code,
-                    "imports": getattr(result, 'imports', []),
+                    "imports": getattr(result, "imports", []),
                     "instance_variable": instance_variable,
-                    "assigned_target": getattr(obs, 'target_qualified_name', None) if obs_type == "assignments" else None,
+                    "assigned_target": (
+                        getattr(obs, "target_qualified_name", None)
+                        if obs_type == "assignments"
+                        else None
+                    ),
                 }
-                
+
                 all_observations.append(observation)
                 symbols_to_find.add(reconstructed_name)
 
@@ -182,7 +225,7 @@ def categorize_symbols(
                 "decorated_name": None,
                 "type": "type_annotation",
                 "raw_code": "",
-                "imports": getattr(result, 'imports', []),
+                "imports": getattr(result, "imports", []),
                 "instance_variable": None,
                 "annotation_target": annotation.target_qualified_name,
             }
@@ -202,7 +245,7 @@ def categorize_symbols(
                 "decorated_name": None,
                 "type": "context_manager",
                 "raw_code": "",
-                "imports": getattr(result, 'imports', []),
+                "imports": getattr(result, "imports", []),
                 "instance_variable": None,
                 "context_target": ctx.as_target,
             }
@@ -245,9 +288,14 @@ def categorize_symbols(
                 if label:
                     comp_details["name"] = label
 
-                if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+                if (
+                    workflow_index
+                    and comp_details.get("file_path")
+                    and comp_details.get("line_number")
+                ):
                     workflows = workflow_index.get_workflow_context(
-                        comp_details["file_path"], comp_details["line_number"],
+                        comp_details["file_path"],
+                        comp_details["line_number"],
                     )
                     if workflows:
                         comp_details["workflows"] = workflows
@@ -255,9 +303,14 @@ def categorize_symbols(
                 categorized_components[concept].append(comp_details)
                 comp_details["instance_id"] = _build_instance_id(comp_details)
                 detected_locations.add((result.file_path, class_obs.line_number))
-                _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+                _register_component_name(
+                    component_lookup_by_name, comp_details["name"], comp_details
+                )
                 _register_component_target(
-                    component_lookup_by_var, result.file_path, comp_name, comp_details,
+                    component_lookup_by_var,
+                    result.file_path,
+                    comp_name,
+                    comp_details,
                 )
 
         for func_obs in getattr(result, "function_annotations", []):
@@ -277,9 +330,14 @@ def categorize_symbols(
             if label:
                 comp_details["name"] = label
 
-            if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+            if (
+                workflow_index
+                and comp_details.get("file_path")
+                and comp_details.get("line_number")
+            ):
                 workflows = workflow_index.get_workflow_context(
-                    comp_details["file_path"], comp_details["line_number"],
+                    comp_details["file_path"],
+                    comp_details["line_number"],
                 )
                 if workflows:
                     comp_details["workflows"] = workflows
@@ -287,9 +345,14 @@ def categorize_symbols(
             categorized_components[concept].append(comp_details)
             comp_details["instance_id"] = _build_instance_id(comp_details)
             detected_locations.add((result.file_path, func_obs.line_number))
-            _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+            _register_component_name(
+                component_lookup_by_name, comp_details["name"], comp_details
+            )
             _register_component_target(
-                component_lookup_by_var, result.file_path, comp_name, comp_details,
+                component_lookup_by_var,
+                result.file_path,
+                comp_name,
+                comp_details,
             )
 
     # ── Pass 2: DuckDB catalog matching ──────────────────────────────────
@@ -314,12 +377,19 @@ def categorize_symbols(
                 matching_observations.append(obs)
 
         if not matching_observations:
-            logging.debug("Skipping symbol '%s' because it could not be matched to any code observation.", db_symbol_name)
+            logging.debug(
+                "Skipping symbol '%s' because it could not be matched to any code observation.",
+                db_symbol_name,
+            )
             continue
 
         # Process each matching observation
         for matched_obs in matching_observations:
-            obs_key = (matched_obs["file_path"], matched_obs["line_number"], matched_obs["parser_name"])
+            obs_key = (
+                matched_obs["file_path"],
+                matched_obs["line_number"],
+                matched_obs["parser_name"],
+            )
             if obs_key in processed_observations:
                 continue  # Skip if already processed by another DB symbol
 
@@ -339,20 +409,26 @@ def categorize_symbols(
             component_details["category"] = category
 
             description = None
-            if category == 'tool':
+            if category == "tool":
                 # Primary strategy: Get description from arguments
-                description = matched_obs.get('arguments', {}).get('description')
+                description = matched_obs.get("arguments", {}).get("description")
                 # Fallback strategy: Generate description with LLM if not found
-                if not description and llm_client and matched_obs.get('raw_code'):
+                if not description and llm_client and matched_obs.get("raw_code"):
                     try:
                         code_snippet = _reconstruct_code_snippet(matched_obs)
                         prompt = f"Please provide a concise, one-sentence description for the following tool based on its code. The tool's code is:\n\n{code_snippet}"
-                        logging.info("Generating description for tool: %s", db_symbol_name)
+                        logging.info(
+                            "Generating description for tool: %s", db_symbol_name
+                        )
                         description = llm_client.invoke(prompt)
                     except Exception as e:
-                        logging.warning("Failed to generate description for %s: %s", db_symbol_name, e)
+                        logging.warning(
+                            "Failed to generate description for %s: %s",
+                            db_symbol_name,
+                            e,
+                        )
                 if description:
-                    component_details['description'] = description
+                    component_details["description"] = description
 
             if matched_obs["type"] == "decorator":
                 component_details["name"] = matched_obs["decorated_name"]
@@ -360,31 +436,43 @@ def categorize_symbols(
 
             elif matched_obs["type"] in ("assignment", "call"):
                 if category == "prompt":
-                    prompt_text = matched_obs["arguments"].get("template") or matched_obs["arguments"].get("prompt")
+                    prompt_text = matched_obs["arguments"].get(
+                        "template"
+                    ) or matched_obs["arguments"].get("prompt")
                     if prompt_text:
                         component_details["text"] = prompt_text
 
                 elif category in ["model", "embedding"] and llm_client:
-                    class_name = db_symbol_name.split('.')[-1]
+                    class_name = db_symbol_name.split(".")[-1]
                     code_snippet = _reconstruct_code_snippet(matched_obs)
 
                     if category == "model":
-                        model_name = llm_client.extract_model_name(code_snippet, class_name)
+                        model_name = llm_client.extract_model_name(
+                            code_snippet, class_name
+                        )
                         if model_name:
                             component_details["model_name"] = model_name
 
                     elif category == "embedding":
-                        embedding_model = llm_client.extract_embedding_model(code_snippet, class_name)
+                        embedding_model = llm_client.extract_embedding_model(
+                            code_snippet, class_name
+                        )
                         if embedding_model:
                             component_details["model_name"] = embedding_model
 
             elif matched_obs["type"] == "type_annotation":
-                component_details["annotated_target"] = matched_obs.get("annotation_target")
+                component_details["annotated_target"] = matched_obs.get(
+                    "annotation_target"
+                )
 
             elif matched_obs["type"] == "context_manager":
                 component_details["context_target"] = matched_obs.get("context_target")
 
-            if workflow_index and component_details.get("file_path") and component_details.get("line_number"):
+            if (
+                workflow_index
+                and component_details.get("file_path")
+                and component_details.get("line_number")
+            ):
                 workflows = workflow_index.get_workflow_context(
                     component_details["file_path"],
                     component_details["line_number"],
@@ -418,7 +506,9 @@ def categorize_symbols(
                     component_details.update(meta)
                     break
 
-            _register_component_name(component_lookup_by_name, component_details["name"], component_details)
+            _register_component_name(
+                component_lookup_by_name, component_details["name"], component_details
+            )
 
     # ── Pass 3: Base class detection (lowest precedence) ─────────────────
     base_class_rules = custom_config.base_class_rules if custom_config else []
@@ -452,9 +542,14 @@ def categorize_symbols(
                             "base_class_matched": rule.base_class,
                         }
 
-                        if workflow_index and comp_details.get("file_path") and comp_details.get("line_number"):
+                        if (
+                            workflow_index
+                            and comp_details.get("file_path")
+                            and comp_details.get("line_number")
+                        ):
                             workflows = workflow_index.get_workflow_context(
-                                comp_details["file_path"], comp_details["line_number"],
+                                comp_details["file_path"],
+                                comp_details["line_number"],
                             )
                             if workflows:
                                 comp_details["workflows"] = workflows
@@ -462,9 +557,14 @@ def categorize_symbols(
                         categorized_components[rule.concept].append(comp_details)
                         comp_details["instance_id"] = _build_instance_id(comp_details)
                         detected_locations.add(loc_key)
-                        _register_component_name(component_lookup_by_name, comp_details["name"], comp_details)
+                        _register_component_name(
+                            component_lookup_by_name, comp_details["name"], comp_details
+                        )
                         _register_component_target(
-                            component_lookup_by_var, result.file_path, comp_name, comp_details,
+                            component_lookup_by_var,
+                            result.file_path,
+                            comp_name,
+                            comp_details,
                         )
                         break  # first matching rule wins
 
@@ -472,7 +572,8 @@ def categorize_symbols(
     if exclude_patterns:
         for category in list(categorized_components.keys()):
             categorized_components[category] = [
-                c for c in categorized_components[category]
+                c
+                for c in categorized_components[category]
                 if not _is_excluded(c.get("name", ""), exclude_patterns)
             ]
 
@@ -501,10 +602,14 @@ def categorize_symbols(
         effective_memory_hints=effective_memory_hints,
         effective_retriever_hints=effective_retriever_hints,
         effective_embedding_hints=effective_embedding_hints,
-        custom_relationships=custom_config.custom_relationships if custom_config else [],
+        custom_relationships=(
+            custom_config.custom_relationships if custom_config else []
+        ),
     )
 
-    return CategorizationOutput(components=dict(categorized_components), relationships=relationships)
+    return CategorizationOutput(
+        components=dict(categorized_components), relationships=relationships
+    )
 
 
 def _augment_agent_metadata_from_graph_wiring(
@@ -554,7 +659,9 @@ def _augment_agent_metadata_from_graph_wiring(
         return
 
     import_map, components_by_file, func_scope_obs = _build_graph_wiring_indices(
-        analysis_results, categorized_components, all_observations,
+        analysis_results,
+        categorized_components,
+        all_observations,
     )
 
     # ── Main add_node scanning loop ─────────────────────────────────────
@@ -638,7 +745,9 @@ def _augment_agent_metadata_from_graph_wiring(
                     if comp_name.endswith(call_name) or comp_name == call_name:
                         cat_lower = cat.lower()
                         if "tool" in cat_lower:
-                            existing_args.setdefault("tools", []).append(f"VARIABLE:{call_name}")
+                            existing_args.setdefault("tools", []).append(
+                                f"VARIABLE:{call_name}"
+                            )
                         elif "model" in cat_lower:
                             existing_args["llm"] = f"VARIABLE:{call_name}"
                         elif "memory" in cat_lower:
@@ -655,8 +764,12 @@ def _augment_agent_metadata_from_graph_wiring(
             qualified = file_imps.get(inner_ref)
             if qualified:
                 _resolve_cross_file_ref(
-                    inner_ref, qualified, components_by_file, analysis_results,
-                    categorized_components, existing_args,
+                    inner_ref,
+                    qualified,
+                    components_by_file,
+                    analysis_results,
+                    categorized_components,
+                    existing_args,
                 )
 
         # Check direct variable references
@@ -678,10 +791,17 @@ def _augment_agent_metadata_from_graph_wiring(
                     matched_inner = False
                     for cat, comp_list in categorized_components.items():
                         for comp in comp_list:
-                            if comp.get("name") and (comp["name"] == inner_name or inner_name.endswith(comp["name"])):
+                            if comp.get("name") and (
+                                comp["name"] == inner_name
+                                or inner_name.endswith(comp["name"])
+                            ):
                                 _merge_component_ref_into_args(
-                                    inner_obs.get("assigned_target", "").rsplit(".", 1)[-1] or inner_name,
-                                    comp, existing_args,
+                                    inner_obs.get("assigned_target", "").rsplit(".", 1)[
+                                        -1
+                                    ]
+                                    or inner_name,
+                                    comp,
+                                    existing_args,
                                 )
                                 matched_inner = True
                                 break
@@ -706,12 +826,22 @@ def _augment_agent_metadata_from_graph_wiring(
                                 fp_norm = fp.replace("/", ".").replace("\\", ".")
                                 if fp_norm.endswith(".py"):
                                     fp_norm = fp_norm[:-3]
-                                if fp_norm.endswith(module_part) or fp_norm.endswith("." + module_part):
+                                if fp_norm.endswith(module_part) or fp_norm.endswith(
+                                    "." + module_part
+                                ):
                                     for mod_comp in file_comps:
-                                        mod_cat = (mod_comp.get("category") or "").lower()
-                                        comp_ref = mod_comp.get("assigned_target") or mod_comp.get("name", "")
-                                        if not _category_matches(mod_cat, AGENT_CATEGORY_HINTS):
-                                            _merge_component_ref_into_args(comp_ref, mod_comp, existing_args)
+                                        mod_cat = (
+                                            mod_comp.get("category") or ""
+                                        ).lower()
+                                        comp_ref = mod_comp.get(
+                                            "assigned_target"
+                                        ) or mod_comp.get("name", "")
+                                        if not _category_matches(
+                                            mod_cat, AGENT_CATEGORY_HINTS
+                                        ):
+                                            _merge_component_ref_into_args(
+                                                comp_ref, mod_comp, existing_args
+                                            )
                                     found_module = True
                                     break
                             if found_module:
@@ -724,8 +854,12 @@ def _augment_agent_metadata_from_graph_wiring(
             qualified = file_imps.get(ref)
             if qualified:
                 _resolve_cross_file_ref(
-                    ref, qualified, components_by_file, analysis_results,
-                    categorized_components, existing_args,
+                    ref,
+                    qualified,
+                    components_by_file,
+                    analysis_results,
+                    categorized_components,
+                    existing_args,
                 )
                 continue
 
@@ -735,7 +869,9 @@ def _augment_agent_metadata_from_graph_wiring(
                 for cat, comp_list in categorized_components.items():
                     matched = False
                     for comp in comp_list:
-                        if comp.get("name", "") == resolved or comp.get("name", "").endswith(f".{ref}"):
+                        if comp.get("name", "") == resolved or comp.get(
+                            "name", ""
+                        ).endswith(f".{ref}"):
                             _merge_component_ref_into_args(ref, comp, existing_args)
                             matched = True
                             break
@@ -745,7 +881,9 @@ def _augment_agent_metadata_from_graph_wiring(
         metadata["arguments"] = existing_args
 
     _apply_same_file_inference(
-        agents_with_wiring, component_metadata_by_instance, components_by_file,
+        agents_with_wiring,
+        component_metadata_by_instance,
+        components_by_file,
     )
 
 
@@ -827,7 +965,10 @@ def _apply_same_file_inference(
         if not metadata:
             continue
         existing_args = metadata.get("arguments", {})
-        if any(k in existing_args for k in ("llm", "model", "tools", "memory", "retriever", "embedding")):
+        if any(
+            k in existing_args
+            for k in ("llm", "model", "tools", "memory", "retriever", "embedding")
+        ):
             continue
 
         agent_file = metadata.get("file_path", "")
@@ -891,7 +1032,11 @@ def _resolve_cross_file_ref(
     """
     # qualified_import is e.g. "react_agent.tools.TOOLS"
     # The variable name in the source file is the last segment
-    remote_var = qualified_import.rsplit(".", 1)[-1] if "." in qualified_import else qualified_import
+    remote_var = (
+        qualified_import.rsplit(".", 1)[-1]
+        if "." in qualified_import
+        else qualified_import
+    )
     # The module path is everything before the last segment
     module_path = qualified_import.rsplit(".", 1)[0] if "." in qualified_import else ""
 
@@ -905,7 +1050,9 @@ def _resolve_cross_file_ref(
         if fp_normalized.endswith(".py"):
             fp_normalized = fp_normalized[:-3]
 
-        if not fp_normalized.endswith(module_path) and not fp_normalized.endswith("." + module_path):
+        if not fp_normalized.endswith(module_path) and not fp_normalized.endswith(
+            "." + module_path
+        ):
             continue
 
         # Found a candidate source file; look for components assigned to remote_var
@@ -944,38 +1091,39 @@ def _is_symbol_match(parser_name: str, db_symbol_name: str, imports: List[str]) 
     """
     return parser_name == db_symbol_name
 
+
 def _reconstruct_code_snippet(observation: Dict[str, Any]) -> str:
     """
     Reconstruct code snippet from observation for LLM analysis.
-    
+
     Args:
         observation: The observation dictionary
-        
+
     Returns:
         Reconstructed code snippet
     """
     if observation.get("raw_code"):
         return observation["raw_code"]
-    
+
     # Fallback: reconstruct from available information
     parser_name = observation.get("parser_name", "")
     arguments = observation.get("arguments", {})
-    
+
     # Handle empty parser_name
     if not parser_name:
         return "()"
-    
-    class_name = parser_name.split('.')[-1] if parser_name else ""
-    
+
+    class_name = parser_name.split(".")[-1] if parser_name else ""
+
     # Build argument string
     arg_parts = []
     for key, value in arguments.items():
         if isinstance(value, str):
             arg_parts.append(f'{key}="{value}"')
         else:
-            arg_parts.append(f'{key}={value}')
-    
-    args_str = ', '.join(arg_parts)
+            arg_parts.append(f"{key}={value}")
+
+    args_str = ", ".join(arg_parts)
     return f"{class_name}({args_str})"
 
 
@@ -997,7 +1145,11 @@ def _register_component_target(
         index[(file_path, normalized)] = component
 
 
-def _register_component_name(index: Dict[str, List[Dict[str, Any]]], name: Optional[str], component: Dict[str, Any]) -> None:
+def _register_component_name(
+    index: Dict[str, List[Dict[str, Any]]],
+    name: Optional[str],
+    component: Dict[str, Any],
+) -> None:
     if not name:
         return
     for normalized in _normalize_reference_names(name):
@@ -1041,11 +1193,16 @@ def _derive_relationships(
             tool_refs = _collect_references(arguments, tool_hints)
             for reference in tool_refs:
                 target_component = _resolve_component_reference(
-                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                    reference,
+                    agent_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
                 )
                 if not target_component:
                     continue
-                if not _category_matches(target_component.get("category"), TOOL_CATEGORY_HINTS):
+                if not _category_matches(
+                    target_component.get("category"), TOOL_CATEGORY_HINTS
+                ):
                     continue
                 _append_relationship(
                     relationships,
@@ -1058,7 +1215,10 @@ def _derive_relationships(
             llm_refs = _collect_references(arguments, llm_hints)
             for reference in llm_refs:
                 target_component = _resolve_component_reference(
-                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                    reference,
+                    agent_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
                 )
                 if not target_component:
                     continue
@@ -1075,11 +1235,16 @@ def _derive_relationships(
             memory_refs = _collect_references(arguments, memory_hints)
             for reference in memory_refs:
                 target_component = _resolve_component_reference(
-                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                    reference,
+                    agent_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
                 )
                 if not target_component:
                     continue
-                if not _category_matches(target_component.get("category"), MEMORY_CATEGORY_HINTS):
+                if not _category_matches(
+                    target_component.get("category"), MEMORY_CATEGORY_HINTS
+                ):
                     continue
                 _append_relationship(
                     relationships,
@@ -1092,11 +1257,16 @@ def _derive_relationships(
             retriever_refs = _collect_references(arguments, retriever_hints)
             for reference in retriever_refs:
                 target_component = _resolve_component_reference(
-                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                    reference,
+                    agent_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
                 )
                 if not target_component:
                     continue
-                if not _category_matches(target_component.get("category"), RETRIEVER_CATEGORY_HINTS):
+                if not _category_matches(
+                    target_component.get("category"), RETRIEVER_CATEGORY_HINTS
+                ):
                     continue
                 _append_relationship(
                     relationships,
@@ -1109,11 +1279,16 @@ def _derive_relationships(
             embedding_refs = _collect_references(arguments, embedding_hints)
             for reference in embedding_refs:
                 target_component = _resolve_component_reference(
-                    reference, agent_file, component_lookup_by_var, component_lookup_by_name
+                    reference,
+                    agent_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
                 )
                 if not target_component:
                     continue
-                if not _category_matches(target_component.get("category"), EMBEDDING_CATEGORY_HINTS):
+                if not _category_matches(
+                    target_component.get("category"), EMBEDDING_CATEGORY_HINTS
+                ):
                     continue
                 _append_relationship(
                     relationships,
@@ -1121,6 +1296,53 @@ def _derive_relationships(
                     component,
                     target_component,
                     RELATIONSHIP_LABEL_EMBEDDING,
+                )
+
+            agent_refs = _collect_references(arguments, AGENT_ARGUMENT_HINTS)
+            for reference in agent_refs:
+                target_component = _resolve_component_reference(
+                    reference,
+                    agent_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
+                )
+                if not target_component:
+                    continue
+                if not _category_matches(
+                    target_component.get("category"), AGENT_CATEGORY_HINTS
+                ):
+                    continue
+                # An agent referencing itself is not a delegation edge.
+                if target_component.get("instance_id") == instance_id:
+                    continue
+                _append_relationship(
+                    relationships,
+                    seen_relationships,
+                    component,
+                    target_component,
+                    RELATIONSHIP_LABEL_AGENT,
+                )
+
+            skill_refs = _collect_references(arguments, SKILL_ARGUMENT_HINTS)
+            for reference in skill_refs:
+                target_component = _resolve_component_reference(
+                    reference,
+                    agent_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
+                )
+                if not target_component:
+                    continue
+                if not _category_matches(
+                    target_component.get("category"), SKILL_CATEGORY_HINTS
+                ):
+                    continue
+                _append_relationship(
+                    relationships,
+                    seen_relationships,
+                    component,
+                    target_component,
+                    RELATIONSHIP_LABEL_SKILL,
                 )
 
     # Also derive USES_EMBEDDING from datastore components
@@ -1140,11 +1362,16 @@ def _derive_relationships(
             embedding_refs = _collect_references(arguments, embedding_hints)
             for reference in embedding_refs:
                 target_component = _resolve_component_reference(
-                    reference, ds_file, component_lookup_by_var, component_lookup_by_name
+                    reference,
+                    ds_file,
+                    component_lookup_by_var,
+                    component_lookup_by_name,
                 )
                 if not target_component:
                     continue
-                if not _category_matches(target_component.get("category"), EMBEDDING_CATEGORY_HINTS):
+                if not _category_matches(
+                    target_component.get("category"), EMBEDDING_CATEGORY_HINTS
+                ):
                     continue
                 _append_relationship(
                     relationships,
@@ -1180,7 +1407,10 @@ def _derive_relationships(
                     refs = _collect_references(arguments, arg_hint_set)
                     for reference in refs:
                         target_component = _resolve_component_reference(
-                            reference, comp_file, component_lookup_by_var, component_lookup_by_name
+                            reference,
+                            comp_file,
+                            component_lookup_by_var,
+                            component_lookup_by_name,
                         )
                         if not target_component:
                             continue

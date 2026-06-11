@@ -175,6 +175,8 @@ class RelationshipType(str, Enum):
     HOSTS_MODEL = "HOSTS_MODEL"
     INVOKES_A2A_AGENT = "INVOKES_A2A_AGENT"
     EXPOSES_A2A_AGENT = "EXPOSES_A2A_AGENT"
+    # An agent invoking / delegating to another agent.
+    USES_AGENT = "USES_AGENT"
+    # An agent using a skill (Semantic Kernel / Copilot-style plugin or skill).
+    USES_SKILL = "USES_SKILL"
     CUSTOM = "CUSTOM"
-
-
