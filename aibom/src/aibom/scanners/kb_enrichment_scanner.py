@@ -52,29 +52,56 @@ _LOGGER = logging.getLogger(__name__)
 def _import_strings(imports: list) -> list[str]:
     """Extract plain import statement strings from a list that may contain
     ``(line_number, stmt)`` tuples or bare strings."""
-    return [
-        entry[1] if isinstance(entry, tuple) else entry
-        for entry in imports
-    ]
+    return [entry[1] if isinstance(entry, tuple) else entry for entry in imports]
 
 
-ALLOWED_CONCEPTS: frozenset[str] = frozenset(
-    {"agent", "model", "tool", "datastore", "embedding", "prompt",
-     "memory", "retriever", "knowledge_base", "feature_store"}
-)
-
+# Concept -> component type mapping.
+#
+# This is the single source of truth for which knowledge-base concepts the
+# CLI is willing to surface; ``ALLOWED_CONCEPTS`` is derived from its keys so
+# the two never drift. The original set covered ten concepts. The expanded
+# vocabulary adds the operational and MCP concepts (guardrail, mcp_server,
+# mcp_client, skill, observability) plus the ML-lifecycle and data concepts
+# (dataset, training_run, model_artifact, vector_store) so that knowledge-base
+# rows carrying those concepts are mapped to a component type instead of being
+# silently dropped at lookup time.
+#
+# Concepts that have no dedicated ``AIComponentType`` yet (reranker, evaluator,
+# framework_core) are mapped to ``OTHER`` rather than dropped, so the evidence
+# survives with the original concept preserved in ``kb_concept`` for downstream
+# refinement. ``datastore`` remains an alias for the vector-store type.
 _CONCEPT_TO_TYPE: dict[str, AIComponentType] = {
     "agent": AIComponentType.AGENT,
     "model": AIComponentType.MODEL,
     "tool": AIComponentType.TOOL,
     "datastore": AIComponentType.VECTOR_STORE,
+    "vector_store": AIComponentType.VECTOR_STORE,
     "embedding": AIComponentType.EMBEDDING,
     "prompt": AIComponentType.PROMPT,
     "memory": AIComponentType.MEMORY,
     "retriever": AIComponentType.RETRIEVER,
     "knowledge_base": AIComponentType.KNOWLEDGE_BASE,
     "feature_store": AIComponentType.FEATURE_STORE,
+    # Operational + MCP concepts.
+    "guardrail": AIComponentType.GUARDRAIL,
+    "mcp_server": AIComponentType.MCP_SERVER,
+    "mcp_client": AIComponentType.MCP_CLIENT,
+    "skill": AIComponentType.SKILL,
+    "observability": AIComponentType.OBSERVABILITY,
+    # Data + ML-lifecycle concepts.
+    "dataset": AIComponentType.DATASET,
+    "training_run": AIComponentType.TRAINING_RUN,
+    "model_artifact": AIComponentType.MODEL_ARTIFACT,
+    # Concepts without a dedicated type yet: keep the evidence as OTHER and
+    # preserve the original concept in ``kb_concept`` instead of dropping.
+    "reranker": AIComponentType.OTHER,
+    "evaluator": AIComponentType.OTHER,
+    "framework_core": AIComponentType.OTHER,
 }
+
+# Concepts the CLI will surface. Derived from the mapping above so a new
+# concept only has to be added in one place.
+ALLOWED_CONCEPTS: frozenset[str] = frozenset(_CONCEPT_TO_TYPE)
 
 # KB id path segments that override or suppress the raw concept.
 # Checked in order; first match wins.  ``None`` means "exclude this entry".
@@ -93,27 +120,29 @@ _ID_PATH_OVERRIDES: list[tuple[str, AIComponentType | None]] = [
 ]
 
 
-_EXCLUDED_CLASS_NAMES: frozenset[str] = frozenset({
-    "RecursiveCharacterTextSplitter",
-    "CharacterTextSplitter",
-    "TokenTextSplitter",
-    "TextSplitter",
-    "SentenceTransformersTokenTextSplitter",
-    "SpacyTextSplitter",
-    "NLTKTextSplitter",
-    "TextLoader",
-    "DirectoryLoader",
-    "WebBaseLoader",
-    "PyPDFLoader",
-    "CSVLoader",
-    "UnstructuredFileLoader",
-    "LLMChain",
-    "RetrievalQA",
-    "ConversationalRetrievalChain",
-    "SequentialChain",
-    "SimpleSequentialChain",
-    "ConversationChain",
-})
+_EXCLUDED_CLASS_NAMES: frozenset[str] = frozenset(
+    {
+        "RecursiveCharacterTextSplitter",
+        "CharacterTextSplitter",
+        "TokenTextSplitter",
+        "TextSplitter",
+        "SentenceTransformersTokenTextSplitter",
+        "SpacyTextSplitter",
+        "NLTKTextSplitter",
+        "TextLoader",
+        "DirectoryLoader",
+        "WebBaseLoader",
+        "PyPDFLoader",
+        "CSVLoader",
+        "UnstructuredFileLoader",
+        "LLMChain",
+        "RetrievalQA",
+        "ConversationalRetrievalChain",
+        "SequentialChain",
+        "SimpleSequentialChain",
+        "ConversationChain",
+    }
+)
 
 
 def _refine_type_from_kb_id(
@@ -133,42 +162,48 @@ def _refine_type_from_kb_id(
     return concept_type
 
 
-_AGENT_CREATION_PATTERNS: frozenset[str] = frozenset({
-    "initialize_agent",
-    "AgentExecutor",
-    "create_react_agent",
-    "create_openai_functions_agent",
-    "create_openai_tools_agent",
-    "create_structured_chat_agent",
-    "create_tool_calling_agent",
-    "create_json_chat_agent",
-    "create_xml_agent",
-    "Agent",
-    "Crew",
-    "AssistantAgent",
-    "UserProxyAgent",
-    "GroupChat",
-    "GroupChatManager",
-})
+_AGENT_CREATION_PATTERNS: frozenset[str] = frozenset(
+    {
+        "initialize_agent",
+        "AgentExecutor",
+        "create_react_agent",
+        "create_openai_functions_agent",
+        "create_openai_tools_agent",
+        "create_structured_chat_agent",
+        "create_tool_calling_agent",
+        "create_json_chat_agent",
+        "create_xml_agent",
+        "Agent",
+        "Crew",
+        "AssistantAgent",
+        "UserProxyAgent",
+        "GroupChat",
+        "GroupChatManager",
+    }
+)
 
-_AGENT_FRAMEWORK_PREFIXES: frozenset[str] = frozenset({
-    "langchain",
-    "crewai",
-    "autogen",
-    # Strands Agents (https://strandsagents.com/) uses module-level
-    # ``from strands import Agent`` followed by ``agent = Agent(...)``
-    # (no class wrapper). Without ``strands`` here, the call-pattern
-    # gate below rejects the call and the agent is never emitted, which
-    # matches the symptom observed on published open-source Strands
-    # sample repositories.
-    "strands",
-})
+_AGENT_FRAMEWORK_PREFIXES: frozenset[str] = frozenset(
+    {
+        "langchain",
+        "crewai",
+        "autogen",
+        # Strands Agents (https://strandsagents.com/) uses module-level
+        # ``from strands import Agent`` followed by ``agent = Agent(...)``
+        # (no class wrapper). Without ``strands`` here, the call-pattern
+        # gate below rejects the call and the agent is never emitted, which
+        # matches the symptom observed on published open-source Strands
+        # sample repositories.
+        "strands",
+    }
+)
 
 
 def _is_agent_creation_call(qualified_name: str, imports: list) -> bool:
     """Return True if *qualified_name* is a known agent creation pattern
     from a recognized framework."""
-    short = qualified_name.rsplit(".", 1)[-1] if "." in qualified_name else qualified_name
+    short = (
+        qualified_name.rsplit(".", 1)[-1] if "." in qualified_name else qualified_name
+    )
     if short not in _AGENT_CREATION_PATTERNS:
         return False
     prefix = qualified_name.split(".")[0].split("_")[0]
@@ -183,19 +218,33 @@ def _is_agent_creation_call(qualified_name: str, imports: list) -> bool:
     return False
 
 
-_STATIC_TOOL_PATTERNS: frozenset[str] = frozenset({
-    "Tool", "StructuredTool",
-})
-_STATIC_MEMORY_PATTERNS: frozenset[str] = frozenset({
-    "ConversationBufferMemory", "ConversationSummaryMemory",
-    "ConversationBufferWindowMemory", "ConversationKGMemory",
-    "ConversationEntityMemory", "ConversationTokenBufferMemory",
-    "VectorStoreRetrieverMemory", "ReadOnlySharedMemory",
-})
-_STATIC_PROMPT_PATTERNS: frozenset[str] = frozenset({
-    "PromptTemplate", "ChatPromptTemplate",
-    "FewShotPromptTemplate", "FewShotChatMessagePromptTemplate",
-})
+_STATIC_TOOL_PATTERNS: frozenset[str] = frozenset(
+    {
+        "Tool",
+        "StructuredTool",
+    }
+)
+_STATIC_MEMORY_PATTERNS: frozenset[str] = frozenset(
+    {
+        "ConversationBufferMemory",
+        "ConversationSummaryMemory",
+        "ConversationBufferWindowMemory",
+        "ConversationKGMemory",
+        "ConversationEntityMemory",
+        "ConversationTokenBufferMemory",
+        "VectorStoreRetrieverMemory",
+        "ReadOnlySharedMemory",
+    }
+)
+_STATIC_PROMPT_PATTERNS: frozenset[str] = frozenset(
+    {
+        "PromptTemplate",
+        "ChatPromptTemplate",
+        "FewShotPromptTemplate",
+        "FewShotChatMessagePromptTemplate",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _MatchResult:
@@ -215,18 +264,51 @@ class _MatchResult:
         return self.entry is None and self.partial_kb_id is not None
 
 
-_AI_SUGGESTIVE_DIR_SEGMENTS: frozenset[str] = frozenset({
-    "models", "agents", "tools", "prompts", "embeddings", "llm",
-    "inference", "ai", "ml", "vectorstores", "vector_stores",
-    "retrievers", "memory", "chains", "chatbots",
-})
+_AI_SUGGESTIVE_DIR_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "models",
+        "agents",
+        "tools",
+        "prompts",
+        "embeddings",
+        "llm",
+        "inference",
+        "ai",
+        "ml",
+        "vectorstores",
+        "vector_stores",
+        "retrievers",
+        "memory",
+        "chains",
+        "chatbots",
+    }
+)
 
-_AI_SUGGESTIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({
-    "llm", "openai", "anthropic", "embedding", "vector", "agent",
-    "model", "inference", "chat", "completion", "bedrock", "vertex",
-    "huggingface", "transformers", "torch", "tensorflow", "keras",
-    "ollama", "cohere", "mistral", "gemini",
-})
+_AI_SUGGESTIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "llm",
+        "openai",
+        "anthropic",
+        "embedding",
+        "vector",
+        "agent",
+        "model",
+        "inference",
+        "chat",
+        "completion",
+        "bedrock",
+        "vertex",
+        "huggingface",
+        "transformers",
+        "torch",
+        "tensorflow",
+        "keras",
+        "ollama",
+        "cohere",
+        "mistral",
+        "gemini",
+    }
+)
 
 _AI_INDICATIVE_CLASS_RE: re.Pattern[str] = re.compile(
     r"(LLM|Model|Agent|Embed(?:ding|der)|Vector|Chain|Tool|Prompt|Memory|Chat|"
@@ -238,7 +320,10 @@ _AI_INDICATIVE_CLASS_RE: re.Pattern[str] = re.compile(
 
 _CLASS_NAME_TYPE_MAP: list[tuple[re.Pattern[str], AIComponentType]] = [
     (re.compile(r"Embed(?:ding|der)", re.IGNORECASE), AIComponentType.EMBEDDING),
-    (re.compile(r"Guard(?:rail)?|Inspector|Rails", re.IGNORECASE), AIComponentType.GUARDRAIL),
+    (
+        re.compile(r"Guard(?:rail)?|Inspector|Rails", re.IGNORECASE),
+        AIComponentType.GUARDRAIL,
+    ),
     (re.compile(r"MCPClient", re.IGNORECASE), AIComponentType.MCP_CLIENT),
     (re.compile(r"Traceloop", re.IGNORECASE), AIComponentType.OBSERVABILITY),
     (re.compile(r"Agent"), AIComponentType.AGENT),
@@ -250,6 +335,7 @@ _CLASS_NAME_TYPE_MAP: list[tuple[re.Pattern[str], AIComponentType]] = [
     (re.compile(r"Retriever", re.IGNORECASE), AIComponentType.RETRIEVER),
     (re.compile(r"Vector(?:Store|DB|Database)"), AIComponentType.VECTOR_STORE),
 ]
+
 
 @dataclass(frozen=True)
 class PlatformEntry:
@@ -269,86 +355,116 @@ _REG = AIComponentType.MODEL_REGISTRY
 
 _IMPORT_MODULE_TYPE_MAP: dict[str, PlatformEntry] = {
     # Pure observability
-    "traceloop":    PlatformEntry(_OBS),
-    "openllmetry":  PlatformEntry(_OBS),
-    "langsmith":    PlatformEntry(_OBS),
-    "langfuse":     PlatformEntry(_OBS),
-    "arize":        PlatformEntry(_OBS),
-    "phoenix":      PlatformEntry(_OBS),
-    "opik":         PlatformEntry(_OBS),
-    "helicone":     PlatformEntry(_OBS),
-    "freeplay":     PlatformEntry(_OBS),
-    "tracia":       PlatformEntry(_OBS),
-    "llmetry":      PlatformEntry(_OBS),
-    "galileo":      PlatformEntry(_OBS),
-    "honeyhive":    PlatformEntry(_OBS),
-    "promptlayer":  PlatformEntry(_OBS),
-    "humanloop":    PlatformEntry(_OBS),
-    "braintrust":   PlatformEntry(_OBS),
-    "whylabs":      PlatformEntry(_OBS),
+    "traceloop": PlatformEntry(_OBS),
+    "openllmetry": PlatformEntry(_OBS),
+    "langsmith": PlatformEntry(_OBS),
+    "langfuse": PlatformEntry(_OBS),
+    "arize": PlatformEntry(_OBS),
+    "phoenix": PlatformEntry(_OBS),
+    "opik": PlatformEntry(_OBS),
+    "helicone": PlatformEntry(_OBS),
+    "freeplay": PlatformEntry(_OBS),
+    "tracia": PlatformEntry(_OBS),
+    "llmetry": PlatformEntry(_OBS),
+    "galileo": PlatformEntry(_OBS),
+    "honeyhive": PlatformEntry(_OBS),
+    "promptlayer": PlatformEntry(_OBS),
+    "humanloop": PlatformEntry(_OBS),
+    "braintrust": PlatformEntry(_OBS),
+    "whylabs": PlatformEntry(_OBS),
     # Observability + model registry
-    "wandb":            PlatformEntry(_OBS, frozenset({_REG})),
-    "weights_biases":   PlatformEntry(_OBS, frozenset({_REG})),
-    "mlflow":           PlatformEntry(_OBS, frozenset({_REG})),
-    "neptune":          PlatformEntry(_OBS, frozenset({_REG})),
-    "comet":            PlatformEntry(_OBS, frozenset({_REG})),
-    "deepchecks":       PlatformEntry(_OBS),
+    "wandb": PlatformEntry(_OBS, frozenset({_REG})),
+    "weights_biases": PlatformEntry(_OBS, frozenset({_REG})),
+    "mlflow": PlatformEntry(_OBS, frozenset({_REG})),
+    "neptune": PlatformEntry(_OBS, frozenset({_REG})),
+    "comet": PlatformEntry(_OBS, frozenset({_REG})),
+    "deepchecks": PlatformEntry(_OBS),
     # Guardrails
-    "nemoguardrails":   PlatformEntry(_GRD),
-    "guardrails":       PlatformEntry(_GRD),
-    "llm_guard":        PlatformEntry(_GRD),
-    "lakera_guard":     PlatformEntry(_GRD),
-    "rebuff":           PlatformEntry(_GRD),
+    "nemoguardrails": PlatformEntry(_GRD),
+    "guardrails": PlatformEntry(_GRD),
+    "llm_guard": PlatformEntry(_GRD),
+    "lakera_guard": PlatformEntry(_GRD),
+    "rebuff": PlatformEntry(_GRD),
 }
 
 OBSERVABILITY_PLATFORM_TOKENS: frozenset[str] = frozenset(
-    k for k, entry in _IMPORT_MODULE_TYPE_MAP.items()
-    if _OBS in entry.all_types
+    k for k, entry in _IMPORT_MODULE_TYPE_MAP.items() if _OBS in entry.all_types
 )
 
 
 _NON_AI_CLASS_SUFFIXES: tuple[str, ...] = (
-    "Response", "Request", "Schema", "Config", "Spec", "Params",
-    "DTO", "DML", "DDL", "Enum", "Type", "Base", "Abstract",
-    "Interface", "Mixin", "Factory", "Builder", "Validator",
-    "Serializer", "Deserializer", "Mapper", "Converter",
-    "Exception", "Error", "Test", "Mock", "Stub", "Fake",
-    "Code", "Status", "Flag",
+    "Response",
+    "Request",
+    "Schema",
+    "Config",
+    "Spec",
+    "Params",
+    "DTO",
+    "DML",
+    "DDL",
+    "Enum",
+    "Type",
+    "Base",
+    "Abstract",
+    "Interface",
+    "Mixin",
+    "Factory",
+    "Builder",
+    "Validator",
+    "Serializer",
+    "Deserializer",
+    "Mapper",
+    "Converter",
+    "Exception",
+    "Error",
+    "Test",
+    "Mock",
+    "Stub",
+    "Fake",
+    "Code",
+    "Status",
+    "Flag",
 )
 
-_AMBIGUOUS_NAME_TYPES: frozenset[AIComponentType] = frozenset({
-    AIComponentType.EMBEDDING,
-    AIComponentType.MEMORY,
-    AIComponentType.TOOL,
-    AIComponentType.AGENT,
-    AIComponentType.VECTOR_STORE,
-    AIComponentType.RETRIEVER,
-    AIComponentType.PROMPT,
-    AIComponentType.GUARDRAIL,
-})
+_AMBIGUOUS_NAME_TYPES: frozenset[AIComponentType] = frozenset(
+    {
+        AIComponentType.EMBEDDING,
+        AIComponentType.MEMORY,
+        AIComponentType.TOOL,
+        AIComponentType.AGENT,
+        AIComponentType.VECTOR_STORE,
+        AIComponentType.RETRIEVER,
+        AIComponentType.PROMPT,
+        AIComponentType.GUARDRAIL,
+    }
+)
 
-_EMBEDDING_IMPORT_SIGNALS: frozenset[str] = frozenset({
-    "embedding",
-    "embedder",
-    "embedders",
-    "openai",
-    "langchain",
-    "haystack",
-    "llama_index",
-    "sentence_transformers",
-    "transformers",
-    "chromadb",
-})
+_EMBEDDING_IMPORT_SIGNALS: frozenset[str] = frozenset(
+    {
+        "embedding",
+        "embedder",
+        "embedders",
+        "openai",
+        "langchain",
+        "haystack",
+        "llama_index",
+        "sentence_transformers",
+        "transformers",
+        "chromadb",
+    }
+)
 
-_EMBEDDING_CALL_SIGNALS: frozenset[str] = frozenset({
-    "model=",
-    "model_name=",
-    "deployment=",
-    "deployment_name=",
-    "api_key=",
-    "client=",
-    "embedding_function=",
-})
+_EMBEDDING_CALL_SIGNALS: frozenset[str] = frozenset(
+    {
+        "model=",
+        "model_name=",
+        "deployment=",
+        "deployment_name=",
+        "api_key=",
+        "client=",
+        "embedding_function=",
+    }
+)
 
 
 def _is_data_class_name(name: str) -> bool:
@@ -376,10 +492,9 @@ def _has_embedding_import_evidence(text: str) -> bool:
 
 def _has_embedding_call_evidence(line: str, source: str) -> bool:
     lower_line = line.lower()
-    return (
-        any(signal in lower_line for signal in _EMBEDDING_CALL_SIGNALS)
-        or _has_embedding_import_evidence(source)
-    )
+    return any(
+        signal in lower_line for signal in _EMBEDDING_CALL_SIGNALS
+    ) or _has_embedding_import_evidence(source)
 
 
 def _infer_type_from_name(name: str) -> tuple[AIComponentType, bool]:
@@ -397,26 +512,88 @@ def _infer_type_from_name(name: str) -> tuple[AIComponentType, bool]:
     return AIComponentType.MODEL, False
 
 
-_GENERIC_CLASS_NAMES: frozenset[str] = frozenset({
-    "ABC", "Any", "Dict", "List", "Optional", "Tuple", "Set", "Type",
-    "Union", "Callable", "Generator", "AsyncGenerator", "Iterator",
-    "Sequence", "Mapping", "MutableMapping", "Annotated", "ClassVar",
-    "Protocol", "BaseModel", "Field", "PrivateAttr", "ConfigDict",
-    "Awaitable", "AsyncIterator", "Path", "Formatter", "ErrorCode",
-})
+_GENERIC_CLASS_NAMES: frozenset[str] = frozenset(
+    {
+        "ABC",
+        "Any",
+        "Dict",
+        "List",
+        "Optional",
+        "Tuple",
+        "Set",
+        "Type",
+        "Union",
+        "Callable",
+        "Generator",
+        "AsyncGenerator",
+        "Iterator",
+        "Sequence",
+        "Mapping",
+        "MutableMapping",
+        "Annotated",
+        "ClassVar",
+        "Protocol",
+        "BaseModel",
+        "Field",
+        "PrivateAttr",
+        "ConfigDict",
+        "Awaitable",
+        "AsyncIterator",
+        "Path",
+        "Formatter",
+        "ErrorCode",
+    }
+)
 
-_NON_AI_PACKAGES: frozenset[str] = frozenset({
-    "more_itertools", "itertools", "functools", "collections",
-    "dataclasses", "typing_extensions", "pydantic", "attrs",
-    "pytest", "unittest", "mock", "faker",
-})
+_NON_AI_PACKAGES: frozenset[str] = frozenset(
+    {
+        "more_itertools",
+        "itertools",
+        "functools",
+        "collections",
+        "dataclasses",
+        "typing_extensions",
+        "pydantic",
+        "attrs",
+        "pytest",
+        "unittest",
+        "mock",
+        "faker",
+    }
+)
 
 _DATA_CLASS_SUFFIXES: tuple[str, ...] = (
-    "Action", "Step", "Finish", "Message", "Output", "Input", "Schema",
-    "Config", "Event", "Error", "Exception", "Result", "Response",
-    "Request", "Callback", "Handler", "Parser", "Serializer",
-    "Kwargs", "Meta", "State", "Log", "Mixin", "Interface", "Value",
-    "Wrapper", "Item", "Record", "Encoder", "Decoder", "Triple",
+    "Action",
+    "Step",
+    "Finish",
+    "Message",
+    "Output",
+    "Input",
+    "Schema",
+    "Config",
+    "Event",
+    "Error",
+    "Exception",
+    "Result",
+    "Response",
+    "Request",
+    "Callback",
+    "Handler",
+    "Parser",
+    "Serializer",
+    "Kwargs",
+    "Meta",
+    "State",
+    "Log",
+    "Mixin",
+    "Interface",
+    "Value",
+    "Wrapper",
+    "Item",
+    "Record",
+    "Encoder",
+    "Decoder",
+    "Triple",
 )
 
 
@@ -446,9 +623,16 @@ def _build_kb_patterns(
     that can be matched in ``call`` observations.  Falls back to
     static lists when the KB yields nothing for a category.
     """
-    _PATH_CONCEPT_MAP: list[tuple[str, tuple[str, ...], AIComponentType, frozenset[str]]] = [
+    _PATH_CONCEPT_MAP: list[
+        tuple[str, tuple[str, ...], AIComponentType, frozenset[str]]
+    ] = [
         (".tools.", ("tool",), AIComponentType.TOOL, _STATIC_TOOL_PATTERNS),
-        (".memory.", ("memory", "datastore"), AIComponentType.MEMORY, _STATIC_MEMORY_PATTERNS),
+        (
+            ".memory.",
+            ("memory", "datastore"),
+            AIComponentType.MEMORY,
+            _STATIC_MEMORY_PATTERNS,
+        ),
         (".prompts.", ("prompt",), AIComponentType.PROMPT, _STATIC_PROMPT_PATTERNS),
         (".agents.", ("agent",), AIComponentType.AGENT, _AGENT_CREATION_PATTERNS),
     ]
@@ -515,7 +699,9 @@ def _is_known_call(
 ) -> bool:
     """Return True if *qualified_name* matches a known creation pattern
     from a recognized framework."""
-    short = qualified_name.rsplit(".", 1)[-1] if "." in qualified_name else qualified_name
+    short = (
+        qualified_name.rsplit(".", 1)[-1] if "." in qualified_name else qualified_name
+    )
     if short not in patterns:
         return False
     prefix = qualified_name.split(".")[0].split("_")[0]
@@ -551,7 +737,9 @@ def _resolve_kb_path(context: ScanContext) -> Optional[Path]:
     return None
 
 
-def _extract_frameworks_from_imports(imports: list[str] | list[tuple[int, str]]) -> set[str]:
+def _extract_frameworks_from_imports(
+    imports: list[str] | list[tuple[int, str]],
+) -> set[str]:
     """Derive top-level package names from import statements.
 
     e.g. ``"from langchain_openai import ChatOpenAI"`` → ``{"langchain_openai"}``
@@ -604,21 +792,28 @@ class KBEnrichmentScanner(BaseScanner):
                     len(BUILTIN_CATALOG_ENTRIES),
                 )
             except Exception:  # noqa: BLE001
-                _LOGGER.debug("KB enrichment: built-in catalog load failed", exc_info=True)
+                _LOGGER.debug(
+                    "KB enrichment: built-in catalog load failed", exc_info=True
+                )
 
             custom_cfg = context.config.get("custom_catalog")
             if custom_cfg is not None:
                 try:
                     from ..custom_catalog import CustomCatalogConfig
 
-                    if isinstance(custom_cfg, CustomCatalogConfig) and not custom_cfg.is_empty:
+                    if (
+                        isinstance(custom_cfg, CustomCatalogConfig)
+                        and not custom_cfg.is_empty
+                    ):
                         db.add_custom_entries(
                             [c.to_catalog_dict() for c in custom_cfg.components]
                         )
                         if custom_cfg.excludes:
                             db.add_excludes(custom_cfg.excludes)
                 except Exception:  # noqa: BLE001
-                    _LOGGER.debug("KB enrichment: custom catalog load failed", exc_info=True)
+                    _LOGGER.debug(
+                        "KB enrichment: custom catalog load failed", exc_info=True
+                    )
 
             kb_patterns = _build_kb_patterns(db)
             kb_fw_prefixes = _build_kb_framework_prefixes(db)
@@ -650,7 +845,8 @@ class KBEnrichmentScanner(BaseScanner):
             _LOGGER.debug(
                 "KB enrichment: %d Tier 1 (framework import), "
                 "%d suggestive (wrapper), %d skipped of %d total",
-                len(tier1_files), len(suggestive_files),
+                len(tier1_files),
+                len(suggestive_files),
                 len(all_py_files) - len(tier1_files) - len(suggestive_files),
                 len(all_py_files),
             )
@@ -664,14 +860,19 @@ class KBEnrichmentScanner(BaseScanner):
                     parsed_results.append(result)
                     _collect_symbols(result, all_symbols)
                 except Exception:  # noqa: BLE001
-                    _LOGGER.debug("KB enrichment: failed to parse %s", py_file, exc_info=True)
+                    _LOGGER.debug(
+                        "KB enrichment: failed to parse %s", py_file, exc_info=True
+                    )
 
             kb_entries = _batch_kb_lookup(db, all_symbols) if all_symbols else {}
 
             for result in parsed_results:
                 components.extend(
                     _process_file_with_cache(
-                        result, kb_entries, kb_patterns, kb_fw_prefixes,
+                        result,
+                        kb_entries,
+                        kb_patterns,
+                        kb_fw_prefixes,
                     )
                 )
 
@@ -682,16 +883,13 @@ class KBEnrichmentScanner(BaseScanner):
                 components.extend(_detect_import_based_assets(result))
 
             for py_file, source in suggestive_files:
-                components.extend(
-                    _emit_suggestive_candidates(py_file, source)
-                )
+                components.extend(_emit_suggestive_candidates(py_file, source))
 
-            components.extend(
-                _detect_cache_ai_co_occurrence(tier1_files)
-            )
+            components.extend(_detect_cache_ai_co_occurrence(tier1_files))
 
         components = [
-            c for c in components
+            c
+            for c in components
             if c.name.lower().replace("-", "_") not in _NON_AI_PACKAGES
         ]
 
@@ -721,9 +919,18 @@ def _build_kb_framework_names(db: CatalogDB) -> frozenset[str]:
     return frozenset(names)
 
 
-_AMBIGUOUS_TOP_LEVEL = frozenset({
-    "google", "aws", "azure", "microsoft", "com", "org", "io", "ai",
-})
+_AMBIGUOUS_TOP_LEVEL = frozenset(
+    {
+        "google",
+        "aws",
+        "azure",
+        "microsoft",
+        "com",
+        "org",
+        "io",
+        "ai",
+    }
+)
 
 
 def _import_matches_framework(dotted_path: str, kb_frameworks: frozenset[str]) -> bool:
@@ -763,7 +970,8 @@ def _import_matches_framework(dotted_path: str, kb_frameworks: frozenset[str]) -
 
 
 def _file_has_kb_framework_import(
-    source: str, kb_frameworks: frozenset[str],
+    source: str,
+    kb_frameworks: frozenset[str],
 ) -> bool:
     """Return True if *source* contains an ``import`` or ``from`` statement
     referencing any framework known to the KB.
@@ -812,7 +1020,8 @@ def _has_suggestive_signal(py_file: Path, source: str) -> bool:
 
 
 def _emit_suggestive_candidates(
-    py_file: Path, source: str,
+    py_file: Path,
+    source: str,
 ) -> list[AIComponent]:
     """Emit low-confidence agentic candidates for AI-indicative class names.
 
@@ -826,7 +1035,8 @@ def _emit_suggestive_candidates(
         if not stripped or stripped.startswith("#"):
             continue
         assign_match = re.match(
-            r"(\w+)\s*=\s*([A-Z]\w+)\s*\(", stripped,
+            r"(\w+)\s*=\s*([A-Z]\w+)\s*\(",
+            stripped,
         )
         if not assign_match:
             continue
@@ -896,7 +1106,14 @@ def _detect_cache_ai_co_occurrence(
             continue
         seen.add(file_key)
         cache_lib = "unknown"
-        for lib in ("redis", "memcache", "pymemcache", "cachetools", "diskcache", "aiocache"):
+        for lib in (
+            "redis",
+            "memcache",
+            "pymemcache",
+            "cachetools",
+            "diskcache",
+            "aiocache",
+        ):
             if re.search(rf"(?:^|\n)\s*(?:from|import)\s+{lib}\b", source):
                 cache_lib = lib
                 break
@@ -961,7 +1178,7 @@ def _detect_import_based_assets(
             tokens = imp_line.split()
             try:
                 import_idx = tokens.index("import")
-                symbols = tokens[import_idx + 1:]
+                symbols = tokens[import_idx + 1 :]
             except ValueError:
                 symbols = tokens
             for part in symbols:
@@ -1032,36 +1249,72 @@ def _detect_import_based_assets(
     return candidates
 
 
-_TOOL_KWARG_NAMES: frozenset[str] = frozenset({
-    "tools", "functions", "tool_choice",
-})
+_TOOL_KWARG_NAMES: frozenset[str] = frozenset(
+    {
+        "tools",
+        "functions",
+        "tool_choice",
+    }
+)
 
-_TOOL_DECORATOR_NAMES: frozenset[str] = frozenset({
-    "tool", "register_tool",
-})
+_TOOL_DECORATOR_NAMES: frozenset[str] = frozenset(
+    {
+        "tool",
+        "register_tool",
+    }
+)
 
-_TOOL_DECORATOR_FRAMEWORKS: frozenset[str] = frozenset({
-    "langchain", "langchain_core", "crewai", "smolagents", "pydantic_ai",
-    "autogen", "deepagents", "llama_index", "agno", "phidata", "strands",
-})
+_TOOL_DECORATOR_FRAMEWORKS: frozenset[str] = frozenset(
+    {
+        "langchain",
+        "langchain_core",
+        "crewai",
+        "smolagents",
+        "pydantic_ai",
+        "autogen",
+        "deepagents",
+        "llama_index",
+        "agno",
+        "phidata",
+        "strands",
+    }
+)
 
-_TOOL_CONVERSION_CALLS: frozenset[str] = frozenset({
-    "function_to_schema",
-    "convert_to_openai_tool",
-    "convert_to_openai_function",
-    "format_tool_to_openai_function",
-    "tool_to_function_definition",
-})
+_TOOL_CONVERSION_CALLS: frozenset[str] = frozenset(
+    {
+        "function_to_schema",
+        "convert_to_openai_tool",
+        "convert_to_openai_function",
+        "format_tool_to_openai_function",
+        "tool_to_function_definition",
+    }
+)
 
-_AI_CLIENT_CALLS: frozenset[str] = frozenset({
-    "create", "chat", "completions", "invoke", "ainvoke",
-    "bind_tools", "with_structured_output",
-})
+_AI_CLIENT_CALLS: frozenset[str] = frozenset(
+    {
+        "create",
+        "chat",
+        "completions",
+        "invoke",
+        "ainvoke",
+        "bind_tools",
+        "with_structured_output",
+    }
+)
 
-_PROMPT_KWARG_NAMES: frozenset[str] = frozenset({
-    "system_prompt", "system_message", "system", "instructions",
-    "prompt", "template", "messages", "few_shot_examples", "examples",
-})
+_PROMPT_KWARG_NAMES: frozenset[str] = frozenset(
+    {
+        "system_prompt",
+        "system_message",
+        "system",
+        "instructions",
+        "prompt",
+        "template",
+        "messages",
+        "few_shot_examples",
+        "examples",
+    }
+)
 
 
 def _detect_tool_schemas(result: "CodeAnalysisResult") -> list[AIComponent]:
@@ -1212,29 +1465,66 @@ def _variable_name(val: Any) -> str | None:
     return None
 
 
-_MODEL_KWARG_NAMES: frozenset[str] = frozenset({
-    "model", "model_name", "model_id", "deployment_name", "engine",
-})
+_MODEL_KWARG_NAMES: frozenset[str] = frozenset(
+    {
+        "model",
+        "model_name",
+        "model_id",
+        "deployment_name",
+        "engine",
+    }
+)
 
-_ENDPOINT_KWARG_NAMES: frozenset[str] = frozenset({
-    "base_url", "azure_endpoint", "api_base", "endpoint_url",
-})
+_ENDPOINT_KWARG_NAMES: frozenset[str] = frozenset(
+    {
+        "base_url",
+        "azure_endpoint",
+        "api_base",
+        "endpoint_url",
+    }
+)
 
-_KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset({
-    "ChatOpenAI", "ChatAnthropic", "ChatGoogleGenerativeAI", "AzureChatOpenAI",
-    "OpenAI", "Anthropic", "GenerativeModel", "AnthropicBedrock",
-    "ChatBedrock", "BedrockChat", "ChatVertexAI", "ChatCohere",
-    "ChatMistralAI", "ChatOllama", "ChatLiteLLM", "ChatFireworks",
-    "ChatGroq", "ChatTogether", "VLLMOpenAI", "AzureOpenAI",
-    # Strands built-in model provider classes (``strands.models.*``). Each
-    # accepts a ``model_id=`` kwarg at construction time and is the primary
-    # way to wire a Strands ``Agent`` to a provider. Covering these here
-    # lets ``_detect_model_kwargs`` surface both the concrete model ID and,
-    # when the constructor is bare, a needs-agentic bare-client component.
-    "BedrockModel", "AnthropicModel", "OpenAIModel", "OllamaModel",
-    "LiteLLMModel", "GeminiModel", "MistralModel", "SageMakerModel",
-    "LlamaAPIModel", "WriterModel", "LlamaCppModel", "CohereModel",
-})
+_KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset(
+    {
+        "ChatOpenAI",
+        "ChatAnthropic",
+        "ChatGoogleGenerativeAI",
+        "AzureChatOpenAI",
+        "OpenAI",
+        "Anthropic",
+        "GenerativeModel",
+        "AnthropicBedrock",
+        "ChatBedrock",
+        "BedrockChat",
+        "ChatVertexAI",
+        "ChatCohere",
+        "ChatMistralAI",
+        "ChatOllama",
+        "ChatLiteLLM",
+        "ChatFireworks",
+        "ChatGroq",
+        "ChatTogether",
+        "VLLMOpenAI",
+        "AzureOpenAI",
+        # Strands built-in model provider classes (``strands.models.*``). Each
+        # accepts a ``model_id=`` kwarg at construction time and is the primary
+        # way to wire a Strands ``Agent`` to a provider. Covering these here
+        # lets ``_detect_model_kwargs`` surface both the concrete model ID and,
+        # when the constructor is bare, a needs-agentic bare-client component.
+        "BedrockModel",
+        "AnthropicModel",
+        "OpenAIModel",
+        "OllamaModel",
+        "LiteLLMModel",
+        "GeminiModel",
+        "MistralModel",
+        "SageMakerModel",
+        "LlamaAPIModel",
+        "WriterModel",
+        "LlamaCppModel",
+        "CohereModel",
+    }
+)
 
 _BARE_CLIENT_HINTS: dict[str, str] = {
     "AnthropicBedrock": "Resolve model ID from .messages.create(model=...) calls. Remove if no model ID found.",
@@ -1311,7 +1601,9 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
         endpoint_url: str | None = None
         for ek in _ENDPOINT_KWARG_NAMES:
             raw = call_obs.arguments.get(ek)
-            if isinstance(raw, str) and not raw.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
+            if isinstance(raw, str) and not raw.startswith(
+                ("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")
+            ):
                 cleaned = raw.strip().strip("'\"")
                 if cleaned.startswith(("http://", "https://")):
                     endpoint_url = cleaned
@@ -1403,7 +1695,9 @@ def _detect_prompt_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     for assignment in result.assignments:
         if assignment.target_qualified_name and assignment.call.qualified_name:
-            variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
+            variable_map[assignment.target_qualified_name] = (
+                assignment.call.qualified_name
+            )
 
     all_calls = [(c, c.line_number) for c in result.calls]
     all_calls += [(a.call, a.line_number) for a in result.assignments]
@@ -1421,7 +1715,9 @@ def _detect_prompt_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
             if key in seen:
                 continue
 
-            if isinstance(val, str) and not val.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
+            if isinstance(val, str) and not val.startswith(
+                ("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")
+            ):
                 seen.add(key)
                 display = val[:80] + "..." if len(val) > 80 else val
                 components.append(
@@ -1486,7 +1782,9 @@ def _collect_symbols(result: CodeAnalysisResult, symbols: set[str]) -> None:
     variable_map: dict[str, str] = {}
     for assignment in result.assignments:
         if assignment.target_qualified_name and assignment.call.qualified_name:
-            variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
+            variable_map[assignment.target_qualified_name] = (
+                assignment.call.qualified_name
+            )
 
     for assignment in result.assignments:
         name = _resolve_chain(assignment.call.qualified_name, variable_map)
@@ -1505,7 +1803,8 @@ def _collect_symbols(result: CodeAnalysisResult, symbols: set[str]) -> None:
 
 
 def _batch_kb_lookup(
-    db: CatalogDB, symbols: set[str],
+    db: CatalogDB,
+    symbols: set[str],
 ) -> dict[str, dict[str, Any]]:
     """Query DuckDB for symbols via the token-based hash-join index.
 
@@ -1544,7 +1843,9 @@ def _process_file_with_cache(
     variable_map: dict[str, str] = {}
     for assignment in result.assignments:
         if assignment.target_qualified_name and assignment.call.qualified_name:
-            variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
+            variable_map[assignment.target_qualified_name] = (
+                assignment.call.qualified_name
+            )
 
     observations: list[dict[str, Any]] = []
     components: list[AIComponent] = []
@@ -1553,9 +1854,14 @@ def _process_file_with_cache(
     for assignment in result.assignments:
         name = _resolve_chain(assignment.call.qualified_name, variable_map)
         observations.append(
-            _obs(name, result.file_path, assignment.line_number, "assignment",
-                 args=assignment.call.arguments,
-                 assigned_target=assignment.target_qualified_name)
+            _obs(
+                name,
+                result.file_path,
+                assignment.line_number,
+                "assignment",
+                args=assignment.call.arguments,
+                assigned_target=assignment.target_qualified_name,
+            )
         )
 
     for dec in result.decorators:
@@ -1566,8 +1872,13 @@ def _process_file_with_cache(
             name = f"{base}.{attr}"
         name = _resolve_chain(name, variable_map)
         observations.append(
-            _obs(name, result.file_path, dec.line_number, "decorator",
-                 decorated=dec.decorated_function_name)
+            _obs(
+                name,
+                result.file_path,
+                dec.line_number,
+                "decorator",
+                decorated=dec.decorated_function_name,
+            )
         )
 
     for ctx in result.context_managers:
@@ -1583,10 +1894,26 @@ def _process_file_with_cache(
     fw_prefixes = kb_fw_prefixes or _AGENT_FRAMEWORK_PREFIXES
     pat = kb_patterns or {}
     _call_pattern_map: list[tuple[frozenset[str], frozenset[str], AIComponentType]] = [
-        (pat.get(AIComponentType.AGENT, _AGENT_CREATION_PATTERNS), fw_prefixes, AIComponentType.AGENT),
-        (pat.get(AIComponentType.TOOL, _STATIC_TOOL_PATTERNS), fw_prefixes, AIComponentType.TOOL),
-        (pat.get(AIComponentType.MEMORY, _STATIC_MEMORY_PATTERNS), fw_prefixes, AIComponentType.MEMORY),
-        (pat.get(AIComponentType.PROMPT, _STATIC_PROMPT_PATTERNS), fw_prefixes, AIComponentType.PROMPT),
+        (
+            pat.get(AIComponentType.AGENT, _AGENT_CREATION_PATTERNS),
+            fw_prefixes,
+            AIComponentType.AGENT,
+        ),
+        (
+            pat.get(AIComponentType.TOOL, _STATIC_TOOL_PATTERNS),
+            fw_prefixes,
+            AIComponentType.TOOL,
+        ),
+        (
+            pat.get(AIComponentType.MEMORY, _STATIC_MEMORY_PATTERNS),
+            fw_prefixes,
+            AIComponentType.MEMORY,
+        ),
+        (
+            pat.get(AIComponentType.PROMPT, _STATIC_PROMPT_PATTERNS),
+            fw_prefixes,
+            AIComponentType.PROMPT,
+        ),
     ]
 
     for call_obs in result.calls:
@@ -1641,7 +1968,10 @@ def _process_file_with_cache(
             continue
 
         match = _match_observation_rich(
-            obs_data["name"], kb_by_id, imported_frameworks, suffix_idx,
+            obs_data["name"],
+            kb_by_id,
+            imported_frameworks,
+            suffix_idx,
         )
 
         if match.is_confirmed:
@@ -1750,7 +2080,9 @@ def _process_file(
     variable_map: dict[str, str] = {}
     for assignment in result.assignments:
         if assignment.target_qualified_name and assignment.call.qualified_name:
-            variable_map[assignment.target_qualified_name] = assignment.call.qualified_name
+            variable_map[assignment.target_qualified_name] = (
+                assignment.call.qualified_name
+            )
 
     observations: list[dict[str, Any]] = []
     symbols: set[str] = set()
@@ -1760,9 +2092,14 @@ def _process_file(
     for assignment in result.assignments:
         name = _resolve_chain(assignment.call.qualified_name, variable_map)
         observations.append(
-            _obs(name, result.file_path, assignment.line_number, "assignment",
-                 args=assignment.call.arguments,
-                 assigned_target=assignment.target_qualified_name)
+            _obs(
+                name,
+                result.file_path,
+                assignment.line_number,
+                "assignment",
+                args=assignment.call.arguments,
+                assigned_target=assignment.target_qualified_name,
+            )
         )
         symbols.add(name)
 
@@ -1774,8 +2111,13 @@ def _process_file(
             name = f"{base}.{attr}"
         name = _resolve_chain(name, variable_map)
         observations.append(
-            _obs(name, result.file_path, dec.line_number, "decorator",
-                 decorated=dec.decorated_function_name)
+            _obs(
+                name,
+                result.file_path,
+                dec.line_number,
+                "decorator",
+                decorated=dec.decorated_function_name,
+            )
         )
         symbols.add(name)
 
@@ -1793,10 +2135,26 @@ def _process_file(
     fw_prefixes = kb_fw_prefixes or _AGENT_FRAMEWORK_PREFIXES
     pat = kb_patterns or {}
     _call_pattern_map: list[tuple[frozenset[str], frozenset[str], AIComponentType]] = [
-        (pat.get(AIComponentType.AGENT, _AGENT_CREATION_PATTERNS), fw_prefixes, AIComponentType.AGENT),
-        (pat.get(AIComponentType.TOOL, _STATIC_TOOL_PATTERNS), fw_prefixes, AIComponentType.TOOL),
-        (pat.get(AIComponentType.MEMORY, _STATIC_MEMORY_PATTERNS), fw_prefixes, AIComponentType.MEMORY),
-        (pat.get(AIComponentType.PROMPT, _STATIC_PROMPT_PATTERNS), fw_prefixes, AIComponentType.PROMPT),
+        (
+            pat.get(AIComponentType.AGENT, _AGENT_CREATION_PATTERNS),
+            fw_prefixes,
+            AIComponentType.AGENT,
+        ),
+        (
+            pat.get(AIComponentType.TOOL, _STATIC_TOOL_PATTERNS),
+            fw_prefixes,
+            AIComponentType.TOOL,
+        ),
+        (
+            pat.get(AIComponentType.MEMORY, _STATIC_MEMORY_PATTERNS),
+            fw_prefixes,
+            AIComponentType.MEMORY,
+        ),
+        (
+            pat.get(AIComponentType.PROMPT, _STATIC_PROMPT_PATTERNS),
+            fw_prefixes,
+            AIComponentType.PROMPT,
+        ),
     ]
 
     for call_obs in result.calls:
@@ -1872,7 +2230,9 @@ def _process_file(
         if key in seen:
             continue
 
-        match = _match_observation_rich(obs_data["name"], kb_by_id, imported_frameworks, suffix_idx)
+        match = _match_observation_rich(
+            obs_data["name"], kb_by_id, imported_frameworks, suffix_idx
+        )
 
         if match.is_confirmed:
             kb_entry = match.entry
@@ -2042,11 +2402,14 @@ def _match_observation_rich(
     if suffix_index is not None:
         all_candidates = suffix_index.get(obs_name, [])
         fw_candidates = [
-            e for e in all_candidates
+            e
+            for e in all_candidates
             if not obs_module or _frameworks_related(obs_module, e.get("framework", ""))
         ]
         if fw_candidates:
-            return _MatchResult(entry=_pick_best(fw_candidates, imported_frameworks, obs_module))
+            return _MatchResult(
+                entry=_pick_best(fw_candidates, imported_frameworks, obs_module)
+            )
 
         if all_candidates and obs_module:
             best = _pick_best(all_candidates, imported_frameworks, obs_module)
@@ -2061,7 +2424,9 @@ def _match_observation_rich(
             all_cls_candidates = suffix_index.get(class_name, [])
             if all_cls_candidates:
                 best = _pick_best(all_cls_candidates, imported_frameworks, obs_module)
-                if not obs_module or _frameworks_related(obs_module, best.get("framework", "")):
+                if not obs_module or _frameworks_related(
+                    obs_module, best.get("framework", "")
+                ):
                     return _MatchResult(entry=best)
                 return _MatchResult(
                     partial_kb_id=best.get("id", ""),
@@ -2075,11 +2440,15 @@ def _match_observation_rich(
     for kb_id, entry in kb_by_id.items():
         if kb_id.endswith("." + obs_name):
             all_suffix_candidates.append(entry)
-            if not obs_module or _frameworks_related(obs_module, entry.get("framework", "")):
+            if not obs_module or _frameworks_related(
+                obs_module, entry.get("framework", "")
+            ):
                 candidates.append(entry)
 
     if candidates:
-        return _MatchResult(entry=_pick_best(candidates, imported_frameworks, obs_module))
+        return _MatchResult(
+            entry=_pick_best(candidates, imported_frameworks, obs_module)
+        )
     if all_suffix_candidates and obs_module:
         best = _pick_best(all_suffix_candidates, imported_frameworks, obs_module)
         return _MatchResult(
