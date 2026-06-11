@@ -27,6 +27,9 @@ from aibom.source_attribution import (
     SOURCE_KIND_LOCAL_PATH,
     canonicalize_image_ref,
     canonicalize_source_ref,
+    capture_git_head_sha,
+    capture_git_remote,
+    capture_source_ref_version,
     detect_source_kind,
 )
 
@@ -46,6 +49,19 @@ def _init_repo(path: Path) -> None:
     _git("init", cwd=path)
     _git("config", "user.email", "dev@example.com", cwd=path)
     _git("config", "user.name", "Dev", cwd=path)
+
+
+def _commit(path: Path) -> str:
+    (path / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "README.md", cwd=path)
+    _git("commit", "-m", "initial", cwd=path)
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
 
 
 class TestDetectSourceKind:
@@ -151,3 +167,71 @@ class TestCanonicalizeImageRef:
             canonicalize_source_ref("redis:7", SOURCE_KIND_CONTAINER_IMAGE)
             == "docker.io/library/redis"
         )
+
+
+class TestCaptureSourceRefVersion:
+    def test_git_head_sha_captured(self, tmp_path: Path) -> None:
+        _init_repo(tmp_path)
+        expected = _commit(tmp_path)
+        sha = capture_git_head_sha(str(tmp_path))
+        assert sha == expected
+        assert len(sha) == 40  # full SHA, not abbreviated
+
+    def test_capture_version_git(self, tmp_path: Path) -> None:
+        _init_repo(tmp_path)
+        expected = _commit(tmp_path)
+        version = capture_source_ref_version(str(tmp_path), SOURCE_KIND_GIT)
+        assert version == expected
+
+    def test_capture_version_container_uses_digest(self) -> None:
+        digest = "sha256:" + "b" * 64
+        version = capture_source_ref_version(
+            "my-app:latest",
+            SOURCE_KIND_CONTAINER_IMAGE,
+            image_digest=digest,
+        )
+        assert version == digest
+
+    def test_capture_version_container_without_digest_is_none(self) -> None:
+        assert (
+            capture_source_ref_version("my-app:latest", SOURCE_KIND_CONTAINER_IMAGE)
+            is None
+        )
+
+    def test_no_commits_returns_none(self, tmp_path: Path) -> None:
+        _init_repo(tmp_path)  # no commit yet
+        assert capture_git_head_sha(str(tmp_path)) is None
+
+    def test_local_path_has_no_version(self, tmp_path: Path) -> None:
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        assert capture_source_ref_version(str(plain), SOURCE_KIND_LOCAL_PATH) is None
+
+
+class TestCaptureGitRemote:
+    def test_origin_remote_captured(self, tmp_path: Path) -> None:
+        _init_repo(tmp_path)
+        _git(
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:org/repo.git",
+            cwd=tmp_path,
+        )
+        assert capture_git_remote(str(tmp_path)) == "git@github.com:org/repo.git"
+
+    def test_no_remote_returns_none(self, tmp_path: Path) -> None:
+        _init_repo(tmp_path)
+        assert capture_git_remote(str(tmp_path)) is None
+
+    def test_captured_remote_canonicalizes(self, tmp_path: Path) -> None:
+        _init_repo(tmp_path)
+        _git(
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/org/repo.git",
+            cwd=tmp_path,
+        )
+        remote = capture_git_remote(str(tmp_path))
+        assert canonicalize_source_ref(remote, SOURCE_KIND_GIT) == "github.com/org/repo"

@@ -202,3 +202,68 @@ def canonicalize_source_ref(source_ref: str, source_kind: str) -> str:
     if source_kind == SOURCE_KIND_CONTAINER_IMAGE:
         return canonicalize_image_ref(source_ref)
     return canonicalize_git_remote(source_ref)
+
+
+def capture_git_remote(path: str) -> Optional[str]:
+    """Return the ``origin`` remote URL for the git working tree at *path*.
+
+    Returns ``None`` when the path is not a git tree or has no ``origin``
+    remote. The raw URL is returned as-is; canonicalization is the caller's
+    responsibility via :func:`canonicalize_source_ref`.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    return url or None
+
+
+def capture_git_head_sha(path: str) -> Optional[str]:
+    """Return the full commit SHA of ``HEAD`` for the git tree at *path*.
+
+    Returns ``None`` when the path is not a git tree or ``HEAD`` cannot be
+    resolved (e.g. a freshly initialized repo with no commits).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def capture_source_ref_version(
+    source: str,
+    source_kind: str,
+    *,
+    image_digest: Optional[str] = None,
+) -> Optional[str]:
+    """Capture the point-in-time ``source_ref_version`` for a scan target.
+
+    For a git source this is the full ``HEAD`` commit SHA; for a container
+    image it is the manifest digest supplied by the caller (the
+    container-extraction path already resolves it). Returns ``None`` when no
+    version can be determined — the field is a best-effort version stamp, not
+    part of the stable identity hash.
+    """
+    if source_kind == SOURCE_KIND_CONTAINER_IMAGE:
+        digest = (image_digest or "").strip()
+        return digest or None
+    if source_kind == SOURCE_KIND_GIT:
+        return capture_git_head_sha(source)
+    return None
