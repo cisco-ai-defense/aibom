@@ -185,6 +185,12 @@ _AGENT_CREATION_PATTERNS: frozenset[str] = frozenset(
 _AGENT_FRAMEWORK_PREFIXES: frozenset[str] = frozenset(
     {
         "langchain",
+        # LangGraph ships the prebuilt ReAct agent factory
+        # ``langgraph.prebuilt.create_react_agent`` (catalogued in the KB as an
+        # agent). The call-pattern gate derives the prefix from the qualified
+        # name's first segment, so ``langgraph`` must be listed here for those
+        # module-level factory calls to be emitted as agents.
+        "langgraph",
         "crewai",
         "autogen",
         # Strands Agents (https://strandsagents.com/) uses module-level

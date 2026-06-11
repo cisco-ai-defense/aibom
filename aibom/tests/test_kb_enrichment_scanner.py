@@ -897,3 +897,50 @@ class TestStrandsAgentFrameworkPrefix:
             f"stray Agent() call from unknown framework should NOT be "
             f"promoted; got {[(c.name, c.framework) for c in agents]}"
         )
+
+
+class TestLangGraphAgentFrameworkPrefix:
+    """``create_react_agent(...)`` from LangGraph must become an AGENT.
+
+    LangGraph's prebuilt ReAct factory is catalogued in the KB as an agent,
+    but the call-pattern gate (``_AGENT_FRAMEWORK_PREFIXES``) derives the
+    framework prefix from the qualified name's first segment. Without
+    ``"langgraph"`` in the set, ``langgraph.prebuilt.create_react_agent(...)``
+    was rejected and the agent was never emitted — observed on published
+    open-source LangGraph sample repositories.
+    """
+
+    def test_langgraph_is_registered_framework_prefix(self) -> None:
+        assert "langgraph" in _AGENT_FRAMEWORK_PREFIXES, (
+            "langgraph must be a recognised agent framework prefix so that "
+            "create_react_agent(...) calls are classified."
+        )
+
+    def test_create_react_agent_call_is_detected(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "\n"
+            "agent = create_react_agent(model=llm, tools=tools)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _process_file_with_cache(result, kb_by_id={})
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert len(agents) == 1, (
+            f"expected exactly one LangGraph agent; got: "
+            f"{[(c.name, c.component_type) for c in comps]}"
+        )
+        call_pattern = agents[0].metadata.get("call_pattern", "")
+        assert call_pattern.endswith("create_react_agent"), call_pattern
+
+
+class TestLangGraphDependencyAllowlist:
+    """LangGraph and sibling agent-framework packages are AI dependencies."""
+
+    def test_agent_framework_packages_are_known_ai(self) -> None:
+        from aibom.scanners.dependency_scanner import is_known_ai_package
+
+        for pkg in ("langgraph", "ag2", "autogen-ext", "google-adk"):
+            assert is_known_ai_package(
+                "pypi", pkg
+            ), f"{pkg} should be recognised as an AI dependency"
