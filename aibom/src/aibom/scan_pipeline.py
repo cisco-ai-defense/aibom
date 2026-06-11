@@ -28,9 +28,9 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 _ENV_PLACEHOLDER_RE = re.compile(r"\$\{[^}]+\}")
@@ -54,8 +54,9 @@ def _strip_env_prefix(name: str) -> str:
     """
     for prefix in _ENV_NAME_PREFIXES:
         if name.startswith(prefix):
-            return name[len(prefix):]
+            return name[len(prefix) :]
     return name
+
 
 from .agent_signatures import AgentSignatureCatalog, resolve_catalog
 from .cross_ref import (
@@ -134,9 +135,14 @@ def _consolidation_key(c: "AIComponent") -> tuple[str, str]:
     return (canonical, c.component_type.value)
 
 
-_CONTEXT_FREE_TYPES: frozenset[str] = frozenset({
-    "dependency", "model", "model_artifact", "embedding",
-})
+_CONTEXT_FREE_TYPES: frozenset[str] = frozenset(
+    {
+        "dependency",
+        "model",
+        "model_artifact",
+        "embedding",
+    }
+)
 
 
 def _dedup_for_agentic(
@@ -215,6 +221,60 @@ def _is_import_only_candidate(c: "AIComponent") -> bool:
     return bool(md.get("import_statement")) and not md.get("call_pattern")
 
 
+def _is_protected_dependency(c: "AIComponent") -> bool:
+    """True for a dependency row that is a recognized AI package.
+
+    A dependency declared in a manifest and matched against the AI-package
+    allow-list is a deterministic, verifiable fact — not a heuristic candidate
+    that needs the agent's keep/prune judgment. The agentic stage may still
+    omit it from its returned set (it processes each candidate independently
+    and an unfamiliar SDK name can be pruned), which would otherwise cause
+    :func:`_propagate_removals` to drop every instance of that package. Such
+    rows must survive regardless of the agent's decision.
+    """
+    return c.component_type == AIComponentType.DEPENDENCY and bool(
+        (c.metadata or {}).get("known_ai_package")
+    )
+
+
+def _reinstate_protected_dependencies(
+    all_candidates: list["AIComponent"],
+    enriched: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Re-add recognized AI dependencies the agent dropped.
+
+    Covers the case where the agent omits the sole dedup representative of a
+    package: fanout then restores none of its instances, so a dependency that
+    is a verified manifest fact would silently disappear. Any protected
+    dependency present in the original candidate set but absent from the
+    enriched output is re-appended (preserving any enrichment already applied
+    to a surviving instance with the same key).
+    """
+    present_keys = {
+        _consolidation_key(c) for c in enriched if _is_protected_dependency(c)
+    }
+    present_ids = {c.instance_id for c in enriched}
+    readded = 0
+    for c in all_candidates:
+        if not _is_protected_dependency(c):
+            continue
+        if c.instance_id in present_ids:
+            continue
+        if _consolidation_key(c) in present_keys:
+            continue
+        enriched.append(c)
+        present_keys.add(_consolidation_key(c))
+        present_ids.add(c.instance_id)
+        readded += 1
+    if readded:
+        _LOGGER.info(
+            "Reinstated %d recognized AI dependency component(s) dropped "
+            "by the agentic stage",
+            readded,
+        )
+    return enriched
+
+
 def _propagate_removals(
     sent: list["AIComponent"],
     received: list["AIComponent"],
@@ -266,6 +326,10 @@ def _propagate_removals(
     for c in sent:
         if c.instance_id not in removed_ids:
             continue
+        # A recognized AI dependency is a deterministic manifest fact; never
+        # let the agent omitting it become a removal signal for that package.
+        if _is_protected_dependency(c):
+            continue
         key = _consolidation_key(c)
         if _is_import_only_candidate(c):
             weak_keys.add(key)
@@ -277,6 +341,8 @@ def _propagate_removals(
     lookup_pool = all_candidates if all_candidates is not None else received
     drop_ids: set[str] = set()
     for c in lookup_pool:
+        if _is_protected_dependency(c):
+            continue
         key = _consolidation_key(c)
         if key in strong_keys:
             drop_ids.add(c.instance_id)
@@ -289,7 +355,9 @@ def _propagate_removals(
         _LOGGER.info(
             "Removal propagation: dropped %d additional component(s) "
             "(%d strong key(s), %d weak import-only key(s))",
-            dropped, len(strong_keys), len(weak_keys),
+            dropped,
+            len(strong_keys),
+            len(weak_keys),
         )
     return result
 
@@ -338,10 +406,12 @@ def _evidence_gate(
     before_map: dict[str, "AIComponent"] = {c.instance_id: c for c in before_agentic}
     allowed_roots = list(scan_paths or [])
 
-    _AGENT_TYPES: frozenset[AIComponentType] = frozenset({
-        AIComponentType.AGENT,
-        AIComponentType.AGENT_PROXY,
-    })
+    _AGENT_TYPES: frozenset[AIComponentType] = frozenset(
+        {
+            AIComponentType.AGENT,
+            AIComponentType.AGENT_PROXY,
+        }
+    )
 
     result: list["AIComponent"] = []
     gate_removed = 0
@@ -360,7 +430,8 @@ def _evidence_gate(
             _LOGGER.info(
                 "Evidence gate removed model '%s' (%s): "
                 "not found in any model registry and detection_source=kb_enrichment",
-                c.name, c.instance_id,
+                c.name,
+                c.instance_id,
             )
             gate_removed += 1
             continue
@@ -375,7 +446,8 @@ def _evidence_gate(
             _LOGGER.info(
                 "Evidence gate removed memory '%s' (%s): "
                 "agent kept kb_enrichment component unchanged",
-                c.name, c.instance_id,
+                c.name,
+                c.instance_id,
             )
             gate_removed += 1
             continue
@@ -388,7 +460,8 @@ def _evidence_gate(
             if is_structural or type_flipped or import_only:
                 raw_evidence = (c.metadata or {}).get("agent_evidence")
                 ok, reason = _verify_agent_evidence(
-                    raw_evidence, allowed_roots=allowed_roots,
+                    raw_evidence,
+                    allowed_roots=allowed_roots,
                 )
                 if not ok:
                     _LOGGER.warning(
@@ -412,15 +485,25 @@ def _evidence_gate(
         _LOGGER.info(
             "Evidence gate: removed %d component(s) "
             "(%d model/memory, %d agent/agent_proxy)",
-            total_removed, gate_removed, agent_evidence_removed,
+            total_removed,
+            gate_removed,
+            agent_evidence_removed,
         )
     return result
 
 
-_TEST_PATH_SEGMENTS: frozenset[str] = frozenset({
-    "tests", "test", "__tests__", "spec", "testing", "testdata",
-    "test_data", "fixtures",
-})
+_TEST_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "tests",
+        "test",
+        "__tests__",
+        "spec",
+        "testing",
+        "testdata",
+        "test_data",
+        "fixtures",
+    }
+)
 
 
 def _is_test_file(file_path: str) -> bool:
@@ -487,12 +570,15 @@ def _consolidate_components(
             result.append(c)
             continue
 
-        best = max(group, key=lambda c: (
-            c.heuristic_confidence,
-            1 if _has_instantiation_marker(c) else 0,
-            0 if _is_test_file(c.file_path) else 1,
-            -c.line_number,
-        ))
+        best = max(
+            group,
+            key=lambda c: (
+                c.heuristic_confidence,
+                1 if _has_instantiation_marker(c) else 0,
+                0 if _is_test_file(c.file_path) else 1,
+                -c.line_number,
+            ),
+        )
         evidence = []
         evidence_files: list[str] = []
         seen_files: set[str] = set()
@@ -505,12 +591,14 @@ def _consolidate_components(
                 seen_files.add(c.file_path)
                 evidence_files.append(c.file_path)
             if c is not best:
-                evidence.append({
-                    "file": c.file_path,
-                    "line": c.line_number,
-                    "service": _service_dir(c.file_path),
-                    "test_only": is_test,
-                })
+                evidence.append(
+                    {
+                        "file": c.file_path,
+                        "line": c.line_number,
+                        "service": _service_dir(c.file_path),
+                        "test_only": is_test,
+                    }
+                )
 
         if not _is_test_file(best.file_path):
             all_test = False
@@ -525,10 +613,12 @@ def _consolidate_components(
 
         needs = any(c.needs_agentic for c in group)
 
-        merged = best.model_copy(update={
-            "metadata": merged_meta,
-            "needs_agentic": needs,
-        })
+        merged = best.model_copy(
+            update={
+                "metadata": merged_meta,
+                "needs_agentic": needs,
+            }
+        )
         result.append(merged)
 
     return result
@@ -559,7 +649,8 @@ def _canonicalize_env_var_names(
     out: list[AIComponent] = []
     for c in components:
         if c.component_type not in (
-            AIComponentType.MODEL, AIComponentType.EMBEDDING,
+            AIComponentType.MODEL,
+            AIComponentType.EMBEDDING,
         ):
             out.append(c)
             continue
@@ -568,19 +659,25 @@ def _canonicalize_env_var_names(
         env_var = meta.get("env_var") or meta.get("env")
         model_name = c.model_name
         if (
-            isinstance(env_var, str) and env_var
+            isinstance(env_var, str)
+            and env_var
             and _strip_env_prefix(c.name) == env_var
-            and isinstance(model_name, str) and model_name
+            and isinstance(model_name, str)
+            and model_name
             and model_name != c.name
             and not model_name.lower().startswith(("http://", "https://"))
             and not _ENV_PLACEHOLDER_RE.search(model_name)
         ):
             canon_meta = dict(meta)
             canon_meta.setdefault("env_var", env_var)
-            out.append(c.model_copy(update={
-                "name": model_name,
-                "metadata": canon_meta,
-            }))
+            out.append(
+                c.model_copy(
+                    update={
+                        "name": model_name,
+                        "metadata": canon_meta,
+                    }
+                )
+            )
         else:
             out.append(c)
     return out
@@ -599,12 +696,11 @@ def _dedup_mcp_clients(
     ``mcp_integration_mcp_client`` beats ``stdio_client``) and whose
     metadata carries ``call_pattern`` / ``assigned_to`` markers.
     """
+
     def _rank(c: "AIComponent") -> tuple[int, int, float]:
         meta = c.metadata or {}
         name = c.name or ""
-        basename_like = 1 if (
-            name.endswith("_client") and "_" in name
-        ) else 0
+        basename_like = 1 if (name.endswith("_client") and "_" in name) else 0
         marker = 1 if _has_instantiation_marker(c) else 0
         return (marker, basename_like, c.heuristic_confidence)
 
@@ -673,7 +769,8 @@ def _filter_relationships_for_components(
         return False
 
     return [
-        rel for rel in relationships
+        rel
+        for rel in relationships
         if _endpoint_present(rel.source_instance_id, rel.source_name)
         and _endpoint_present(rel.target_instance_id, rel.target_name)
     ]
@@ -745,11 +842,14 @@ def _consolidate_vector_stores(
             merged.append(c.model_copy(update={"metadata": meta}))
             continue
 
-        best = max(group, key=lambda c: (
-            c.heuristic_confidence,
-            0 if _is_test_file(c.file_path) else 1,
-            -c.line_number,
-        ))
+        best = max(
+            group,
+            key=lambda c: (
+                c.heuristic_confidence,
+                0 if _is_test_file(c.file_path) else 1,
+                -c.line_number,
+            ),
+        )
         seen: set[tuple[str, int]] = set()
         evidence: list[dict[str, Any]] = []
 
@@ -765,12 +865,14 @@ def _consolidate_vector_stores(
             if key in seen:
                 return
             seen.add(key)
-            evidence.append({
-                "file": file_path,
-                "line": line_number,
-                "service": _service_dir(file_path),
-                "test_only": test_only,
-            })
+            evidence.append(
+                {
+                    "file": file_path,
+                    "line": line_number,
+                    "service": _service_dir(file_path),
+                    "test_only": test_only,
+                }
+            )
 
         def _merge_prior_evidence(meta: dict[str, Any]) -> None:
             for ev in meta.get("evidence") or []:
@@ -794,7 +896,8 @@ def _consolidate_vector_stores(
 
         best_key = (best.file_path, best.line_number)
         merged_evidence = [
-            ev for ev in evidence
+            ev
+            for ev in evidence
             if (str(ev.get("file", "")), int(ev.get("line", 0) or 0)) != best_key
         ]
 
@@ -809,10 +912,14 @@ def _consolidate_vector_stores(
 
         needs = any(c.needs_agentic for c in group)
 
-        merged.append(best.model_copy(update={
-            "metadata": merged_meta,
-            "needs_agentic": needs,
-        }))
+        merged.append(
+            best.model_copy(
+                update={
+                    "metadata": merged_meta,
+                    "needs_agentic": needs,
+                }
+            )
+        )
 
     return merged
 
@@ -905,7 +1012,11 @@ def _propagate_model_from_relationships(
     result: list[AIComponent] = []
     for comp in components:
         if comp.model_name is None:
-            target = model_targets.get(f"id:{comp.instance_id}") if comp.instance_id else None
+            target = (
+                model_targets.get(f"id:{comp.instance_id}")
+                if comp.instance_id
+                else None
+            )
             if target is None:
                 target = model_targets.get(f"name:{comp.name}") if comp.name else None
             if target is not None:
@@ -976,9 +1087,7 @@ class ScanPipeline:
         self.agentic_fast_model = agentic_fast_model
         self.agentic_timeout = agentic_timeout
         self.agentic_cache_dir = (
-            Path(agentic_cache_dir)
-            if agentic_cache_dir is not None
-            else None
+            Path(agentic_cache_dir) if agentic_cache_dir is not None else None
         )
         self.include_code_snippets = include_code_snippets
         self.progress_callback = progress_callback
@@ -1018,11 +1127,14 @@ class ScanPipeline:
         components, relationships = self._stage_scan(ctx)
         elapsed = time.monotonic() - t0
         fc = cache_stats()
-        timings.append(StageTiming(
-            "scan", elapsed,
-            f"{len(components)} components, {len(relationships)} relationships, "
-            f"file cache {fc['hits']} hits / {fc['misses']} misses",
-        ))
+        timings.append(
+            StageTiming(
+                "scan",
+                elapsed,
+                f"{len(components)} components, {len(relationships)} relationships, "
+                f"file cache {fc['hits']} hits / {fc['misses']} misses",
+            )
+        )
         self._emit_progress(
             "stage_completed",
             stage="scan",
@@ -1032,15 +1144,16 @@ class ScanPipeline:
 
         self._emit_progress("stage_started", stage="cross_ref", total_stages=4)
         t0 = time.monotonic()
-        components, env_idx, pkg_idx, ext_deps = self._stage_cross_ref(
-            components
-        )
+        components, env_idx, pkg_idx, ext_deps = self._stage_cross_ref(components)
         elapsed = time.monotonic() - t0
-        timings.append(StageTiming(
-            "cross_ref", elapsed,
-            f"{sum(len(v) for v in env_idx.env.values())} env vars, "
-            f"{len(pkg_idx.packages)} packages, {len(ext_deps)} external deps",
-        ))
+        timings.append(
+            StageTiming(
+                "cross_ref",
+                elapsed,
+                f"{sum(len(v) for v in env_idx.env.values())} env vars, "
+                f"{len(pkg_idx.packages)} packages, {len(ext_deps)} external deps",
+            )
+        )
         self._emit_progress(
             "stage_completed",
             stage="cross_ref",
@@ -1055,10 +1168,17 @@ class ScanPipeline:
         )
         elapsed = time.monotonic() - t0
         skipped = not self.llm_config
-        timings.append(StageTiming(
-            "agentic", elapsed,
-            "skipped (no --llm-model)" if skipped else f"{len(agentic_flags)} risk flags",
-        ))
+        timings.append(
+            StageTiming(
+                "agentic",
+                elapsed,
+                (
+                    "skipped (no --llm-model)"
+                    if skipped
+                    else f"{len(agentic_flags)} risk flags"
+                ),
+            )
+        )
         self._emit_progress(
             "stage_completed",
             stage="agentic",
@@ -1070,9 +1190,13 @@ class ScanPipeline:
         t0 = time.monotonic()
         components, agentic_count = self._stage_assemble(components)
         elapsed = time.monotonic() - t0
-        timings.append(StageTiming(
-            "assemble", elapsed, f"{len(components)} final, {agentic_count} agentic",
-        ))
+        timings.append(
+            StageTiming(
+                "assemble",
+                elapsed,
+                f"{len(components)} final, {agentic_count} agentic",
+            )
+        )
         self._emit_progress(
             "stage_completed",
             stage="assemble",
@@ -1082,9 +1206,7 @@ class ScanPipeline:
         relationships = _resolve_relationship_types(relationships, components)
         components = _propagate_model_from_relationships(components, relationships)
         relationships = _dedup_relationships(relationships)
-        relationships = _filter_relationships_for_components(
-            relationships, components
-        )
+        relationships = _filter_relationships_for_components(relationships, components)
         agentic_flags = _filter_risk_flags_for_default_scope(agentic_flags)
 
         total_elapsed = time.monotonic() - pipeline_start
@@ -1121,8 +1243,7 @@ class ScanPipeline:
             _LOGGER.info(
                 "Pass 1: discovered %d AI package(s) from manifests: %s",
                 len(ai_pkgs),
-                ", ".join(sorted(ai_pkgs)[:10])
-                + ("…" if len(ai_pkgs) > 10 else ""),
+                ", ".join(sorted(ai_pkgs)[:10]) + ("…" if len(ai_pkgs) > 10 else ""),
             )
         else:
             _LOGGER.debug("Pass 1: no AI packages found in manifests")
@@ -1132,6 +1253,7 @@ class ScanPipeline:
         idx = ctx_pass2.file_index()
         if idx:
             import asyncio
+
             from .scanners.file_cache import warm_cache_async
 
             all_paths = [e.path for entries in idx.values() for e in entries]
@@ -1146,6 +1268,7 @@ class ScanPipeline:
 
             if loop and loop.is_running():
                 import concurrent.futures
+
                 with concurrent.futures.ThreadPoolExecutor(1) as pool:
                     warmed = pool.submit(
                         asyncio.run, warm_cache_async(all_paths)
@@ -1154,7 +1277,8 @@ class ScanPipeline:
                 warmed = asyncio.run(warm_cache_async(all_paths))
             _LOGGER.info(
                 "Pass 2 prep: pre-cached %d / %d files via async I/O",
-                warmed, len(all_paths),
+                warmed,
+                len(all_paths),
             )
             self._emit_progress(
                 "file_cache_prep_completed",
@@ -1188,9 +1312,7 @@ class ScanPipeline:
 
         ext_deps = detect_external_repo_deps(self.scan_paths)
         if ext_deps:
-            _LOGGER.info(
-                "Detected %d external repo dependency(ies)", len(ext_deps)
-            )
+            _LOGGER.info("Detected %d external repo dependency(ies)", len(ext_deps))
             escaping = [d for d in ext_deps if d.escapes_root]
             if escaping:
                 _LOGGER.warning(
@@ -1235,7 +1357,9 @@ class ScanPipeline:
             if len(deduped) < len(components):
                 _LOGGER.info(
                     "Pre-agentic dedup: %d → %d components (%d context-free duplicates removed)",
-                    len(components), len(deduped), len(components) - len(deduped),
+                    len(components),
+                    len(deduped),
+                    len(components) - len(deduped),
                 )
 
             model_str = self.llm_config["model"]
@@ -1253,32 +1377,41 @@ class ScanPipeline:
                     len(user_sigs.protocols),
                     len(user_sigs.anti_patterns),
                 )
-            enriched, agentic_rels, agentic_flags, agentic_token_usage = run_agentic_enrichment(
-                model_string=model_str,
-                deterministic_components=deduped,
-                deterministic_relationships=relationships,
-                scan_paths=self.scan_paths,
-                llm_config=self.llm_config,
-                batch_size=self.agentic_batch_size,
-                max_concurrent=self.agentic_concurrency,
-                fast_model=self.agentic_fast_model,
-                timeout_s=self.agentic_timeout,
-                cache_dir=self.agentic_cache_dir,
-                include_code_snippets=self.include_code_snippets,
-                agent_signature_catalog=agent_catalog,
+            enriched, agentic_rels, agentic_flags, agentic_token_usage = (
+                run_agentic_enrichment(
+                    model_string=model_str,
+                    deterministic_components=deduped,
+                    deterministic_relationships=relationships,
+                    scan_paths=self.scan_paths,
+                    llm_config=self.llm_config,
+                    batch_size=self.agentic_batch_size,
+                    max_concurrent=self.agentic_concurrency,
+                    fast_model=self.agentic_fast_model,
+                    timeout_s=self.agentic_timeout,
+                    cache_dir=self.agentic_cache_dir,
+                    include_code_snippets=self.include_code_snippets,
+                    agent_signature_catalog=agent_catalog,
+                )
             )
             deduped_ids = {c.instance_id for c in deduped}
-            enriched_deduped_ids = {c.instance_id for c in enriched if c.instance_id in deduped_ids}
+            enriched_deduped_ids = {
+                c.instance_id for c in enriched if c.instance_id in deduped_ids
+            }
             new_components = [c for c in enriched if c.instance_id not in deduped_ids]
             pre_fanout_removed = deduped_ids - enriched_deduped_ids
             enriched_for_fanout = [c for c in enriched if c.instance_id in deduped_ids]
             enriched = _fanout_agentic_results(enriched_for_fanout, fanout)
             enriched = _propagate_removals(
-                deduped, enriched, all_candidates=components,
+                deduped,
+                enriched,
+                all_candidates=components,
                 pre_fanout_removed_ids=pre_fanout_removed,
             )
+            enriched = _reinstate_protected_dependencies(components, enriched)
             enriched = _evidence_gate(
-                components, enriched, scan_paths=self.scan_paths,
+                components,
+                enriched,
+                scan_paths=self.scan_paths,
             )
             if new_components:
                 enriched = enriched + new_components
@@ -1288,6 +1421,7 @@ class ScanPipeline:
                 _reject_class_name_models,
                 _remove_unresolved_embedders,
             )
+
             enriched = _reject_class_name_models(enriched)
             all_rels = relationships + agentic_rels
             enriched = _remove_unresolved_embedders(enriched, all_rels)
@@ -1315,7 +1449,8 @@ class ScanPipeline:
         components = _canonicalize_env_var_names(components)
         if before_canon:
             _LOGGER.debug(
-                "Env-var canonicalization applied to %d components", before_canon,
+                "Env-var canonicalization applied to %d components",
+                before_canon,
             )
 
         before_mcp = len(components)
@@ -1323,7 +1458,9 @@ class ScanPipeline:
         if before_mcp != len(components):
             _LOGGER.info(
                 "MCP client dedup: %d → %d components (-%d)",
-                before_mcp, len(components), before_mcp - len(components),
+                before_mcp,
+                len(components),
+                before_mcp - len(components),
             )
 
         # Normalize MODEL → EMBEDDING for components whose name is a
@@ -1354,7 +1491,9 @@ class ScanPipeline:
         if before != after:
             _LOGGER.info(
                 "Consolidation: %d → %d components (-%d duplicates)",
-                before, after, before - after,
+                before,
+                after,
+                before - after,
             )
 
         before_vs = len(components)
@@ -1363,7 +1502,9 @@ class ScanPipeline:
         if before_vs != after_vs:
             _LOGGER.info(
                 "Vector store dedup: %d → %d components (-%d)",
-                before_vs, after_vs, before_vs - after_vs,
+                before_vs,
+                after_vs,
+                before_vs - after_vs,
             )
 
         before_td = len(components)
@@ -1372,7 +1513,9 @@ class ScanPipeline:
         if before_td != after_td:
             _LOGGER.info(
                 "Tool/vector_store priority dedup: %d → %d (-%d)",
-                before_td, after_td, before_td - after_td,
+                before_td,
+                after_td,
+                before_td - after_td,
             )
 
         before_scope = len(components)
@@ -1381,7 +1524,9 @@ class ScanPipeline:
         if before_scope != after_scope:
             _LOGGER.info(
                 "Default BOM scope: %d → %d components (-%d test/fixture-only)",
-                before_scope, after_scope, before_scope - after_scope,
+                before_scope,
+                after_scope,
+                before_scope - after_scope,
             )
 
         before_deps = len(components)
@@ -1390,15 +1535,15 @@ class ScanPipeline:
         if before_deps != after_deps:
             _LOGGER.info(
                 "AI-only dependency policy: %d → %d components (-%d non-AI dependencies)",
-                before_deps, after_deps, before_deps - after_deps,
+                before_deps,
+                after_deps,
+                before_deps - after_deps,
             )
 
         agentic_count = sum(1 for c in components if c.needs_agentic)
 
         if self.strict:
             components = [c for c in components if not c.needs_agentic]
-            _LOGGER.info(
-                "Strict mode: filtered %d agentic candidates", agentic_count
-            )
+            _LOGGER.info("Strict mode: filtered %d agentic candidates", agentic_count)
 
         return components, agentic_count

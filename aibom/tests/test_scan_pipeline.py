@@ -33,14 +33,10 @@ class TestScanPipeline:
         (tmp_path / "values.yaml").write_text(
             "inference:\n  model: some-custom-thing\n"
         )
-        pipeline_relaxed = ScanPipeline(
-            scan_paths=[str(tmp_path)], strict=False
-        )
+        pipeline_relaxed = ScanPipeline(scan_paths=[str(tmp_path)], strict=False)
         result_relaxed = pipeline_relaxed.run()
 
-        pipeline_strict = ScanPipeline(
-            scan_paths=[str(tmp_path)], strict=True
-        )
+        pipeline_strict = ScanPipeline(scan_paths=[str(tmp_path)], strict=True)
         result_strict = pipeline_strict.run()
 
         agentic_relaxed = [c for c in result_relaxed.components if c.needs_agentic]
@@ -53,23 +49,18 @@ class TestScanPipeline:
         """EnvVarResolver + cross-ref should wire env vars to config values."""
         (tmp_path / ".env").write_text("LLM_MODEL=gpt-4o\n")
         (tmp_path / "app.py").write_text(
-            'import os\nfrom openai import OpenAI\n'
-            'client = OpenAI()\n'
-            'resp = client.chat.completions.create(\n'
+            "import os\nfrom openai import OpenAI\n"
+            "client = OpenAI()\n"
+            "resp = client.chat.completions.create(\n"
             '    model=os.getenv("LLM_MODEL"),\n'
-            '    messages=[]\n'
-            ')\n'
+            "    messages=[]\n"
+            ")\n"
         )
         pipeline = ScanPipeline(scan_paths=[str(tmp_path)])
         result = pipeline.run()
 
-        env_comps = [
-            c for c in result.components if c.name.startswith("env:")
-        ]
-        resolved = [
-            c for c in env_comps
-            if c.model_name and c.model_name == "gpt-4o"
-        ]
+        env_comps = [c for c in result.components if c.name.startswith("env:")]
+        resolved = [c for c in env_comps if c.model_name and c.model_name == "gpt-4o"]
         if env_comps:
             assert any(
                 c.metadata.get("resolved_value") == "gpt-4o" or c.model_name == "gpt-4o"
@@ -124,7 +115,9 @@ class TestPipelineTiming:
         scan_timing = next(t for t in result.timings if t.name == "scan")
         assert "file cache" in scan_timing.detail
 
-    def test_progress_callback_receives_stage_and_scanner_events(self, tmp_path: Path) -> None:
+    def test_progress_callback_receives_stage_and_scanner_events(
+        self, tmp_path: Path
+    ) -> None:
         (tmp_path / "app.py").write_text("import openai\n")
         events: list[dict[str, object]] = []
         result = ScanPipeline(
@@ -139,9 +132,7 @@ class TestPipelineTiming:
         assert "scanner_completed" in event_names
         assert event_names[-1] == "stage_completed"
         stage_names = [
-            str(event["stage"])
-            for event in events
-            if event["event"] == "stage_started"
+            str(event["stage"]) for event in events if event["event"] == "stage_started"
         ]
         assert stage_names == ["scan", "cross_ref", "agentic", "assemble"]
 
@@ -232,15 +223,13 @@ class TestResolveComponentsProvenance:
         """Resolved env vars should carry provenance in metadata."""
         (tmp_path / ".env").write_text("MODEL_VAR=gpt-4o\n")
         (tmp_path / "main.py").write_text(
-            'import os\n'
-            'model=os.getenv("MODEL_VAR")\n'
+            "import os\n" 'model=os.getenv("MODEL_VAR")\n'
         )
         pipeline = ScanPipeline(scan_paths=[str(tmp_path)])
         result = pipeline.run()
 
         env_comps = [
-            c for c in result.components
-            if c.metadata.get("env") == "MODEL_VAR"
+            c for c in result.components if c.metadata.get("env") == "MODEL_VAR"
         ]
         for c in env_comps:
             if c.metadata.get("resolved_from"):
@@ -255,9 +244,24 @@ class TestDedupForAgentic:
         from aibom.scan_pipeline import _dedup_for_agentic
 
         comps = [
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="c/req.txt", line_number=1),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="a/req.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="b/req.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="c/req.txt",
+                line_number=1,
+            ),
         ]
         deduped, fanout = _dedup_for_agentic(comps)
         assert len(deduped) == 1
@@ -269,8 +273,18 @@ class TestDedupForAgentic:
         from aibom.scan_pipeline import _dedup_for_agentic
 
         comps = [
-            AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="a.yaml", line_number=1),
-            AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="b.yaml", line_number=5),
+            AIComponent(
+                name="env:EP",
+                component_type=AIComponentType.LLM_ENDPOINT,
+                file_path="a.yaml",
+                line_number=1,
+            ),
+            AIComponent(
+                name="env:EP",
+                component_type=AIComponentType.LLM_ENDPOINT,
+                file_path="b.yaml",
+                line_number=5,
+            ),
         ]
         deduped, fanout = _dedup_for_agentic(comps)
         assert len(deduped) == 2
@@ -280,9 +294,24 @@ class TestDedupForAgentic:
         from aibom.scan_pipeline import _dedup_for_agentic
 
         comps = [
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
-            AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="a.yaml", line_number=1),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="a/req.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="b/req.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="env:EP",
+                component_type=AIComponentType.LLM_ENDPOINT,
+                file_path="a.yaml",
+                line_number=1,
+            ),
         ]
         deduped, fanout = _dedup_for_agentic(comps)
         assert len(deduped) == 2
@@ -291,10 +320,17 @@ class TestDedupForAgentic:
     def test_picks_richest_representative(self):
         from aibom.scan_pipeline import _dedup_for_agentic
 
-        sparse = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1)
+        sparse = AIComponent(
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="a/req.txt",
+            line_number=1,
+        )
         rich = AIComponent(
-            name="torch", component_type=AIComponentType.DEPENDENCY,
-            file_path="b/req.txt", line_number=1,
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="b/req.txt",
+            line_number=1,
             description="PyTorch deep learning framework",
             metadata={"version": "2.1.0", "known_ai_package": True},
         )
@@ -306,8 +342,18 @@ class TestDedupForAgentic:
         from aibom.scan_pipeline import _dedup_for_agentic
 
         comps = [
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a.txt", line_number=1),
-            AIComponent(name="tensorflow", component_type=AIComponentType.DEPENDENCY, file_path="b.txt", line_number=1),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="a.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="tensorflow",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="b.txt",
+                line_number=1,
+            ),
         ]
         deduped, fanout = _dedup_for_agentic(comps)
         assert len(deduped) == 2
@@ -320,11 +366,23 @@ class TestFanoutAgenticResults:
         from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
 
         comps = [
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
-            AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="a/req.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="b/req.txt",
+                line_number=1,
+            ),
         ]
         deduped, fanout = _dedup_for_agentic(comps)
-        rep = deduped[0].model_copy(update={"heuristic_confidence": 0.95, "needs_agentic": False})
+        rep = deduped[0].model_copy(
+            update={"heuristic_confidence": 0.95, "needs_agentic": False}
+        )
 
         result = _fanout_agentic_results([rep], fanout)
         assert len(result) == 2
@@ -336,8 +394,18 @@ class TestFanoutAgenticResults:
         from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
 
         comps = [
-            AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="a/req.txt", line_number=1),
-            AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="b/req.txt", line_number=1),
+            AIComponent(
+                name="requests",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="a/req.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="requests",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="b/req.txt",
+                line_number=1,
+            ),
         ]
         _, fanout = _dedup_for_agentic(comps)
         result = _fanout_agentic_results([], fanout)
@@ -347,15 +415,27 @@ class TestFanoutAgenticResults:
         from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
 
         comps = [
-            AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="a.yaml", line_number=1),
-            AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="b.yaml", line_number=5),
+            AIComponent(
+                name="ada-ep",
+                component_type=AIComponentType.EMBEDDING,
+                file_path="a.yaml",
+                line_number=1,
+            ),
+            AIComponent(
+                name="ada-ep",
+                component_type=AIComponentType.EMBEDDING,
+                file_path="b.yaml",
+                line_number=5,
+            ),
         ]
         deduped, fanout = _dedup_for_agentic(comps)
-        rep = deduped[0].model_copy(update={
-            "component_type": AIComponentType.MODEL_ENDPOINT,
-            "heuristic_confidence": 0.9,
-            "needs_agentic": False,
-        })
+        rep = deduped[0].model_copy(
+            update={
+                "component_type": AIComponentType.MODEL_ENDPOINT,
+                "heuristic_confidence": 0.9,
+                "needs_agentic": False,
+            }
+        )
 
         result = _fanout_agentic_results([rep], fanout)
         assert len(result) == 2
@@ -366,7 +446,12 @@ class TestFanoutAgenticResults:
     def test_non_fanout_components_pass_through(self):
         from aibom.scan_pipeline import _fanout_agentic_results
 
-        ep = AIComponent(name="env:EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="v.yaml", line_number=1)
+        ep = AIComponent(
+            name="env:EP",
+            component_type=AIComponentType.LLM_ENDPOINT,
+            file_path="v.yaml",
+            line_number=1,
+        )
         result = _fanout_agentic_results([ep], {})
         assert len(result) == 1
         assert result[0].instance_id == ep.instance_id
@@ -549,6 +634,81 @@ class TestPropagateRemovals:
         )
 
 
+class TestProtectedDependencies:
+    """Recognized AI dependencies are deterministic manifest facts and must
+    survive the agentic stage even if the LLM omits them from its set."""
+
+    def _dep(self, name: str, path: str) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=AIComponentType.DEPENDENCY,
+            file_path=path,
+            line_number=1,
+            metadata={"ecosystem": "pypi", "known_ai_package": True},
+        )
+
+    def test_protected_dependency_predicate(self):
+        from aibom.scan_pipeline import _is_protected_dependency
+
+        known = self._dep("cisco-aidefense-sdk", "a/pyproject.toml")
+        assert _is_protected_dependency(known) is True
+
+        unknown_dep = AIComponent(
+            name="some-random-lib",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="a/pyproject.toml",
+            line_number=1,
+            metadata={"ecosystem": "pypi"},
+        )
+        assert _is_protected_dependency(unknown_dep) is False
+
+        model = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="a.yaml",
+            line_number=1,
+        )
+        assert _is_protected_dependency(model) is False
+
+    def test_agent_omission_does_not_cascade_to_dependency(self):
+        from aibom.scan_pipeline import _propagate_removals
+
+        dep = self._dep("cisco-aidefense-sdk", "a/pyproject.toml")
+        # Agent returned nothing for the dependency (omitted from its set).
+        result = _propagate_removals(
+            sent=[dep],
+            received=[],
+            all_candidates=[dep],
+            pre_fanout_removed_ids={dep.instance_id},
+        )
+        # No strong/weak key should be formed from a protected dependency.
+        assert [c.name for c in result] == []  # received was empty here
+
+    def test_dropped_sole_representative_is_reinstated(self):
+        from aibom.scan_pipeline import _reinstate_protected_dependencies
+
+        # Two manifests declare the same package; dedup keeps one
+        # representative, which the agent then dropped — fanout restored none.
+        dep_a = self._dep("cisco-aidefense-sdk", "a/pyproject.toml")
+        dep_b = self._dep("cisco-aidefense-sdk", "b/pyproject.toml")
+        # enriched lost both instances.
+        enriched: list[AIComponent] = []
+        result = _reinstate_protected_dependencies([dep_a, dep_b], enriched)
+        names = [c.name for c in result]
+        assert names.count("cisco-aidefense-sdk") == 1, (
+            "exactly one protected dependency instance should be reinstated; "
+            f"got {names}"
+        )
+
+    def test_reinstate_noop_when_dependency_survived(self):
+        from aibom.scan_pipeline import _reinstate_protected_dependencies
+
+        dep = self._dep("strands-agents", "a/pyproject.toml")
+        enriched = [dep]
+        result = _reinstate_protected_dependencies([dep], enriched)
+        assert [c.name for c in result] == ["strands-agents"]
+
+
 class TestDefaultBomScope:
     def test_stage_assemble_excludes_test_only_components(self):
         component = AIComponent(
@@ -663,8 +823,8 @@ class TestDefaultBomScope:
         assert components[0].file_path.endswith(".github/workflows/ai-review.yml")
 
     def test_run_filters_test_scope_relationships_and_risk_flags(self):
-        from aibom.models.scan import ComponentRelationship, RiskFlag
         from aibom.models.enums import RelationshipType, Severity
+        from aibom.models.scan import ComponentRelationship, RiskFlag
 
         prod = AIComponent(
             name="gpt-4o",
@@ -719,9 +879,25 @@ class TestDefaultBomScope:
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
         with (
-            patch.object(pipeline, "_stage_scan", return_value=([prod, test], [kept_rel, dropped_rel])),
-            patch.object(pipeline, "_stage_cross_ref", return_value=([prod, test], MagicMock(), MagicMock(), [])),
-            patch.object(pipeline, "_stage_agentic", return_value=([prod, test], [kept_rel, dropped_rel], [kept_flag, dropped_flag])),
+            patch.object(
+                pipeline,
+                "_stage_scan",
+                return_value=([prod, test], [kept_rel, dropped_rel]),
+            ),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=([prod, test], MagicMock(), MagicMock(), []),
+            ),
+            patch.object(
+                pipeline,
+                "_stage_agentic",
+                return_value=(
+                    [prod, test],
+                    [kept_rel, dropped_rel],
+                    [kept_flag, dropped_flag],
+                ),
+            ),
         ):
             result = pipeline.run()
 
@@ -761,8 +937,8 @@ class TestDependencyPolicyScope:
         assert [c.name for c in components] == ["openai"]
 
     def test_run_keeps_name_only_agentic_relationships_for_kept_components(self):
-        from aibom.models.scan import ComponentRelationship
         from aibom.models.enums import RelationshipType
+        from aibom.models.scan import ComponentRelationship
 
         prod = AIComponent(
             name="gpt-4o",
@@ -802,9 +978,21 @@ class TestDependencyPolicyScope:
         pipeline = ScanPipeline(scan_paths=["/tmp"])
 
         with (
-            patch.object(pipeline, "_stage_scan", return_value=([prod, test], [kept_rel, dropped_rel])),
-            patch.object(pipeline, "_stage_cross_ref", return_value=([prod, test], MagicMock(), MagicMock(), [])),
-            patch.object(pipeline, "_stage_agentic", return_value=([prod, test], [kept_rel, dropped_rel], [])),
+            patch.object(
+                pipeline,
+                "_stage_scan",
+                return_value=([prod, test], [kept_rel, dropped_rel]),
+            ),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=([prod, test], MagicMock(), MagicMock(), []),
+            ),
+            patch.object(
+                pipeline,
+                "_stage_agentic",
+                return_value=([prod, test], [kept_rel, dropped_rel], []),
+            ),
         ):
             result = pipeline.run()
 
@@ -842,8 +1030,7 @@ class TestSymmetricEvidenceGate:
         path.write_text(source, encoding="utf-8")
         lines = source.splitlines()
         class_start = next(
-            i + 1 for i, line in enumerate(lines)
-            if line.lstrip().startswith("class ")
+            i + 1 for i, line in enumerate(lines) if line.lstrip().startswith("class ")
         )
         return str(path), class_start, len(lines)
 
@@ -875,9 +1062,7 @@ class TestSymmetricEvidenceGate:
         )
         after = before.model_copy()
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert kept == [], (
             "A structural agent emission without agent_evidence must "
@@ -898,9 +1083,7 @@ class TestSymmetricEvidenceGate:
         file_path, class_start, class_end = self._make_class_file(
             tmp_path, "traced.py", source
         )
-        snippet = "\n".join(
-            source.splitlines()[class_start - 1:class_end]
-        )
+        snippet = "\n".join(source.splitlines()[class_start - 1 : class_end])
         before = AIComponent(
             name="TracedLoop",
             component_type=AIComponentType.AGENT,
@@ -921,9 +1104,7 @@ class TestSymmetricEvidenceGate:
         )
         after = before.model_copy()
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert len(kept) == 1
         assert kept[0].name == "TracedLoop"
@@ -966,26 +1147,18 @@ class TestSymmetricEvidenceGate:
         )
         after = before.model_copy()
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert kept == []
 
-    def test_llm_type_flip_without_evidence_is_dropped(
-        self, tmp_path: Path
-    ) -> None:
+    def test_llm_type_flip_without_evidence_is_dropped(self, tmp_path: Path) -> None:
         """If the LLM reclassifies a non-agent component to AGENT but
         the middleware somehow failed to attach evidence, the pipeline
         gate must still drop it.
         """
         from aibom.scan_pipeline import _evidence_gate
 
-        source = (
-            "class Endpoint:\n"
-            "    def run(self, x):\n"
-            "        return x\n"
-        )
+        source = "class Endpoint:\n" "    def run(self, x):\n" "        return x\n"
         file_path, class_start, class_end = self._make_class_file(
             tmp_path, "endpoint.py", source
         )
@@ -999,15 +1172,11 @@ class TestSymmetricEvidenceGate:
             update={"component_type": AIComponentType.AGENT},
         )
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert kept == []
 
-    def test_kb_agent_without_structural_marker_is_kept(
-        self, tmp_path: Path
-    ) -> None:
+    def test_kb_agent_without_structural_marker_is_kept(self, tmp_path: Path) -> None:
         """An AGENT that did not come from the structural scanner and
         was not reclassified by the LLM (type did not change) is left
         alone by the symmetric gate — its authority comes from whichever
@@ -1028,9 +1197,7 @@ class TestSymmetricEvidenceGate:
         )
         after = before.model_copy()
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert len(kept) == 1
         assert kept[0].name == "FrameworkAgent"
@@ -1071,9 +1238,7 @@ class TestSymmetricEvidenceGate:
         )
         after = before.model_copy()
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert kept == [], (
             "Import-only agent candidate without agent_evidence must be "
@@ -1124,9 +1289,7 @@ class TestSymmetricEvidenceGate:
             },
         )
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert kept == [], (
             "Import-only status must be based on the original scanner "
@@ -1151,9 +1314,7 @@ class TestSymmetricEvidenceGate:
         file_path, class_start, class_end = self._make_class_file(
             tmp_path, "deep_agent_loop.py", source
         )
-        snippet = "\n".join(
-            source.splitlines()[class_start - 1:class_end]
-        )
+        snippet = "\n".join(source.splitlines()[class_start - 1 : class_end])
         before = AIComponent(
             name="DeepAgentLoop",
             component_type=AIComponentType.AGENT,
@@ -1162,9 +1323,7 @@ class TestSymmetricEvidenceGate:
             framework="kb_enrichment",
             heuristic_confidence=0.35,
             metadata={
-                "import_statement": (
-                    "from local.deep import DeepAgentLoop"
-                ),
+                "import_statement": ("from local.deep import DeepAgentLoop"),
                 "agent_evidence": {
                     "pattern": "react_loop",
                     "definition_file": file_path,
@@ -1177,9 +1336,7 @@ class TestSymmetricEvidenceGate:
         )
         after = before.model_copy()
 
-        kept = _evidence_gate(
-            [before], [after], scan_paths=[str(tmp_path)]
-        )
+        kept = _evidence_gate([before], [after], scan_paths=[str(tmp_path)])
 
         assert len(kept) == 1
         assert kept[0].name == "DeepAgentLoop"
@@ -1345,27 +1502,26 @@ class TestPipelineEnvPrefixInvariant:
 
     _FORBIDDEN_PREFIXES = ("env_model_", "env_embedding_", "dockerfile_env_")
 
-    def test_dotenv_model_does_not_leak_env_prefix(
-        self, tmp_path: Path
-    ) -> None:
+    def test_dotenv_model_does_not_leak_env_prefix(self, tmp_path: Path) -> None:
         (tmp_path / ".env").write_text(
             "ANTHROPIC_MODEL=claude-sonnet-4-20250514\n"
             "EMBED_MODEL=text-embedding-3-large\n"
         )
         (tmp_path / "app.py").write_text(
-            'import os\nfrom anthropic import Anthropic\n'
-            'client = Anthropic()\n'
-            'resp = client.messages.create(\n'
+            "import os\nfrom anthropic import Anthropic\n"
+            "client = Anthropic()\n"
+            "resp = client.messages.create(\n"
             '    model=os.getenv("ANTHROPIC_MODEL"),\n'
-            '    messages=[]\n'
-            ')\n'
+            "    messages=[]\n"
+            ")\n"
         )
         pipeline = ScanPipeline(scan_paths=[str(tmp_path)])
         result = pipeline.run()
 
         for c in result.components:
             if c.component_type not in (
-                AIComponentType.MODEL, AIComponentType.EMBEDDING,
+                AIComponentType.MODEL,
+                AIComponentType.EMBEDDING,
             ):
                 continue
             if not (isinstance(c.model_name, str) and c.model_name):
@@ -1376,20 +1532,19 @@ class TestPipelineEnvPrefixInvariant:
                     f"name={c.name!r}, model_name={c.model_name!r}"
                 )
 
-    def test_dockerfile_env_model_does_not_leak_prefix(
-        self, tmp_path: Path
-    ) -> None:
+    def test_dockerfile_env_model_does_not_leak_prefix(self, tmp_path: Path) -> None:
         (tmp_path / "Dockerfile").write_text(
             "FROM python:3.11-slim\n"
             "ENV OPENAI_MODEL=gpt-4o\n"
-            "CMD [\"python\", \"app.py\"]\n"
+            'CMD ["python", "app.py"]\n'
         )
         pipeline = ScanPipeline(scan_paths=[str(tmp_path)])
         result = pipeline.run()
 
         for c in result.components:
             if c.component_type not in (
-                AIComponentType.MODEL, AIComponentType.EMBEDDING,
+                AIComponentType.MODEL,
+                AIComponentType.EMBEDDING,
             ):
                 continue
             if not (isinstance(c.model_name, str) and c.model_name):
