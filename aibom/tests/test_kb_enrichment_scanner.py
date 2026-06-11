@@ -944,3 +944,47 @@ class TestLangGraphDependencyAllowlist:
             assert is_known_ai_package(
                 "pypi", pkg
             ), f"{pkg} should be recognised as an AI dependency"
+
+
+class TestGuardrailDetection:
+    """``agentsec.protect(...)`` and guardrail frameworks must be detected."""
+
+    def test_agentsec_protect_call_is_guardrail(self, tmp_path: Path) -> None:
+        from aibom.scanners.kb_enrichment_scanner import _detect_guardrail_calls
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from aidefense.runtime import agentsec\n"
+            "agentsec.protect(config='agentsec.yaml')\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_guardrail_calls(result)
+        guardrails = [c for c in comps if c.component_type == AIComponentType.GUARDRAIL]
+        assert len(guardrails) == 1, (
+            f"expected one guardrail from agentsec.protect(); got "
+            f"{[(c.name, c.component_type) for c in comps]}"
+        )
+        assert guardrails[0].metadata.get("guardrail_protection") is True
+        assert (
+            guardrails[0].metadata.get("call_pattern", "").endswith("agentsec.protect")
+        )
+
+    def test_non_guardrail_call_is_ignored(self, tmp_path: Path) -> None:
+        from aibom.scanners.kb_enrichment_scanner import _detect_guardrail_calls
+
+        src = tmp_path / "app.py"
+        src.write_text(
+            "import logging\n"
+            "logging.getLogger(__name__).info('protect')\n"
+            "some_obj.protect_something()\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_guardrail_calls(result)
+        assert comps == []
+
+    def test_guardrail_framework_imports_mapped(self) -> None:
+        from aibom.scanners.kb_enrichment_scanner import _IMPORT_MODULE_TYPE_MAP
+
+        for mod in ("agentsec", "aidefense", "nemoguardrails", "guardrails"):
+            assert mod in _IMPORT_MODULE_TYPE_MAP
+            assert _IMPORT_MODULE_TYPE_MAP[mod].primary is AIComponentType.GUARDRAIL

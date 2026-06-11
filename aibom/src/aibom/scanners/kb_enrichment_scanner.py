@@ -389,8 +389,13 @@ _IMPORT_MODULE_TYPE_MAP: dict[str, PlatformEntry] = {
     "nemoguardrails": PlatformEntry(_GRD),
     "guardrails": PlatformEntry(_GRD),
     "llm_guard": PlatformEntry(_GRD),
+    "llm_guardrails": PlatformEntry(_GRD),
     "lakera_guard": PlatformEntry(_GRD),
     "rebuff": PlatformEntry(_GRD),
+    "guardrails_ai": PlatformEntry(_GRD),
+    # Cisco AI Defense runtime protection (agentsec).
+    "aidefense": PlatformEntry(_GRD),
+    "agentsec": PlatformEntry(_GRD),
 }
 
 OBSERVABILITY_PLATFORM_TOKENS: frozenset[str] = frozenset(
@@ -887,6 +892,7 @@ class KBEnrichmentScanner(BaseScanner):
                 components.extend(_detect_prompt_kwargs(result))
                 components.extend(_detect_model_kwargs(result))
                 components.extend(_detect_import_based_assets(result))
+                components.extend(_detect_guardrail_calls(result))
 
             for py_file, source in suggestive_files:
                 components.extend(_emit_suggestive_candidates(py_file, source))
@@ -1253,6 +1259,76 @@ def _detect_import_based_assets(
             )
 
     return candidates
+
+
+# Guardrail protection call sites. These are unambiguous: a call to one of
+# these qualified names installs runtime safety/guardrail protection over LLM
+# or MCP traffic, so the call site itself is a guardrail component. Keyed on
+# the ``module.method`` tail so e.g. ``agentsec.protect(...)`` matches whether
+# imported as ``from aidefense.runtime import agentsec`` or ``import agentsec``.
+_GUARDRAIL_CALL_PATTERNS: frozenset[str] = frozenset(
+    {
+        "agentsec.protect",
+        "RailsConfig.from_path",  # NeMo Guardrails
+        "LLMRails",  # NeMo Guardrails
+        "Guard.for_string",  # Guardrails AI
+        "Guard.for_pydantic",  # Guardrails AI
+    }
+)
+
+
+def _detect_guardrail_calls(result: "CodeAnalysisResult") -> list[AIComponent]:
+    """Detect guardrail components from protection call sites.
+
+    The clearest guardrail signal is a call that installs runtime protection,
+    e.g. Cisco AI Defense's ``agentsec.protect(...)`` or a NeMo Guardrails /
+    Guardrails AI entry point. Import-based detection alone misses these when
+    the protection is wired through a call rather than a class import, and the
+    call site carries the precise file/line evidence.
+    """
+    from ..structures import CodeAnalysisResult as _CAR  # noqa: F811
+
+    if not isinstance(result, _CAR):
+        return []
+
+    components: list[AIComponent] = []
+    seen: set[tuple[str, int]] = set()
+
+    all_calls = [(c.qualified_name or "", c.line_number) for c in result.calls]
+    all_calls += [
+        (a.call.qualified_name or "", a.line_number) for a in result.assignments
+    ]
+
+    for qn, line in all_calls:
+        if not qn:
+            continue
+        # Match either the full ``module.method`` tail or a bare class name.
+        tail2 = ".".join(qn.split(".")[-2:]) if "." in qn else qn
+        short = qn.rsplit(".", 1)[-1] if "." in qn else qn
+        if tail2 not in _GUARDRAIL_CALL_PATTERNS and short not in (
+            _GUARDRAIL_CALL_PATTERNS
+        ):
+            continue
+
+        key = (result.file_path, line)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        framework = qn.split(".")[0] if "." in qn else qn
+        components.append(
+            AIComponent(
+                name=tail2 if tail2 in _GUARDRAIL_CALL_PATTERNS else short,
+                component_type=AIComponentType.GUARDRAIL,
+                file_path=result.file_path,
+                line_number=line,
+                framework=framework,
+                detection_source=DetectionSource.CODE_ANALYSIS,
+                metadata={"call_pattern": qn, "guardrail_protection": True},
+            )
+        )
+
+    return components
 
 
 _TOOL_KWARG_NAMES: frozenset[str] = frozenset(
