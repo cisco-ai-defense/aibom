@@ -57,6 +57,19 @@ _RE_MULTI_MCP_CLIENT = re.compile(r"\bMultiServerMCPClient\s*\(")
 _RE_LANGCHAIN_MCP_ADAPTERS = re.compile(r"from\s+langchain_mcp_adapters\b")
 _RE_CLIENT_SESSION = re.compile(r"\bClientSession\s*\(")
 _RE_MCP_CLIENT_MODULE = re.compile(r"\bmcp\.client\b")
+# MCP Python SDK transport factories. The modern SDK idiom opens a connection
+# with one of these and then wraps the streams in a ClientSession, e.g.
+# ``async with streamablehttp_client(url) as (r, w, _): ClientSession(r, w)``.
+_RE_STREAMABLEHTTP_CLIENT = re.compile(r"\bstreamablehttp_client\s*\(")
+_RE_SSE_CLIENT = re.compile(r"\bsse_client\s*\(")
+_RE_STDIO_CLIENT = re.compile(r"\bstdio_client\s*\(")
+# Google ADK MCP integration: ``McpToolset(connection_params=...)`` with a
+# ``StreamableHTTPConnectionParams`` / ``SseConnectionParams`` / stdio params.
+_RE_ADK_MCP_TOOLSET = re.compile(r"\bMcpToolset\s*\(")
+_RE_ADK_MCP_CONN_PARAMS = re.compile(
+    r"\b(?:StreamableHTTPConnectionParams|SseConnectionParams|"
+    r"StdioConnectionParams|StdioServerParameters)\s*\("
+)
 
 
 def _is_mcp_config_path(path: Path) -> bool:
@@ -72,9 +85,7 @@ def _load_exclude_spec(patterns: list[str]) -> Optional[PathSpec]:
     return PathSpec.from_lines("gitwildmatch", patterns)
 
 
-def _is_excluded(
-    file_path: Path, root: Path, spec: Optional[PathSpec]
-) -> bool:
+def _is_excluded(file_path: Path, root: Path, spec: Optional[PathSpec]) -> bool:
     if not spec:
         return False
     try:
@@ -221,9 +232,7 @@ def _components_from_python(path: Path) -> list[AIComponent]:
         constructor_hits.append(("FastMCP", _first_match_line(_RE_FASTMCP, text)))
 
     m_srv_call = _RE_SERVER_CALL.search(text)
-    if m_srv_call and (
-        _RE_FROM_MCP_SERVER_IMPORT.search(text) or "mcp.server" in text
-    ):
+    if m_srv_call and (_RE_FROM_MCP_SERVER_IMPORT.search(text) or "mcp.server" in text):
         if not constructor_name:
             m_srv_name = _RE_SERVER_CALL_NAME.search(text)
             if m_srv_name:
@@ -286,6 +295,11 @@ def _components_from_python(path: Path) -> list[AIComponent]:
     for label, pat in (
         ("MCPClient", _RE_MCP_CLIENT),
         ("MultiServerMCPClient", _RE_MULTI_MCP_CLIENT),
+        ("streamablehttp_client", _RE_STREAMABLEHTTP_CLIENT),
+        ("sse_client", _RE_SSE_CLIENT),
+        ("stdio_client", _RE_STDIO_CLIENT),
+        ("McpToolset", _RE_ADK_MCP_TOOLSET),
+        ("mcp_connection_params", _RE_ADK_MCP_CONN_PARAMS),
     ):
         m = pat.search(text)
         if m:
@@ -295,8 +309,17 @@ def _components_from_python(path: Path) -> list[AIComponent]:
         client_hits.append(
             ("langchain_mcp_adapters", _line_for_match(text, m_lc.start()))
         )
+    # ``ClientSession`` is a generic name, so it only counts as an MCP client
+    # when the file also references the MCP client module *or* opens one of the
+    # MCP SDK transport clients above (the modern Streamable-HTTP idiom imports
+    # ``ClientSession`` from ``mcp`` rather than touching ``mcp.client``).
     m_cs = _RE_CLIENT_SESSION.search(text)
-    if m_cs and _RE_MCP_CLIENT_MODULE.search(text):
+    has_mcp_transport = bool(
+        _RE_STREAMABLEHTTP_CLIENT.search(text)
+        or _RE_SSE_CLIENT.search(text)
+        or _RE_STDIO_CLIENT.search(text)
+    )
+    if m_cs and (_RE_MCP_CLIENT_MODULE.search(text) or m_imp or has_mcp_transport):
         client_hits.append(("ClientSession", _line_for_match(text, m_cs.start())))
     if client_hits:
         client_hits.sort(key=lambda x: x[1])
@@ -331,9 +354,7 @@ def _run_optional_yara_on_configs(config_paths: list[str]) -> None:
                     analyzers=[AnalyzerEnum.YARA],
                 )
             except Exception:
-                _LOGGER.debug(
-                    "mcpscanner YARA scan failed for %s", cfg, exc_info=True
-                )
+                _LOGGER.debug("mcpscanner YARA scan failed for %s", cfg, exc_info=True)
 
     try:
         asyncio.run(_scan_all())
