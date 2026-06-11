@@ -36,6 +36,7 @@ in the loop, so the CLI is the source of truth.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,11 @@ SOURCE_KIND_CONTAINER_IMAGE = "container_image"
 SOURCE_KIND_LOCAL_PATH = "local-path"
 
 _GIT_TIMEOUT_S = 5
+
+# scp-style git remote, e.g. ``git@github.com:org/repo.git``.
+_SCP_LIKE_RE = re.compile(r"^[^/@]+@([^:/]+):(.+)$")
+# ``scheme://[user[:pass]@]host[:port]/path`` for git remotes.
+_URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://(?P<rest>.*)$")
 
 
 def _is_git_working_tree(path: Path) -> bool:
@@ -87,3 +93,112 @@ def detect_source_kind(
         return SOURCE_KIND_GIT
 
     return SOURCE_KIND_LOCAL_PATH
+
+
+def canonicalize_git_remote(remote_url: str) -> str:
+    """Canonicalize a git remote URL to one stable ``host/path`` string.
+
+    The same repository can be expressed many ways
+    (``git@github.com:org/repo.git``, ``https://github.com/org/repo``, with or
+    without a trailing ``.git``, mixed host casing, embedded credentials, a
+    trailing slash). A downstream backend derives a deterministic asset
+    identity from this string, so every equivalent spelling must collapse to a
+    single canonical form.
+
+    Canonicalization: drop the scheme, strip any ``user[:pass]@`` credentials,
+    lowercase the host, drop a ``:port``, normalize path separators to ``/``,
+    remove a trailing ``.git``, and drop a trailing slash. The result is
+    ``host/path`` lowercased on the host only (paths stay case-sensitive).
+    """
+    if not remote_url:
+        return ""
+
+    raw = remote_url.strip()
+    host = ""
+    path = ""
+
+    scp = _SCP_LIKE_RE.match(raw)
+    url = _URL_RE.match(raw)
+    if scp:
+        host = scp.group(1)
+        path = scp.group(2)
+    elif url:
+        rest = url.group("rest")
+        # Strip credentials.
+        if "@" in rest:
+            rest = rest.rsplit("@", 1)[1]
+        if "/" in rest:
+            authority, path = rest.split("/", 1)
+        else:
+            authority, path = rest, ""
+        host = authority
+    else:
+        # Bare ``host:path`` or ``host/path`` (no scheme, not scp/user form).
+        if ":" in raw and "/" not in raw.split(":", 1)[0]:
+            host, path = raw.split(":", 1)
+        elif "/" in raw:
+            host, path = raw.split("/", 1)
+        else:
+            host, path = raw, ""
+
+    # Drop a :port from the host.
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    host = host.lower()
+
+    path = path.replace("\\", "/").strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+
+    return f"{host}/{path}" if path else host
+
+
+def canonicalize_image_ref(image_ref: str) -> str:
+    """Canonicalize a container image reference to a stable registry path.
+
+    Strips a digest (``@sha256:...``) and a tag (``:tag``), normalizes the
+    registry host to lowercase, and applies Docker Hub defaults
+    (``library/`` for single-segment official images; an implicit
+    ``docker.io`` registry). The version (tag/digest) is captured separately as
+    ``source_ref_version`` and intentionally not part of the canonical ref.
+    """
+    if not image_ref:
+        return ""
+
+    ref = image_ref.strip()
+
+    # Drop digest.
+    if "@" in ref:
+        ref = ref.split("@", 1)[0]
+
+    # Split off an optional registry host (first segment containing '.' or
+    # ':' or equal to 'localhost').
+    first, sep, remainder = ref.partition("/")
+    if sep and ("." in first or ":" in first or first == "localhost"):
+        registry = first.lower()
+        repo = remainder
+    else:
+        registry = "docker.io"
+        repo = ref
+
+    # Drop a tag from the final path segment (but not from a registry port).
+    if ":" in repo:
+        repo_head, _, repo_tag = repo.rpartition(":")
+        # A ':' that is part of the path (tag) has no '/' after it.
+        if "/" not in repo_tag:
+            repo = repo_head
+
+    repo = repo.replace("\\", "/").strip("/")
+
+    # Docker Hub official images get the implicit ``library/`` namespace.
+    if registry == "docker.io" and "/" not in repo and repo:
+        repo = f"library/{repo}"
+
+    return f"{registry}/{repo}" if repo else registry
+
+
+def canonicalize_source_ref(source_ref: str, source_kind: str) -> str:
+    """Canonicalize a source reference according to its ``source_kind``."""
+    if source_kind == SOURCE_KIND_CONTAINER_IMAGE:
+        return canonicalize_image_ref(source_ref)
+    return canonicalize_git_remote(source_ref)
