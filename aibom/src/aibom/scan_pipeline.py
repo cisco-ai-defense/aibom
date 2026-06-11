@@ -964,6 +964,60 @@ def _rel_endpoint_key(instance_id: str, name: str) -> str:
     return ""
 
 
+def _backfill_relationship_instance_ids(
+    relationships: list[ComponentRelationship],
+    components: list[AIComponent],
+) -> list[ComponentRelationship]:
+    """Deterministically populate blank endpoint ``instance_id``s on edges.
+
+    The agentic/LLM path emits relationships with empty
+    ``source_instance_id``/``target_instance_id`` even though every component
+    carries a stable, deterministic ``instance_id``. Downstream consumers that
+    link edges to components by id therefore drop those edges entirely.
+
+    This pass resolves a blank endpoint by matching its ``*_name`` against the
+    final component set, using the same rule as the deterministic resolver:
+    assign the component's ``instance_id`` only when the name resolves to
+    exactly one component (or when a model-name alias resolves uniquely).
+    Ambiguous or unresolvable endpoints are left blank — no guessed ids, so
+    the existing safe name-fallback behaviour is preserved. Resolution is
+    fully deterministic and never depends on LLM output.
+    """
+    by_name: dict[str, list[AIComponent]] = {}
+    for comp in components:
+        if comp.name:
+            by_name.setdefault(comp.name, []).append(comp)
+        if comp.model_name and comp.model_name != comp.name:
+            by_name.setdefault(comp.model_name, []).append(comp)
+
+    def _resolve(name: str) -> str | None:
+        candidates = by_name.get(name)
+        if candidates and len(candidates) == 1:
+            return candidates[0].instance_id
+        return None
+
+    result: list[ComponentRelationship] = []
+    filled = 0
+    for rel in relationships:
+        updates: dict[str, Any] = {}
+        if not rel.source_instance_id and rel.source_name:
+            resolved = _resolve(rel.source_name)
+            if resolved:
+                updates["source_instance_id"] = resolved
+        if not rel.target_instance_id and rel.target_name:
+            resolved = _resolve(rel.target_name)
+            if resolved:
+                updates["target_instance_id"] = resolved
+        if updates:
+            filled += 1
+            result.append(rel.model_copy(update=updates))
+        else:
+            result.append(rel)
+    if filled:
+        _LOGGER.info("Backfilled endpoint instance_ids on %d relationship(s)", filled)
+    return result
+
+
 def _resolve_relationship_types(
     relationships: list[ComponentRelationship],
     components: list[AIComponent],
@@ -1426,6 +1480,7 @@ class ScanPipeline:
             all_rels = relationships + agentic_rels
             enriched = _remove_unresolved_embedders(enriched, all_rels)
             enriched = _drop_env_placeholder_identifiers(enriched)
+            all_rels = _backfill_relationship_instance_ids(all_rels, enriched)
             self._agentic_token_usage = agentic_token_usage
             return enriched, all_rels, agentic_flags
 

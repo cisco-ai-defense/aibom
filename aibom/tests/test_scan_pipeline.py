@@ -709,6 +709,97 @@ class TestProtectedDependencies:
         assert [c.name for c in result] == ["strands-agents"]
 
 
+class TestBackfillRelationshipInstanceIds:
+    """LLM-emitted edges with blank endpoint ids are backfilled deterministically."""
+
+    def _model(self, name: str, path: str, line: int) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=AIComponentType.MODEL,
+            file_path=path,
+            line_number=line,
+            model_name=name,
+        )
+
+    def _agent(self, name: str, path: str, line: int) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=AIComponentType.AGENT,
+            file_path=path,
+            line_number=line,
+        )
+
+    def test_unique_name_endpoints_are_resolved(self):
+        from aibom.models import ComponentRelationship, RelationshipType
+        from aibom.scan_pipeline import _backfill_relationship_instance_ids
+
+        agent = self._agent("agent", "lab/a.py", 5)
+        model = self._model("claude-3-5-haiku", "lab/a.py", 10)
+        rel = ComponentRelationship(
+            source_instance_id="",
+            target_instance_id="",
+            source_name="agent",
+            target_name="claude-3-5-haiku",
+            relationship_type=RelationshipType.USES_MODEL,
+        )
+        out = _backfill_relationship_instance_ids([rel], [agent, model])
+        assert out[0].source_instance_id == agent.instance_id
+        assert out[0].target_instance_id == model.instance_id
+
+    def test_ambiguous_name_left_blank(self):
+        from aibom.models import ComponentRelationship, RelationshipType
+        from aibom.scan_pipeline import _backfill_relationship_instance_ids
+
+        # Two agents named "agent" in different files -> ambiguous.
+        a1 = self._agent("agent", "lab/a.py", 5)
+        a2 = self._agent("agent", "lab/b.py", 5)
+        model = self._model("gpt-4o", "lab/a.py", 10)
+        rel = ComponentRelationship(
+            source_instance_id="",
+            target_instance_id="",
+            source_name="agent",
+            target_name="gpt-4o",
+            relationship_type=RelationshipType.USES_MODEL,
+        )
+        out = _backfill_relationship_instance_ids([rel], [a1, a2, model])
+        # Ambiguous source stays blank; unique target is resolved.
+        assert out[0].source_instance_id == ""
+        assert out[0].target_instance_id == model.instance_id
+
+    def test_existing_ids_preserved(self):
+        from aibom.models import ComponentRelationship, RelationshipType
+        from aibom.scan_pipeline import _backfill_relationship_instance_ids
+
+        agent = self._agent("agent", "lab/a.py", 5)
+        model = self._model("gpt-4o", "lab/a.py", 10)
+        rel = ComponentRelationship(
+            source_instance_id="preset-src",
+            target_instance_id="preset-tgt",
+            source_name="agent",
+            target_name="gpt-4o",
+            relationship_type=RelationshipType.USES_MODEL,
+        )
+        out = _backfill_relationship_instance_ids([rel], [agent, model])
+        assert out[0].source_instance_id == "preset-src"
+        assert out[0].target_instance_id == "preset-tgt"
+
+    def test_unknown_name_left_blank(self):
+        from aibom.models import ComponentRelationship, RelationshipType
+        from aibom.scan_pipeline import _backfill_relationship_instance_ids
+
+        agent = self._agent("agent", "lab/a.py", 5)
+        rel = ComponentRelationship(
+            source_instance_id="",
+            target_instance_id="",
+            source_name="agent",
+            target_name="model-that-was-pruned",
+            relationship_type=RelationshipType.USES_MODEL,
+        )
+        out = _backfill_relationship_instance_ids([rel], [agent])
+        assert out[0].source_instance_id == agent.instance_id
+        assert out[0].target_instance_id == ""
+
+
 class TestDefaultBomScope:
     def test_stage_assemble_excludes_test_only_components(self):
         component = AIComponent(
