@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cisco-aibom"
-version = "1.0.0rc4"
+version = "1.0.0"
 description = "A tool to generate an AI BOM from source code."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -69,8 +69,13 @@ analysis = [
     "tree-sitter-c-sharp>=0.23.0",
 ]
 security = [
-    "cisco-ai-mcp-scanner>=4.3.0",
-    "cisco-ai-skill-scanner>=2.0.0",
+    # Floors raised so the transitive ``litellm`` resolves to >=1.83.7, which
+    # is past the malicious 1.82.7/1.82.8 supply-chain releases and the
+    # proxy-side SQL-injection / OIDC auth-bypass criticals. The AI BOM CLI
+    # never runs the litellm proxy, but these floors keep dependency audits
+    # clean on the ``security``/``all`` installs.
+    "cisco-ai-mcp-scanner>=4.7.3",
+    "cisco-ai-skill-scanner>=2.0.11",
 ]
 agentic = [
     "deepagents>=0.4.12",
