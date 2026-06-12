@@ -1038,11 +1038,12 @@ class TestDefaultBomScope:
 
         assert [c.name for c in components] == ["gpt-4o-mini"]
 
-    def test_stage_assemble_excludes_fixture_components(self):
+    def test_stage_assemble_excludes_fixture_components_under_test_root(self):
+        # A fixtures/ dir nested under a test root is genuine test scaffolding.
         component = AIComponent(
             name="FakePrompt",
             component_type=AIComponentType.PROMPT,
-            file_path="repo/fixtures/sample_prompt.py",
+            file_path="repo/tests/fixtures/sample_prompt.py",
             line_number=4,
             heuristic_confidence=0.8,
         )
@@ -1052,6 +1053,23 @@ class TestDefaultBomScope:
 
         assert components == []
         assert agentic_count == 0
+
+    def test_stage_assemble_keeps_top_level_fixtures_production_component(self):
+        # A bare top-level fixtures/ dir with no other test signal is NOT
+        # automatically test-only — it may be a production data loader. The
+        # over-broad ``fixtures`` segment previously dropped this asset.
+        component = AIComponent(
+            name="gpt-4o-mini",
+            component_type=AIComponentType.MODEL,
+            file_path="repo/fixtures/prompt_loader.py",
+            line_number=4,
+            heuristic_confidence=0.8,
+        )
+        pipeline = ScanPipeline(scan_paths=["/tmp"])
+
+        components, _ = pipeline._stage_assemble([component])
+
+        assert [c.name for c in components] == ["gpt-4o-mini"]
 
     def test_stage_assemble_keeps_components_with_production_evidence(self):
         prod = AIComponent(
@@ -1172,6 +1190,58 @@ class TestDefaultBomScope:
 
         assert [c.name for c in result.components] == ["gpt-4o"]
         assert result.relationships == [kept_rel]
+
+
+class TestIsTestFile:
+    """``_is_test_file`` must classify genuine test files as test-only without
+    misclassifying production files that merely live under a ``spec``,
+    ``testing``, or ``fixtures`` directory."""
+
+    def _f(self, p: str) -> bool:
+        from aibom.scan_pipeline import _is_test_file
+
+        return _is_test_file(p)
+
+    # Unambiguous test markers — standalone, still test-only.
+    def test_tests_dir_is_test(self):
+        assert self._f("repo/tests/test_agent.py") is True
+
+    def test_dunder_tests_dir_is_test(self):
+        assert self._f("repo/__tests__/agent.py") is True
+
+    def test_testdata_dir_is_test(self):
+        assert self._f("repo/testdata/agent.py") is True
+        assert self._f("repo/test_data/agent.py") is True
+
+    def test_test_prefix_filename_is_test(self):
+        assert self._f("repo/src/test_router.py") is True
+
+    def test_test_suffix_filename_is_test(self):
+        assert self._f("repo/src/router_test.py") is True
+
+    # Ambiguous segments — only test-only WITH a co-located test signal.
+    def test_fixtures_under_test_root_is_test(self):
+        assert self._f("repo/tests/fixtures/sample.py") is True
+
+    def test_spec_with_test_filename_is_test(self):
+        assert self._f("repo/spec/test_contract.py") is True
+
+    def test_testing_under_test_root_is_test(self):
+        assert self._f("repo/test/testing/helpers.py") is True
+
+    # Ambiguous segments alone in a production tree — NOT test-only.
+    def test_top_level_fixtures_production_is_not_test(self):
+        assert self._f("repo/fixtures/prompt_loader.py") is False
+
+    def test_top_level_spec_production_is_not_test(self):
+        assert self._f("repo/spec/openapi_models.py") is False
+
+    def test_top_level_testing_utility_is_not_test(self):
+        assert self._f("repo/src/testing/harness.py") is False
+
+    # Regression: a production file with no test signal stays production.
+    def test_plain_production_file_is_not_test(self):
+        assert self._f("repo/src/app/service.py") is False
 
 
 class TestDependencyPolicyScope:

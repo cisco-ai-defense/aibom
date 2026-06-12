@@ -522,30 +522,65 @@ def _evidence_gate(
     return result
 
 
+# Path segments that unambiguously denote test-only code on their own.
 _TEST_PATH_SEGMENTS: frozenset[str] = frozenset(
     {
         "tests",
         "test",
         "__tests__",
-        "spec",
-        "testing",
         "testdata",
         "test_data",
+    }
+)
+
+# Segments that are commonly used for test scaffolding but ALSO occur in
+# production trees (an OpenAPI ``spec/``, a shipped ``testing`` utility
+# package, a ``fixtures/`` data loader). These count as test-only only when
+# accompanied by another test signal — an unambiguous test directory ancestor
+# or a test-style filename — so a production asset living under one of these
+# directories is not silently dropped from the BOM.
+_AMBIGUOUS_TEST_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "spec",
+        "testing",
         "fixtures",
     }
 )
 
 
+def _has_test_filename(path: "Path") -> bool:
+    """True when the filename itself follows a test naming convention."""
+    stem = path.stem.lower()
+    return stem.startswith("test_") or stem.endswith("_test")
+
+
 def _is_test_file(file_path: str) -> bool:
-    """Return True when the file is clearly test-only by path or filename."""
+    """Return True when the file is clearly test-only by path or filename.
+
+    Unambiguous test directories (``tests``, ``__tests__``, ``testdata`` …)
+    and test-style filenames (``test_*`` / ``*_test``) classify on their own.
+    The ambiguous segments (``spec``/``testing``/``fixtures``) classify only
+    when a second test signal is present, so production code under those
+    directory names is not misclassified as test-only.
+    """
     from pathlib import Path
 
     path = Path(file_path)
-    if any(seg in _TEST_PATH_SEGMENTS for seg in path.parts):
+    parts = set(path.parts)
+
+    if parts & _TEST_PATH_SEGMENTS:
         return True
 
-    stem = path.stem.lower()
-    return stem.startswith("test_") or stem.endswith("_test")
+    has_test_name = _has_test_filename(path)
+    if has_test_name:
+        return True
+
+    if parts & _AMBIGUOUS_TEST_PATH_SEGMENTS:
+        # Only test-only when corroborated by an unambiguous test directory
+        # ancestor (the filename signal is already handled above).
+        return bool(parts & _TEST_PATH_SEGMENTS)
+
+    return False
 
 
 def _has_instantiation_marker(c: "AIComponent") -> bool:
