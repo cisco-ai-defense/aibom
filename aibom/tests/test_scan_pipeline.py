@@ -633,6 +633,184 @@ class TestPropagateRemovals:
             f"{[(c.name, c.metadata.get('import_statement')) for c in result]}"
         )
 
+    def test_test_file_removal_does_not_kill_production_sibling(self):
+        """Regression: the LLM pruning a guardrail call-site in a *test* file
+        must NOT cascade to the production call-site that shares the same
+        canonical consolidation key.
+
+        ``agentsec.protect(...)`` appears once in production ``agent.py`` and
+        many times across ``tests/`` (mode-handling unit tests). Both are
+        call-site emissions (``call_pattern`` set), so both are "strong" under
+        the import-only rule. ``_consolidation_key`` lowercases the name and
+        ignores the file, collapsing them to ``("agentsec.protect",
+        "guardrail")``. When the agent removed a test-file instance as test
+        scaffolding, the strong removal cascaded and wiped the production
+        guardrail — observed end-to-end where the agentsec example tree
+        produced 0 guardrails while a prod-only copy produced the guardrail.
+        """
+        from aibom.scan_pipeline import _propagate_removals
+
+        prod = AIComponent(
+            name="agentsec.protect",
+            component_type=AIComponentType.GUARDRAIL,
+            file_path="langchain-agent/agent.py",
+            line_number=77,
+            metadata={"call_pattern": "aidefense.runtime.agentsec.protect"},
+        )
+        test_use = AIComponent(
+            name="agentsec.protect",
+            component_type=AIComponentType.GUARDRAIL,
+            file_path="langchain-agent/tests/unit/test_langchain_example.py",
+            line_number=210,
+            metadata={"call_pattern": "aidefense.runtime.agentsec.protect"},
+        )
+
+        result = _propagate_removals(
+            sent=[prod, test_use],
+            received=[prod],
+            pre_fanout_removed_ids={test_use.instance_id},
+        )
+
+        names = [(c.name, c.file_path) for c in result]
+        assert prod.instance_id in {c.instance_id for c in result}, (
+            "production agentsec.protect guardrail must survive when only a "
+            f"test-file sibling was removed; got kept: {names}"
+        )
+
+    def test_production_removal_still_cascades_to_test_sibling(self):
+        """A production-scope removal must still take out test-scope siblings
+        sharing the canonical key — the original cascade intent is preserved
+        for the production→all direction."""
+        from aibom.scan_pipeline import _propagate_removals
+
+        prod = AIComponent(
+            name="FakeAgent",
+            component_type=AIComponentType.AGENT,
+            file_path="src/app.py",
+            line_number=10,
+            metadata={"call_pattern": "pkg.FakeAgent"},
+        )
+        test_use = AIComponent(
+            name="FakeAgent",
+            component_type=AIComponentType.AGENT,
+            file_path="tests/test_app.py",
+            line_number=5,
+            metadata={"call_pattern": "pkg.FakeAgent"},
+        )
+
+        result = _propagate_removals(
+            sent=[prod, test_use],
+            received=[test_use],
+            pre_fanout_removed_ids={prod.instance_id},
+        )
+
+        assert result == [], (
+            "a production-scope removal must cascade to the test-scope "
+            f"sibling; got kept: {[(c.name, c.file_path) for c in result]}"
+        )
+
+    def test_test_removal_still_cascades_to_other_test_sibling(self):
+        """A test-scope removal still cascades to *other test-scope* siblings
+        (one rejection is enough for test scaffolding), just not to
+        production."""
+        from aibom.scan_pipeline import _propagate_removals
+
+        test_a = AIComponent(
+            name="agentsec.protect",
+            component_type=AIComponentType.GUARDRAIL,
+            file_path="tests/unit/test_a.py",
+            line_number=10,
+            metadata={"call_pattern": "aidefense.runtime.agentsec.protect"},
+        )
+        test_b = AIComponent(
+            name="agentsec.protect",
+            component_type=AIComponentType.GUARDRAIL,
+            file_path="tests/unit/test_b.py",
+            line_number=20,
+            metadata={"call_pattern": "aidefense.runtime.agentsec.protect"},
+        )
+
+        result = _propagate_removals(
+            sent=[test_a, test_b],
+            received=[test_b],
+            pre_fanout_removed_ids={test_a.instance_id},
+        )
+
+        assert result == [], (
+            "a test-scope removal should cascade to other test-scope "
+            f"siblings; got kept: {[(c.name, c.file_path) for c in result]}"
+        )
+
+    def test_test_file_import_only_removal_does_not_kill_production_import(self):
+        """A removed *test-file* import-only line must not cascade to a
+        *production* import-only sibling.
+
+        Removal reach is the intersection of evidence-strength (import-only →
+        only other imports) AND scope (test → only other test files). A
+        bare ``from X import Y`` pruned in a unit test is the weakest possible
+        signal and must not delete the production import of the same symbol.
+        """
+        from aibom.scan_pipeline import _propagate_removals
+
+        test_import = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="tests/unit/test_app.py",
+            line_number=2,
+            metadata={"import_statement": "from strands import Agent"},
+        )
+        prod_import = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="src/app.py",
+            line_number=2,
+            metadata={"import_statement": "from strands import Agent"},
+        )
+
+        result = _propagate_removals(
+            sent=[test_import, prod_import],
+            received=[prod_import],
+            pre_fanout_removed_ids={test_import.instance_id},
+        )
+
+        assert prod_import.instance_id in {c.instance_id for c in result}, (
+            "production import-only sibling must survive when only a "
+            "test-file import-only line was removed; got kept: "
+            f"{[(c.name, c.file_path) for c in result]}"
+        )
+
+    def test_production_import_only_removal_still_cascades_to_all_imports(self):
+        """Guard: a *production* import-only removal still cascades to all
+        import-only siblings (the original strands weak-cascade), test or
+        production."""
+        from aibom.scan_pipeline import _propagate_removals
+
+        prod_import = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="src/a.py",
+            line_number=2,
+            metadata={"import_statement": "from strands import Agent"},
+        )
+        other_import = AIComponent(
+            name="Agent",
+            component_type=AIComponentType.AGENT,
+            file_path="src/b.py",
+            line_number=3,
+            metadata={"import_statement": "from strands import Agent"},
+        )
+
+        result = _propagate_removals(
+            sent=[prod_import, other_import],
+            received=[other_import],
+            pre_fanout_removed_ids={prod_import.instance_id},
+        )
+
+        assert result == [], (
+            "a production import-only removal should still cascade to other "
+            f"import-only siblings; got kept: {[c.file_path for c in result]}"
+        )
+
 
 class TestProtectedDependencies:
     """Recognized AI dependencies are deterministic manifest facts and must

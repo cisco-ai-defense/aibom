@@ -283,8 +283,14 @@ def _propagate_removals(
     pre_fanout_removed_ids: set[str] | None = None,
 ) -> list["AIComponent"]:
     """If the agent removed ANY instance of (name, type), remove ALL — with
-    one asymmetry: import-only removals are *weak* and only cascade to
-    other import-only siblings.
+    two asymmetries that *compose*: (1) import-only removals are *weak* and
+    only cascade to other import-only siblings; (2) removals of a *test-file*
+    instance are *test-scoped* and only cascade to other test-file siblings,
+    never to a production sibling sharing the same canonical key. A removal's
+    reach is the intersection of these restrictions, so e.g. a test-file
+    import-only removal cascades only to siblings that are *both* import-only
+    *and* in test files. An unrestricted production call-site removal cascades
+    to all siblings, as before.
 
     The agent processes each instance independently and sometimes makes
     inconsistent decisions (removes the usage at line 595 but keeps the
@@ -321,8 +327,18 @@ def _propagate_removals(
     if not removed_ids:
         return received
 
-    strong_keys: set[tuple] = set()
-    weak_keys: set[tuple] = set()
+    # For each consolidation key, record how *restricted* its removal cascade
+    # is. A removal's reach is the intersection of two independent axes:
+    #   * import-only ("weak"): may only cascade to other import-only siblings
+    #     (an import alone is not evidence the usage-line is invalid);
+    #   * test-file ("test-scoped"): may only cascade to other test-file
+    #     siblings (pruning a test artifact must not delete a production one).
+    # A production call-site removal is unrestricted (cascades to all). When
+    # the SAME key is removed from multiple instances, the cascade takes the
+    # LEAST restrictive removal seen (e.g. a production call-site removal
+    # overrides a test-file one for that key).
+    restrict_import: dict[tuple, bool] = {}
+    restrict_test: dict[tuple, bool] = {}
     for c in sent:
         if c.instance_id not in removed_ids:
             continue
@@ -331,11 +347,15 @@ def _propagate_removals(
         if _is_protected_dependency(c):
             continue
         key = _consolidation_key(c)
-        if _is_import_only_candidate(c):
-            weak_keys.add(key)
+        weak = _is_import_only_candidate(c)
+        test = _is_test_file(c.file_path)
+        if key in restrict_import:
+            restrict_import[key] = restrict_import[key] and weak
+            restrict_test[key] = restrict_test[key] and test
         else:
-            strong_keys.add(key)
-    if not strong_keys and not weak_keys:
+            restrict_import[key] = weak
+            restrict_test[key] = test
+    if not restrict_import:
         return received
 
     lookup_pool = all_candidates if all_candidates is not None else received
@@ -344,20 +364,30 @@ def _propagate_removals(
         if _is_protected_dependency(c):
             continue
         key = _consolidation_key(c)
-        if key in strong_keys:
-            drop_ids.add(c.instance_id)
-        elif key in weak_keys and _is_import_only_candidate(c):
-            drop_ids.add(c.instance_id)
+        if key not in restrict_import:
+            continue
+        # Drop only if the sibling satisfies every restriction the removal
+        # carries: an import-only-restricted removal drops only import-only
+        # siblings; a test-scoped-restricted removal drops only test-file
+        # siblings.
+        if restrict_import[key] and not _is_import_only_candidate(c):
+            continue
+        if restrict_test[key] and not _is_test_file(c.file_path):
+            continue
+        drop_ids.add(c.instance_id)
 
     result = [c for c in lookup_pool if c.instance_id not in drop_ids]
     dropped = len(lookup_pool) - len(result)
     if dropped:
+        weak_n = sum(1 for v in restrict_import.values() if v)
+        test_n = sum(1 for v in restrict_test.values() if v)
         _LOGGER.info(
             "Removal propagation: dropped %d additional component(s) "
-            "(%d strong key(s), %d weak import-only key(s))",
+            "(%d key(s); %d import-only-restricted, %d test-scoped)",
             dropped,
-            len(strong_keys),
-            len(weak_keys),
+            len(restrict_import),
+            weak_n,
+            test_n,
         )
     return result
 
