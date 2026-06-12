@@ -23,9 +23,30 @@ from __future__ import annotations
 
 import importlib
 import logging
+import re
 from typing import Any
 
 _logger = logging.getLogger(__name__)
+
+# OpenAI reasoning-class models reject ``max_tokens`` (they require
+# ``max_completion_tokens``) and reject a non-default ``temperature``. Matches
+# the o-series (o1, o3, o4, …) and gpt-5.x reasoning families by the leaf model
+# id (after any ``provider/`` prefix and any date/version suffix).
+_REASONING_MODEL_RE = re.compile(
+    r"^(?:o\d+(?:-|$)|gpt-5)",
+    re.IGNORECASE,
+)
+
+
+def _is_reasoning_model(model_id: str) -> bool:
+    """True for OpenAI reasoning-class models (o-series, gpt-5.x).
+
+    These models do not accept ``max_tokens`` or a custom ``temperature``.
+    Detection is on the leaf model id with any ``provider/`` prefix stripped.
+    """
+    leaf = model_id.rsplit("/", 1)[-1].strip()
+    return bool(_REASONING_MODEL_RE.match(leaf))
+
 
 try:
     from langchain.chat_models import init_chat_model
@@ -33,11 +54,11 @@ except ImportError:
     init_chat_model = None  # agentic extras not installed
 
 _PROVIDER_IMPORT_HINTS: dict[str, tuple[str, str]] = {
-    "openai": ("langchain_openai", 'cisco-aibom[agentic,llm-openai]'),
-    "azure_openai": ("langchain_openai", 'cisco-aibom[agentic,llm-openai]'),
-    "bedrock": ("langchain_aws", 'cisco-aibom[agentic,llm-aws]'),
-    "anthropic": ("langchain_anthropic", 'cisco-aibom[agentic,llm-anthropic]'),
-    "google_genai": ("langchain_google_genai", 'cisco-aibom[agentic,llm-google]'),
+    "openai": ("langchain_openai", "cisco-aibom[agentic,llm-openai]"),
+    "azure_openai": ("langchain_openai", "cisco-aibom[agentic,llm-openai]"),
+    "bedrock": ("langchain_aws", "cisco-aibom[agentic,llm-aws]"),
+    "anthropic": ("langchain_anthropic", "cisco-aibom[agentic,llm-anthropic]"),
+    "google_genai": ("langchain_google_genai", "cisco-aibom[agentic,llm-google]"),
 }
 
 
@@ -149,9 +170,16 @@ def build_chat_model(
     if api_version and resolved_provider == "azure_openai":
         init_kwargs["api_version"] = api_version
 
-    init_kwargs["temperature"] = temperature
-    if max_tokens is not None:
-        init_kwargs["max_tokens"] = max_tokens
+    # Reasoning-class models (o-series, gpt-5.x) reject ``max_tokens`` and a
+    # non-default ``temperature``; emit ``max_completion_tokens`` instead and
+    # omit ``temperature`` so the provider applies its required default.
+    if _is_reasoning_model(model_id):
+        if max_tokens is not None:
+            init_kwargs["max_completion_tokens"] = max_tokens
+    else:
+        init_kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            init_kwargs["max_tokens"] = max_tokens
 
     if rate_limiter is not None:
         init_kwargs["rate_limiter"] = rate_limiter
