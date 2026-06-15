@@ -26,7 +26,6 @@ authority on whether a repository contains AI/ML assets.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -143,19 +142,23 @@ class RepoTriager:
             )
 
     def _invoke_with_timeout(self, agent: Any, user_msg: str) -> Any:
-        """Invoke the agent with a wall-clock timeout."""
-        async def _run() -> Any:
-            return await asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: agent.invoke(
-                        {"messages": [{"role": "user", "content": user_msg}]},
-                        config={"recursion_limit": _TRIAGE_RECURSION_LIMIT},
-                    ),
-                ),
-                timeout=_TRIAGE_TIMEOUT_S,
-            )
+        """Invoke the agent with a hard wall-clock timeout.
 
-        return asyncio.run(_run())
+        Delegates to the shared daemon-thread deadline helper: a blocking
+        ``agent.invoke`` that hangs is abandoned after ``_TRIAGE_TIMEOUT_S``
+        rather than wedging the scan at event-loop/process shutdown.
+        The helper raises ``_InvokeTimeout`` (an ``Exception``),
+        which the caller's broad ``except Exception`` maps to a deep-scan
+        fallback. Imported lazily to keep the agentic extras optional.
+        """
+        from .agentic.agent import _invoke_agent_bounded
+
+        return _invoke_agent_bounded(
+            agent,
+            user_msg,
+            _TRIAGE_TIMEOUT_S,
+            recursion_limit=_TRIAGE_RECURSION_LIMIT,
+        )
 
     def _parse_result(self, repo_path: str, result: Any) -> TriageResult:
         """Extract the triage decision from the agent response."""

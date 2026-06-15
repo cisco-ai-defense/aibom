@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -82,6 +84,66 @@ class TestTriageAgentIntegration:
         assert len(results) == 2
         assert results[0].decision == "deep-scan"
         assert results[1].decision == "skip"
+
+
+class TestTriageInvokeTimeout:
+    """A hung triage agent.invoke must be bounded by the daemon-thread deadline
+    helper and fail open to deep-scan, never wedging the scan."""
+
+    def test_invoke_with_timeout_bounds_hung_agent(self) -> None:
+        never = threading.Event()  # never set -> invoke blocks forever
+
+        def hung_invoke(*_a: object, **_k: object) -> object:
+            never.wait()
+            return {"messages": []}
+
+        agent = MagicMock()
+        agent.invoke.side_effect = hung_invoke
+
+        triager = RepoTriager()
+        with patch("aibom.repo_triage._TRIAGE_TIMEOUT_S", 1):
+            start = time.monotonic()
+            from aibom.agentic.agent import _InvokeTimeout
+
+            try:
+                triager._invoke_with_timeout(agent, "triage this repo")
+                raised = None
+            except _InvokeTimeout as exc:
+                raised = exc
+            elapsed = time.monotonic() - start
+
+        assert raised is not None, "expected _InvokeTimeout on a hung invoke"
+        assert elapsed < 10, f"triage invoke hung for {elapsed:.1f}s"
+
+    def test_hung_triage_degrades_to_deep_scan(self, tmp_path: Path) -> None:
+        repo = tmp_path / "ai-app"
+        repo.mkdir()
+
+        never = threading.Event()
+
+        def hung_invoke(*_a: object, **_k: object) -> object:
+            never.wait()
+            return {"messages": []}
+
+        agent = MagicMock()
+        agent.invoke.side_effect = hung_invoke
+        fake_deepagents = MagicMock()
+        fake_deepagents.create_deep_agent.return_value = agent
+
+        triager = RepoTriager(llm_config={"model": "test-model", "api_key": "k"})
+        with (
+            patch("aibom.repo_triage._TRIAGE_TIMEOUT_S", 1),
+            patch("aibom.llm_factory.build_chat_model", return_value=MagicMock()),
+            patch("aibom.agentic.tools.build_triage_tools", return_value=[]),
+            patch.dict("sys.modules", {"deepagents": fake_deepagents}),
+        ):
+            start = time.monotonic()
+            results = triager.triage_repos([str(repo)])
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 15, f"triage hung for {elapsed:.1f}s"
+        assert results[0].decision == "deep-scan"
+        assert "failed" in results[0].reason
 
 
 class TestTriageSingleNoExtras:

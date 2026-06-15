@@ -903,11 +903,31 @@ def _circuit_breaker_skipped_batch(batch: list[AIComponent]) -> list[AIComponent
     return _degraded_batch_components(batch, hint="circuit_breaker_tripped")
 
 
-class _BatchTimeout(Exception):
-    """Raised when a synchronous batch invocation exceeds its deadline."""
+class _InvokeTimeout(Exception):
+    """Raised when a synchronous ``agent.invoke`` exceeds its wall-clock deadline.
+
+    The generic timeout sentinel for every synchronous agent-invocation site.
+    Subclasses :class:`Exception` (not ``BaseException``) so a site-level
+    ``except Exception`` still catches it and fails open.
+    """
 
 
-def _invoke_with_deadline(agent: Any, summary: str, timeout_s: int) -> Any:
+class _BatchTimeout(_InvokeTimeout):
+    """Raised when a synchronous *batch* invocation exceeds its deadline.
+
+    A subclass of :class:`_InvokeTimeout` so the batch path's existing
+    ``except _BatchTimeout`` handling is unchanged while the deadline mechanism
+    is shared with every other invoke site.
+    """
+
+
+def _invoke_agent_bounded(
+    agent: Any,
+    content: str,
+    timeout_s: int,
+    *,
+    recursion_limit: int | None = None,
+) -> Any:
     """Run ``agent.invoke`` in a daemon thread with a hard wall-clock deadline.
 
     ``agent.invoke`` is a blocking deep-agent loop that cannot be cancelled.
@@ -917,35 +937,63 @@ def _invoke_with_deadline(agent: Any, summary: str, timeout_s: int) -> Any:
     genuinely hung LLM call wedged the whole scan.
 
     Instead, run the call in a *daemon* thread and ``join`` it for at most
-    ``timeout_s``. On timeout we raise :class:`_BatchTimeout` and abandon the
+    ``timeout_s``. On timeout we raise :class:`_InvokeTimeout` and abandon the
     thread; being a daemon, it never blocks process/loop shutdown and dies with
-    the interpreter. This makes ``--agentic-timeout`` actually bound a hung
-    batch.
+    the interpreter. This is the single bounded-invoke primitive used by every
+    synchronous agent-invocation site (batch enrichment, cross-repo
+    coordination, container-layout resolution, and repo triage).
+
+    ``recursion_limit`` is forwarded as ``config={"recursion_limit": N}`` only
+    when set; left ``None`` the call passes no ``config`` so the agent applies
+    its own default (some sites intentionally do not cap recursion).
     """
     box: dict[str, Any] = {}
+    config: dict[str, Any] | None = (
+        {"recursion_limit": recursion_limit} if recursion_limit is not None else None
+    )
 
     def _worker() -> None:
         try:
-            box["result"] = agent.invoke(
-                {"messages": [{"role": "user", "content": summary}]},
-                config={"recursion_limit": _RECURSION_LIMIT},
-            )
+            message = {"messages": [{"role": "user", "content": content}]}
+            if config is not None:
+                box["result"] = agent.invoke(message, config=config)
+            else:
+                box["result"] = agent.invoke(message)
         except BaseException as exc:  # noqa: BLE001 - propagate to caller thread
             box["error"] = exc
 
     worker = threading.Thread(
         target=_worker,
-        name="aibom-agentic-batch",
+        name="aibom-agentic-invoke",
         daemon=True,
     )
     worker.start()
     worker.join(timeout_s)
 
     if worker.is_alive():
-        raise _BatchTimeout()
+        # Timed out: abandon the still-running daemon worker. If its invoke
+        # later completes it writes box["result"], but the caller never reads
+        # box again after raising, so that late write is harmless (and dict
+        # writes are GIL-atomic). The daemon dies with the interpreter.
+        raise _InvokeTimeout()
     if "error" in box:
         raise box["error"]
     return box.get("result")
+
+
+def _invoke_with_deadline(agent: Any, summary: str, timeout_s: int) -> Any:
+    """Bounded batch invocation — thin wrapper over :func:`_invoke_agent_bounded`.
+
+    Preserves the batch path's ``_BatchTimeout`` contract (so ``_run_batch``'s
+    ``except _BatchTimeout`` is unchanged) while sharing the daemon-thread
+    deadline mechanism with every other invoke site.
+    """
+    try:
+        return _invoke_agent_bounded(
+            agent, summary, timeout_s, recursion_limit=_RECURSION_LIMIT
+        )
+    except _InvokeTimeout as exc:
+        raise _BatchTimeout() from exc
 
 
 def _run_async_bounded(coro: Any) -> Any:
@@ -2316,17 +2364,11 @@ def run_cross_repo_coordination(
             tools=xrepo_tools,
             model=model_obj,
         )
-        result = asyncio.run(
-            asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: agent.invoke(
-                        {"messages": [{"role": "user", "content": prompt}]}
-                    ),
-                ),
-                timeout=_DEFAULT_AGENTIC_TIMEOUT_S,
-            )
-        )
-    except asyncio.TimeoutError:
+        # Daemon-thread deadline: a hung coordinator invoke is abandoned, never
+        # wedging the scan at teardown. No recursion_limit here —
+        # the coordinator intentionally uses the agent's default.
+        result = _invoke_agent_bounded(agent, prompt, _DEFAULT_AGENTIC_TIMEOUT_S)
+    except _InvokeTimeout:
         _LOGGER.warning(
             "Cross-repo coordination timed out after %ds",
             _DEFAULT_AGENTIC_TIMEOUT_S,
@@ -2494,16 +2536,11 @@ def resolve_container_layout(
             indent=2,
         )
 
-        result = asyncio.run(
-            asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: agent.invoke(
-                        {"messages": [{"role": "user", "content": user_message}]},
-                        config={"recursion_limit": 25},
-                    ),
-                ),
-                timeout=timeout_s,
-            )
+        # Daemon-thread deadline: a hung layout invoke is abandoned, never
+        # wedging the scan at teardown. _InvokeTimeout is an
+        # Exception subclass, so it is caught below and falls back cleanly.
+        result = _invoke_agent_bounded(
+            agent, user_message, timeout_s, recursion_limit=25
         )
     except Exception:
         _LOGGER.warning(

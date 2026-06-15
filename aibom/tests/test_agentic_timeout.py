@@ -190,6 +190,192 @@ class TestAgenticAsyncTimeout:
         assert all(c.agentic_hint == "batch_timeout" for c in out)
 
 
+class TestInvokeAgentBounded:
+    """Unit tests for the shared daemon-thread deadline helper used by every
+    synchronous ``agent.invoke`` site."""
+
+    def test_returns_result_on_success(self) -> None:
+        from aibom.agentic.agent import _invoke_agent_bounded
+
+        agent = MagicMock()
+        agent.invoke.return_value = {"messages": ["ok"]}
+        result = _invoke_agent_bounded(agent, "hello", timeout_s=5)
+        assert result == {"messages": ["ok"]}
+
+    def test_propagates_worker_exception(self) -> None:
+        from aibom.agentic.agent import _invoke_agent_bounded
+
+        agent = MagicMock()
+        agent.invoke.side_effect = RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"):
+            _invoke_agent_bounded(agent, "hello", timeout_s=5)
+
+    def test_times_out_on_never_returning_invoke(self) -> None:
+        from aibom.agentic.agent import _invoke_agent_bounded, _InvokeTimeout
+
+        never = threading.Event()  # never set -> invoke blocks forever
+
+        def hung_invoke(*_a: object, **_k: object) -> object:
+            never.wait()
+            return {"messages": []}
+
+        agent = MagicMock()
+        agent.invoke.side_effect = hung_invoke
+
+        start = time.monotonic()
+        with pytest.raises(_InvokeTimeout):
+            _invoke_agent_bounded(agent, "hello", timeout_s=1)
+        elapsed = time.monotonic() - start
+        # Must abandon the hung daemon thread promptly, not block on it.
+        assert elapsed < 10, f"helper hung for {elapsed:.1f}s"
+
+    def test_omits_config_when_recursion_limit_none(self) -> None:
+        from aibom.agentic.agent import _invoke_agent_bounded
+
+        agent = MagicMock()
+        agent.invoke.return_value = {"messages": []}
+        _invoke_agent_bounded(agent, "hi", timeout_s=5)
+        _, kwargs = agent.invoke.call_args
+        assert "config" not in kwargs
+
+    def test_passes_recursion_limit_when_set(self) -> None:
+        from aibom.agentic.agent import _invoke_agent_bounded
+
+        agent = MagicMock()
+        agent.invoke.return_value = {"messages": []}
+        _invoke_agent_bounded(agent, "hi", timeout_s=5, recursion_limit=25)
+        _, kwargs = agent.invoke.call_args
+        assert kwargs["config"] == {"recursion_limit": 25}
+
+    def test_message_shape(self) -> None:
+        from aibom.agentic.agent import _invoke_agent_bounded
+
+        agent = MagicMock()
+        agent.invoke.return_value = {"messages": []}
+        _invoke_agent_bounded(agent, "the-prompt", timeout_s=5)
+        args, _ = agent.invoke.call_args
+        assert args[0] == {"messages": [{"role": "user", "content": "the-prompt"}]}
+
+
+class TestCrossRepoCoordinationTimeout:
+    """run_cross_repo_coordination must bound a hung coordinator call and fail
+    open (return no relationships/flags) without wedging the scan."""
+
+    @patch("aibom.agentic.agent._DEFAULT_AGENTIC_TIMEOUT_S", 1)
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_hung_coordinator_fails_open(self, mock_create, _mb, _mc, tmp_path) -> None:
+        from types import SimpleNamespace
+
+        from aibom.agentic.agent import run_cross_repo_coordination
+
+        never = threading.Event()
+
+        def hung_invoke(*_a: object, **_k: object) -> object:
+            never.wait()
+            return {"messages": []}
+
+        mock_agent = MagicMock()
+        mock_agent.invoke.side_effect = hung_invoke
+        mock_create.return_value = mock_agent
+
+        per_repo_results = {
+            "/repo-a": {
+                "components": [
+                    AIComponent(
+                        name="repo-a-model",
+                        component_type=AIComponentType.MODEL,
+                        file_path="/repo-a/app.py",
+                        line_number=10,
+                        model_name="gpt-4o-mini",
+                    )
+                ],
+                "_unresolved_env_vars": [],
+            },
+            "/repo-b": {
+                "components": [
+                    AIComponent(
+                        name="repo-b-endpoint",
+                        component_type=AIComponentType.LLM_ENDPOINT,
+                        file_path="/repo-b/values.yaml",
+                        line_number=20,
+                    )
+                ],
+                "_unresolved_env_vars": [],
+            },
+        }
+
+        with (
+            patch(
+                "aibom.agentic.cross_repo.cross_repo_summary_tool",
+                return_value=json.dumps(
+                    {
+                        "shared_env_vars": [],
+                        "shared_packages": [],
+                        "unresolved_env_var_refs": [],
+                    }
+                ),
+            ),
+            patch(
+                "aibom.agentic.cross_repo.build_cross_repo_tools",
+                return_value=[MagicMock()],
+            ),
+            patch(
+                "aibom.cross_ref.build_env_index",
+                return_value=SimpleNamespace(env={}),
+            ),
+        ):
+            start = time.monotonic()
+            rels, flags = run_cross_repo_coordination(
+                model_string="test-model",
+                per_repo_results=per_repo_results,
+                cache_dir=tmp_path / "agentic-cache",
+            )
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 15, f"coordination hung for {elapsed:.1f}s"
+        assert rels == []
+        assert flags == []
+
+
+class TestContainerLayoutTimeout:
+    """resolve_container_layout must bound a hung layout call and fall back to
+    the deterministic candidate directories."""
+
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_hung_layout_agent_falls_back_to_candidates(
+        self, mock_create, _mb, _mc
+    ) -> None:
+        from aibom.agentic.agent import resolve_container_layout
+
+        never = threading.Event()
+
+        def hung_invoke(*_a: object, **_k: object) -> object:
+            never.wait()
+            return {"messages": []}
+
+        mock_agent = MagicMock()
+        mock_agent.invoke.side_effect = hung_invoke
+        mock_create.return_value = mock_agent
+
+        candidates = ["/app", "/srv/app"]
+        start = time.monotonic()
+        result = resolve_container_layout(
+            model_string="test-model",
+            image_config={"workdir": "/app", "entrypoint": [], "cmd": [], "env": {}},
+            candidate_dirs=candidates,
+            file_listing=["/app/main.py"],
+            timeout_s=1,
+        )
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 15, f"layout agent hung for {elapsed:.1f}s"
+        assert result == candidates
+
+
 class TestAgenticCircuitBreaker:
     @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
     @patch("aibom.agentic.agent._close_model_clients")
