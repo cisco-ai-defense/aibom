@@ -345,10 +345,7 @@ class TestContainerLayoutTimeout:
 
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
-    @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_hung_layout_agent_falls_back_to_candidates(
-        self, mock_create, _mb, _mc
-    ) -> None:
+    def test_hung_layout_agent_falls_back_to_candidates(self, _mb, _mc) -> None:
         from aibom.agentic.agent import resolve_container_layout
 
         never = threading.Event()
@@ -359,18 +356,29 @@ class TestContainerLayoutTimeout:
 
         mock_agent = MagicMock()
         mock_agent.invoke.side_effect = hung_invoke
-        mock_create.return_value = mock_agent
+
+        # resolve_container_layout calls ``from deepagents import
+        # create_deep_agent`` directly (not via create_aibom_agent), so inject a
+        # fake module — the agentic extra is not installed in CI's base env.
+        fake_deepagents = MagicMock()
+        fake_deepagents.create_deep_agent.return_value = mock_agent
 
         candidates = ["/app", "/srv/app"]
-        start = time.monotonic()
-        result = resolve_container_layout(
-            model_string="test-model",
-            image_config={"workdir": "/app", "entrypoint": [], "cmd": [], "env": {}},
-            candidate_dirs=candidates,
-            file_listing=["/app/main.py"],
-            timeout_s=1,
-        )
-        elapsed = time.monotonic() - start
+        with patch.dict("sys.modules", {"deepagents": fake_deepagents}):
+            start = time.monotonic()
+            result = resolve_container_layout(
+                model_string="test-model",
+                image_config={
+                    "workdir": "/app",
+                    "entrypoint": [],
+                    "cmd": [],
+                    "env": {},
+                },
+                candidate_dirs=candidates,
+                file_listing=["/app/main.py"],
+                timeout_s=1,
+            )
+            elapsed = time.monotonic() - start
 
         assert elapsed < 15, f"layout agent hung for {elapsed:.1f}s"
         assert result == candidates

@@ -2348,10 +2348,12 @@ def run_cross_repo_coordination(
         f"```json\n{json.dumps(orientation, indent=2, default=str)}\n```"
     )
 
+    # Log only the repo count — the model id is already logged per tier during
+    # enrichment, and ``model_string`` is read from the credential-bearing
+    # ``llm_config`` dict, so logging it trips clear-text-logging taint analysis.
     _LOGGER.info(
-        "Running cross-repo coordination across %d repos with %s",
+        "Running cross-repo coordination across %d repos",
         len(per_repo_results),
-        model_string,
     )
 
     xrepo_tools = build_cross_repo_tools(per_repo_results, scan_paths)
