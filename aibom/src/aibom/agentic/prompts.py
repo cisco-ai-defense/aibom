@@ -246,6 +246,10 @@ You receive two lists:
      ``agent`` it calls over the A2A protocol
    - ``EXPOSES_A2A_AGENT``: host service / server → ``agent`` exposed via
      an Agent Card at a well-known endpoint
+   - ``USES_AGENT``: agent → another ``agent`` it invokes or delegates to
+     (sub-agent, handoff, multi-agent orchestration) within the same process
+   - ``USES_SKILL``: agent → a ``skill`` it uses (Semantic Kernel / Copilot
+     plugin or skill definition)
    - ``HOSTS_MODEL``: endpoint → model ID it serves
    - ``CUSTOM``: ONLY as last resort when none of the above apply.
    For EVERY relationship, you MUST also specify:

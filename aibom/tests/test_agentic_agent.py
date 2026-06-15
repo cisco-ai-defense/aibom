@@ -76,7 +76,9 @@ class TestBuildContextMessage:
             model_name="gpt-4o",
         )
         msg = _build_context_message(
-            [batch_comp], [], ["/tmp"],
+            [batch_comp],
+            [],
+            ["/tmp"],
             all_components=[batch_comp, other_comp],
         )
         json_start = msg.index("```json\n") + 8
@@ -109,7 +111,9 @@ class TestBuildContextMessage:
 
     def test_includes_code_context_for_real_file(self, tmp_path):
         src = tmp_path / "example.py"
-        src.write_text("import openai\nclient = openai.OpenAI()\nresult = client.chat.completions.create(model='gpt-4o')\n")
+        src.write_text(
+            "import openai\nclient = openai.OpenAI()\nresult = client.chat.completions.create(model='gpt-4o')\n"
+        )
         comps = [
             AIComponent(
                 name="gpt-4o",
@@ -168,31 +172,31 @@ class TestExtractStructuredResponse:
 class TestLazyImport:
     def test_aibom_import_does_not_import_deepagents(self):
         """Importing aibom.agentic should NOT trigger deepagents import."""
-        import sys
         import importlib
+        import sys
 
         mods_before = set(sys.modules.keys())
         importlib.import_module("aibom.agentic")
         mods_after = set(sys.modules.keys())
         new_mods = mods_after - mods_before
         deepagent_mods = [m for m in new_mods if "deepagent" in m.lower()]
-        assert deepagent_mods == [], (
-            f"Importing aibom.agentic pulled in deepagents: {deepagent_mods}"
-        )
+        assert (
+            deepagent_mods == []
+        ), f"Importing aibom.agentic pulled in deepagents: {deepagent_mods}"
 
     def test_aibom_import_does_not_import_langchain(self):
         """Importing aibom.agentic should NOT trigger langchain import."""
-        import sys
         import importlib
+        import sys
 
         mods_before = set(sys.modules.keys())
         importlib.import_module("aibom.agentic")
         mods_after = set(sys.modules.keys())
         new_mods = mods_after - mods_before
         langchain_mods = [m for m in new_mods if "langchain" in m.lower()]
-        assert langchain_mods == [], (
-            f"Importing aibom.agentic pulled in langchain: {langchain_mods}"
-        )
+        assert (
+            langchain_mods == []
+        ), f"Importing aibom.agentic pulled in langchain: {langchain_mods}"
 
 
 class TestRunAgenticEnrichment:
@@ -229,24 +233,28 @@ class TestRunAgenticEnrichment:
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_merges_agent_output_into_components(self, mock_create, _mock_build, _mock_close):
+    def test_merges_agent_output_into_components(
+        self, mock_create, _mock_build, _mock_close
+    ):
         from aibom.agentic.agent import run_agentic_enrichment
 
-        agent_response = json.dumps({
-            "enriched_components": [],
-            "new_components": [
-                {
-                    "name": "agent-found-model",
-                    "component_type": "model",
-                    "file_path": "new.py",
-                    "line_number": 1,
-                    "framework": "openai",
-                    "model_name": "gpt-5",
-                }
-            ],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        agent_response = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [
+                    {
+                        "name": "agent-found-model",
+                        "component_type": "model",
+                        "file_path": "new.py",
+                        "line_number": 1,
+                        "framework": "openai",
+                        "model_name": "gpt-5",
+                    }
+                ],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
 
         mock_agent = MagicMock()
         mock_msg = MagicMock()
@@ -276,24 +284,28 @@ class TestRunAgenticEnrichment:
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_cached_rerun_replays_new_components(self, mock_create, _mock_build, _mock_close, tmp_path):
+    def test_cached_rerun_replays_new_components(
+        self, mock_create, _mock_build, _mock_close, tmp_path
+    ):
         from aibom.agentic.agent import run_agentic_enrichment
 
-        agent_response = json.dumps({
-            "enriched_components": [],
-            "new_components": [
-                {
-                    "name": "agent-found-model",
-                    "component_type": "model",
-                    "file_path": "new.py",
-                    "line_number": 1,
-                    "framework": "openai",
-                    "model_name": "gpt-5",
-                }
-            ],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        agent_response = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [
+                    {
+                        "name": "agent-found-model",
+                        "component_type": "model",
+                        "file_path": "new.py",
+                        "line_number": 1,
+                        "framework": "openai",
+                        "model_name": "gpt-5",
+                    }
+                ],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
 
         mock_agent = MagicMock()
         mock_msg = MagicMock()
@@ -340,42 +352,46 @@ class TestRunAgenticEnrichment:
         from aibom.agentic.agent import run_agentic_enrichment
 
         first_msg = MagicMock()
-        first_msg.content = json.dumps({
-            "enriched_components": [],
-            "new_components": [
-                {
-                    "name": "agent-found-model",
-                    "component_type": "model",
-                    "file_path": "new.py",
-                    "line_number": 1,
-                    "framework": "openai",
-                    "model_name": "gpt-5",
-                }
-            ],
-            "new_relationships": [
-                {
-                    "source_name": "existing-a",
-                    "target_name": "existing-b",
-                    "relationship_type": "USES_MODEL",
-                }
-            ],
-            "risk_findings": [
-                {
-                    "flag": "cache_replayed",
-                    "description": "cached finding",
-                    "file_path": "app_a.py",
-                    "line_number": 1,
-                    "severity": "low",
-                }
-            ],
-        })
+        first_msg.content = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [
+                    {
+                        "name": "agent-found-model",
+                        "component_type": "model",
+                        "file_path": "new.py",
+                        "line_number": 1,
+                        "framework": "openai",
+                        "model_name": "gpt-5",
+                    }
+                ],
+                "new_relationships": [
+                    {
+                        "source_name": "existing-a",
+                        "target_name": "existing-b",
+                        "relationship_type": "USES_MODEL",
+                    }
+                ],
+                "risk_findings": [
+                    {
+                        "flag": "cache_replayed",
+                        "description": "cached finding",
+                        "file_path": "app_a.py",
+                        "line_number": 1,
+                        "severity": "low",
+                    }
+                ],
+            }
+        )
         second_msg = MagicMock()
-        second_msg.content = json.dumps({
-            "enriched_components": [],
-            "new_components": [],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        second_msg.content = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
         mock_agent = MagicMock()
         mock_agent.invoke.side_effect = [
             {"messages": [first_msg]},
@@ -423,10 +439,15 @@ class TestRunAgenticEnrichment:
         )
 
         assert {c.name for c in fresh_components} == {
-            "existing-a", "existing-b", "agent-found-model",
+            "existing-a",
+            "existing-b",
+            "agent-found-model",
         }
         assert {c.name for c in cached_components} == {
-            "existing-a", "existing-b", "existing-c", "agent-found-model",
+            "existing-a",
+            "existing-b",
+            "existing-c",
+            "agent-found-model",
         }
         assert sum(c.name == "agent-found-model" for c in cached_components) == 1
         assert len(cached_rels) == 1
@@ -449,22 +470,24 @@ class TestRunAgenticEnrichment:
         from aibom.agentic.agent import run_cross_repo_coordination
 
         mock_msg = MagicMock()
-        mock_msg.content = json.dumps({
-            "new_relationships": [
-                {
-                    "source_name": "repo-a-model",
-                    "target_name": "repo-b-endpoint",
-                    "relationship_type": "USES_MODEL",
-                }
-            ],
-            "risk_findings": [
-                {
-                    "flag": "cross_repo_env_var_mismatch",
-                    "description": "backend mismatch",
-                    "severity": "medium",
-                }
-            ],
-        })
+        mock_msg.content = json.dumps(
+            {
+                "new_relationships": [
+                    {
+                        "source_name": "repo-a-model",
+                        "target_name": "repo-b-endpoint",
+                        "relationship_type": "USES_MODEL",
+                    }
+                ],
+                "risk_findings": [
+                    {
+                        "flag": "cross_repo_env_var_mismatch",
+                        "description": "backend mismatch",
+                        "severity": "medium",
+                    }
+                ],
+            }
+        )
         mock_agent = MagicMock()
         mock_agent.invoke.return_value = {"messages": [mock_msg]}
         mock_create.return_value = mock_agent
@@ -538,7 +561,9 @@ class TestRunAgenticEnrichment:
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_handles_agent_failure_gracefully(self, mock_create, _mock_build, _mock_close):
+    def test_handles_agent_failure_gracefully(
+        self, mock_create, _mock_build, _mock_close
+    ):
         from aibom.agentic.agent import run_agentic_enrichment
 
         mock_create.return_value = MagicMock(
@@ -568,12 +593,14 @@ class TestRunAgenticEnrichment:
 
         mock_agent = MagicMock()
         mock_msg = MagicMock()
-        mock_msg.content = json.dumps({
-            "enriched_components": [],
-            "new_components": [],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        mock_msg.content = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
         mock_agent.invoke.return_value = {"messages": [mock_msg]}
         mock_agent.ainvoke = AsyncMock(return_value={"messages": [mock_msg]})
         mock_create.return_value = mock_agent
@@ -607,12 +634,14 @@ class TestRunAgenticEnrichment:
 
         mock_agent = MagicMock()
         mock_msg = MagicMock()
-        mock_msg.content = json.dumps({
-            "enriched_components": [],
-            "new_components": [],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        mock_msg.content = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
         mock_agent.invoke.return_value = {"messages": [mock_msg]}
         mock_create.return_value = mock_agent
 
@@ -637,17 +666,21 @@ class TestRunAgenticEnrichment:
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_tiered_model_uses_fast_for_simple(self, mock_create, mock_build, _mock_close):
+    def test_tiered_model_uses_fast_for_simple(
+        self, mock_create, mock_build, _mock_close
+    ):
         from aibom.agentic.agent import run_agentic_enrichment
 
         mock_agent = MagicMock()
         mock_msg = MagicMock()
-        mock_msg.content = json.dumps({
-            "enriched_components": [],
-            "new_components": [],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        mock_msg.content = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
         mock_agent.invoke.return_value = {"messages": [mock_msg]}
         mock_create.return_value = mock_agent
 
@@ -678,7 +711,11 @@ class TestRunAgenticEnrichment:
 
 class TestToolStats:
     def test_tool_stats_isolated_per_reset(self):
-        from aibom.agentic.tools import _reset_tool_stats, get_tool_stats, _get_stats_dict
+        from aibom.agentic.tools import (
+            _get_stats_dict,
+            _reset_tool_stats,
+            get_tool_stats,
+        )
 
         _reset_tool_stats()
         assert get_tool_stats() == {}
@@ -690,7 +727,7 @@ class TestToolStats:
         assert get_tool_stats() == {}
 
     def test_track_tool_decorator(self):
-        from aibom.agentic.tools import _reset_tool_stats, get_tool_stats, _track_tool
+        from aibom.agentic.tools import _reset_tool_stats, _track_tool, get_tool_stats
 
         _reset_tool_stats()
 
@@ -712,10 +749,30 @@ class TestLocalityAwareBatching:
         from aibom.agentic.agent import _locality_aware_batches
 
         comps = [
-            AIComponent(name="a", component_type=AIComponentType.MODEL, file_path="/repo/dir1/a.py", line_number=1),
-            AIComponent(name="b", component_type=AIComponentType.MODEL, file_path="/repo/dir1/b.py", line_number=2),
-            AIComponent(name="c", component_type=AIComponentType.MODEL, file_path="/repo/dir2/c.py", line_number=1),
-            AIComponent(name="d", component_type=AIComponentType.MODEL, file_path="/repo/dir2/d.py", line_number=2),
+            AIComponent(
+                name="a",
+                component_type=AIComponentType.MODEL,
+                file_path="/repo/dir1/a.py",
+                line_number=1,
+            ),
+            AIComponent(
+                name="b",
+                component_type=AIComponentType.MODEL,
+                file_path="/repo/dir1/b.py",
+                line_number=2,
+            ),
+            AIComponent(
+                name="c",
+                component_type=AIComponentType.MODEL,
+                file_path="/repo/dir2/c.py",
+                line_number=1,
+            ),
+            AIComponent(
+                name="d",
+                component_type=AIComponentType.MODEL,
+                file_path="/repo/dir2/d.py",
+                line_number=2,
+            ),
         ]
         batches = _locality_aware_batches(comps, batch_size=3)
         assert len(batches) == 2
@@ -726,7 +783,12 @@ class TestLocalityAwareBatching:
         from aibom.agentic.agent import _locality_aware_batches
 
         comps = [
-            AIComponent(name=f"m{i}", component_type=AIComponentType.MODEL, file_path=f"/repo/pkg/{i}.py", line_number=i)
+            AIComponent(
+                name=f"m{i}",
+                component_type=AIComponentType.MODEL,
+                file_path=f"/repo/pkg/{i}.py",
+                line_number=i,
+            )
             for i in range(4)
         ]
         batches = _locality_aware_batches(comps, batch_size=5)
@@ -737,7 +799,12 @@ class TestLocalityAwareBatching:
         from aibom.agentic.agent import _locality_aware_batches
 
         comps = [
-            AIComponent(name=f"m{i}", component_type=AIComponentType.MODEL, file_path=f"/repo/pkg/{i}.py", line_number=i)
+            AIComponent(
+                name=f"m{i}",
+                component_type=AIComponentType.MODEL,
+                file_path=f"/repo/pkg/{i}.py",
+                line_number=i,
+            )
             for i in range(7)
         ]
         batches = _locality_aware_batches(comps, batch_size=3)
@@ -753,8 +820,11 @@ class TestAgenticResultCache:
 
         cache = _AgenticResultCache(tmp_path / "cache")
         comp = AIComponent(
-            name="gpt-4o", component_type=AIComponentType.MODEL,
-            file_path="a.py", line_number=1, model_name="gpt-4o",
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="a.py",
+            line_number=1,
+            model_name="gpt-4o",
         )
         key = _component_cache_key(comp)
         assert cache.get(key) is None
@@ -766,8 +836,20 @@ class TestAgenticResultCache:
         from aibom.agentic.agent import _AgenticResultCache, _component_cache_key
 
         cache = _AgenticResultCache(tmp_path / "cache")
-        c1 = AIComponent(name="a", component_type=AIComponentType.MODEL, file_path="a.py", line_number=1, model_name="gpt-4o")
-        c2 = AIComponent(name="b", component_type=AIComponentType.MODEL, file_path="b.py", line_number=1, model_name="gpt-5")
+        c1 = AIComponent(
+            name="a",
+            component_type=AIComponentType.MODEL,
+            file_path="a.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        c2 = AIComponent(
+            name="b",
+            component_type=AIComponentType.MODEL,
+            file_path="b.py",
+            line_number=1,
+            model_name="gpt-5",
+        )
         cache.put(_component_cache_key(c1), {"enriched_components": []})
 
         cached, uncached = cache.partition([c1, c2])
@@ -781,7 +863,12 @@ class TestAgenticResultCache:
 
         cache_dir = tmp_path / "cache"
         cache1 = _AgenticResultCache(cache_dir)
-        comp = AIComponent(name="x", component_type=AIComponentType.MODEL, file_path="x.py", line_number=1)
+        comp = AIComponent(
+            name="x",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+        )
         key = _component_cache_key(comp)
         cache1.put(key, {"enriched_components": [], "test": True})
 
@@ -805,26 +892,33 @@ class TestAgenticResultCache:
             heuristic_confidence=0.2,
             agentic_hint="stale_hint",
         )
-        after = before.model_copy(update={
-            "component_type": AIComponentType.MODEL_ENDPOINT,
-            "description": "",
-            "framework": "openai",
-            "metadata": {"verified": True},
-            "heuristic_confidence": 0.97,
-            "agentic_hint": "",
-            "needs_agentic": False,
-        })
-        cache.put(_component_cache_key(before), {
-            "cached_component": after.model_dump(mode="json"),
-            "enriched_components": [],
-            "new_components": [],
-            "remove_components": [],
-            "reclassify_components": [],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        after = before.model_copy(
+            update={
+                "component_type": AIComponentType.MODEL_ENDPOINT,
+                "description": "",
+                "framework": "openai",
+                "metadata": {"verified": True},
+                "heuristic_confidence": 0.97,
+                "agentic_hint": "",
+                "needs_agentic": False,
+            }
+        )
+        cache.put(
+            _component_cache_key(before),
+            {
+                "cached_component": after.model_dump(mode="json"),
+                "enriched_components": [],
+                "new_components": [],
+                "remove_components": [],
+                "reclassify_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            },
+        )
 
-        enriched, new, rels, flags = cache.apply_cached([before], AIBOMScannerMiddleware())
+        enriched, new, rels, flags = cache.apply_cached(
+            [before], AIBOMScannerMiddleware()
+        )
 
         assert new == []
         assert rels == []
@@ -844,9 +938,7 @@ class TestAgenticResultCache:
 
         source = tmp_path / "service.py"
         source.write_text(
-            "setup()\n"
-            "agent = RouterAgent()\n"
-            "agent.run(task)\n",
+            "setup()\n" "agent = RouterAgent()\n" "agent.run(task)\n",
             encoding="utf-8",
         )
 
@@ -907,8 +999,8 @@ class TestRunTier:
     def test_tier_cache_hit_populates_memo(self, tmp_path):
         from aibom.agentic.agent import (
             _AgenticResultCache,
-            _DecisionMemo,
             _build_tier_cache_payload,
+            _DecisionMemo,
             _run_tier,
             _tier_cache_key,
         )
@@ -921,9 +1013,13 @@ class TestRunTier:
             line_number=1,
             model_name="gpt-4o",
         )
-        cached = comp.model_copy(update={"heuristic_confidence": 0.99, "needs_agentic": False})
+        cached = comp.model_copy(
+            update={"heuristic_confidence": 0.99, "needs_agentic": False}
+        )
         cache = _AgenticResultCache(tmp_path / "cache")
-        cache.put(_tier_cache_key([comp]), _build_tier_cache_payload([cached], [], [], []))
+        cache.put(
+            _tier_cache_key([comp]), _build_tier_cache_payload([cached], [], [], [])
+        )
 
         memo = _DecisionMemo()
         agent = MagicMock()
@@ -949,7 +1045,12 @@ class TestRunTier:
         assert memo.lookup(comp) == {"action": "keep", "heuristic_confidence": 0.99}
 
     def test_cache_only_fast_path_populates_memo(self, tmp_path):
-        from aibom.agentic.agent import _AgenticResultCache, _DecisionMemo, _component_cache_key, _run_tier
+        from aibom.agentic.agent import (
+            _AgenticResultCache,
+            _component_cache_key,
+            _DecisionMemo,
+            _run_tier,
+        )
         from aibom.agentic.middleware import AIBOMScannerMiddleware
 
         comp = AIComponent(
@@ -958,21 +1059,26 @@ class TestRunTier:
             file_path="cfg.yaml",
             line_number=7,
         )
-        cached = comp.model_copy(update={
-            "component_type": AIComponentType.MODEL_ENDPOINT,
-            "heuristic_confidence": 0.91,
-            "needs_agentic": False,
-        })
+        cached = comp.model_copy(
+            update={
+                "component_type": AIComponentType.MODEL_ENDPOINT,
+                "heuristic_confidence": 0.91,
+                "needs_agentic": False,
+            }
+        )
         cache = _AgenticResultCache(tmp_path / "cache")
-        cache.put(_component_cache_key(comp), {
-            "cached_component": cached.model_dump(mode="json"),
-            "enriched_components": [],
-            "new_components": [],
-            "remove_components": [],
-            "reclassify_components": [],
-            "new_relationships": [],
-            "risk_findings": [],
-        })
+        cache.put(
+            _component_cache_key(comp),
+            {
+                "cached_component": cached.model_dump(mode="json"),
+                "enriched_components": [],
+                "new_components": [],
+                "remove_components": [],
+                "reclassify_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            },
+        )
 
         memo = _DecisionMemo()
         agent = MagicMock()
@@ -1010,10 +1116,31 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        dep = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="req.txt", line_number=1)
-        model = AIComponent(name="gpt-4o", component_type=AIComponentType.MODEL, file_path="a.py", line_number=1, model_name="gpt-4o")
-        emb = AIComponent(name="ada-002", component_type=AIComponentType.EMBEDDING, file_path="b.py", line_number=1)
-        artifact = AIComponent(name="model.onnx", component_type=AIComponentType.MODEL_ARTIFACT, file_path="c.py", line_number=1)
+        dep = AIComponent(
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="req.txt",
+            line_number=1,
+        )
+        model = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="a.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        emb = AIComponent(
+            name="ada-002",
+            component_type=AIComponentType.EMBEDDING,
+            file_path="b.py",
+            line_number=1,
+        )
+        artifact = AIComponent(
+            name="model.onnx",
+            component_type=AIComponentType.MODEL_ARTIFACT,
+            file_path="c.py",
+            line_number=1,
+        )
 
         assert memo._key(dep) is not None
         assert memo._key(model) is not None
@@ -1024,9 +1151,24 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        endpoint = AIComponent(name="env:ENDPOINT", component_type=AIComponentType.LLM_ENDPOINT, file_path="v.yaml", line_number=5)
-        prompt = AIComponent(name="my-prompt", component_type=AIComponentType.PROMPT, file_path="p.py", line_number=1)
-        secret = AIComponent(name="api-key", component_type=AIComponentType.SECRET, file_path="s.py", line_number=1)
+        endpoint = AIComponent(
+            name="env:ENDPOINT",
+            component_type=AIComponentType.LLM_ENDPOINT,
+            file_path="v.yaml",
+            line_number=5,
+        )
+        prompt = AIComponent(
+            name="my-prompt",
+            component_type=AIComponentType.PROMPT,
+            file_path="p.py",
+            line_number=1,
+        )
+        secret = AIComponent(
+            name="api-key",
+            component_type=AIComponentType.SECRET,
+            file_path="s.py",
+            line_number=1,
+        )
 
         assert memo._key(endpoint) is None
         assert memo._key(prompt) is None
@@ -1036,8 +1178,15 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        before = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="req.txt", line_number=1)
-        after = before.model_copy(update={"heuristic_confidence": 0.95, "needs_agentic": False})
+        before = AIComponent(
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="req.txt",
+            line_number=1,
+        )
+        after = before.model_copy(
+            update={"heuristic_confidence": 0.95, "needs_agentic": False}
+        )
 
         memo.record(before, after)
         verdict = memo.lookup(before)
@@ -1049,7 +1198,12 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        before = AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="req.txt", line_number=5)
+        before = AIComponent(
+            name="requests",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="req.txt",
+            line_number=5,
+        )
 
         memo.record(before, None)
         verdict = memo.lookup(before)
@@ -1060,8 +1214,18 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        before = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="cfg.yaml", line_number=3)
-        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "heuristic_confidence": 0.9})
+        before = AIComponent(
+            name="ada-ep",
+            component_type=AIComponentType.EMBEDDING,
+            file_path="cfg.yaml",
+            line_number=3,
+        )
+        after = before.model_copy(
+            update={
+                "component_type": AIComponentType.MODEL_ENDPOINT,
+                "heuristic_confidence": 0.9,
+            }
+        )
 
         memo.record(before, after)
         verdict = memo.lookup(before)
@@ -1074,11 +1238,29 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        c1 = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="a.txt", line_number=1)
-        memo.record(c1, c1.model_copy(update={"heuristic_confidence": 0.9, "needs_agentic": False}))
+        c1 = AIComponent(
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="a.txt",
+            line_number=1,
+        )
+        memo.record(
+            c1,
+            c1.model_copy(update={"heuristic_confidence": 0.9, "needs_agentic": False}),
+        )
 
-        c1_dup = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="c.txt", line_number=3)
-        c2 = AIComponent(name="flask", component_type=AIComponentType.DEPENDENCY, file_path="b.txt", line_number=2)
+        c1_dup = AIComponent(
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="c.txt",
+            line_number=3,
+        )
+        c2 = AIComponent(
+            name="flask",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="b.txt",
+            line_number=2,
+        )
         hits, misses = memo.partition([c1_dup, c2])
         assert len(hits) == 1
         assert hits[0].name == "torch"
@@ -1089,7 +1271,12 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        c = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
+        c = AIComponent(
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="r.txt",
+            line_number=1,
+        )
         memo.record(c, c.model_copy(update={"heuristic_confidence": 0.95}))
 
         result = memo.apply([c])
@@ -1101,7 +1288,12 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        c = AIComponent(name="requests", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
+        c = AIComponent(
+            name="requests",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="r.txt",
+            line_number=1,
+        )
         memo.record(c, None)
 
         result = memo.apply([c])
@@ -1111,11 +1303,26 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        before = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="x.yaml", line_number=1)
-        after = before.model_copy(update={"component_type": AIComponentType.MODEL_ENDPOINT, "heuristic_confidence": 0.85})
+        before = AIComponent(
+            name="ada-ep",
+            component_type=AIComponentType.EMBEDDING,
+            file_path="x.yaml",
+            line_number=1,
+        )
+        after = before.model_copy(
+            update={
+                "component_type": AIComponentType.MODEL_ENDPOINT,
+                "heuristic_confidence": 0.85,
+            }
+        )
         memo.record(before, after)
 
-        dup = AIComponent(name="ada-ep", component_type=AIComponentType.EMBEDDING, file_path="y.yaml", line_number=5)
+        dup = AIComponent(
+            name="ada-ep",
+            component_type=AIComponentType.EMBEDDING,
+            file_path="y.yaml",
+            line_number=5,
+        )
         result = memo.apply([dup])
         assert len(result) == 1
         assert result[0].component_type == AIComponentType.MODEL_ENDPOINT
@@ -1126,8 +1333,15 @@ class TestDecisionMemo:
         from aibom.agentic.agent import _DecisionMemo
 
         memo = _DecisionMemo()
-        ep = AIComponent(name="env:WEAVIATE_EP", component_type=AIComponentType.LLM_ENDPOINT, file_path="v.yaml", line_number=1)
-        memo.record(ep, ep.model_copy(update={"component_type": AIComponentType.VECTOR_STORE}))
+        ep = AIComponent(
+            name="env:WEAVIATE_EP",
+            component_type=AIComponentType.LLM_ENDPOINT,
+            file_path="v.yaml",
+            line_number=1,
+        )
+        memo.record(
+            ep, ep.model_copy(update={"component_type": AIComponentType.VECTOR_STORE})
+        )
 
         assert memo.lookup(ep) is None
         assert len(memo) == 0
@@ -1137,7 +1351,12 @@ class TestDecisionMemo:
 
         memo = _DecisionMemo()
         assert len(memo) == 0
-        c = AIComponent(name="torch", component_type=AIComponentType.DEPENDENCY, file_path="r.txt", line_number=1)
+        c = AIComponent(
+            name="torch",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="r.txt",
+            line_number=1,
+        )
         memo.record(c, c.model_copy(update={"heuristic_confidence": 0.9}))
         assert len(memo) == 1
 
@@ -1149,9 +1368,24 @@ class TestSubAgentGrouping:
         from aibom.agentic.agent import _group_by_top_dir
 
         comps = [
-            AIComponent(name="a", component_type=AIComponentType.MODEL, file_path="/repo1/src/a.py", line_number=1),
-            AIComponent(name="b", component_type=AIComponentType.MODEL, file_path="/repo1/src/b.py", line_number=2),
-            AIComponent(name="c", component_type=AIComponentType.MODEL, file_path="/repo2/lib/c.py", line_number=1),
+            AIComponent(
+                name="a",
+                component_type=AIComponentType.MODEL,
+                file_path="/repo1/src/a.py",
+                line_number=1,
+            ),
+            AIComponent(
+                name="b",
+                component_type=AIComponentType.MODEL,
+                file_path="/repo1/src/b.py",
+                line_number=2,
+            ),
+            AIComponent(
+                name="c",
+                component_type=AIComponentType.MODEL,
+                file_path="/repo2/lib/c.py",
+                line_number=1,
+            ),
         ]
         groups = _group_by_top_dir(comps, scan_paths=["/repo1", "/repo2"])
         assert len(groups) == 2
@@ -1160,7 +1394,12 @@ class TestSubAgentGrouping:
         from aibom.agentic.agent import _group_by_top_dir
 
         comps = [
-            AIComponent(name=f"m{i}", component_type=AIComponentType.MODEL, file_path=f"/repo/d{i}/f.py", line_number=i)
+            AIComponent(
+                name=f"m{i}",
+                component_type=AIComponentType.MODEL,
+                file_path=f"/repo/d{i}/f.py",
+                line_number=i,
+            )
             for i in range(5)
         ]
         groups = _group_by_top_dir(comps, scan_paths=["/repo"])
@@ -1272,7 +1511,11 @@ class TestAgentEvidenceOnClassifications:
         )
         resp = AgentResponse(
             reclassify_components=[
-                {"instance_id": "a", "new_type": "agent", "agent_evidence": ev.model_dump()},
+                {
+                    "instance_id": "a",
+                    "new_type": "agent",
+                    "agent_evidence": ev.model_dump(),
+                },
             ],
         )
         assert resp.reclassify_components[0].agent_evidence == ev
@@ -1298,5 +1541,75 @@ class TestA2ARelationshipTypes:
     def test_a2a_types_round_trip_via_string(self):
         from aibom.models import RelationshipType
 
-        assert RelationshipType("INVOKES_A2A_AGENT") is RelationshipType.INVOKES_A2A_AGENT
-        assert RelationshipType("EXPOSES_A2A_AGENT") is RelationshipType.EXPOSES_A2A_AGENT
+        assert (
+            RelationshipType("INVOKES_A2A_AGENT") is RelationshipType.INVOKES_A2A_AGENT
+        )
+        assert (
+            RelationshipType("EXPOSES_A2A_AGENT") is RelationshipType.EXPOSES_A2A_AGENT
+        )
+
+
+class TestAgenticResultCacheAtomicWrite:
+    """``_AgenticResultCache`` must write cache entries atomically so an
+    interrupted run never leaves a half-written ``.json`` that a later resume
+    reads as a partial/corrupt entry."""
+
+    def test_successful_put_writes_complete_json_only(self, tmp_path: Path):
+        from aibom.agentic.agent import _AgenticResultCache
+
+        cache = _AgenticResultCache(cache_dir=tmp_path)
+        cache.put("k1", {"a": 1, "b": [1, 2, 3]})
+
+        # The committed entry is complete and parseable JSON.
+        files = list(tmp_path.glob("*.json"))
+        assert [f.name for f in files] == ["k1.json"]
+        assert json.loads(files[0].read_text(encoding="utf-8")) == {
+            "a": 1,
+            "b": [1, 2, 3],
+        }
+        # No temp/partial artifacts left behind.
+        assert list(tmp_path.glob("*.tmp")) == []
+        assert list(tmp_path.glob("*.json.*")) == []
+
+    def test_write_is_atomic_via_temp_then_rename(self, tmp_path: Path, monkeypatch):
+        """``put`` must stage to a temp file and atomically rename into place,
+        so a crash during the commit never leaves a partial ``key.json``. We
+        intercept ``os.replace`` (the atomic commit) to fail; the target file
+        must not exist afterwards (only a leftover temp at worst)."""
+        import os as _os
+
+        from aibom.agentic.agent import _AgenticResultCache
+
+        cache = _AgenticResultCache(cache_dir=tmp_path)
+
+        calls: dict[str, int] = {"replace": 0}
+
+        def failing_replace(src, dst):
+            calls["replace"] += 1
+            raise OSError("simulated crash during atomic commit")
+
+        monkeypatch.setattr(_os, "replace", failing_replace)
+
+        # put() swallows OSError today; the contract we assert is that the
+        # atomic commit was attempted and no corrupt target file remains.
+        cache.put("k1", {"a": 1})
+
+        assert (
+            calls["replace"] == 1
+        ), "put() must commit via os.replace (atomic temp-file rename)"
+        assert not (
+            tmp_path / "k1.json"
+        ).exists(), "a failed commit must not leave a partial/corrupt k1.json"
+
+    def test_resume_skips_truncated_cache_entry(self, tmp_path: Path):
+        from aibom.agentic.agent import _AgenticResultCache
+
+        # Simulate a killed run that left a truncated (invalid) JSON file.
+        (tmp_path / "good.json").write_text('{"ok": true}', encoding="utf-8")
+        (tmp_path / "partial.json").write_text('{"ok": tr', encoding="utf-8")
+
+        cache = _AgenticResultCache(cache_dir=tmp_path)
+
+        # Good entry loads; truncated entry is skipped (cache miss), not fatal.
+        assert cache.get("good") == {"ok": True}
+        assert cache.get("partial") is None

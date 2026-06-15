@@ -65,9 +65,7 @@ EXPECTED_REPORTER_NAMES = frozenset(
 )
 
 
-def _source_with_three_components(
-    path: str, name_prefix: str
-) -> SourceResult:
+def _source_with_three_components(path: str, name_prefix: str) -> SourceResult:
     model = AIComponent(
         name=f"{name_prefix}-model",
         component_type=AIComponentType.MODEL,
@@ -157,12 +155,14 @@ def test_get_reporter_unknown_returns_none():
 
 def test_friendly_source_name(tmp_path, monkeypatch):
     from unittest.mock import patch
+
     from aibom.reporters.json_reporter import _friendly_source_name
 
     def _fake_run(cmd, **_kw):
         class R:
             returncode = 0
             stdout = "git@github.com:acme-org/my-service.git\n"
+
         return R()
 
     with patch("aibom.reporters.json_reporter.subprocess.run", side_effect=_fake_run):
@@ -172,6 +172,7 @@ def test_friendly_source_name(tmp_path, monkeypatch):
         class R:
             returncode = 0
             stdout = "https://github.com/org/repo.git\n"
+
         return R()
 
     with patch("aibom.reporters.json_reporter.subprocess.run", side_effect=_fake_https):
@@ -230,7 +231,9 @@ def test_json_reporter_preserves_decision_annotations():
     )
     result = ScanResult(
         metadata={"analyzer_version": "2.0.0-test", "run_id": "run-test-annotations"},
-        sources=[SourceResult(path="/proj/src", components=[component], relationships=[])],
+        sources=[
+            SourceResult(path="/proj/src", components=[component], relationships=[])
+        ],
         risk=RiskScore(),
     )
 
@@ -244,11 +247,15 @@ def test_json_reporter_preserves_decision_annotations():
     assert rendered["decision_annotation"]["code_snippet"]["truncated"] is False
 
 
-def test_json_reporter_disambiguates_colliding_source_names(sample_scan_result: ScanResult):
+def test_json_reporter_disambiguates_colliding_source_names(
+    sample_scan_result: ScanResult,
+):
     from unittest.mock import patch
 
     buf = StringIO()
-    with patch("aibom.reporters.json_reporter._friendly_source_name", return_value="dup"):
+    with patch(
+        "aibom.reporters.json_reporter._friendly_source_name", return_value="dup"
+    ):
         get_reporter("json").render(sample_scan_result, buf)
 
     data = json.loads(buf.getvalue())
@@ -260,7 +267,52 @@ def test_json_reporter_disambiguates_colliding_source_names(sample_scan_result: 
     assert sources["dup#2"]["source_path"] == "/proj/src/beta"
 
 
-def test_json_reporter_omits_component_summary_by_default(sample_scan_result: ScanResult):
+def test_json_reporter_emits_source_attribution_block(
+    sample_scan_result: ScanResult,
+):
+    buf = StringIO()
+    JsonReporter().render(sample_scan_result, buf)
+    data = json.loads(buf.getvalue())
+
+    sources = data["aibom_analysis"]["sources"]
+    for src in sources.values():
+        meta = src["metadata"]
+        # The attribution triple is always present.
+        assert "source_kind" in meta
+        assert "source_ref_canonical" in meta
+        assert "source_ref_version" in meta
+        # Fixture paths are not real checkouts -> local-path, empty refs.
+        assert meta["source_kind"] == "local-path"
+        assert meta["source_ref_canonical"] == ""
+        assert meta["source_ref_version"] == ""
+
+
+def test_json_reporter_source_attribution_prefers_supplied_detail(
+    sample_scan_result: ScanResult,
+):
+    # Pipeline / cross-repo discovery may already know the attribution; those
+    # values must win over local-path derivation.
+    sample_scan_result.metadata["_report_source_details"] = {
+        "/proj/src/alpha": {
+            "source_kind": "git",
+            "source_ref_canonical": "github.com/org/repo",
+            "source_ref_version": "a" * 40,
+        }
+    }
+    buf = StringIO()
+    JsonReporter().render(sample_scan_result, buf)
+    data = json.loads(buf.getvalue())
+
+    alpha = data["aibom_analysis"]["sources"]["alpha"]
+    assert alpha["summary"]["source_kind"] == "git"
+    assert alpha["metadata"]["source_kind"] == "git"
+    assert alpha["metadata"]["source_ref_canonical"] == "github.com/org/repo"
+    assert alpha["metadata"]["source_ref_version"] == "a" * 40
+
+
+def test_json_reporter_omits_component_summary_by_default(
+    sample_scan_result: ScanResult,
+):
     buf = StringIO()
     JsonReporter().render(sample_scan_result, buf)
     data = json.loads(buf.getvalue())
@@ -268,7 +320,9 @@ def test_json_reporter_omits_component_summary_by_default(sample_scan_result: Sc
     assert "component_summary" not in data["aibom_analysis"]
 
 
-def test_json_reporter_emits_component_summary_when_enabled(sample_scan_result: ScanResult):
+def test_json_reporter_emits_component_summary_when_enabled(
+    sample_scan_result: ScanResult,
+):
     buf = StringIO()
     JsonReporter(include_component_summary=True).render(sample_scan_result, buf)
     data = json.loads(buf.getvalue())

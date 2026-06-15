@@ -33,12 +33,12 @@ import pytest
 from aibom.cst_parser import parse_source_code
 from aibom.models import AIComponentType, DetectionSource, ScanContext
 from aibom.scanners.kb_enrichment_scanner import (
-    ALLOWED_CONCEPTS,
-    KBEnrichmentScanner,
     _AGENT_FRAMEWORK_PREFIXES,
     _BARE_CLIENT_HINTS,
+    _CONCEPT_TO_TYPE,
     _KNOWN_AI_CLIENT_CLASSES,
-    _MatchResult,
+    ALLOWED_CONCEPTS,
+    KBEnrichmentScanner,
     _build_kb_patterns,
     _detect_model_kwargs,
     _emit_suggestive_candidates,
@@ -47,10 +47,10 @@ from aibom.scanners.kb_enrichment_scanner import (
     _frameworks_related,
     _has_suggestive_signal,
     _match_observation_rich,
+    _MatchResult,
     _process_file_with_cache,
     _resolve_kb_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Unit tests for helper functions
@@ -62,10 +62,15 @@ class TestExtractClassSegment:
         assert _extract_class_segment("langchain_openai.ChatOpenAI") == "ChatOpenAI"
 
     def test_factory_method(self):
-        assert _extract_class_segment("langchain_community.vectorstores.FAISS.from_texts") == "FAISS"
+        assert (
+            _extract_class_segment("langchain_community.vectorstores.FAISS.from_texts")
+            == "FAISS"
+        )
 
     def test_deep_method_chain(self):
-        assert _extract_class_segment("openai.OpenAI.chat.completions.create") == "OpenAI"
+        assert (
+            _extract_class_segment("openai.OpenAI.chat.completions.create") == "OpenAI"
+        )
 
     def test_single_name(self):
         assert _extract_class_segment("ChatOpenAI") is None
@@ -185,15 +190,14 @@ class TestMethodLabelFiltering:
         }
 
         comps = _process_file_with_cache(result, kb_entries)
-        assert [c for c in comps if c.component_type == AIComponentType.VECTOR_STORE] == []
+        assert [
+            c for c in comps if c.component_type == AIComponentType.VECTOR_STORE
+        ] == []
 
     def test_kb_class_match_still_emits_vector_store_asset(self, tmp_path: Path):
         helper = tmp_path / "store.py"
         helper.write_text(
-            "class FakeVectorStore:\n"
-            "    pass\n"
-            "\n"
-            "store = FakeVectorStore()\n"
+            "class FakeVectorStore:\n" "    pass\n" "\n" "store = FakeVectorStore()\n"
         )
 
         result = parse_source_code(str(helper), helper.read_text())
@@ -221,7 +225,9 @@ class TestMethodLabelFiltering:
             },
         }
         result = _match_observation_rich(
-            "models.llm.openai.ChatOpenAI.invoke", kb, set(),
+            "models.llm.openai.ChatOpenAI.invoke",
+            kb,
+            set(),
         )
         assert result.is_partial
         assert "ChatOpenAI" in (result.partial_kb_id or "")
@@ -234,7 +240,9 @@ class TestMethodLabelFiltering:
                 "framework": "langchain_openai",
             },
         }
-        result = _match_observation_rich("langchain_openai.ChatOpenAI", kb, {"langchain_openai"})
+        result = _match_observation_rich(
+            "langchain_openai.ChatOpenAI", kb, {"langchain_openai"}
+        )
         assert result.is_confirmed
 
     def test_tier3_lowercase_short_name_skipped(self):
@@ -264,12 +272,17 @@ class TestExtractLeafClass:
 
     def test_valid_deep_class(self):
         assert (
-            _extract_leaf_class("langchain_community.tools.ddg_search.tool.DuckDuckGoSearchRun")
+            _extract_leaf_class(
+                "langchain_community.tools.ddg_search.tool.DuckDuckGoSearchRun"
+            )
             == "DuckDuckGoSearchRun"
         )
 
     def test_rejects_lowercase_leaf(self):
-        assert _extract_leaf_class("langchain.tools.render.format_tool_to_openai_function") is None
+        assert (
+            _extract_leaf_class("langchain.tools.render.format_tool_to_openai_function")
+            is None
+        )
 
     def test_rejects_all_uppercase(self):
         assert _extract_leaf_class("langchain.constants.API") is None
@@ -290,7 +303,12 @@ class TestExtractLeafClass:
         assert _extract_leaf_class("Tool") is None
 
     def test_excluded_class_blocked(self):
-        assert _extract_leaf_class("langchain.text_splitter.RecursiveCharacterTextSplitter") is None
+        assert (
+            _extract_leaf_class(
+                "langchain.text_splitter.RecursiveCharacterTextSplitter"
+            )
+            is None
+        )
 
 
 @pytest.mark.skipif(not _kb_available(), reason="No KB DuckDB installed")
@@ -378,6 +396,41 @@ class TestAllowedConcepts:
     def test_other_excluded(self):
         assert "other" not in ALLOWED_CONCEPTS
 
+    def test_expanded_vocabulary_concepts_accepted(self):
+        # Operational + MCP concepts must be surfaced, not dropped.
+        for concept in (
+            "guardrail",
+            "mcp_server",
+            "mcp_client",
+            "skill",
+            "observability",
+            "vector_store",
+            "dataset",
+            "training_run",
+            "model_artifact",
+        ):
+            assert concept in ALLOWED_CONCEPTS
+
+    def test_allowed_concepts_derived_from_mapping(self):
+        # ALLOWED_CONCEPTS must stay in lockstep with the type mapping so the
+        # two never drift.
+        assert ALLOWED_CONCEPTS == frozenset(_CONCEPT_TO_TYPE)
+
+    def test_concepts_map_to_expected_types(self):
+        assert _CONCEPT_TO_TYPE["guardrail"] is AIComponentType.GUARDRAIL
+        assert _CONCEPT_TO_TYPE["mcp_server"] is AIComponentType.MCP_SERVER
+        assert _CONCEPT_TO_TYPE["mcp_client"] is AIComponentType.MCP_CLIENT
+        assert _CONCEPT_TO_TYPE["skill"] is AIComponentType.SKILL
+        assert _CONCEPT_TO_TYPE["observability"] is AIComponentType.OBSERVABILITY
+        assert _CONCEPT_TO_TYPE["vector_store"] is AIComponentType.VECTOR_STORE
+
+    def test_typeless_concepts_map_to_other_not_dropped(self):
+        # Concepts without a dedicated type are kept as OTHER so the evidence
+        # is not silently discarded.
+        for concept in ("reranker", "evaluator", "framework_core"):
+            assert _CONCEPT_TO_TYPE[concept] is AIComponentType.OTHER
+            assert concept in ALLOWED_CONCEPTS
+
 
 # ---------------------------------------------------------------------------
 # Scanner-level tests (KB presence required)
@@ -425,8 +478,7 @@ class TestKBEnrichmentScannerIntegration:
 
     def test_detects_agent(self, tmp_path: Path):
         (tmp_path / "graph.py").write_text(
-            "from langgraph.graph import StateGraph\n"
-            "graph = StateGraph()\n"
+            "from langgraph.graph import StateGraph\n" "graph = StateGraph()\n"
         )
         ctx = ScanContext(paths=[str(tmp_path)])
         comps, _ = KBEnrichmentScanner().scan(ctx)
@@ -457,8 +509,7 @@ class TestKBEnrichmentScannerIntegration:
 
     def test_filters_other_concept(self, tmp_path: Path):
         (tmp_path / "client.py").write_text(
-            "import openai\n"
-            "client = openai.OpenAI()\n"
+            "import openai\n" "client = openai.OpenAI()\n"
         )
         ctx = ScanContext(paths=[str(tmp_path)])
         comps, _ = KBEnrichmentScanner().scan(ctx)
@@ -479,8 +530,7 @@ class TestKBEnrichmentScannerIntegration:
 
     def test_dedup_same_line(self, tmp_path: Path):
         (tmp_path / "app.py").write_text(
-            "from crewai import Agent\n"
-            "a = Agent(role='r')\n"
+            "from crewai import Agent\n" "a = Agent(role='r')\n"
         )
         ctx = ScanContext(paths=[str(tmp_path)])
         comps, _ = KBEnrichmentScanner().scan(ctx)
@@ -495,12 +545,10 @@ class TestKBEnrichmentScannerIntegration:
 
     def test_multiple_files(self, tmp_path: Path):
         (tmp_path / "a.py").write_text(
-            "from crewai import Agent\n"
-            "a = Agent(role='r')\n"
+            "from crewai import Agent\n" "a = Agent(role='r')\n"
         )
         (tmp_path / "b.py").write_text(
-            "from langgraph.graph import StateGraph\n"
-            "g = StateGraph()\n"
+            "from langgraph.graph import StateGraph\n" "g = StateGraph()\n"
         )
         ctx = ScanContext(paths=[str(tmp_path)])
         comps, _ = KBEnrichmentScanner().scan(ctx)
@@ -580,8 +628,7 @@ class TestEmitSuggestiveCandidates:
         f = tmp_path / "agents" / "multi.py"
         f.parent.mkdir()
         source = (
-            "router = RouterAgent(api_key='x')\n"
-            "search = SearchTool(name='docs')\n"
+            "router = RouterAgent(api_key='x')\n" "search = SearchTool(name='docs')\n"
         )
         f.write_text(source)
         candidates = _emit_suggestive_candidates(f, source)
@@ -661,15 +708,11 @@ class TestAgentSpecificHint:
 
     def test_non_agent_hint_unchanged(self, tmp_path: Path):
         (tmp_path / "app.py").write_text(
-            "from stores.vector_store import VectorStore\n"
-            "vs = VectorStore()\n"
+            "from stores.vector_store import VectorStore\n" "vs = VectorStore()\n"
         )
         ctx = ScanContext(paths=[str(tmp_path)])
         comps, _ = KBEnrichmentScanner().scan(ctx)
-        stores = [
-            c for c in comps
-            if c.component_type == AIComponentType.VECTOR_STORE
-        ]
+        stores = [c for c in comps if c.component_type == AIComponentType.VECTOR_STORE]
         if stores:
             hint = stores[0].agentic_hint
             assert "REMOVE unless surrounding code proves" in hint
@@ -708,19 +751,19 @@ class TestStrandsProviderClassCoverage:
 
     @pytest.mark.parametrize("class_name", _STRANDS_MODEL_CLASSES)
     def test_strands_class_is_registered(self, class_name: str) -> None:
-        assert class_name in _KNOWN_AI_CLIENT_CLASSES, (
-            f"{class_name} missing from _KNOWN_AI_CLIENT_CLASSES"
-        )
+        assert (
+            class_name in _KNOWN_AI_CLIENT_CLASSES
+        ), f"{class_name} missing from _KNOWN_AI_CLIENT_CLASSES"
 
     @pytest.mark.parametrize("class_name", _STRANDS_MODEL_CLASSES)
     def test_strands_class_has_bare_client_hint(self, class_name: str) -> None:
-        assert class_name in _BARE_CLIENT_HINTS, (
-            f"{class_name} missing from _BARE_CLIENT_HINTS"
-        )
+        assert (
+            class_name in _BARE_CLIENT_HINTS
+        ), f"{class_name} missing from _BARE_CLIENT_HINTS"
         hint = _BARE_CLIENT_HINTS[class_name]
-        assert "Remove" in hint, (
-            f"{class_name} bare-client hint must mention removal: {hint!r}"
-        )
+        assert (
+            "Remove" in hint
+        ), f"{class_name} bare-client hint must mention removal: {hint!r}"
 
     def test_bedrock_model_resolves_model_id_kwarg(self, tmp_path: Path) -> None:
         """``BedrockModel(model_id="...")`` should yield a MODEL asset with
@@ -741,17 +784,14 @@ class TestStrandsProviderClassCoverage:
         assert models[0].heuristic_confidence == 1.0
         assert models[0].metadata["constructor"] == "BedrockModel"
         assert models[0].metadata["extracted_from_kwarg"] == "model_id"
-        assert (
-            models[0].metadata.get("detection_method") != "bare_provider_client"
-        )
+        assert models[0].metadata.get("detection_method") != "bare_provider_client"
 
     def test_bare_bedrock_model_emits_agentic_candidate(self, tmp_path: Path) -> None:
         """``BedrockModel()`` with no model_id is a bare client, so we emit a
         needs_agentic MODEL so the agentic layer can resolve or prune it."""
         src = tmp_path / "agent.py"
         src.write_text(
-            "from strands.models import BedrockModel\n"
-            "model = BedrockModel()\n"
+            "from strands.models import BedrockModel\n" "model = BedrockModel()\n"
         )
         result = parse_source_code(str(src), src.read_text())
         comps = _detect_model_kwargs(result)
@@ -834,9 +874,9 @@ class TestStrandsAgentFrameworkPrefix:
         agent = agents[0]
         assert agent.detection_source == DetectionSource.CODE_ANALYSIS
         call_pattern = agent.metadata.get("call_pattern", "")
-        assert call_pattern.endswith("Agent"), (
-            f"call_pattern should end with 'Agent', got {call_pattern!r}"
-        )
+        assert call_pattern.endswith(
+            "Agent"
+        ), f"call_pattern should end with 'Agent', got {call_pattern!r}"
 
     def test_non_strands_non_framework_call_is_not_detected(
         self, tmp_path: Path
@@ -857,3 +897,94 @@ class TestStrandsAgentFrameworkPrefix:
             f"stray Agent() call from unknown framework should NOT be "
             f"promoted; got {[(c.name, c.framework) for c in agents]}"
         )
+
+
+class TestLangGraphAgentFrameworkPrefix:
+    """``create_react_agent(...)`` from LangGraph must become an AGENT.
+
+    LangGraph's prebuilt ReAct factory is catalogued in the KB as an agent,
+    but the call-pattern gate (``_AGENT_FRAMEWORK_PREFIXES``) derives the
+    framework prefix from the qualified name's first segment. Without
+    ``"langgraph"`` in the set, ``langgraph.prebuilt.create_react_agent(...)``
+    was rejected and the agent was never emitted — observed on published
+    open-source LangGraph sample repositories.
+    """
+
+    def test_langgraph_is_registered_framework_prefix(self) -> None:
+        assert "langgraph" in _AGENT_FRAMEWORK_PREFIXES, (
+            "langgraph must be a recognised agent framework prefix so that "
+            "create_react_agent(...) calls are classified."
+        )
+
+    def test_create_react_agent_call_is_detected(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "\n"
+            "agent = create_react_agent(model=llm, tools=tools)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _process_file_with_cache(result, kb_by_id={})
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert len(agents) == 1, (
+            f"expected exactly one LangGraph agent; got: "
+            f"{[(c.name, c.component_type) for c in comps]}"
+        )
+        call_pattern = agents[0].metadata.get("call_pattern", "")
+        assert call_pattern.endswith("create_react_agent"), call_pattern
+
+
+class TestLangGraphDependencyAllowlist:
+    """LangGraph and sibling agent-framework packages are AI dependencies."""
+
+    def test_agent_framework_packages_are_known_ai(self) -> None:
+        from aibom.scanners.dependency_scanner import is_known_ai_package
+
+        for pkg in ("langgraph", "ag2", "autogen-ext", "google-adk"):
+            assert is_known_ai_package(
+                "pypi", pkg
+            ), f"{pkg} should be recognised as an AI dependency"
+
+
+class TestGuardrailDetection:
+    """``agentsec.protect(...)`` and guardrail frameworks must be detected."""
+
+    def test_agentsec_protect_call_is_guardrail(self, tmp_path: Path) -> None:
+        from aibom.scanners.kb_enrichment_scanner import _detect_guardrail_calls
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from aidefense.runtime import agentsec\n"
+            "agentsec.protect(config='agentsec.yaml')\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_guardrail_calls(result)
+        guardrails = [c for c in comps if c.component_type == AIComponentType.GUARDRAIL]
+        assert len(guardrails) == 1, (
+            f"expected one guardrail from agentsec.protect(); got "
+            f"{[(c.name, c.component_type) for c in comps]}"
+        )
+        assert guardrails[0].metadata.get("guardrail_protection") is True
+        assert (
+            guardrails[0].metadata.get("call_pattern", "").endswith("agentsec.protect")
+        )
+
+    def test_non_guardrail_call_is_ignored(self, tmp_path: Path) -> None:
+        from aibom.scanners.kb_enrichment_scanner import _detect_guardrail_calls
+
+        src = tmp_path / "app.py"
+        src.write_text(
+            "import logging\n"
+            "logging.getLogger(__name__).info('protect')\n"
+            "some_obj.protect_something()\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        comps = _detect_guardrail_calls(result)
+        assert comps == []
+
+    def test_guardrail_framework_imports_mapped(self) -> None:
+        from aibom.scanners.kb_enrichment_scanner import _IMPORT_MODULE_TYPE_MAP
+
+        for mod in ("agentsec", "aidefense", "nemoguardrails", "guardrails"):
+            assert mod in _IMPORT_MODULE_TYPE_MAP
+            assert _IMPORT_MODULE_TYPE_MAP[mod].primary is AIComponentType.GUARDRAIL

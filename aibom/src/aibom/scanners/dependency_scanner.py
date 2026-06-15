@@ -54,6 +54,12 @@ KNOWN_AI_PACKAGES: dict[str, set[str]] = {
         "crewai",
         "autogen",
         "autogen-agentchat",
+        "autogen-ext",
+        "ag2",
+        "langgraph",
+        "langgraph-prebuilt",
+        "langgraph-checkpoint",
+        "google-adk",
         "mcp",
         "fastmcp",
         "llama-index",
@@ -371,7 +377,10 @@ def _parse_pyproject_toml(text: str) -> list[tuple[str, str, int, Optional[str],
                             "pypi",
                         ),
                     )
-    poetry_re = re.compile(r"^\[(tool\.poetry(?:\.group\.[^.]+)?\.dependencies)\]\s*$", re.MULTILINE | re.IGNORECASE)
+    poetry_re = re.compile(
+        r"^\[(tool\.poetry(?:\.group\.[^.]+)?\.dependencies)\]\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
     for m in poetry_re.finditer(text):
         start = m.end()
         rest = text[start:]
@@ -957,9 +966,7 @@ def _iter_scan_paths(context: ScanContext) -> Iterator[Path]:
             yield root
             continue
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames if not should_skip_dir(d)
-            ]
+            dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
             for fname in filenames:
                 f = Path(dirpath) / fname
                 try:

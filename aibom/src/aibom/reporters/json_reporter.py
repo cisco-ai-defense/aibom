@@ -44,7 +44,9 @@ def _friendly_source_name(path: str) -> str:
         try:
             result = subprocess.run(
                 ["git", "-C", str(resolved), "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode == 0:
                 m = _REMOTE_ORG_REPO_RE.search(result.stdout.strip())
@@ -55,7 +57,56 @@ def _friendly_source_name(path: str) -> str:
     return PurePosixPath(path).name or path
 
 
-def _components_by_type(components: Iterable[AIComponent]) -> dict[str, list[dict[str, Any]]]:
+def _source_attribution(path: str, detail: dict[str, Any]) -> dict[str, str]:
+    """Resolve the source-attribution triple for one scanned source.
+
+    Values supplied by the scan pipeline / cross-repo discovery (in ``detail``)
+    win, since that path may already know the resolved remote or image digest.
+    Otherwise the triple is derived deterministically from the local path:
+    ``source_kind`` from the working tree, ``source_ref_canonical`` from the
+    canonicalized ``origin`` remote, and ``source_ref_version`` from ``HEAD``.
+    """
+    from ..source_attribution import (
+        SOURCE_KIND_CONTAINER_IMAGE,
+        canonicalize_source_ref,
+        capture_git_remote,
+        capture_source_ref_version,
+        detect_source_kind,
+    )
+
+    is_image = (detail.get("source_kind") == SOURCE_KIND_CONTAINER_IMAGE) or None
+    source_kind = detail.get("source_kind") or detect_source_kind(
+        path, is_container_image=is_image
+    )
+
+    canonical = detail.get("source_ref_canonical")
+    if not canonical:
+        raw_ref = detail.get("source_ref")
+        if not raw_ref and source_kind != SOURCE_KIND_CONTAINER_IMAGE:
+            raw_ref = capture_git_remote(path)
+        canonical = canonicalize_source_ref(raw_ref, source_kind) if raw_ref else ""
+
+    version = detail.get("source_ref_version")
+    if not version:
+        version = (
+            capture_source_ref_version(
+                path,
+                source_kind,
+                image_digest=detail.get("image_digest"),
+            )
+            or ""
+        )
+
+    return {
+        "source_kind": source_kind,
+        "source_ref_canonical": canonical or "",
+        "source_ref_version": version or "",
+    }
+
+
+def _components_by_type(
+    components: Iterable[AIComponent],
+) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for comp in components:
         key = comp.component_type.value
@@ -126,8 +177,13 @@ def _aibom_payload(
         source_name = detail.get("source_name") or _friendly_source_name(src.path)
         source_key = _disambiguate_source_key(source_name, seen_source_names)
         source_path = detail.get("source_path") or src.path
-        source_kind = detail.get("source_kind") or "local-path"
-        per_source_meta: dict[str, Any] = {}
+        attribution = _source_attribution(src.path, detail)
+        source_kind = attribution["source_kind"]
+        per_source_meta: dict[str, Any] = {
+            "source_kind": attribution["source_kind"],
+            "source_ref_canonical": attribution["source_ref_canonical"],
+            "source_ref_version": attribution["source_ref_version"],
+        }
         for mk in ("elapsed_s", "prompt_tokens", "completion_tokens", "total_tokens"):
             val = detail.get(mk)
             if val is not None:
@@ -140,18 +196,17 @@ def _aibom_payload(
             "summary": {
                 "status": detail.get("status") or "completed",
                 "source_kind": source_kind,
-                "assets_discovered": detail.get("assets_discovered") or total_components,
+                "assets_discovered": detail.get("assets_discovered")
+                or total_components,
                 "last_generated_at": (
-                    detail.get("last_generated_at")
-                    or raw_metadata.get("completed_at")
+                    detail.get("last_generated_at") or raw_metadata.get("completed_at")
                 ),
             },
-            **({"metadata": per_source_meta} if per_source_meta else {}),
+            "metadata": per_source_meta,
         }
         components_by_source[source_key] = list(src.components)
     cross_repo_links_out = [
-        link.model_dump(mode="json")
-        for link in result.cross_repo_links
+        link.model_dump(mode="json") for link in result.cross_repo_links
     ]
     analysis: dict[str, Any] = {
         "metadata": raw_metadata,

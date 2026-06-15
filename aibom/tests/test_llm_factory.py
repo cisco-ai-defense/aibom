@@ -21,8 +21,9 @@ from unittest.mock import MagicMock, patch
 @patch(
     "aibom.llm_factory.ensure_llm_runtime_available",
     side_effect=lambda model_string, *, provider=None: (
-        __import__("aibom.llm_factory", fromlist=["resolve_provider"])
-        .resolve_provider(model_string, provider)
+        __import__("aibom.llm_factory", fromlist=["resolve_provider"]).resolve_provider(
+            model_string, provider
+        )
     ),
 )
 class TestBuildChatModel(unittest.TestCase):
@@ -189,6 +190,62 @@ class TestBuildChatModel(unittest.TestCase):
         self.assertEqual(kwargs["model_provider"], "bedrock")
         self.assertNotIn("base_url", kwargs)
         self.assertNotIn("azure_endpoint", kwargs)
+
+    # --- Reasoning-model parameter handling ---
+
+    @patch("aibom.llm_factory.init_chat_model")
+    def test_reasoning_model_uses_max_completion_tokens(
+        self, mock_init, _mock_preflight
+    ):
+        """Reasoning models (gpt-5.x) reject ``max_tokens`` and require
+        ``max_completion_tokens``."""
+        from aibom.llm_factory import build_chat_model
+
+        mock_init.return_value = MagicMock()
+        build_chat_model("gpt-5.5", max_tokens=256)
+        _, kwargs = mock_init.call_args
+        self.assertEqual(kwargs.get("max_completion_tokens"), 256)
+        self.assertNotIn("max_tokens", kwargs)
+
+    @patch("aibom.llm_factory.init_chat_model")
+    def test_reasoning_model_omits_temperature(self, mock_init, _mock_preflight):
+        """Reasoning models reject a non-default ``temperature``; omit it."""
+        from aibom.llm_factory import build_chat_model
+
+        mock_init.return_value = MagicMock()
+        build_chat_model("gpt-5.5", temperature=0.0)
+        _, kwargs = mock_init.call_args
+        self.assertNotIn("temperature", kwargs)
+
+    @patch("aibom.llm_factory.init_chat_model")
+    def test_reasoning_model_detected_via_provider_slash(
+        self, mock_init, _mock_preflight
+    ):
+        """Detection works on the bare model id after stripping a provider/
+        prefix (e.g. ``openai/o3-mini``)."""
+        from aibom.llm_factory import build_chat_model
+
+        mock_init.return_value = MagicMock()
+        build_chat_model("openai/o3-mini", max_tokens=128)
+        _, kwargs = mock_init.call_args
+        self.assertEqual(kwargs.get("max_completion_tokens"), 128)
+        self.assertNotIn("max_tokens", kwargs)
+        self.assertNotIn("temperature", kwargs)
+
+    @patch("aibom.llm_factory.init_chat_model")
+    def test_non_reasoning_model_keeps_max_tokens_and_temperature(
+        self, mock_init, _mock_preflight
+    ):
+        """Regression: non-reasoning models are unaffected — they keep
+        ``max_tokens`` and ``temperature``."""
+        from aibom.llm_factory import build_chat_model
+
+        mock_init.return_value = MagicMock()
+        build_chat_model("gpt-4o", max_tokens=256, temperature=0.2)
+        _, kwargs = mock_init.call_args
+        self.assertEqual(kwargs["max_tokens"], 256)
+        self.assertEqual(kwargs["temperature"], 0.2)
+        self.assertNotIn("max_completion_tokens", kwargs)
 
 
 if __name__ == "__main__":

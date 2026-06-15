@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -214,6 +216,7 @@ class AgentResponse(BaseModel):
     new_relationships: list[_Relationship] = Field(default_factory=list)
     risk_findings: list[_RiskFinding] = Field(default_factory=list)
 
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -348,11 +351,13 @@ _SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
 _SUB_AGENT_THRESHOLD = 50
 
 _RETRY_COOLDOWN_S = 30
-_RETRYABLE_HINTS = frozenset({
-    "batch_timeout",
-    "batch_recursion_limit",
-    "circuit_breaker_tripped",
-})
+_RETRYABLE_HINTS = frozenset(
+    {
+        "batch_timeout",
+        "batch_recursion_limit",
+        "circuit_breaker_tripped",
+    }
+)
 
 
 def _collect_failed(
@@ -363,7 +368,9 @@ def _collect_failed(
     retry: list[AIComponent] = []
     for c in enriched:
         if c.agentic_hint in _RETRYABLE_HINTS:
-            retry.append(c.model_copy(update={"needs_agentic": True, "agentic_hint": ""}))
+            retry.append(
+                c.model_copy(update={"needs_agentic": True, "agentic_hint": ""})
+            )
         else:
             ok.append(c)
     return ok, retry
@@ -498,14 +505,25 @@ def _build_tier_cache_payload(
 
 def _load_tier_cache_payload(
     data: dict[str, Any] | None,
-) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]] | None:
+) -> (
+    tuple[
+        list[AIComponent],
+        list[AIComponent],
+        list[ComponentRelationship],
+        list[RiskFlag],
+    ]
+    | None
+):
     """Deserialize a cached tier payload, returning None for non-tier entries."""
     if not data or data.get("_tier_cache_version") != _TIER_CACHE_VERSION:
         return None
     return (
         [AIComponent.model_validate(item) for item in data.get("tier_enriched", [])],
         [AIComponent.model_validate(item) for item in data.get("tier_new", [])],
-        [ComponentRelationship.model_validate(item) for item in data.get("tier_rels", [])],
+        [
+            ComponentRelationship.model_validate(item)
+            for item in data.get("tier_rels", [])
+        ],
         [RiskFlag.model_validate(item) for item in data.get("tier_flags", [])],
     )
 
@@ -532,7 +550,10 @@ def _load_batch_cache_payload(
         return None
     return (
         [AIComponent.model_validate(item) for item in data.get("batch_new", [])],
-        [ComponentRelationship.model_validate(item) for item in data.get("batch_rels", [])],
+        [
+            ComponentRelationship.model_validate(item)
+            for item in data.get("batch_rels", [])
+        ],
         [RiskFlag.model_validate(item) for item in data.get("batch_flags", [])],
     )
 
@@ -672,15 +693,25 @@ class _AgenticResultCache:
     def put(self, key: str, value: dict[str, Any]) -> None:
         self._mem[key] = value
         if self._disk_dir:
+            # Write atomically: serialize to a temp file in the same directory,
+            # then os.replace() into place. A crash mid-write leaves only the
+            # temp file (ignored by the ``*.json`` resume glob), never a
+            # half-written ``key.json`` that a resume would read as a corrupt
+            # cache hit.
+            dest = self._disk_dir / f"{key}.json"
+            tmp = self._disk_dir / f".{key}.json.{os.getpid()}.tmp"
             try:
-                (self._disk_dir / f"{key}.json").write_text(
-                    json.dumps(value, default=str), encoding="utf-8",
-                )
+                tmp.write_text(json.dumps(value, default=str), encoding="utf-8")
+                os.replace(tmp, dest)
             except OSError:
-                pass
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def partition(
-        self, components: list[AIComponent],
+        self,
+        components: list[AIComponent],
     ) -> tuple[list[AIComponent], list[AIComponent]]:
         """Split components into cached (hit) and uncached (miss)."""
         cached: list[AIComponent] = []
@@ -697,7 +728,12 @@ class _AgenticResultCache:
         self,
         components: list[AIComponent],
         middleware: AIBOMScannerMiddleware,
-    ) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+    ) -> tuple[
+        list[AIComponent],
+        list[AIComponent],
+        list[ComponentRelationship],
+        list[RiskFlag],
+    ]:
         """Apply cached agentic results to components."""
         enriched: list[AIComponent] = []
         all_new: list[AIComponent] = []
@@ -717,7 +753,11 @@ class _AgenticResultCache:
 
                 batch_key = data.get("batch_artifact_key")
                 batch_payload = None
-                if isinstance(batch_key, str) and batch_key and batch_key not in seen_batch_keys:
+                if (
+                    isinstance(batch_key, str)
+                    and batch_key
+                    and batch_key not in seen_batch_keys
+                ):
                     seen_batch_keys.add(batch_key)
                     batch_payload = _load_batch_cache_payload(self.get(batch_key))
 
@@ -734,9 +774,14 @@ class _AgenticResultCache:
         return enriched, all_new, all_rels, all_flags
 
 
-_MEMO_SAFE_TYPES: frozenset[str] = frozenset({
-    "dependency", "model", "model_artifact", "embedding",
-})
+_MEMO_SAFE_TYPES: frozenset[str] = frozenset(
+    {
+        "dependency",
+        "model",
+        "model_artifact",
+        "embedding",
+    }
+)
 
 
 class _DecisionMemo:
@@ -785,7 +830,8 @@ class _DecisionMemo:
         return self._verdicts.get(k) if k else None
 
     def partition(
-        self, components: list[AIComponent],
+        self,
+        components: list[AIComponent],
     ) -> tuple[list[AIComponent], list[AIComponent]]:
         """Split into (memo_hits, memo_misses)."""
         hits: list[AIComponent] = []
@@ -814,16 +860,28 @@ class _DecisionMemo:
                 except ValueError:
                     result.append(c)
                     continue
-                result.append(c.model_copy(update={
-                    "component_type": new_type,
-                    "heuristic_confidence": verdict.get("heuristic_confidence", c.heuristic_confidence),
-                    "needs_agentic": False,
-                }))
+                result.append(
+                    c.model_copy(
+                        update={
+                            "component_type": new_type,
+                            "heuristic_confidence": verdict.get(
+                                "heuristic_confidence", c.heuristic_confidence
+                            ),
+                            "needs_agentic": False,
+                        }
+                    )
+                )
             else:
-                result.append(c.model_copy(update={
-                    "heuristic_confidence": verdict.get("heuristic_confidence", c.heuristic_confidence),
-                    "needs_agentic": False,
-                }))
+                result.append(
+                    c.model_copy(
+                        update={
+                            "heuristic_confidence": verdict.get(
+                                "heuristic_confidence", c.heuristic_confidence
+                            ),
+                            "needs_agentic": False,
+                        }
+                    )
+                )
         return result
 
     def __len__(self) -> int:
@@ -845,6 +903,162 @@ def _circuit_breaker_skipped_batch(batch: list[AIComponent]) -> list[AIComponent
     return _degraded_batch_components(batch, hint="circuit_breaker_tripped")
 
 
+class _InvokeTimeout(Exception):
+    """Raised when a synchronous ``agent.invoke`` exceeds its wall-clock deadline.
+
+    The generic timeout sentinel for every synchronous agent-invocation site.
+    Subclasses :class:`Exception` (not ``BaseException``) so a site-level
+    ``except Exception`` still catches it and fails open.
+    """
+
+
+class _BatchTimeout(_InvokeTimeout):
+    """Raised when a synchronous *batch* invocation exceeds its deadline.
+
+    A subclass of :class:`_InvokeTimeout` so the batch path's existing
+    ``except _BatchTimeout`` handling is unchanged while the deadline mechanism
+    is shared with every other invoke site.
+    """
+
+
+def _invoke_agent_bounded(
+    agent: Any,
+    content: str,
+    timeout_s: int,
+    *,
+    recursion_limit: int | None = None,
+) -> Any:
+    """Run ``agent.invoke`` in a daemon thread with a hard wall-clock deadline.
+
+    ``agent.invoke`` is a blocking deep-agent loop that cannot be cancelled.
+    Running it via ``asyncio.run(asyncio.wait_for(asyncio.to_thread(...)))``
+    returned control on timeout but then blocked **forever** on event-loop
+    shutdown, which joins the orphaned (non-cancellable) executor thread — so a
+    genuinely hung LLM call wedged the whole scan.
+
+    Instead, run the call in a *daemon* thread and ``join`` it for at most
+    ``timeout_s``. On timeout we raise :class:`_InvokeTimeout` and abandon the
+    thread; being a daemon, it never blocks process/loop shutdown and dies with
+    the interpreter. This is the single bounded-invoke primitive used by every
+    synchronous agent-invocation site (batch enrichment, cross-repo
+    coordination, container-layout resolution, and repo triage).
+
+    ``recursion_limit`` is forwarded as ``config={"recursion_limit": N}`` only
+    when set; left ``None`` the call passes no ``config`` so the agent applies
+    its own default (some sites intentionally do not cap recursion).
+    """
+    box: dict[str, Any] = {}
+    config: dict[str, Any] | None = (
+        {"recursion_limit": recursion_limit} if recursion_limit is not None else None
+    )
+
+    def _worker() -> None:
+        try:
+            message = {"messages": [{"role": "user", "content": content}]}
+            if config is not None:
+                box["result"] = agent.invoke(message, config=config)
+            else:
+                box["result"] = agent.invoke(message)
+        except BaseException as exc:  # noqa: BLE001 - propagate to caller thread
+            box["error"] = exc
+
+    worker = threading.Thread(
+        target=_worker,
+        name="aibom-agentic-invoke",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout_s)
+
+    if worker.is_alive():
+        # Timed out: abandon the still-running daemon worker. If its invoke
+        # later completes it writes box["result"], but the caller never reads
+        # box again after raising, so that late write is harmless (and dict
+        # writes are GIL-atomic). The daemon dies with the interpreter.
+        raise _InvokeTimeout()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _invoke_with_deadline(agent: Any, summary: str, timeout_s: int) -> Any:
+    """Bounded batch invocation — thin wrapper over :func:`_invoke_agent_bounded`.
+
+    Preserves the batch path's ``_BatchTimeout`` contract (so ``_run_batch``'s
+    ``except _BatchTimeout`` is unchanged) while sharing the daemon-thread
+    deadline mechanism with every other invoke site.
+    """
+    try:
+        return _invoke_agent_bounded(
+            agent, summary, timeout_s, recursion_limit=_RECURSION_LIMIT
+        )
+    except _InvokeTimeout as exc:
+        raise _BatchTimeout() from exc
+
+
+def _run_async_bounded(coro: Any) -> Any:
+    """Run *coro* to completion on a private event loop without wedging the
+    scan, then return its result (re-raising any exception).
+
+    Each batch in *coro* is wrapped in ``asyncio.timeout``, so a stalled
+    ``agent.ainvoke`` is cancelled at the coroutine level and the batch fails
+    open. The problem this helper solves is teardown: ``asyncio.run`` finishes
+    by calling ``loop.shutdown_default_executor()``, which *joins* the loop's
+    default ``ThreadPoolExecutor`` with ``wait=True``. If the provider stack
+    offloaded any blocking work via ``run_in_executor`` and that worker is
+    slow/stuck, the scan blocks there long after every batch has timed out —
+    the same class of hang fixed on the sync path.
+
+    Instead we run the loop with ``run_until_complete`` inside a daemon thread
+    and tear it down manually, deliberately **not** calling
+    ``shutdown_default_executor``; the executor is abandoned with
+    ``shutdown(wait=False)``. So once the bounded *coro* returns, the scan
+    returns immediately regardless of executor state. Running inside a daemon
+    thread also makes any executor workers daemon (threads inherit daemon
+    status from their creator), so they don't keep the interpreter alive.
+
+    Caveat (Python limitation, not specific to this code): if a provider hands
+    a *truly blocking* call to ``run_in_executor`` that never returns, that
+    worker cannot be hard-cancelled by any means, and ``concurrent.futures``
+    joins pool workers in its own ``atexit`` handler — so process *exit* can
+    lag on that single orphan. The scan itself still completes on time. Real
+    langchain async providers use native-async I/O, which cancels cleanly.
+    """
+    import concurrent.futures
+
+    box: dict[str, Any] = {}
+
+    def _runner() -> None:
+        loop = asyncio.new_event_loop()
+        # Created inside this daemon thread, so its workers are daemon too.
+        executor = concurrent.futures.ThreadPoolExecutor(
+            thread_name_prefix="aibom-agentic-io",
+        )
+        loop.set_default_executor(executor)
+        asyncio.set_event_loop(loop)
+        try:
+            box["result"] = loop.run_until_complete(coro)
+        except BaseException as exc:  # noqa: BLE001 - propagate to caller
+            box["error"] = exc
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:  # noqa: BLE001
+                pass
+            # Abandon (do NOT join) any in-flight executor work, then close.
+            # Daemon workers die with the process; nothing blocks teardown.
+            executor.shutdown(wait=False)
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    thread = threading.Thread(target=_runner, name="aibom-agentic-loop", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
 def _run_batch(
     agent: Any,
     middleware: AIBOMScannerMiddleware,
@@ -857,18 +1071,28 @@ def _run_batch(
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     dossier_index: DossierIndex | None = None,
-) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag], bool]:
+) -> tuple[
+    list[AIComponent],
+    list[AIComponent],
+    list[ComponentRelationship],
+    list[RiskFlag],
+    bool,
+]:
     """Invoke the agent on a single batch and return parsed results."""
     from .tools import _reset_tool_stats, get_tool_stats
 
     _reset_tool_stats()
     _LOGGER.info(
         "Agentic batch %d/%d — %d components [%s]",
-        batch_num, total_batches, len(batch),
+        batch_num,
+        total_batches,
+        len(batch),
         ", ".join(c.name for c in batch),
     )
     summary = _build_context_message(
-        batch, relationships, scan_paths,
+        batch,
+        relationships,
+        scan_paths,
         all_components=all_components,
         dossier_index=dossier_index,
     )
@@ -876,25 +1100,16 @@ def _run_batch(
 
     result = None
 
-    async def _invoke_timed() -> Any:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                lambda: agent.invoke(
-                    {"messages": [{"role": "user", "content": summary}]},
-                    config={"recursion_limit": _RECURSION_LIMIT},
-                ),
-            ),
-            timeout=timeout_s,
-        )
-
     try:
-        result = asyncio.run(_invoke_timed())
-    except asyncio.TimeoutError:
+        result = _invoke_with_deadline(agent, summary, timeout_s)
+    except _BatchTimeout:
         elapsed = time.monotonic() - t0
         stats = get_tool_stats()
         _LOGGER.warning(
             "Batch %d timed out after %.1fs | tool_stats=%s",
-            batch_num, elapsed, json.dumps(stats),
+            batch_num,
+            elapsed,
+            json.dumps(stats),
         )
         enriched = _degraded_batch_components(batch, hint="batch_timeout")
         return enriched, [], [], [], True
@@ -903,13 +1118,18 @@ def _run_batch(
         stats = get_tool_stats()
         _LOGGER.warning(
             "Batch %d failed after %.1fs: %s | tool_stats=%s",
-            batch_num, elapsed, exc, json.dumps(stats),
+            batch_num,
+            elapsed,
+            exc,
+            json.dumps(stats),
         )
         if result is not None:
             _accumulate_token_usage(result)
             data = _extract_structured_response(result)
             if data:
-                _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
+                _LOGGER.info(
+                    "Batch %d: recovering partial results from failed run", batch_num
+                )
                 new_c, new_r, rf = middleware.extract_findings_from_dict(data)
                 enriched = middleware.apply_enrichments_from_dict(batch, data)
                 return enriched, new_c, new_r, rf, False
@@ -924,7 +1144,10 @@ def _run_batch(
 
     _LOGGER.info(
         "Batch %d completed in %.1fs — %d tool calls (%.1fs tool time) | breakdown=%s",
-        batch_num, elapsed, total_tool_calls, total_tool_time,
+        batch_num,
+        elapsed,
+        total_tool_calls,
+        total_tool_time,
         json.dumps(stats),
     )
 
@@ -950,18 +1173,28 @@ async def _run_batch_async(
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     dossier_index: DossierIndex | None = None,
-) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag], bool]:
+) -> tuple[
+    list[AIComponent],
+    list[AIComponent],
+    list[ComponentRelationship],
+    list[RiskFlag],
+    bool,
+]:
     """Async version of _run_batch using agent.ainvoke()."""
     from .tools import _reset_tool_stats, get_tool_stats
 
     _reset_tool_stats()
     _LOGGER.info(
         "Agentic batch %d/%d — %d components [%s]",
-        batch_num, total_batches, len(batch),
+        batch_num,
+        total_batches,
+        len(batch),
         ", ".join(c.name for c in batch),
     )
     summary = _build_context_message(
-        batch, relationships, scan_paths,
+        batch,
+        relationships,
+        scan_paths,
         all_components=all_components,
         dossier_index=dossier_index,
     )
@@ -969,19 +1202,24 @@ async def _run_batch_async(
 
     result = None
     try:
-        result = await asyncio.wait_for(
-            agent.ainvoke(
+        # asyncio.timeout() (3.11+) is the recommended primitive over
+        # wait_for: it cancels the awaited ainvoke at the coroutine level and
+        # raises TimeoutError outside the block. Any blocking work the provider
+        # stack offloaded to the loop executor is abandoned at teardown by
+        # _run_async_bounded rather than joined.
+        async with asyncio.timeout(timeout_s):
+            result = await agent.ainvoke(
                 {"messages": [{"role": "user", "content": summary}]},
                 config={"recursion_limit": _RECURSION_LIMIT},
-            ),
-            timeout=timeout_s,
-        )
+            )
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
         stats = get_tool_stats()
         _LOGGER.warning(
             "Batch %d timed out after %.1fs | tool_stats=%s",
-            batch_num, elapsed, json.dumps(stats),
+            batch_num,
+            elapsed,
+            json.dumps(stats),
         )
         enriched = _degraded_batch_components(batch, hint="batch_timeout")
         return enriched, [], [], [], True
@@ -990,13 +1228,18 @@ async def _run_batch_async(
         stats = get_tool_stats()
         _LOGGER.warning(
             "Batch %d failed after %.1fs: %s | tool_stats=%s",
-            batch_num, elapsed, exc, json.dumps(stats),
+            batch_num,
+            elapsed,
+            exc,
+            json.dumps(stats),
         )
         if result is not None:
             _accumulate_token_usage(result)
             data = _extract_structured_response(result)
             if data:
-                _LOGGER.info("Batch %d: recovering partial results from failed run", batch_num)
+                _LOGGER.info(
+                    "Batch %d: recovering partial results from failed run", batch_num
+                )
                 new_c, new_r, rf = middleware.extract_findings_from_dict(data)
                 enriched = middleware.apply_enrichments_from_dict(batch, data)
                 return enriched, new_c, new_r, rf, False
@@ -1011,7 +1254,10 @@ async def _run_batch_async(
 
     _LOGGER.info(
         "Batch %d completed in %.1fs — %d tool calls (%.1fs tool time) | breakdown=%s",
-        batch_num, elapsed, total_tool_calls, total_tool_time,
+        batch_num,
+        elapsed,
+        total_tool_calls,
+        total_tool_time,
         json.dumps(stats),
     )
 
@@ -1070,12 +1316,24 @@ async def _run_batches_parallel(
             return idx, batch, _circuit_breaker_skipped_batch(batch), [], [], [], True
         async with sem:
             if tripped.is_set():
-                return idx, batch, _circuit_breaker_skipped_batch(batch), [], [], [], True
+                return (
+                    idx,
+                    batch,
+                    _circuit_breaker_skipped_batch(batch),
+                    [],
+                    [],
+                    [],
+                    True,
+                )
             try:
                 enriched, new, rels, flags, failed = await _run_batch_async(
-                    agent, middleware, batch,
-                    relationships, scan_paths,
-                    idx, total,
+                    agent,
+                    middleware,
+                    batch,
+                    relationships,
+                    scan_paths,
+                    idx,
+                    total,
                     all_components=all_components,
                     timeout_s=timeout_s,
                     dossier_index=dossier_index,
@@ -1148,7 +1406,9 @@ def _run_tier(
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
     dossier_index: DossierIndex | None = None,
-) -> tuple[list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
+) -> tuple[
+    list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]
+]:
     """Execute a single tier (simple or complex) with caching and parallel batches."""
     tier_enriched: list[AIComponent] = []
     tier_new: list[AIComponent] = []
@@ -1172,7 +1432,8 @@ def _run_tier(
         if cached_comps:
             _LOGGER.info(
                 "Cache hit for %d/%d components — skipping LLM",
-                len(cached_comps), len(components),
+                len(cached_comps),
+                len(components),
             )
             e, n, r, f = cache.apply_cached(cached_comps, middleware)
             tier_enriched.extend(e)
@@ -1185,7 +1446,8 @@ def _run_tier(
         if memo_hits:
             _LOGGER.info(
                 "Memo hit for %d/%d components — reusing earlier verdicts",
-                len(memo_hits), len(memo_hits) + len(to_send),
+                len(memo_hits),
+                len(memo_hits) + len(to_send),
             )
             memo_results = memo.apply(memo_hits)
             tier_enriched.extend(memo_results)
@@ -1195,21 +1457,28 @@ def _run_tier(
         if cache and tier_cache_key is not None:
             cache.put(
                 tier_cache_key,
-                _build_tier_cache_payload(tier_enriched, tier_new, tier_rels, tier_flags),
+                _build_tier_cache_payload(
+                    tier_enriched, tier_new, tier_rels, tier_flags
+                ),
             )
         return tier_enriched, tier_new, tier_rels, tier_flags
 
     batches = _locality_aware_batches(to_send, batch_size)
     _LOGGER.info(
         "%d components → %d locality-aware batches (concurrency=%d)",
-        len(to_send), len(batches), max_concurrent,
+        len(to_send),
+        len(batches),
+        max_concurrent,
     )
 
     if max_concurrent > 1 and len(batches) > 1:
-        enriched, new, rels, flags, batch_artifacts = asyncio.run(
+        enriched, new, rels, flags, batch_artifacts = _run_async_bounded(
             _run_batches_parallel(
-                agent, middleware, batches,
-                relationships, scan_paths,
+                agent,
+                middleware,
+                batches,
+                relationships,
+                scan_paths,
                 all_components=all_components,
                 max_concurrent=max_concurrent,
                 timeout_s=timeout_s,
@@ -1229,15 +1498,21 @@ def _run_tier(
                 _LOGGER.warning(
                     "Agentic circuit breaker: skipping batches %d–%d after "
                     "%d consecutive failures",
-                    idx, len(batches), max_consecutive_failures,
+                    idx,
+                    len(batches),
+                    max_consecutive_failures,
                 )
-                for b in batches[idx - 1:]:
+                for b in batches[idx - 1 :]:
                     enriched.extend(_circuit_breaker_skipped_batch(b))
                 break
             e, n, r, f, batch_failed = _run_batch(
-                agent, middleware, batch,
-                relationships, scan_paths,
-                idx, len(batches),
+                agent,
+                middleware,
+                batch,
+                relationships,
+                scan_paths,
+                idx,
+                len(batches),
                 all_components=all_components,
                 timeout_s=timeout_s,
                 dossier_index=dossier_index,
@@ -1256,7 +1531,8 @@ def _run_tier(
     if retry_candidates:
         _LOGGER.info(
             "Retry pass: %d degraded components, cooling down %ds",
-            len(retry_candidates), _RETRY_COOLDOWN_S,
+            len(retry_candidates),
+            _RETRY_COOLDOWN_S,
         )
         time.sleep(_RETRY_COOLDOWN_S)
 
@@ -1272,7 +1548,8 @@ def _run_tier(
         retry_batches = _locality_aware_batches(retry_candidates, retry_batch_size)
         _LOGGER.info(
             "Retrying %d batches sequentially (batch_size=%d)",
-            len(retry_batches), retry_batch_size,
+            len(retry_batches),
+            retry_batch_size,
         )
 
         retry_enriched: list[AIComponent] = []
@@ -1284,15 +1561,22 @@ def _run_tier(
             if retry_consecutive >= max_consecutive_failures:
                 _LOGGER.warning(
                     "Retry circuit breaker: skipping retry batches %d–%d",
-                    idx, len(retry_batches),
+                    idx,
+                    len(retry_batches),
                 )
-                for b in retry_batches[idx - 1:]:
-                    retry_enriched.extend(_degraded_batch_components(b, hint="retry_failed"))
+                for b in retry_batches[idx - 1 :]:
+                    retry_enriched.extend(
+                        _degraded_batch_components(b, hint="retry_failed")
+                    )
                 break
             e, n, r, f, batch_failed = _run_batch(
-                agent, middleware, batch,
-                relationships, scan_paths,
-                idx, len(retry_batches),
+                agent,
+                middleware,
+                batch,
+                relationships,
+                scan_paths,
+                idx,
+                len(retry_batches),
                 all_components=all_components,
                 timeout_s=timeout_s,
                 dossier_index=dossier_index,
@@ -1307,11 +1591,18 @@ def _run_tier(
             else:
                 retry_consecutive = 0
 
-        recovered = sum(1 for c in retry_enriched if c.agentic_hint not in _RETRYABLE_HINTS and c.agentic_hint != "retry_failed")
+        recovered = sum(
+            1
+            for c in retry_enriched
+            if c.agentic_hint not in _RETRYABLE_HINTS
+            and c.agentic_hint != "retry_failed"
+        )
         still_degraded = len(retry_candidates) - recovered
         _LOGGER.info(
             "Retry pass complete: %d/%d recovered, %d still degraded",
-            recovered, len(retry_candidates), still_degraded,
+            recovered,
+            len(retry_candidates),
+            still_degraded,
         )
 
         enriched = ok + retry_enriched
@@ -1327,9 +1618,7 @@ def _run_tier(
             batch_key = _batch_cache_key(artifact.inputs)
             cache.put(
                 batch_key,
-                _build_batch_cache_payload(
-                    artifact.new, artifact.rels, artifact.flags
-                ),
+                _build_batch_cache_payload(artifact.new, artifact.rels, artifact.flags),
             )
             for c_in in artifact.inputs:
                 artifact_key_by_instance_id[c_in.instance_id] = batch_key
@@ -1343,7 +1632,12 @@ def _run_tier(
                 entry: dict[str, Any] = {
                     "enriched_components": [],
                     "new_components": [],
-                    "remove_components": [{"instance_id": c_before.instance_id, "reason": "cached_removal"}],
+                    "remove_components": [
+                        {
+                            "instance_id": c_before.instance_id,
+                            "reason": "cached_removal",
+                        }
+                    ],
                     "reclassify_components": [],
                     "new_relationships": [],
                     "risk_findings": [],
@@ -1485,10 +1779,14 @@ def run_agentic_enrichment(
             len(dossier_index),
         )
 
-    resolved_cache_dir = cache_dir if cache_dir is not None else _default_agentic_cache_dir()
+    resolved_cache_dir = (
+        cache_dir if cache_dir is not None else _default_agentic_cache_dir()
+    )
     fallback_dirs: list[Path] = []
     if cache_dir is None and resolved_cache_dir is not None:
-        fallback_dirs = [p for p in cache_read_dirs("agentic") if p != resolved_cache_dir]
+        fallback_dirs = [
+            p for p in cache_read_dirs("agentic") if p != resolved_cache_dir
+        ]
     cache = _AgenticResultCache(resolved_cache_dir, fallback_dirs=fallback_dirs)
     middleware = AIBOMScannerMiddleware(
         include_code_snippets=include_code_snippets,
@@ -1516,13 +1814,21 @@ def run_agentic_enrichment(
         if simple:
             _LOGGER.info(
                 "Tier 1 (simple confirmations): %d candidates via %s (batch=%d)",
-                len(simple), tier_model_name, simple_batch_size,
+                len(simple),
+                tier_model_name,
+                simple_batch_size,
             )
             agent = create_aibom_agent(tier_model_name, model=tier_model_obj)
             e, n, r, f = _run_tier(
-                agent, middleware, simple,
-                deterministic_relationships, scan_paths,
-                simple_batch_size, max_concurrent, deterministic_components, cache,
+                agent,
+                middleware,
+                simple,
+                deterministic_relationships,
+                scan_paths,
+                simple_batch_size,
+                max_concurrent,
+                deterministic_components,
+                cache,
                 memo=memo,
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
@@ -1536,26 +1842,36 @@ def run_agentic_enrichment(
         if complex_:
             dir_groups = _group_by_top_dir(complex_, scan_paths)
             use_sub_agents = (
-                len(dir_groups) > 1
-                and len(complex_) > _SUB_AGENT_THRESHOLD
+                len(dir_groups) > 1 and len(complex_) > _SUB_AGENT_THRESHOLD
             )
 
             if use_sub_agents:
                 _LOGGER.info(
                     "Sub-agent dispatch: %d directory groups for %d complex candidates",
-                    len(dir_groups), len(complex_),
+                    len(dir_groups),
+                    len(complex_),
                 )
                 for dir_key, group in sorted(dir_groups.items()):
-                    dir_label = Path(dir_key).name if dir_key != "__default__" else "default"
+                    dir_label = (
+                        Path(dir_key).name if dir_key != "__default__" else "default"
+                    )
                     _LOGGER.info(
                         "Sub-agent [%s]: %d candidates via %s",
-                        dir_label, len(group), model_string,
+                        dir_label,
+                        len(group),
+                        model_string,
                     )
                     agent = create_aibom_agent(model_string, model=complex_model_obj)
                     e, n, r, f = _run_tier(
-                        agent, middleware, group,
-                        deterministic_relationships, scan_paths,
-                        batch_size, max_concurrent, deterministic_components, cache,
+                        agent,
+                        middleware,
+                        group,
+                        deterministic_relationships,
+                        scan_paths,
+                        batch_size,
+                        max_concurrent,
+                        deterministic_components,
+                        cache,
                         memo=memo,
                         timeout_s=timeout_s,
                         max_consecutive_failures=max_consecutive_failures,
@@ -1568,13 +1884,20 @@ def run_agentic_enrichment(
             else:
                 _LOGGER.info(
                     "Tier 2 (complex reasoning): %d candidates via %s",
-                    len(complex_), model_string,
+                    len(complex_),
+                    model_string,
                 )
                 agent = create_aibom_agent(model_string, model=complex_model_obj)
                 e, n, r, f = _run_tier(
-                    agent, middleware, complex_,
-                    deterministic_relationships, scan_paths,
-                    batch_size, max_concurrent, deterministic_components, cache,
+                    agent,
+                    middleware,
+                    complex_,
+                    deterministic_relationships,
+                    scan_paths,
+                    batch_size,
+                    max_concurrent,
+                    deterministic_components,
+                    cache,
                     memo=memo,
                     timeout_s=timeout_s,
                     max_consecutive_failures=max_consecutive_failures,
@@ -1632,7 +1955,7 @@ def _truncate_class_body(body: str) -> tuple[str, bool]:
     """Cap *body* at :data:`_MAX_CLASS_BODY_CHARS`. Returns (text, truncated?)."""
     if len(body) <= _MAX_CLASS_BODY_CHARS:
         return body, False
-    head = body[: _MAX_CLASS_BODY_CHARS]
+    head = body[:_MAX_CLASS_BODY_CHARS]
     return head, True
 
 
@@ -1677,8 +2000,8 @@ def _component_to_summary(
             entry["code_context"] = snippet
 
     if enrich_target and dossier_index:
-        from .evidence_injection import lookup_dossier
         from ..scanners.agent_evidence_builder import render_dossier_for_prompt
+        from .evidence_injection import lookup_dossier
 
         dossier = lookup_dossier(c, dossier_index)
         if dossier is not None:
@@ -1958,11 +2281,11 @@ def run_cross_repo_coordination(
     scan_paths = list(per_repo_results.keys())
 
     # --- Deterministic pre-computation -----------------------------------
+    from ..cross_ref import build_env_index
     from .cross_repo import (
         build_cross_repo_tools,
         cross_repo_summary_tool,
     )
-    from ..cross_ref import build_env_index
 
     summary_json = cross_repo_summary_tool(scan_paths)
     summary = json.loads(summary_json)
@@ -1978,13 +2301,17 @@ def run_cross_repo_coordination(
             var_name = mn[4:]
             entries = env_index.env.get(var_name, [])
             if entries:
-                pre_resolved.append({
-                    "component": c.name if hasattr(c, "name") else c.get("name", ""),
-                    "repo": source,
-                    "env_var": var_name,
-                    "resolved_value": entries[0].value,
-                    "defined_in": entries[0].source_path,
-                })
+                pre_resolved.append(
+                    {
+                        "component": (
+                            c.name if hasattr(c, "name") else c.get("name", "")
+                        ),
+                        "repo": source,
+                        "env_var": var_name,
+                        "resolved_value": entries[0].value,
+                        "defined_in": entries[0].source_path,
+                    }
+                )
 
     repo_overview: list[dict[str, Any]] = []
     for source, data in per_repo_results.items():
@@ -1992,17 +2319,20 @@ def run_cross_repo_coordination(
         type_counts: dict[str, int] = {}
         for c in components:
             ct = (
-                c.component_type.value if hasattr(c, "component_type")
+                c.component_type.value
+                if hasattr(c, "component_type")
                 else c.get("type", "unknown")
             )
             type_counts[ct] = type_counts.get(ct, 0) + 1
         unresolved = data.get("_unresolved_env_vars", [])
-        repo_overview.append({
-            "repo": source,
-            "total_components": len(components),
-            "by_type": type_counts,
-            "unresolved_env_vars": unresolved,
-        })
+        repo_overview.append(
+            {
+                "repo": source,
+                "total_components": len(components),
+                "by_type": type_counts,
+                "unresolved_env_vars": unresolved,
+            }
+        )
 
     orientation = {
         "repos": repo_overview,
@@ -2018,9 +2348,12 @@ def run_cross_repo_coordination(
         f"```json\n{json.dumps(orientation, indent=2, default=str)}\n```"
     )
 
+    # Log only the repo count — the model id is already logged per tier during
+    # enrichment, and ``model_string`` is read from the credential-bearing
+    # ``llm_config`` dict, so logging it trips clear-text-logging taint analysis.
     _LOGGER.info(
-        "Running cross-repo coordination across %d repos with %s",
-        len(per_repo_results), model_string,
+        "Running cross-repo coordination across %d repos",
+        len(per_repo_results),
     )
 
     xrepo_tools = build_cross_repo_tools(per_repo_results, scan_paths)
@@ -2033,19 +2366,14 @@ def run_cross_repo_coordination(
             tools=xrepo_tools,
             model=model_obj,
         )
-        result = asyncio.run(
-            asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: agent.invoke(
-                        {"messages": [{"role": "user", "content": prompt}]}
-                    ),
-                ),
-                timeout=_DEFAULT_AGENTIC_TIMEOUT_S,
-            )
-        )
-    except asyncio.TimeoutError:
+        # Daemon-thread deadline: a hung coordinator invoke is abandoned, never
+        # wedging the scan at teardown. No recursion_limit here —
+        # the coordinator intentionally uses the agent's default.
+        result = _invoke_agent_bounded(agent, prompt, _DEFAULT_AGENTIC_TIMEOUT_S)
+    except _InvokeTimeout:
         _LOGGER.warning(
-            "Cross-repo coordination timed out after %ds", _DEFAULT_AGENTIC_TIMEOUT_S,
+            "Cross-repo coordination timed out after %ds",
+            _DEFAULT_AGENTIC_TIMEOUT_S,
         )
         return [], []
     except Exception as exc:
@@ -2064,15 +2392,17 @@ def run_cross_repo_coordination(
             rel_type = RelationshipType(item.get("relationship_type", "CUSTOM"))
         except ValueError:
             rel_type = RelationshipType.CUSTOM
-        rels.append(ComponentRelationship(
-            source_instance_id="",
-            target_instance_id="",
-            source_name=item.get("source_name", ""),
-            target_name=item.get("target_name", ""),
-            relationship_type=rel_type,
-            source_repo=item.get("source_repo", ""),
-            target_repo=item.get("target_repo", ""),
-        ))
+        rels.append(
+            ComponentRelationship(
+                source_instance_id="",
+                target_instance_id="",
+                source_name=item.get("source_name", ""),
+                target_name=item.get("target_name", ""),
+                relationship_type=rel_type,
+                source_repo=item.get("source_repo", ""),
+                target_repo=item.get("target_repo", ""),
+            )
+        )
 
     from ..models import Severity as Sev
 
@@ -2082,16 +2412,19 @@ def run_cross_repo_coordination(
             sev = Sev(item.get("severity", "info"))
         except ValueError:
             sev = Sev.INFO
-        flags.append(RiskFlag(
-            flag=item.get("flag", "cross_repo_issue"),
-            severity=sev,
-            weight=5,
-            description=item.get("description", ""),
-        ))
+        flags.append(
+            RiskFlag(
+                flag=item.get("flag", "cross_repo_issue"),
+                severity=sev,
+                weight=5,
+                description=item.get("description", ""),
+            )
+        )
 
     _LOGGER.info(
         "Cross-repo coordination: %d relationships, %d risk flags",
-        len(rels), len(flags),
+        len(rels),
+        len(flags),
     )
     cache.put(cache_key, _build_cross_repo_cache_payload(rels, flags))
     return rels, flags
@@ -2100,6 +2433,7 @@ def run_cross_repo_coordination(
 # ---------------------------------------------------------------------------
 # Container layout resolution (agentic)
 # ---------------------------------------------------------------------------
+
 
 class _SelectedDirectory(BaseModel):
     path: str = ""
@@ -2179,7 +2513,10 @@ def resolve_container_layout(
     try:
         model = _build_model(model_string, llm_config)
     except Exception:
-        _LOGGER.warning("Failed to init LLM for container layout, using all candidates", exc_info=True)
+        _LOGGER.warning(
+            "Failed to init LLM for container layout, using all candidates",
+            exc_info=True,
+        )
         return candidate_dirs
 
     try:
@@ -2192,25 +2529,25 @@ def resolve_container_layout(
         )
 
         file_sample = file_listing[:2000]
-        user_message = json.dumps({
-            "image_config": image_config,
-            "candidate_directories": candidate_dirs,
-            "file_listing_sample": file_sample,
-        }, indent=2)
+        user_message = json.dumps(
+            {
+                "image_config": image_config,
+                "candidate_directories": candidate_dirs,
+                "file_listing_sample": file_sample,
+            },
+            indent=2,
+        )
 
-        result = asyncio.run(
-            asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: agent.invoke(
-                        {"messages": [{"role": "user", "content": user_message}]},
-                        config={"recursion_limit": 25},
-                    ),
-                ),
-                timeout=timeout_s,
-            )
+        # Daemon-thread deadline: a hung layout invoke is abandoned, never
+        # wedging the scan at teardown. _InvokeTimeout is an
+        # Exception subclass, so it is caught below and falls back cleanly.
+        result = _invoke_agent_bounded(
+            agent, user_message, timeout_s, recursion_limit=25
         )
     except Exception:
-        _LOGGER.warning("Container layout agent failed, using all candidates", exc_info=True)
+        _LOGGER.warning(
+            "Container layout agent failed, using all candidates", exc_info=True
+        )
         return candidate_dirs
     finally:
         _close_model_clients(model)
@@ -2224,11 +2561,15 @@ def resolve_container_layout(
     selected = [d for d in selected if d]
 
     if not selected:
-        _LOGGER.info("Container layout agent selected no directories, using all candidates")
+        _LOGGER.info(
+            "Container layout agent selected no directories, using all candidates"
+        )
         return candidate_dirs
 
     _LOGGER.info(
         "Container layout agent selected %d of %d dirs: %s",
-        len(selected), len(candidate_dirs), selected,
+        len(selected),
+        len(candidate_dirs),
+        selected,
     )
     return selected
