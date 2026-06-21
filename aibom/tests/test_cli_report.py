@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -265,6 +266,9 @@ def test_two_sources_fan_out_to_two_uploads(mock_post, tmp_path: Path):
 
     run_ids = {p["run_id"] for p in payloads}
     assert len(run_ids) == 2, f"run_ids must be distinct, got {run_ids}"
+    # A fanned-out run_id must stay a valid UUID (the backend keys ingests on it).
+    for rid in run_ids:
+        uuid.UUID(str(rid))
 
     canonicals = {p["source_attribution"]["source_ref_canonical"] for p in payloads}
     assert canonicals == {"github.com/org/service-a", "registry.example.com/app"}

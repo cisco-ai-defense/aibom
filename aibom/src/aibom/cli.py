@@ -958,8 +958,13 @@ def _build_submission_payloads(
     base_run_id = analysis.get("metadata", {}).get("run_id")
     total = len(sources)
     payloads: List[Dict[str, Any]] = []
-    for index, (source_key, entry) in enumerate(sources.items()):
-        run_id = base_run_id if total <= 1 else f"{base_run_id}-{index}"
+    for source_key, entry in sources.items():
+        # Each upload needs its own distinct run_id (the backend idempotency key
+        # is (tenant_id, run_id); a shared run_id collapses sources into one
+        # ingest). run_id is a UUID by convention, so a fan-out mints a fresh
+        # one per source rather than suffixing the base. The single-source
+        # common case keeps the original run_id untouched.
+        run_id = base_run_id if total <= 1 else str(uuid.uuid4())
         scoped_report = _scope_report_to_source(report, source_key, entry, run_id)
         payload = _build_submission_payload(scoped_report)
         attribution = _attribution_from_source_entry(entry)
