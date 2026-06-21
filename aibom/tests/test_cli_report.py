@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -137,3 +138,168 @@ def test_report_upload_rejects_non_aibom_json(tmp_path: Path):
 
     assert result.exit_code == 1
     assert "aibom_analysis" in result.output
+
+
+def _write_multi_source_report(
+    path: Path, sources_spec: list[dict], *, run_id: str = "run-123"
+) -> None:
+    """Write a report whose per-source metadata carries an attribution triple.
+
+    Injecting ``source_outcomes`` into the scan metadata lets the JSON reporter
+    embed the triple deterministically without touching git or a registry.
+    """
+    source_outcomes: dict = {}
+    sources = []
+    for spec in sources_spec:
+        sources.append(
+            SourceResult(
+                path=spec["path"],
+                components=[
+                    AIComponent(
+                        name="router_agent",
+                        component_type=AIComponentType.AGENT,
+                        file_path=spec["path"] + "/app.py",
+                        line_number=12,
+                    )
+                ],
+                relationships=[],
+            )
+        )
+        source_outcomes[spec["path"]] = {
+            "source_name": spec["name"],
+            "source_path": spec["path"],
+            "source_kind": spec["kind"],
+            "source_ref_canonical": spec["canonical"],
+            "source_ref_version": spec["version"],
+            "status": "completed",
+        }
+    result = ScanResult(
+        metadata={
+            "run_id": run_id,
+            "analyzer_version": "1.2.3",
+            "completed_at": "2026-04-11T12:00:00Z",
+            "source_outcomes": source_outcomes,
+        },
+        sources=sources,
+        risk=RiskScore(),
+        errors=[],
+    )
+    buf = StringIO()
+    JsonReporter().render(result, buf)
+    path.write_text(buf.getvalue(), encoding="utf-8")
+
+
+def _invoke_upload(report_file: Path):
+    return runner.invoke(
+        app,
+        [
+            "report",
+            "upload",
+            str(report_file),
+            "--format",
+            "json",
+            "--post-url",
+            "https://mgmt.example.test/upload",
+            "--ai-defense-api-key",
+            "tenant-key",
+        ],
+    )
+
+
+@patch("aibom.cli.post_report_with_retries")
+def test_single_git_source_uploads_once_with_full_triple(mock_post, tmp_path: Path):
+    report_file = tmp_path / "report.json"
+    _write_multi_source_report(
+        report_file,
+        [
+            {
+                "path": "/repo/service-a",
+                "name": "org/service-a",
+                "kind": "git",
+                "canonical": "github.com/org/service-a",
+                "version": "abc123",
+            }
+        ],
+    )
+
+    result = _invoke_upload(report_file)
+
+    assert result.exit_code == 0, result.output
+    assert mock_post.call_count == 1
+    payload = mock_post.call_args.args[1]
+    assert payload["run_id"] == "run-123"
+    assert payload["source_attribution"] == {
+        "source_kind": "git",
+        "source_ref_canonical": "github.com/org/service-a",
+        "source_ref_version": "abc123",
+    }
+
+
+@patch("aibom.cli.post_report_with_retries")
+def test_two_sources_fan_out_to_two_uploads(mock_post, tmp_path: Path):
+    report_file = tmp_path / "report.json"
+    _write_multi_source_report(
+        report_file,
+        [
+            {
+                "path": "/repo/service-a",
+                "name": "org/service-a",
+                "kind": "git",
+                "canonical": "github.com/org/service-a",
+                "version": "aaa",
+            },
+            {
+                "path": "registry/app:1.0",
+                "name": "registry/app",
+                "kind": "container_image",
+                "canonical": "registry.example.com/app",
+                "version": "sha256:deadbeef",
+            },
+        ],
+    )
+
+    result = _invoke_upload(report_file)
+
+    assert result.exit_code == 0, result.output
+    assert mock_post.call_count == 2
+    payloads = [call.args[1] for call in mock_post.call_args_list]
+
+    run_ids = {p["run_id"] for p in payloads}
+    assert len(run_ids) == 2, f"run_ids must be distinct, got {run_ids}"
+    # A fanned-out run_id must stay a valid UUID (the backend keys ingests on it).
+    for rid in run_ids:
+        uuid.UUID(str(rid))
+
+    canonicals = {p["source_attribution"]["source_ref_canonical"] for p in payloads}
+    assert canonicals == {"github.com/org/service-a", "registry.example.com/app"}
+
+    kinds = {p["source_attribution"]["source_kind"] for p in payloads}
+    assert kinds == {"git", "container_image"}
+
+    # Each upload's report is scoped to exactly one source.
+    for p in payloads:
+        assert len(p["report"]["aibom_analysis"]["sources"]) == 1
+
+
+@patch("aibom.cli.post_report_with_retries")
+def test_unresolved_source_uploads_without_attribution(mock_post, tmp_path: Path):
+    report_file = tmp_path / "report.json"
+    _write_multi_source_report(
+        report_file,
+        [
+            {
+                "path": "/tmp/extracted-tarball",
+                "name": "extracted",
+                "kind": "local-path",
+                "canonical": "",
+                "version": "",
+            }
+        ],
+    )
+
+    result = _invoke_upload(report_file)
+
+    assert result.exit_code == 0, result.output
+    assert mock_post.call_count == 1
+    payload = mock_post.call_args.args[1]
+    assert "source_attribution" not in payload

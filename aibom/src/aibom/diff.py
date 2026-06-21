@@ -131,11 +131,16 @@ def load_scan_result_json(path: Path | str) -> ScanResult:
     for path_s, src in sources_raw.items():
         source_path = str(src.get("source_path") or path_s)
         summary = src.get("summary", {}) if isinstance(src, dict) else {}
+        per_source_meta = src.get("metadata", {}) if isinstance(src, dict) else {}
         source_details[source_path] = {
             "source_key": path_s,
             "source_name": src.get("source_name") or path_s,
             "source_path": source_path,
             "source_kind": summary.get("source_kind"),
+            # Preserve the attribution triple so it survives the disk round-trip
+            # (it lives in the per-source ``metadata`` block, not ``summary``).
+            "source_ref_canonical": per_source_meta.get("source_ref_canonical"),
+            "source_ref_version": per_source_meta.get("source_ref_version"),
             "status": summary.get("status"),
             "last_generated_at": summary.get("last_generated_at"),
             "assets_discovered": summary.get("assets_discovered"),
