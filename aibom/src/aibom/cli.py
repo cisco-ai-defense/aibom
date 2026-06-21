@@ -884,6 +884,91 @@ def _build_submission_payload(
     }
 
 
+def _attribution_from_source_entry(entry: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return the request-level ``source_attribution`` triple for one source.
+
+    The triple is read from the per-source ``metadata`` block embedded by the
+    JSON reporter (computed there by ``_source_attribution``). Returns ``None``
+    when the source cannot be attributed — a plain local path, a detached
+    tarball, or a git tree with no remote — so the caller uploads it without
+    attribution rather than crashing. The backend needs all three fields to
+    project an asset, so every field must be present.
+    """
+    from .source_attribution import (
+        SOURCE_KIND_CONTAINER_IMAGE,
+        SOURCE_KIND_GIT,
+    )
+
+    meta = entry.get("metadata", {}) if isinstance(entry.get("metadata"), dict) else {}
+    source_kind = meta.get("source_kind")
+    canonical = meta.get("source_ref_canonical")
+    version = meta.get("source_ref_version")
+    if source_kind not in (SOURCE_KIND_GIT, SOURCE_KIND_CONTAINER_IMAGE):
+        return None
+    if not canonical or not version:
+        return None
+    return {
+        "source_kind": source_kind,
+        "source_ref_canonical": canonical,
+        "source_ref_version": version,
+    }
+
+
+def _scope_report_to_source(
+    report: Dict[str, Any],
+    source_key: str,
+    entry: Dict[str, Any],
+    run_id: Optional[str],
+) -> Dict[str, Any]:
+    """Build a copy of *report* whose sources are scoped to a single source.
+
+    The backend's model is one upload = one source scope, so each fanned-out
+    upload carries only its own source and a distinct ``run_id`` (the backend
+    idempotency key is ``(tenant_id, run_id)``; reusing one across sources
+    would collapse them into a single ingest).
+    """
+    analysis = report.get("aibom_analysis", {})
+    scoped_analysis = dict(analysis)
+    scoped_metadata = dict(analysis.get("metadata", {}))
+    scoped_metadata["run_id"] = run_id
+    scoped_analysis["metadata"] = scoped_metadata
+    scoped_analysis["sources"] = {source_key: entry}
+    return {"aibom_analysis": scoped_analysis}
+
+
+def _build_submission_payloads(
+    report: Dict[str, Any],
+    source_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Fan out an upload to one submission per scanned source.
+
+    The backend creates one asset projection per ingest, where one ingest = one
+    repo/image. A multi-source scan (``--discover-repos``/``--github-org``)
+    therefore needs one upload per source, each carrying that source's own
+    ``source_attribution`` triple and a distinct ``run_id``. A single-source
+    scan still produces exactly one upload.
+    """
+    analysis = report.get("aibom_analysis", {})
+    sources = analysis.get("sources", {})
+    if not isinstance(sources, dict) or not sources:
+        # No per-source breakdown (e.g. a legacy report); fall back to a single
+        # combined submission so the upload still happens.
+        return [_build_submission_payload(report, source_outcomes)]
+
+    base_run_id = analysis.get("metadata", {}).get("run_id")
+    total = len(sources)
+    payloads: List[Dict[str, Any]] = []
+    for index, (source_key, entry) in enumerate(sources.items()):
+        run_id = base_run_id if total <= 1 else f"{base_run_id}-{index}"
+        scoped_report = _scope_report_to_source(report, source_key, entry, run_id)
+        payload = _build_submission_payload(scoped_report)
+        attribution = _attribution_from_source_entry(entry)
+        if attribution is not None:
+            payload["source_attribution"] = attribution
+        payloads.append(payload)
+    return payloads
+
+
 def _source_outcomes_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Reconstruct per-source submission metadata from an on-disk JSON report."""
     analysis = report.get("aibom_analysis", {})
@@ -1072,15 +1157,18 @@ def report_command(
                 "[yellow]Warning:[/] Report uses a deprecated schema without "
                 "`report_schema_version`; synthesizing the current schema for upload."
             )
-        submission_payload = _build_submission_payload(canonical_report)
-        post_report_with_retries(
-            post_url,
-            submission_payload,
-            api_key=ai_defense_api_key,
-            verify_tls=post_verify_tls,
-            timeout_seconds=post_timeout,
+        submission_payloads = _build_submission_payloads(canonical_report)
+        for submission_payload in submission_payloads:
+            post_report_with_retries(
+                post_url,
+                submission_payload,
+                api_key=ai_defense_api_key,
+                verify_tls=post_verify_tls,
+                timeout_seconds=post_timeout,
+            )
+        console.print(
+            f"[green]Uploaded {len(submission_payloads)} report(s) to {post_url}[/]"
         )
-        console.print(f"[green]Report uploaded to {post_url}[/]")
     except ValueError as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1)
@@ -1998,15 +2086,18 @@ def analyze(
             json_rep.render(scan_result, buf)
             report_data = json.loads(buf.getvalue())
             try:
-                submission_payload = _build_submission_payload(report_data, source_outcomes)
-                logging.info("Sending report")
-                post_report_with_retries(
-                    post_url,
-                    submission_payload,
-                    api_key=ai_defense_api_key,
-                    verify_tls=post_verify_tls,
-                    timeout_seconds=post_timeout,
+                submission_payloads = _build_submission_payloads(
+                    report_data, source_outcomes
                 )
+                logging.info("Sending %d report(s)", len(submission_payloads))
+                for submission_payload in submission_payloads:
+                    post_report_with_retries(
+                        post_url,
+                        submission_payload,
+                        api_key=ai_defense_api_key,
+                        verify_tls=post_verify_tls,
+                        timeout_seconds=post_timeout,
+                    )
                 logging.info("Report uploaded to %s", post_url)
             except Exception as exc:  # noqa: BLE001
                 logging.error("Failed to POST report: %s", exc)
