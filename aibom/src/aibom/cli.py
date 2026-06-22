@@ -839,6 +839,27 @@ def _map_source_kind(kind: Optional[str]) -> str:
     return "SOURCE_KIND_UNSPECIFIED"
 
 
+def _map_projection_source_kind(kind: Optional[str]) -> Optional[str]:
+    """Map an internal projection source kind to the value the backend expects.
+
+    The downstream backend that projects assets expects the source kind as an
+    uppercase ``PROJECTION_SOURCE_KIND_*`` value, not the internal lowercase
+    ``git`` / ``container_image`` constant, so the kind must be mapped before
+    upload. Returns ``None`` for any kind that is not projection-eligible
+    (e.g. the analyze-only ``local-path``).
+    """
+    from .source_attribution import (
+        SOURCE_KIND_CONTAINER_IMAGE,
+        SOURCE_KIND_GIT,
+    )
+
+    if kind == SOURCE_KIND_GIT:
+        return "PROJECTION_SOURCE_KIND_GIT"
+    if kind == SOURCE_KIND_CONTAINER_IMAGE:
+        return "PROJECTION_SOURCE_KIND_CONTAINER_IMAGE"
+    return None
+
+
 def _build_submission_payload(
     report: Dict[str, Any],
     source_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -894,16 +915,11 @@ def _attribution_from_source_entry(entry: Dict[str, Any]) -> Optional[Dict[str, 
     attribution rather than crashing. The backend needs all three fields to
     project an asset, so every field must be present.
     """
-    from .source_attribution import (
-        SOURCE_KIND_CONTAINER_IMAGE,
-        SOURCE_KIND_GIT,
-    )
-
     meta = entry.get("metadata", {}) if isinstance(entry.get("metadata"), dict) else {}
-    source_kind = meta.get("source_kind")
+    source_kind = _map_projection_source_kind(meta.get("source_kind"))
     canonical = meta.get("source_ref_canonical")
     version = meta.get("source_ref_version")
-    if source_kind not in (SOURCE_KIND_GIT, SOURCE_KIND_CONTAINER_IMAGE):
+    if source_kind is None:
         return None
     if not canonical or not version:
         return None

@@ -228,8 +228,10 @@ def test_single_git_source_uploads_once_with_full_triple(mock_post, tmp_path: Pa
     assert mock_post.call_count == 1
     payload = mock_post.call_args.args[1]
     assert payload["run_id"] == "run-123"
+    # The wire value is the uppercase source-kind the backend expects, not the
+    # internal lowercase kind.
     assert payload["source_attribution"] == {
-        "source_kind": "git",
+        "source_kind": "PROJECTION_SOURCE_KIND_GIT",
         "source_ref_canonical": "github.com/org/service-a",
         "source_ref_version": "abc123",
     }
@@ -274,7 +276,10 @@ def test_two_sources_fan_out_to_two_uploads(mock_post, tmp_path: Path):
     assert canonicals == {"github.com/org/service-a", "registry.example.com/app"}
 
     kinds = {p["source_attribution"]["source_kind"] for p in payloads}
-    assert kinds == {"git", "container_image"}
+    assert kinds == {
+        "PROJECTION_SOURCE_KIND_GIT",
+        "PROJECTION_SOURCE_KIND_CONTAINER_IMAGE",
+    }
 
     # Each upload's report is scoped to exactly one source.
     for p in payloads:
@@ -303,3 +308,48 @@ def test_unresolved_source_uploads_without_attribution(mock_post, tmp_path: Path
     assert mock_post.call_count == 1
     payload = mock_post.call_args.args[1]
     assert "source_attribution" not in payload
+
+
+def test_attribution_from_source_entry_maps_projection_enum():
+    """The projection kind is sent as the uppercase value the backend expects."""
+    from aibom.cli import _attribution_from_source_entry
+
+    git = _attribution_from_source_entry(
+        {
+            "metadata": {
+                "source_kind": "git",
+                "source_ref_canonical": "github.com/org/repo",
+                "source_ref_version": "a" * 40,
+            }
+        }
+    )
+    assert git == {
+        "source_kind": "PROJECTION_SOURCE_KIND_GIT",
+        "source_ref_canonical": "github.com/org/repo",
+        "source_ref_version": "a" * 40,
+    }
+
+    image = _attribution_from_source_entry(
+        {
+            "metadata": {
+                "source_kind": "container_image",
+                "source_ref_canonical": "registry.example.com/app",
+                "source_ref_version": "sha256:deadbeef",
+            }
+        }
+    )
+    assert image["source_kind"] == "PROJECTION_SOURCE_KIND_CONTAINER_IMAGE"
+
+    # An analyze-only kind (local-path) is not projection-eligible -> omitted.
+    assert (
+        _attribution_from_source_entry(
+            {
+                "metadata": {
+                    "source_kind": "local-path",
+                    "source_ref_canonical": "",
+                    "source_ref_version": "",
+                }
+            }
+        )
+        is None
+    )
