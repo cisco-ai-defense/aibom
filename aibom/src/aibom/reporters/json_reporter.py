@@ -60,24 +60,36 @@ def _friendly_source_name(path: str) -> str:
 def _source_attribution(path: str, detail: dict[str, Any]) -> dict[str, str]:
     """Resolve the source-attribution triple for one scanned source.
 
-    Values supplied by the scan pipeline / cross-repo discovery (in ``detail``)
-    win, since that path may already know the resolved remote or image digest.
-    Otherwise the triple is derived deterministically from the local path:
-    ``source_kind`` from the working tree, ``source_ref_canonical`` from the
-    canonicalized ``origin`` remote, and ``source_ref_version`` from ``HEAD``.
+    The ``source_kind`` returned here is the *projection* kind (``git`` /
+    ``container_image`` / ``local-path``) a downstream backend uses to derive a
+    stable asset identity. This is a different taxonomy from the *analyze*
+    source kind the pipeline records (``git-url`` / ``container`` /
+    ``local-path``): a local git checkout is legitimately ``local-path`` for
+    analyze and ``git`` for projection. The projection kind is therefore derived
+    from the git/container reality of the source, not the analyze ``detail``
+    kind — only a ``detail`` kind that is already a valid projection kind (e.g.
+    a cross-repo source that resolved the image directly) is reused. Resolved
+    ref/version values supplied in ``detail`` still win.
     """
     from ..source_attribution import (
         SOURCE_KIND_CONTAINER_IMAGE,
+        SOURCE_KIND_GIT,
         canonicalize_source_ref,
         capture_git_remote,
         capture_source_ref_version,
         detect_source_kind,
     )
 
-    is_image = (detail.get("source_kind") == SOURCE_KIND_CONTAINER_IMAGE) or None
-    source_kind = detail.get("source_kind") or detect_source_kind(
-        path, is_container_image=is_image
-    )
+    detail_kind = detail.get("source_kind")
+    if detail_kind in (SOURCE_KIND_GIT, SOURCE_KIND_CONTAINER_IMAGE):
+        source_kind = detail_kind
+    else:
+        # ``detail_kind`` here is an analyze kind (or absent). Only the analyze
+        # ``container`` kind hints at an image; everything else is detected from
+        # the source so a local checkout is attributed as ``git`` rather than
+        # being suppressed by its ``local-path`` analyze kind.
+        is_image = (detail_kind == "container") or None
+        source_kind = detect_source_kind(path, is_container_image=is_image)
 
     canonical = detail.get("source_ref_canonical")
     if not canonical:
@@ -178,7 +190,11 @@ def _aibom_payload(
         source_key = _disambiguate_source_key(source_name, seen_source_names)
         source_path = detail.get("source_path") or src.path
         attribution = _source_attribution(src.path, detail)
-        source_kind = attribution["source_kind"]
+        # The summary keeps the analyze-side source kind (``git-url`` /
+        # ``container`` / ``local-path``); only the attribution ``metadata``
+        # block carries the projection kind. Fall back to the projection kind
+        # when the analyze kind is absent (e.g. cross-repo discovery).
+        summary_source_kind = detail.get("source_kind") or attribution["source_kind"]
         per_source_meta: dict[str, Any] = {
             "source_kind": attribution["source_kind"],
             "source_ref_canonical": attribution["source_ref_canonical"],
@@ -195,7 +211,7 @@ def _aibom_payload(
             "relationships": [r.model_dump(mode="json") for r in src.relationships],
             "summary": {
                 "status": detail.get("status") or "completed",
-                "source_kind": source_kind,
+                "source_kind": summary_source_kind,
                 "assets_discovered": detail.get("assets_discovered")
                 or total_components,
                 "last_generated_at": (

@@ -152,3 +152,69 @@ class TestSourceAttributionEndToEnd:
         assert meta_a["source_ref_canonical"] == "github.com/example-org/svc"
         assert meta_b["source_ref_canonical"] == "github.com/example-org/other"
         assert meta_a["source_ref_canonical"] != meta_b["source_ref_canonical"]
+
+
+def _scan_result_with_analyze_kind(path: str, analyze_kind: str) -> ScanResult:
+    """Single-source result whose pipeline detail carries the *analyze* source
+    kind (``local-path``/``git-url``/``container``), exactly as the real CLI
+    emits it into ``source_outcomes``."""
+    comp = AIComponent(
+        name="agent",
+        component_type=AIComponentType.AGENT,
+        file_path=str(Path(path) / "agent.py"),
+        line_number=2,
+        framework="langgraph",
+    )
+    return ScanResult(
+        metadata={
+            "analyzer_version": "test",
+            "run_id": "e2e-002",
+            "source_outcomes": {
+                path: {
+                    "source_name": "svc",
+                    "source_path": path,
+                    "source_kind": analyze_kind,
+                    "status": "completed",
+                }
+            },
+        },
+        sources=[SourceResult(path=path, components=[comp], relationships=[])],
+    )
+
+
+def _render_source(path: str, analyze_kind: str) -> dict:
+    buf = StringIO()
+    JsonReporter().render(_scan_result_with_analyze_kind(path, analyze_kind), buf)
+    data = json.loads(buf.getvalue())
+    return next(iter(data["aibom_analysis"]["sources"].values()))
+
+
+class TestAnalyzeKindDoesNotSuppressProjectionKind:
+    """A local git checkout has analyze kind ``local-path`` but must still be
+    attributed as ``git`` for projection."""
+
+    def test_local_git_checkout_is_attributed_as_git(self, tmp_path: Path) -> None:
+        head = _make_repo(tmp_path)
+
+        src = _render_source(str(tmp_path), "local-path")
+        meta = src["metadata"]
+
+        # Projection attribution reflects the git reality of the source.
+        assert meta["source_kind"] == "git"
+        assert meta["source_ref_canonical"] == "github.com/example-org/svc"
+        assert meta["source_ref_version"] == head
+        # The analyze-side summary kind is intentionally left untouched.
+        assert src["summary"]["source_kind"] == "local-path"
+
+    def test_plain_dir_degrades_to_local_path_with_empty_refs(
+        self, tmp_path: Path
+    ) -> None:
+        # No ``git init`` -> a plain directory that is not a checkout.
+        (tmp_path / "agent.py").write_text("x = 1\n", encoding="utf-8")
+
+        src = _render_source(str(tmp_path), "local-path")
+        meta = src["metadata"]
+
+        assert meta["source_kind"] == "local-path"
+        assert meta["source_ref_canonical"] == ""
+        assert meta["source_ref_version"] == ""
