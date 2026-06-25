@@ -257,6 +257,12 @@ def _build_model(
         api_key=cfg.get("api_key"),
         api_base=cfg.get("api_base"),
         api_version=cfg.get("api_version"),
+        # Pass an explicit, generous cap so a verbose/reasoning model is not
+        # truncated mid-output by a gateway's low default completion budget
+        # (which otherwise yields an empty/partial batch). Overridable via
+        # llm_config["max_tokens"].  build_chat_model maps this to
+        # max_completion_tokens for reasoning-class models.
+        max_tokens=cfg.get("max_tokens", _DEFAULT_AGENTIC_MAX_TOKENS),
         rate_limiter=rate_limiter,
     )
 
@@ -346,6 +352,12 @@ _RECURSION_LIMIT = 1000
 _DEFAULT_AGENTIC_TIMEOUT_S = 120
 _DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 
+# Generous default completion budget for agentic enrichment. Set explicitly so
+# output length is governed here rather than by an OpenAI-compatible gateway's
+# (often small) default, which can truncate a verbose/reasoning model mid-output
+# and yield an empty batch. Overridable via llm_config["max_tokens"].
+_DEFAULT_AGENTIC_MAX_TOKENS = 16000
+
 _SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
 
 _SUB_AGENT_THRESHOLD = 50
@@ -356,8 +368,51 @@ _RETRYABLE_HINTS = frozenset(
         "batch_timeout",
         "batch_recursion_limit",
         "circuit_breaker_tripped",
+        # Transient provider-side failures — worth one retry pass.
+        "provider_outage",
+        "rate_limited",
+        "structured_output_parse_error",
     }
 )
+
+
+def _classify_failure_hint(exc: Exception) -> str:
+    """Classify a batch-invocation exception into a precise agentic hint.
+
+    Distinguishes provider outages and rate limits (HTTP status carried by
+    ``openai.APIStatusError`` and friends) and structured-output parse failures
+    (``langchain`` ``StructuredOutputValidationError`` carries an ``ai_message``)
+    from the generic recursion/unknown bucket. Uses duck-typed attributes so no
+    optional provider/agent dependency is imported.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        if status == 429:
+            return "rate_limited"
+        if status >= 500:
+            return "provider_outage"
+    if getattr(exc, "ai_message", None) is not None:
+        return "structured_output_parse_error"
+    if type(exc).__name__ in (
+        "StructuredOutputValidationError",
+        "OutputParserException",
+    ):
+        return "structured_output_parse_error"
+    return "batch_recursion_limit"
+
+
+def _refusal_present(result: Any) -> bool:
+    """True when the final message is a model refusal with no usable content.
+
+    Providers surface refusals in ``additional_kwargs['refusal']``; aibom uses
+    this to record a distinct ``model_refused`` status instead of conflating a
+    refusal with "examined and found nothing".
+    """
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    if not messages:
+        return False
+    extra = getattr(messages[-1], "additional_kwargs", None)
+    return isinstance(extra, dict) and bool(extra.get("refusal"))
 
 
 def _collect_failed(
@@ -1123,17 +1178,26 @@ def _run_batch(
             exc,
             json.dumps(stats),
         )
+        data = None
         if result is not None:
             _accumulate_token_usage(result)
             data = _extract_structured_response(result)
-            if data:
-                _LOGGER.info(
-                    "Batch %d: recovering partial results from failed run", batch_num
-                )
-                new_c, new_r, rf = middleware.extract_findings_from_dict(data)
-                enriched = middleware.apply_enrichments_from_dict(batch, data)
-                return enriched, new_c, new_r, rf, False
-        enriched = _degraded_batch_components(batch, hint="batch_recursion_limit")
+        if not data:
+            # langchain's StructuredOutputValidationError carries the offending
+            # AIMessage; recover the answer from its carriers (tool-call args,
+            # parsed object, or text) instead of dropping the whole batch.
+            ai_message = getattr(exc, "ai_message", None)
+            if ai_message is not None:
+                data = _extract_structured_response({"messages": [ai_message]})
+        if data:
+            _LOGGER.info(
+                "Batch %d: recovering partial results from failed run", batch_num
+            )
+            new_c, new_r, rf = middleware.extract_findings_from_dict(data)
+            enriched = middleware.apply_enrichments_from_dict(batch, data)
+            return enriched, new_c, new_r, rf, False
+        hint = _classify_failure_hint(exc)
+        enriched = _degraded_batch_components(batch, hint=hint)
         return enriched, [], [], [], True
 
     _accumulate_token_usage(result)
@@ -1153,8 +1217,23 @@ def _run_batch(
 
     data = _extract_structured_response(result)
     if not data:
+        if _refusal_present(result):
+            _LOGGER.warning("Batch %d: model refused", batch_num)
+            return (
+                _degraded_batch_components(batch, hint="model_refused"),
+                [],
+                [],
+                [],
+                True,
+            )
         _LOGGER.warning("Batch %d returned no usable output", batch_num)
-        return batch, [], [], [], True
+        return (
+            _degraded_batch_components(batch, hint="no_usable_output"),
+            [],
+            [],
+            [],
+            True,
+        )
 
     new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
     enriched = middleware.apply_enrichments_from_dict(batch, data)
@@ -1233,17 +1312,26 @@ async def _run_batch_async(
             exc,
             json.dumps(stats),
         )
+        data = None
         if result is not None:
             _accumulate_token_usage(result)
             data = _extract_structured_response(result)
-            if data:
-                _LOGGER.info(
-                    "Batch %d: recovering partial results from failed run", batch_num
-                )
-                new_c, new_r, rf = middleware.extract_findings_from_dict(data)
-                enriched = middleware.apply_enrichments_from_dict(batch, data)
-                return enriched, new_c, new_r, rf, False
-        enriched = _degraded_batch_components(batch, hint="batch_recursion_limit")
+        if not data:
+            # langchain's StructuredOutputValidationError carries the offending
+            # AIMessage; recover the answer from its carriers (tool-call args,
+            # parsed object, or text) instead of dropping the whole batch.
+            ai_message = getattr(exc, "ai_message", None)
+            if ai_message is not None:
+                data = _extract_structured_response({"messages": [ai_message]})
+        if data:
+            _LOGGER.info(
+                "Batch %d: recovering partial results from failed run", batch_num
+            )
+            new_c, new_r, rf = middleware.extract_findings_from_dict(data)
+            enriched = middleware.apply_enrichments_from_dict(batch, data)
+            return enriched, new_c, new_r, rf, False
+        hint = _classify_failure_hint(exc)
+        enriched = _degraded_batch_components(batch, hint=hint)
         return enriched, [], [], [], True
 
     _accumulate_token_usage(result)
@@ -1263,8 +1351,23 @@ async def _run_batch_async(
 
     data = _extract_structured_response(result)
     if not data:
+        if _refusal_present(result):
+            _LOGGER.warning("Batch %d: model refused", batch_num)
+            return (
+                _degraded_batch_components(batch, hint="model_refused"),
+                [],
+                [],
+                [],
+                True,
+            )
         _LOGGER.warning("Batch %d returned no usable output", batch_num)
-        return batch, [], [], [], True
+        return (
+            _degraded_batch_components(batch, hint="no_usable_output"),
+            [],
+            [],
+            [],
+            True,
+        )
 
     new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
     enriched = middleware.apply_enrichments_from_dict(batch, data)
@@ -2081,12 +2184,94 @@ def _build_context_message(
     )
 
 
+def _structured_from_tool_calls(message: Any) -> dict[str, Any] | None:
+    """Return the structured object from a message's tool-call args, if any.
+
+    The ``function_calling`` structured-output method carries the answer as a
+    dict in ``tool_calls[].args``. This is uniform across LangChain providers
+    (OpenAI, Anthropic, Bedrock, Google), so reading it is provider-agnostic.
+    """
+    tool_calls = getattr(message, "tool_calls", None)
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+    for call in reversed(tool_calls):
+        if isinstance(call, dict):
+            args = call.get("args")
+        else:
+            args = getattr(call, "args", None)
+        if isinstance(args, dict) and args:
+            return args
+    return None
+
+
+def _structured_from_parsed(message: Any) -> dict[str, Any] | None:
+    """Return the parsed object from ``additional_kwargs['parsed']``, if any.
+
+    The ``json_schema`` structured-output method (ChatOpenAI's default)
+    deposits the parsed object here while leaving ``content`` empty.
+    """
+    extra = getattr(message, "additional_kwargs", None)
+    if not isinstance(extra, dict):
+        return None
+    parsed = extra.get("parsed")
+    if isinstance(parsed, BaseModel):
+        return parsed.model_dump()
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _message_text(message: Any) -> str:
+    """Return the textual content of a message.
+
+    Handles both string content and list-form content blocks
+    (thinking/tool_use/text) returned by Anthropic, Bedrock, and Gemini by
+    concatenating only the ``text`` blocks — never ``str()``-coercing the whole
+    list, which would yield an unparseable Python repr.
+    """
+    if hasattr(message, "content"):
+        content = message.content
+    elif isinstance(message, dict):
+        content = message.get("content", "")
+    else:
+        return str(message)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _dedouble_text(text: str) -> str:
+    """Collapse exact character-doubling ("hheelllloo" -> "hello").
+
+    Handles only the every-character-doubled case (each character repeated once
+    consecutively); returns the input unchanged otherwise. Safe by design: the
+    caller re-validates the result with ``json.loads`` and discards it unless it
+    parses, so an inexact heuristic can never make things worse.
+    """
+    if len(text) >= 2 and len(text) % 2 == 0 and text[0::2] == text[1::2]:
+        return text[0::2]
+    return text
+
+
 def _extract_structured_response(result: Any) -> dict[str, Any] | None:
     """Extract the structured response from the agent's final state.
 
     When ``response_format`` is provided, Deep Agents populates
-    ``structured_response`` in the graph state.  Falls back to parsing
-    the last message as JSON if structured output is unavailable.
+    ``structured_response`` in the graph state.  When it does not — because the
+    model emitted the answer via a tool call, a parsed object, or list-form
+    content blocks instead of a JSON string — recover it from the last
+    message's carriers in order of reliability before falling back to JSON
+    parsing of the message text.
     """
     sr = result.get("structured_response")
     if sr is not None:
@@ -2099,20 +2284,39 @@ def _extract_structured_response(result: Any) -> dict[str, Any] | None:
     if not messages:
         return None
     last = messages[-1]
-    content = ""
-    if hasattr(last, "content"):
-        content = last.content if isinstance(last.content, str) else str(last.content)
-    elif isinstance(last, dict):
-        content = str(last.get("content", ""))
-    else:
-        content = str(last)
 
-    content = content.strip()
+    # Prefer the already-parsed carriers (no JSON parsing needed): tool-call
+    # args (function_calling), then a parsed object (json_schema).
+    from_tools = _structured_from_tool_calls(last)
+    if from_tools is not None:
+        return from_tools
+    from_parsed = _structured_from_parsed(last)
+    if from_parsed is not None:
+        return from_parsed
+
+    # Fall back to JSON embedded in the message text, concatenating text blocks
+    # for list-form content rather than str()-coercing the whole list.
+    content = _message_text(last).strip()
     if not content:
         return None
     try:
         return json.loads(content)
     except json.JSONDecodeError:
+        # Best-effort: some OpenAI-compatible gateways echo character-doubled
+        # content ("hheelllloo"). Re-validate via json.loads so we never accept
+        # a worse result — only an exactly-doubled payload that parses cleanly.
+        repaired = _dedouble_text(content)
+        if repaired != content:
+            try:
+                data = json.loads(repaired)
+            except json.JSONDecodeError:
+                data = None
+            if data is not None:
+                _LOGGER.info(
+                    "Recovered structured output after de-doubling "
+                    "gateway-corrupted content"
+                )
+                return data
         _LOGGER.warning(
             "Failed to parse agent JSON output — first 300 chars: %s",
             content[:300],

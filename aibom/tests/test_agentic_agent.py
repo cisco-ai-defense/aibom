@@ -169,6 +169,218 @@ class TestExtractStructuredResponse:
         assert _extract_structured_response({}) is None
 
 
+class TestExtractStructuredResponseCarriers:
+    """Provider-agnostic carriers beyond ``message.content``.
+
+    Many models return the structured answer via tool-call args, a parsed
+    object in ``additional_kwargs``, or list-form content blocks rather than
+    a JSON string in ``message.content``. The extractor must recover all of
+    these so non-OpenAI-native output is not silently dropped.
+    """
+
+    class _Msg:
+        """Minimal stand-in for a LangChain ``AIMessage`` (no langchain dep)."""
+
+        def __init__(self, content="", tool_calls=None, additional_kwargs=None):
+            self.content = content
+            self.tool_calls = [] if tool_calls is None else tool_calls
+            self.additional_kwargs = (
+                {} if additional_kwargs is None else additional_kwargs
+            )
+
+    def test_extracts_from_tool_call_args(self):
+        # function_calling: the answer is a dict in tool_calls[].args, content empty
+        msg = self._Msg(
+            content="",
+            tool_calls=[
+                {
+                    "name": "AgentResponse",
+                    "args": {
+                        "enriched_components": [],
+                        "new_components": [{"name": "x"}],
+                    },
+                    "id": "call_1",
+                }
+            ],
+        )
+        data = _extract_structured_response({"messages": [msg]})
+        assert data == {"enriched_components": [], "new_components": [{"name": "x"}]}
+
+    def test_extracts_from_additional_kwargs_parsed_dict(self):
+        # json_schema: the parsed object lands in additional_kwargs, content empty
+        msg = self._Msg(
+            content="", additional_kwargs={"parsed": {"enriched_components": []}}
+        )
+        data = _extract_structured_response({"messages": [msg]})
+        assert data == {"enriched_components": []}
+
+    def test_extracts_from_additional_kwargs_parsed_model(self):
+        from pydantic import BaseModel as _BM
+
+        class _Parsed(_BM):
+            enriched_components: list = []
+            new_components: list = []
+
+        msg = self._Msg(content="", additional_kwargs={"parsed": _Parsed()})
+        data = _extract_structured_response({"messages": [msg]})
+        assert data == {"enriched_components": [], "new_components": []}
+
+    def test_parses_list_form_text_content(self):
+        # Anthropic/Bedrock/Gemini return content as a list of blocks
+        msg = self._Msg(content=[{"type": "text", "text": '{"new_components": []}'}])
+        data = _extract_structured_response({"messages": [msg]})
+        assert data == {"new_components": []}
+
+    def test_list_form_strips_non_text_blocks(self):
+        msg = self._Msg(
+            content=[
+                {"type": "thinking", "thinking": "let me reason about this..."},
+                {"type": "text", "text": '{"enriched_components": []}'},
+            ]
+        )
+        data = _extract_structured_response({"messages": [msg]})
+        assert data == {"enriched_components": []}
+
+    def test_tool_call_args_preferred_over_content(self):
+        # When both are present, the structured tool-call args win over free text
+        msg = self._Msg(
+            content='{"new_components": [{"name": "from_content"}]}',
+            tool_calls=[
+                {
+                    "name": "AgentResponse",
+                    "args": {"new_components": [{"name": "from_tool"}]},
+                    "id": "call_1",
+                }
+            ],
+        )
+        data = _extract_structured_response({"messages": [msg]})
+        assert data == {"new_components": [{"name": "from_tool"}]}
+
+    def test_recovers_char_doubled_content(self):
+        # Gateways may echo character-doubled content ("hheelllloo"); when the
+        # de-doubled form is valid JSON, recover it.
+        original = '{"enriched_components": [], "new_components": []}'
+        doubled = "".join(ch * 2 for ch in original)
+        msg = self._Msg(content=doubled)
+        data = _extract_structured_response({"messages": [msg]})
+        assert data == {"enriched_components": [], "new_components": []}
+
+    def test_unrepairable_content_returns_none(self):
+        msg = self._Msg(content="this is not json at all")
+        assert _extract_structured_response({"messages": [msg]}) is None
+
+
+class TestFailureClassification:
+    """A batch failure must be classified into a precise, distinct hint."""
+
+    def _exc(self, **attrs):
+        exc = Exception("boom")
+        for k, v in attrs.items():
+            setattr(exc, k, v)
+        return exc
+
+    def test_classify_rate_limited(self):
+        from aibom.agentic.agent import _classify_failure_hint
+
+        assert _classify_failure_hint(self._exc(status_code=429)) == "rate_limited"
+
+    def test_classify_provider_outage(self):
+        from aibom.agentic.agent import _classify_failure_hint
+
+        assert _classify_failure_hint(self._exc(status_code=503)) == "provider_outage"
+        assert _classify_failure_hint(self._exc(status_code=500)) == "provider_outage"
+
+    def test_classify_structured_output_parse_error(self):
+        from aibom.agentic.agent import _classify_failure_hint
+
+        # StructuredOutputValidationError carries an ai_message attribute.
+        exc = self._exc(ai_message=object())
+        assert _classify_failure_hint(exc) == "structured_output_parse_error"
+
+    def test_classify_generic_unknown_stays_recursion_limit(self):
+        from aibom.agentic.agent import _classify_failure_hint
+
+        assert _classify_failure_hint(RuntimeError("x")) == "batch_recursion_limit"
+
+    def test_refusal_present(self):
+        from aibom.agentic.agent import _refusal_present
+
+        class _M:
+            def __init__(self, ak):
+                self.additional_kwargs = ak
+
+        assert _refusal_present({"messages": [_M({"refusal": "no"})]}) is True
+        assert _refusal_present({"messages": [_M({})]}) is False
+        assert _refusal_present({"messages": []}) is False
+
+
+class TestBuildModelMaxTokens:
+    @patch("aibom.agentic.agent._build_rate_limiter", return_value=None)
+    @patch("aibom.llm_factory.build_chat_model")
+    def test_passes_generous_default_max_tokens(self, mock_build, _mock_rl):
+        from aibom.agentic.agent import _DEFAULT_AGENTIC_MAX_TOKENS, _build_model
+
+        _build_model("some-model", {"provider": "openai"})
+        _, kwargs = mock_build.call_args
+        assert kwargs.get("max_tokens") == _DEFAULT_AGENTIC_MAX_TOKENS
+
+    @patch("aibom.agentic.agent._build_rate_limiter", return_value=None)
+    @patch("aibom.llm_factory.build_chat_model")
+    def test_llm_config_overrides_max_tokens(self, mock_build, _mock_rl):
+        from aibom.agentic.agent import _build_model
+
+        _build_model("some-model", {"max_tokens": 123})
+        _, kwargs = mock_build.call_args
+        assert kwargs.get("max_tokens") == 123
+
+
+class TestStructuredOutputRecovery:
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_recovers_from_structured_output_validation_error(
+        self, mock_create, _mock_build, _mock_close
+    ):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        class _ParseErr(Exception):
+            def __init__(self, ai_message):
+                super().__init__("parse failed")
+                self.ai_message = ai_message
+
+        class _Msg:
+            def __init__(self):
+                self.content = ""
+                self.tool_calls = [
+                    {
+                        "name": "AgentResponse",
+                        "args": {"enriched_components": [], "new_components": []},
+                        "id": "call_1",
+                    }
+                ]
+                self.additional_kwargs = {}
+
+        mock_create.return_value = MagicMock(
+            invoke=MagicMock(side_effect=_ParseErr(_Msg()))
+        )
+        comp = AIComponent(
+            name="test-model",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        comps, _rels, _flags, _usage = run_agentic_enrichment(
+            model_string="bad-model",
+            deterministic_components=[comp],
+            deterministic_relationships=[],
+            scan_paths=["/tmp"],
+        )
+        assert len(comps) == 1
+        # Recovered from the exception's ai_message -> not degraded.
+        assert not comps[0].agentic_hint
+
+
 class TestLazyImport:
     def test_aibom_import_does_not_import_deepagents(self):
         """Importing aibom.agentic should NOT trigger deepagents import."""
