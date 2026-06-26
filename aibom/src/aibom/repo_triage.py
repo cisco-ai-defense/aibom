@@ -179,11 +179,14 @@ class RepoTriager:
                 content = sr
 
         if content is None:
+            # Reuse the shared extractor so list-form content blocks
+            # (thinking/tool_use/text) are normalized to text before JSON
+            # scanning, instead of assuming msg.content is a string.
+            from .agentic.agent import _message_text
+
             messages = result.get("messages", []) if isinstance(result, dict) else []
             for msg in reversed(messages):
-                text = (
-                    getattr(msg, "content", "") if hasattr(msg, "content") else str(msg)
-                )
+                text = _message_text(msg)
                 if not text:
                     continue
                 start = text.find("{")

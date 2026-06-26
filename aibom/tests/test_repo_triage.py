@@ -214,6 +214,19 @@ class TestParseResult:
         tr = triager._parse_result("/repo", result)
         assert tr.decision == "needs-clone"
 
+    def test_message_list_content_fallback(self):
+        # LangChain-style list content (thinking + text blocks) must be
+        # normalized to text before JSON scanning, not break the parser.
+        triager = RepoTriager()
+        msg = MagicMock()
+        msg.content = [
+            {"type": "thinking", "thinking": "let me look..."},
+            {"type": "text", "text": '{"decision": "skip", "reason": "no AI"}'},
+        ]
+        tr = triager._parse_result("/repo", {"messages": [msg]})
+        assert tr.decision == "skip"
+        assert tr.reason == "no AI"
+
     def test_invalid_decision_defaults_deep_scan(self):
         triager = RepoTriager()
         result = {
