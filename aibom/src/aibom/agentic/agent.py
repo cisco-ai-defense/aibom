@@ -355,8 +355,10 @@ _DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 # Generous default completion budget for agentic enrichment. Set explicitly so
 # output length is governed here rather than by an OpenAI-compatible gateway's
 # (often small) default, which can truncate a verbose/reasoning model mid-output
-# and yield an empty batch. Overridable via llm_config["max_tokens"].
-_DEFAULT_AGENTIC_MAX_TOKENS = 16000
+# and yield an empty batch. This caps *output* tokens only — for reasoning
+# models the budget also covers reasoning tokens, so it is set high. Overridable
+# via llm_config["max_tokens"] (CLI: --llm-max-tokens / AIBOM_LLM_MAX_TOKENS).
+_DEFAULT_AGENTIC_MAX_TOKENS = 128000
 
 _SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
 
@@ -1188,7 +1190,9 @@ def _run_batch(
             # parsed object, or text) instead of dropping the whole batch.
             ai_message = getattr(exc, "ai_message", None)
             if ai_message is not None:
-                data = _extract_structured_response({"messages": [ai_message]})
+                recovered = {"messages": [ai_message]}
+                _accumulate_token_usage(recovered)
+                data = _extract_structured_response(recovered)
         if data:
             _LOGGER.info(
                 "Batch %d: recovering partial results from failed run", batch_num
@@ -1322,7 +1326,9 @@ async def _run_batch_async(
             # parsed object, or text) instead of dropping the whole batch.
             ai_message = getattr(exc, "ai_message", None)
             if ai_message is not None:
-                data = _extract_structured_response({"messages": [ai_message]})
+                recovered = {"messages": [ai_message]}
+                _accumulate_token_usage(recovered)
+                data = _extract_structured_response(recovered)
         if data:
             _LOGGER.info(
                 "Batch %d: recovering partial results from failed run", batch_num
@@ -2194,12 +2200,16 @@ def _structured_from_tool_calls(message: Any) -> dict[str, Any] | None:
     tool_calls = getattr(message, "tool_calls", None)
     if not isinstance(tool_calls, list) or not tool_calls:
         return None
+    response_fields = set(AgentResponse.model_fields)
     for call in reversed(tool_calls):
         if isinstance(call, dict):
             args = call.get("args")
         else:
             args = getattr(call, "args", None)
-        if isinstance(args, dict) and args:
+        # Only treat a tool call as the structured response when its args carry
+        # AgentResponse fields. A normal tool invocation (search_codebase,
+        # lookup_model, ...) must not be misread as the agent's response.
+        if isinstance(args, dict) and (response_fields & args.keys()):
             return args
     return None
 
@@ -2300,28 +2310,35 @@ def _extract_structured_response(result: Any) -> dict[str, Any] | None:
     if not content:
         return None
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except json.JSONDecodeError:
+        parsed = None
+    # Only a JSON object is a usable response; arrays/scalars would pass a
+    # truthy check and then break middleware's ``data.get(...)``.
+    if isinstance(parsed, dict):
+        return parsed
+    if parsed is None:
         # Best-effort: some OpenAI-compatible gateways echo character-doubled
         # content ("hheelllloo"). Re-validate via json.loads so we never accept
-        # a worse result — only an exactly-doubled payload that parses cleanly.
+        # a worse result — only an exactly-doubled payload that parses to an
+        # object.
         repaired = _dedouble_text(content)
         if repaired != content:
             try:
-                data = json.loads(repaired)
+                redone = json.loads(repaired)
             except json.JSONDecodeError:
-                data = None
-            if data is not None:
+                redone = None
+            if isinstance(redone, dict):
                 _LOGGER.info(
                     "Recovered structured output after de-doubling "
                     "gateway-corrupted content"
                 )
-                return data
-        _LOGGER.warning(
-            "Failed to parse agent JSON output — first 300 chars: %s",
-            content[:300],
-        )
-        return None
+                return redone
+    _LOGGER.warning(
+        "Failed to parse agent JSON output — first 300 chars: %s",
+        content[:300],
+    )
+    return None
 
 
 _CROSS_REPO_COORDINATOR_PROMPT = """\

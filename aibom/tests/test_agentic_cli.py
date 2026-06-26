@@ -18,8 +18,8 @@
 
 from __future__ import annotations
 
-import json
 import importlib
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -46,34 +46,50 @@ class TestAgenticEnrichmentViaCLI:
         result = runner.invoke(
             app,
             [
-                "analyze", str(sample_dir),
-                "--output-format", "plaintext",
-                "--output-file", str(out),
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
             ],
             env={"AIBOM_LLM_MODEL": ""},
         )
         assert result.exit_code == 1
-        assert "llm-model" in result.output.lower() or "AIBOM_LLM_MODEL" in result.output
+        assert (
+            "llm-model" in result.output.lower() or "AIBOM_LLM_MODEL" in result.output
+        )
 
     @patch("aibom.scan_pipeline.ensure_llm_runtime_available", return_value=None)
     @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent.create_aibom_agent")
-    def test_llm_model_triggers_agentic_enrichment(self, mock_create, _mock_build, _mock_close, _mock_cli_preflight, _mock_pipeline_preflight, sample_dir, tmp_path):
+    def test_llm_model_triggers_agentic_enrichment(
+        self,
+        mock_create,
+        _mock_build,
+        _mock_close,
+        _mock_cli_preflight,
+        _mock_pipeline_preflight,
+        sample_dir,
+        tmp_path,
+    ):
         out = tmp_path / "report.txt"
-        agent_response = json.dumps({
-            "enriched_components": [],
-            "new_components": [],
-            "new_relationships": [
-                {
-                    "source_name": "client",
-                    "target_name": "gpt-4o",
-                    "relationship_type": "USES_MODEL",
-                }
-            ],
-            "risk_findings": [],
-        })
+        agent_response = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [],
+                "new_relationships": [
+                    {
+                        "source_name": "client",
+                        "target_name": "gpt-4o",
+                        "relationship_type": "USES_MODEL",
+                    }
+                ],
+                "risk_findings": [],
+            }
+        )
         mock_msg = MagicMock()
         mock_msg.content = agent_response
         mock_agent = MagicMock()
@@ -83,12 +99,18 @@ class TestAgenticEnrichmentViaCLI:
         result = runner.invoke(
             app,
             [
-                "analyze", str(sample_dir),
-                "--output-format", "plaintext",
-                "--output-file", str(out),
-                "--llm-model", "test-model",
-                "--llm-api-base", "http://localhost:11434",
-                "--agentic-scope", "all",
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
+                "--llm-model",
+                "test-model",
+                "--llm-api-base",
+                "http://localhost:11434",
+                "--agentic-scope",
+                "all",
             ],
         )
         assert result.exit_code == 0
@@ -101,6 +123,63 @@ class TestAgenticEnrichmentViaCLI:
         clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         assert "--llm-model" in clean
         assert "agentic" in clean
+
+    def test_llm_max_tokens_help_listed(self):
+        import re
+
+        result = runner.invoke(app, ["analyze", "--help"])
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--llm-max-tokens" in clean
+
+    @patch("aibom.scan_pipeline.ensure_llm_runtime_available", return_value=None)
+    @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_llm_max_tokens_flag_threaded_into_config(
+        self,
+        mock_create,
+        mock_build,
+        _mock_close,
+        _mock_cli_preflight,
+        _mock_pipeline_preflight,
+        sample_dir,
+        tmp_path,
+    ):
+        out = tmp_path / "report.txt"
+        mock_msg = MagicMock()
+        mock_msg.content = json.dumps({"enriched_components": [], "new_components": []})
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {"messages": [mock_msg]}
+        mock_create.return_value = mock_agent
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
+                "--llm-model",
+                "test-model",
+                "--llm-api-base",
+                "http://localhost:11434",
+                "--llm-max-tokens",
+                "99999",
+                "--agentic-scope",
+                "all",
+            ],
+        )
+        assert result.exit_code == 0
+        # The --llm-max-tokens value must reach _build_model via llm_config.
+        found = False
+        for call in mock_build.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                if isinstance(arg, dict) and arg.get("max_tokens") == 99999:
+                    found = True
+        assert found, "llm_config['max_tokens']=99999 not passed to _build_model"
 
     def test_missing_agentic_extras_fail_fast_with_install_hint(
         self, monkeypatch, sample_dir, tmp_path

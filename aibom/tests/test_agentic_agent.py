@@ -269,6 +269,37 @@ class TestExtractStructuredResponseCarriers:
         msg = self._Msg(content="this is not json at all")
         assert _extract_structured_response({"messages": [msg]}) is None
 
+    def test_ignores_non_agentresponse_tool_call(self):
+        # A normal tool invocation (not the structured-output tool) must not be
+        # mistaken for the agent's response.
+        msg = self._Msg(
+            content="",
+            tool_calls=[
+                {"name": "search_codebase", "args": {"query": "foo"}, "id": "t1"}
+            ],
+        )
+        assert _extract_structured_response({"messages": [msg]}) is None
+
+    def test_falls_through_to_content_when_tool_call_not_response(self):
+        # Non-response tool call ignored, but valid JSON content still parsed.
+        msg = self._Msg(
+            content='{"new_components": []}',
+            tool_calls=[
+                {"name": "lookup_model", "args": {"name": "gpt-4o"}, "id": "t1"}
+            ],
+        )
+        assert _extract_structured_response({"messages": [msg]}) == {
+            "new_components": []
+        }
+
+    def test_rejects_non_object_json_array(self):
+        msg = self._Msg(content="[1, 2, 3]")
+        assert _extract_structured_response({"messages": [msg]}) is None
+
+    def test_rejects_non_object_json_scalar(self):
+        msg = self._Msg(content='"just a string"')
+        assert _extract_structured_response({"messages": [msg]}) is None
+
 
 class TestFailureClassification:
     """A batch failure must be classified into a precise, distinct hint."""
@@ -359,6 +390,11 @@ class TestStructuredOutputRecovery:
                     }
                 ]
                 self.additional_kwargs = {}
+                self.usage_metadata = {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                }
 
         mock_create.return_value = MagicMock(
             invoke=MagicMock(side_effect=_ParseErr(_Msg()))
@@ -370,7 +406,7 @@ class TestStructuredOutputRecovery:
             line_number=1,
             model_name="gpt-4o",
         )
-        comps, _rels, _flags, _usage = run_agentic_enrichment(
+        comps, _rels, _flags, usage = run_agentic_enrichment(
             model_string="bad-model",
             deterministic_components=[comp],
             deterministic_relationships=[],
@@ -379,6 +415,8 @@ class TestStructuredOutputRecovery:
         assert len(comps) == 1
         # Recovered from the exception's ai_message -> not degraded.
         assert not comps[0].agentic_hint
+        # Token usage from the recovered ai_message is counted, not lost.
+        assert usage.total_tokens == 15
 
 
 class TestLazyImport:
