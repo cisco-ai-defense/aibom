@@ -62,7 +62,10 @@ class RepoTriager:
             if not root.exists():
                 results.append(
                     TriageResult(
-                        repo_path, "skip", "path does not exist", method="deterministic",
+                        repo_path,
+                        "skip",
+                        "path does not exist",
+                        method="deterministic",
                     )
                 )
                 continue
@@ -76,24 +79,26 @@ class RepoTriager:
         """Run the triage agent on a single repository."""
         if not self.llm_config:
             return TriageResult(
-                repo_path, "deep-scan",
+                repo_path,
+                "deep-scan",
                 "no LLM config — defaulting to deep-scan (safe bias)",
                 method="deterministic",
             )
 
         try:
+            from deepagents import create_deep_agent
+
             from .agentic.prompts import TRIAGE_AGENT_SYSTEM_PROMPT
             from .agentic.tools import build_triage_tools
             from .llm_factory import build_chat_model
-
-            from deepagents import create_deep_agent
         except ImportError:
             _LOGGER.warning(
                 "Agentic triage requires 'cisco-aibom[agentic]'; "
                 "defaulting to deep-scan"
             )
             return TriageResult(
-                repo_path, "deep-scan",
+                repo_path,
+                "deep-scan",
                 "agentic extras unavailable — defaulting to deep-scan",
                 method="deterministic",
             )
@@ -108,6 +113,7 @@ class RepoTriager:
                 api_key=cfg.get("api_key"),
                 api_base=cfg.get("api_base"),
                 api_version=cfg.get("api_version"),
+                max_tokens=cfg.get("max_tokens"),
             )
 
             tools = build_triage_tools(repo_path)
@@ -133,10 +139,12 @@ class RepoTriager:
         except Exception:
             _LOGGER.warning(
                 "Agentic triage failed for %s; defaulting to deep-scan",
-                repo_path, exc_info=True,
+                repo_path,
+                exc_info=True,
             )
             return TriageResult(
-                repo_path, "deep-scan",
+                repo_path,
+                "deep-scan",
                 "agentic triage failed — defaulting to deep-scan",
                 method="agentic",
             )
@@ -173,7 +181,9 @@ class RepoTriager:
         if content is None:
             messages = result.get("messages", []) if isinstance(result, dict) else []
             for msg in reversed(messages):
-                text = getattr(msg, "content", "") if hasattr(msg, "content") else str(msg)
+                text = (
+                    getattr(msg, "content", "") if hasattr(msg, "content") else str(msg)
+                )
                 if not text:
                     continue
                 start = text.find("{")
@@ -187,7 +197,8 @@ class RepoTriager:
 
         if not content or not isinstance(content, dict):
             return TriageResult(
-                repo_path, "deep-scan",
+                repo_path,
+                "deep-scan",
                 "could not parse agent response — defaulting to deep-scan",
                 method="agentic",
             )

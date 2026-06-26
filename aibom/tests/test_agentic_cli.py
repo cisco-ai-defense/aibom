@@ -181,6 +181,55 @@ class TestAgenticEnrichmentViaCLI:
                     found = True
         assert found, "llm_config['max_tokens']=99999 not passed to _build_model"
 
+    def test_llm_max_tokens_rejects_non_positive(self, sample_dir, tmp_path):
+        import re
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--llm-model",
+                "test-model",
+                "--llm-max-tokens",
+                "0",
+            ],
+        )
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert result.exit_code != 0
+        assert "max-tokens" in clean.lower() or "range" in clean.lower()
+
+    @patch("aibom.repo_triage.RepoTriager")
+    def test_triage_config_includes_max_tokens(self, mock_triager_cls):
+        from aibom.cli import _gather_analysis_sources
+
+        inst = MagicMock()
+        inst.triage_repos.return_value = []
+        mock_triager_cls.return_value = inst
+
+        _gather_analysis_sources(
+            sources=["repoA", "repoB"],
+            images_file=None,
+            repos_file=None,
+            discover_repos=False,
+            github_org=None,
+            gitlab_group=None,
+            bitbucket_project=None,
+            platform_token=None,
+            repo_name_filter=None,
+            repo_topic_filter=None,
+            max_repos=None,
+            parallel_repos=1,
+            llm_model="test-model",
+            llm_provider=None,
+            llm_api_base=None,
+            llm_api_key=None,
+            llm_api_version=None,
+            llm_max_tokens=4242,
+        )
+        _, kwargs = mock_triager_cls.call_args
+        assert kwargs["llm_config"].get("max_tokens") == 4242
+
     def test_missing_agentic_extras_fail_fast_with_install_hint(
         self, monkeypatch, sample_dir, tmp_path
     ):

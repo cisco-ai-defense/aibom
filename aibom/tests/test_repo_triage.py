@@ -38,8 +38,11 @@ class TestTriageAgentIntegration:
         triager = RepoTriager(llm_config={"model": "test-model", "api_key": "k"})
         with patch.object(triager, "_triage_single") as mock_triage:
             mock_triage.return_value = TriageResult(
-                str(repo), "deep-scan", "uses openai",
-                evidence=["requirements.txt"], method="agentic",
+                str(repo),
+                "deep-scan",
+                "uses openai",
+                evidence=["requirements.txt"],
+                method="agentic",
             )
             results = triager.triage_repos([str(repo)])
 
@@ -53,12 +56,37 @@ class TestTriageAgentIntegration:
         triager = RepoTriager(llm_config={"model": "test-model", "api_key": "k"})
         with patch.object(triager, "_triage_single") as mock_triage:
             mock_triage.return_value = TriageResult(
-                str(repo), "skip", "pure web framework", method="agentic",
+                str(repo),
+                "skip",
+                "pure web framework",
+                method="agentic",
             )
             results = triager.triage_repos([str(repo)])
 
         assert results[0].decision == "skip"
         assert results[0].method == "agentic"
+
+    def test_triage_passes_max_tokens_to_model(self, tmp_path: Path):
+        repo = tmp_path / "ai-app"
+        repo.mkdir()
+
+        fake_deepagents = MagicMock()
+        triager = RepoTriager(
+            llm_config={"model": "test-model", "api_key": "k", "max_tokens": 4242}
+        )
+        with (
+            patch(
+                "aibom.llm_factory.build_chat_model", return_value=MagicMock()
+            ) as mock_build,
+            patch.object(
+                triager, "_invoke_with_timeout", side_effect=RuntimeError("stop")
+            ),
+            patch.dict("sys.modules", {"deepagents": fake_deepagents}),
+        ):
+            triager.triage_repos([str(repo)])
+
+        _, kwargs = mock_build.call_args
+        assert kwargs.get("max_tokens") == 4242
 
     def test_agent_failure_defaults_deep_scan(self, tmp_path: Path):
         repo = tmp_path / "broken"
@@ -66,9 +94,13 @@ class TestTriageAgentIntegration:
 
         fake_deepagents = MagicMock()
         triager = RepoTriager(llm_config={"model": "test-model", "api_key": "k"})
-        with patch.object(triager, "_invoke_with_timeout", side_effect=RuntimeError("LLM timeout")), \
-             patch("aibom.llm_factory.build_chat_model", return_value=MagicMock()), \
-             patch.dict("sys.modules", {"deepagents": fake_deepagents}):
+        with (
+            patch.object(
+                triager, "_invoke_with_timeout", side_effect=RuntimeError("LLM timeout")
+            ),
+            patch("aibom.llm_factory.build_chat_model", return_value=MagicMock()),
+            patch.dict("sys.modules", {"deepagents": fake_deepagents}),
+        ):
             results = triager.triage_repos([str(repo)])
 
         assert results[0].decision == "deep-scan"
@@ -174,7 +206,9 @@ class TestParseResult:
         triager = RepoTriager()
         result = {
             "messages": [
-                MagicMock(content='{"decision": "needs-clone", "reason": "opaque repo"}')
+                MagicMock(
+                    content='{"decision": "needs-clone", "reason": "opaque repo"}'
+                )
             ]
         }
         tr = triager._parse_result("/repo", result)

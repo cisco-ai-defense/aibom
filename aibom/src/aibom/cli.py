@@ -385,6 +385,7 @@ def _gather_analysis_sources(
     llm_api_base: Optional[str],
     llm_api_key: Optional[str],
     llm_api_version: Optional[str],
+    llm_max_tokens: Optional[int],
 ) -> List[str]:
     sources_to_process = list(sources) if sources else []
     if images_file:
@@ -465,6 +466,8 @@ def _gather_analysis_sources(
             triage_llm_cfg["api_key"] = llm_api_key
         if llm_api_version:
             triage_llm_cfg["api_version"] = llm_api_version
+        if llm_max_tokens is not None:
+            triage_llm_cfg["max_tokens"] = llm_max_tokens
 
         triager = RepoTriager(llm_config=triage_llm_cfg)
         triage_results = triager.triage_repos(sources_to_process)
@@ -1335,11 +1338,12 @@ def analyze(
         None,
         "--llm-max-tokens",
         envvar="AIBOM_LLM_MAX_TOKENS",
+        min=1,
         help=(
             "Max completion (output) tokens per agentic LLM call. Caps output "
-            "only, not input. Defaults to a generous value; raise it if a "
-            "verbose/reasoning model is being truncated, or lower it to bound "
-            "cost."
+            "only, not input. Must be a positive integer. Defaults to a generous "
+            "value; raise it if a verbose/reasoning model is being truncated, or "
+            "lower it to bound cost."
         ),
     ),
     show_summary: bool = typer.Option(
@@ -1658,6 +1662,7 @@ def analyze(
         llm_api_base=llm_api_base,
         llm_api_key=llm_api_key,
         llm_api_version=llm_api_version,
+        llm_max_tokens=llm_max_tokens,
     )
 
     if not sources_to_process:
