@@ -45,30 +45,37 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.tree import Tree
 
-from .report_sender import post_report_with_retries
-from .utils.version import resolve_package_version
-from .scanners.container_extractor import extract_source_from_image, is_container_image, VALID_TIERS, validate_tier
+from .api_handler import start_api_server
+from .cache_paths import cache_dir as resolve_cache_type_dir
 from .cache_paths import (
-    cache_dir as resolve_cache_type_dir,
     cache_read_dirs,
     cache_types,
     resolve_cache_root,
 )
-from .llm_factory import ensure_llm_runtime_available
 from .custom_catalog import (
     CustomCatalogConfig,
     load_custom_catalog,
 )
-from .api_handler import start_api_server
-from .reporters import get_reporter, reporter_registry
+from .kb.manager import KBError, KBManager
+from .llm_factory import ensure_llm_runtime_available
 from .models.enums import Severity as SeverityEnum
-from .kb.manager import KBManager, KBError
+from .report_sender import post_report_with_retries
+from .reporters import get_reporter, reporter_registry
+from .scanners.container_extractor import (
+    VALID_TIERS,
+    extract_source_from_image,
+    is_container_image,
+    validate_tier,
+)
+from .utils.version import resolve_package_version
 
 _LOGGER = logging.getLogger(__name__)
 
 console = Console()
 
-_VALID_OUTPUT_FORMATS = {"plaintext", "json", "api"} | {r.name for r in reporter_registry}
+_VALID_OUTPUT_FORMATS = {"plaintext", "json", "api"} | {
+    r.name for r in reporter_registry
+}
 
 app = typer.Typer(
     help="Generate an AI BOM from source code.",
@@ -143,12 +150,18 @@ def _print_timing_table(console: "rich.console.Console", result: "PipelineResult
 
     table = Table(title="Pipeline Timing", show_footer=True)
     table.add_column("Stage", footer="Total")
-    table.add_column("Elapsed", justify="right", footer=f"{result.total_elapsed_s:.2f}s")
+    table.add_column(
+        "Elapsed", justify="right", footer=f"{result.total_elapsed_s:.2f}s"
+    )
     table.add_column("%", justify="right")
     table.add_column("Detail")
 
     for st in result.timings:
-        pct = (st.elapsed_s / result.total_elapsed_s * 100) if result.total_elapsed_s else 0
+        pct = (
+            (st.elapsed_s / result.total_elapsed_s * 100)
+            if result.total_elapsed_s
+            else 0
+        )
         table.add_row(st.name, f"{st.elapsed_s:.2f}s", f"{pct:.1f}%", st.detail)
 
     console.print(table)
@@ -372,6 +385,7 @@ def _gather_analysis_sources(
     llm_api_base: Optional[str],
     llm_api_key: Optional[str],
     llm_api_version: Optional[str],
+    llm_max_tokens: Optional[int],
 ) -> List[str]:
     sources_to_process = list(sources) if sources else []
     if images_file:
@@ -434,14 +448,11 @@ def _gather_analysis_sources(
                     topic_filter=repo_topic_filter,
                 )
                 console.print(
-                    f"  [dim]{plat}: discovered {len(repos)} repo(s) "
-                    f"in {ns}[/]"
+                    f"  [dim]{plat}: discovered {len(repos)} repo(s) " f"in {ns}[/]"
                 )
                 sources_to_process.extend(r.clone_url for r in repos)
             except Exception as exc:
-                console.print(
-                    f"[yellow]Warning: {plat} discovery failed: {exc}[/]"
-                )
+                console.print(f"[yellow]Warning: {plat} discovery failed: {exc}[/]")
 
     if len(sources_to_process) > 1 and llm_model:
         from .repo_triage import RepoTriager
@@ -455,6 +466,8 @@ def _gather_analysis_sources(
             triage_llm_cfg["api_key"] = llm_api_key
         if llm_api_version:
             triage_llm_cfg["api_version"] = llm_api_version
+        if llm_max_tokens is not None:
+            triage_llm_cfg["max_tokens"] = llm_max_tokens
 
         triager = RepoTriager(llm_config=triage_llm_cfg)
         triage_results = triager.triage_repos(sources_to_process)
@@ -570,8 +583,7 @@ def _print_missing_repositories_panel(result: Any) -> None:
     for d in escaping[:10]:
         label = d.name or d.url_or_path
         lines.append(
-            f"  • [bold]{label}[/] ({d.dep_type}) "
-            f"from {Path(d.source_file).name}"
+            f"  • [bold]{label}[/] ({d.dep_type}) " f"from {Path(d.source_file).name}"
         )
     if len(escaping) > 10:
         lines.append(f"  … and {len(escaping) - 10} more")
@@ -617,8 +629,7 @@ def _cross_repo_llm_enrichment(
     from .models.scan import CrossRepoLink, RepoOccurrence
 
     console.print(
-        f"  [cyan]Cross-repo LLM coordination across "
-        f"{len(v2_outputs)} repos…[/]"
+        f"  [cyan]Cross-repo LLM coordination across " f"{len(v2_outputs)} repos…[/]"
     )
     xrepo_rels, xrepo_flags = run_cross_repo_coordination(
         model_string=llm_config["model"],
@@ -699,7 +710,9 @@ def main_callback(
         raise typer.Exit(code=1)
 
 
-def _render_component_table(source: str, categorized_components: Dict[str, List[Dict[str, Any]]]) -> None:
+def _render_component_table(
+    source: str, categorized_components: Dict[str, List[Dict[str, Any]]]
+) -> None:
     table = Table(
         "Category",
         "Count",
@@ -718,13 +731,17 @@ def _render_component_table(source: str, categorized_components: Dict[str, List[
     if has_rows:
         console.print(table)
     else:
-        console.print(Panel.fit("No components detected.", title=source, style="yellow"))
+        console.print(
+            Panel.fit("No components detected.", title=source, style="yellow")
+        )
 
 
 def _build_workflow_tree(component: Dict[str, Any]) -> Tree:
     title = f"[bold]{component.get('name')}[/] ({component.get('category')})"
     root = Tree(title)
-    workflows = sorted(component.get("workflows") or [], key=lambda wf: wf.get("distance", 0))
+    workflows = sorted(
+        component.get("workflows") or [], key=lambda wf: wf.get("distance", 0)
+    )
     for workflow in workflows:
         distance = workflow.get("distance", 0)
         func = workflow.get("function", "unknown")
@@ -775,29 +792,45 @@ def _render_relationship_table(relationships: List[Any]) -> None:
 def _display_v2_summary(source: str, components: list, relationships: list) -> None:
     """Rich summary for v2 detector output."""
     from .models import AIComponent as _V2Comp
+
     components = [
-        _V2Comp.model_validate(c) if isinstance(c, dict) else c
-        for c in components
+        _V2Comp.model_validate(c) if isinstance(c, dict) else c for c in components
     ]
     panel_title = f"[bold green]Analysis Summary (v2)[/] • {source}"
     console.print(Panel(panel_title, style="green", expand=False))
     if not components:
-        console.print(Panel.fit("No AI components detected.", title=source, style="yellow"))
+        console.print(
+            Panel.fit("No AI components detected.", title=source, style="yellow")
+        )
         return
     by_type: Counter = Counter()
     grouped: Dict[str, list] = {}
     for comp in components:
-        ctype = comp.component_type.value if hasattr(comp.component_type, "value") else str(comp.component_type)
+        ctype = (
+            comp.component_type.value
+            if hasattr(comp.component_type, "value")
+            else str(comp.component_type)
+        )
         by_type[ctype] += 1
         grouped.setdefault(ctype, []).append(comp)
-    table = Table("Category", "Count", title=f"Components in {source}", box=box.SIMPLE_HEAVY, header_style="bold magenta")
+    table = Table(
+        "Category",
+        "Count",
+        title=f"Components in {source}",
+        box=box.SIMPLE_HEAVY,
+        header_style="bold magenta",
+    )
     for ctype, count in sorted(by_type.items()):
         table.add_row(ctype, str(count))
     console.print(table)
     for ctype, items in sorted(grouped.items()):
         console.print(Panel.fit(f"{ctype.upper()} details", style="bold white"))
         for comp in items[:5]:
-            loc = f"{comp.file_path}:{comp.line_path}" if hasattr(comp, "line_path") else f"{comp.file_path}:{comp.line_number}"
+            loc = (
+                f"{comp.file_path}:{comp.line_path}"
+                if hasattr(comp, "line_path")
+                else f"{comp.file_path}:{comp.line_number}"
+            )
             extra = ""
             if comp.model_name:
                 extra = f" model={comp.model_name}"
@@ -809,7 +842,9 @@ def _display_v2_summary(source: str, components: list, relationships: list) -> N
             console.print(f"  [cyan]{comp.name}[/]{extra} [dim]{loc}[/]")
 
 
-def _display_analysis_summary(all_analysis_outputs: Dict[str, Any], max_examples: int = 3) -> None:
+def _display_analysis_summary(
+    all_analysis_outputs: Dict[str, Any], max_examples: int = 3
+) -> None:
     for source, output in all_analysis_outputs.items():
         if isinstance(output, dict) and output.get("_v2"):
             _display_v2_summary(source, output["components"], output["relationships"])
@@ -891,9 +926,7 @@ def _build_submission_payload(
         )
 
     submitted_at = (
-        metadata.get("completed_at")
-        or metadata.get("started_at")
-        or _utcnow_iso()
+        metadata.get("completed_at") or metadata.get("started_at") or _utcnow_iso()
     )
     return {
         "run_id": metadata.get("run_id"),
@@ -998,7 +1031,9 @@ def _source_outcomes_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, 
     for source_key, entry in sources.items():
         if not isinstance(entry, dict):
             continue
-        summary = entry.get("summary", {}) if isinstance(entry.get("summary"), dict) else {}
+        summary = (
+            entry.get("summary", {}) if isinstance(entry.get("summary"), dict) else {}
+        )
         source_path = str(entry.get("source_path") or source_key)
         outcomes[source_path] = {
             "source_name": str(entry.get("source_name") or source_key),
@@ -1100,7 +1135,11 @@ def report_command(
         resolve_path=True,
         help="Path to the JSON report file when using 'show' or 'upload'.",
     ),
-    raw: bool = typer.Option(False, "--raw-json", help="Display the raw JSON using syntax highlighting before the summary."),
+    raw: bool = typer.Option(
+        False,
+        "--raw-json",
+        help="Display the raw JSON using syntax highlighting before the summary.",
+    ),
     report_format: str = typer.Option(
         "json",
         "--format",
@@ -1294,6 +1333,18 @@ def analyze(
         "--llm-api-version",
         envvar="AIBOM_LLM_API_VERSION",
         help="LLM API version (for Azure OpenAI). May be optional for other providers.",
+    ),
+    llm_max_tokens: Optional[int] = typer.Option(
+        None,
+        "--llm-max-tokens",
+        envvar="AIBOM_LLM_MAX_TOKENS",
+        min=1,
+        help=(
+            "Max completion (output) tokens per agentic LLM call. Caps output "
+            "only, not input. Must be a positive integer. Defaults to a generous "
+            "value; raise it if a verbose/reasoning model is being truncated, or "
+            "lower it to bound cost."
+        ),
     ),
     show_summary: bool = typer.Option(
         True,
@@ -1521,7 +1572,9 @@ def analyze(
     """Analyzes a Python codebase to generate an AI BOM."""
     if output_format not in _VALID_OUTPUT_FORMATS:
         valid = ", ".join(sorted(_VALID_OUTPUT_FORMATS))
-        console.print(f"[red]Invalid output format[/] '{output_format}'. Must be one of: {valid}")
+        console.print(
+            f"[red]Invalid output format[/] '{output_format}'. Must be one of: {valid}"
+        )
         raise typer.Exit(code=1)
 
     if component_summary and output_format != "json":
@@ -1548,14 +1601,18 @@ def analyze(
         try:
             fail_on_severity = SeverityEnum(fail_on.lower())
         except ValueError:
-            logging.error(f"Invalid --fail-on value '{fail_on}'. Must be: critical, high, medium, low, info")
+            logging.error(
+                f"Invalid --fail-on value '{fail_on}'. Must be: critical, high, medium, low, info"
+            )
             raise typer.Exit(code=1)
     try:
         severity_filter = SeverityEnum(min_severity.lower())
     except ValueError:
-        logging.error(f"Invalid --severity value '{min_severity}'. Must be: critical, high, medium, low, info")
+        logging.error(
+            f"Invalid --severity value '{min_severity}'. Must be: critical, high, medium, low, info"
+        )
         raise typer.Exit(code=1)
-    
+
     llm_config = None
     if llm_model:
         llm_config = {
@@ -1565,6 +1622,8 @@ def analyze(
             "api_base": llm_api_base,
             "api_version": llm_api_version,
         }
+        if llm_max_tokens is not None:
+            llm_config["max_tokens"] = llm_max_tokens
         try:
             ensure_llm_runtime_available(
                 llm_model,
@@ -1603,6 +1662,7 @@ def analyze(
         llm_api_base=llm_api_base,
         llm_api_key=llm_api_key,
         llm_api_version=llm_api_version,
+        llm_max_tokens=llm_max_tokens,
     )
 
     if not sources_to_process:
@@ -1632,7 +1692,9 @@ def analyze(
         explicit_config = load_custom_catalog(Path(custom_catalog))
     cache_root = resolve_cache_root(cache_dir)
     scan_cache_dir = resolve_cache_type_dir("scan", cache_root)
-    scan_cache_read_dirs = [p for p in cache_read_dirs("scan", cache_root) if p != scan_cache_dir]
+    scan_cache_read_dirs = [
+        p for p in cache_read_dirs("scan", cache_root) if p != scan_cache_dir
+    ]
     scan_cache_settings = _scan_cache_settings(
         strict=strict,
         min_severity=severity_filter,
@@ -1655,7 +1717,7 @@ def analyze(
         temp_dir = None
         clone_ctx = None
 
-        from .multi_repo import is_git_url, ClonedRepo
+        from .multi_repo import ClonedRepo, is_git_url
 
         is_git = is_git_url(source)
         if is_git:
@@ -1664,7 +1726,9 @@ def analyze(
             is_container = is_container_image(source)
 
         source_summary = {
-            "source_kind": "git-url" if is_git else "container" if is_container else "local-path",
+            "source_kind": (
+                "git-url" if is_git else "container" if is_container else "local-path"
+            ),
             "status": "in_progress",
             "status_detail": None,
             "assets_discovered": 0,
@@ -1698,7 +1762,9 @@ def analyze(
 
         if is_container:
             logging.info(f"Source '{source}' detected as a container image.")
-            extraction = extract_source_from_image(source, llm_config=llm_config, tier=container_tier)
+            extraction = extract_source_from_image(
+                source, llm_config=llm_config, tier=container_tier
+            )
             if extraction.error or extraction.extracted_dir is None:
                 message = f"Error extracting from container image: {extraction.error or 'unknown'}"
                 logging.error(message)
@@ -1714,12 +1780,17 @@ def analyze(
             path_to_analyze = extraction.extracted_dir
 
         if is_container:
-            source_summary["source_path"] = "/app" if path_to_analyze.name == "app" else str(path_to_analyze)
+            source_summary["source_path"] = (
+                "/app" if path_to_analyze.name == "app" else str(path_to_analyze)
+            )
             source_summary["source_name"] = str(source)
         else:
             source_summary["source_path"] = str(path_to_analyze.resolve())
             from .reporters.json_reporter import _friendly_source_name
-            source_summary["source_name"] = _friendly_source_name(str(path_to_analyze.resolve()))
+
+            source_summary["source_name"] = _friendly_source_name(
+                str(path_to_analyze.resolve())
+            )
 
         if not path_to_analyze.exists():
             message = f"Path or image '{source}' not found or could not be processed."
@@ -1746,12 +1817,13 @@ def analyze(
             cached_sr = org_cache.get_cached(str(path_to_analyze.resolve()))
             if cached_sr is not None:
                 console.print(
-                    f"[green]Org cache hit[/] for {source} "
-                    f"(~/.aibom/cache/org)"
+                    f"[green]Org cache hit[/] for {source} " f"(~/.aibom/cache/org)"
                 )
                 cached_v2_output = _v2_output_from_org_cache(cached_sr)
                 all_analysis_outputs[source] = cached_v2_output
-                source_summary["assets_discovered"] = len(cached_v2_output["components"])
+                source_summary["assets_discovered"] = len(
+                    cached_v2_output["components"]
+                )
                 source_summary["last_generated_at"] = _utcnow_iso()
                 if source_summary["status"] == "in_progress":
                     source_summary["status"] = "completed"
@@ -1876,7 +1948,8 @@ def analyze(
         run_metadata["status"] = "completed"
 
     v2_outputs = {
-        k: v for k, v in all_analysis_outputs.items()
+        k: v
+        for k, v in all_analysis_outputs.items()
         if isinstance(v, dict) and v.get("_v2")
     }
     _cross_repo_links: list = []
@@ -1887,7 +1960,8 @@ def analyze(
 
         scan_paths_for_xrepo = list(v2_outputs.keys())
         _cross_repo_links = build_deterministic_cross_repo_links(
-            v2_outputs, scan_paths_for_xrepo,
+            v2_outputs,
+            scan_paths_for_xrepo,
         )
         if _cross_repo_links:
             console.print(
@@ -1897,7 +1971,9 @@ def analyze(
 
     if llm_config and len(v2_outputs) > 1:
         try:
-            extra_links, extra_flags = _cross_repo_llm_enrichment(llm_config, v2_outputs)
+            extra_links, extra_flags = _cross_repo_llm_enrichment(
+                llm_config, v2_outputs
+            )
             _cross_repo_links.extend(extra_links)
             _cross_repo_risk_flags.extend(extra_flags)
         except ImportError:
@@ -1910,6 +1986,7 @@ def analyze(
             _filter_intra_repo_links,
             _filter_quality_bar,
         )
+
         before = len(_cross_repo_links)
         _cross_repo_links = _filter_intra_repo_links(_cross_repo_links)
         _cross_repo_links = _filter_quality_bar(_cross_repo_links)
@@ -1928,14 +2005,16 @@ def analyze(
     else:
         reporter = get_reporter(output_format)
 
+    from .finding_annotations import annotate_findings
+    from .models import AIComponent as V2Component
     from .models import (
-        AIComponent as V2Component,
         AIComponentType,
-        ComponentRelationship as V2Relationship,
+    )
+    from .models import ComponentRelationship as V2Relationship
+    from .models import (
         ScanResult,
         SourceResult,
     )
-    from .finding_annotations import annotate_findings
     from .models.scan import RiskFlag
     from .risk import RiskScorer
 
@@ -1957,11 +2036,13 @@ def analyze(
                 include_code_snippets=include_code_snippets,
                 allowed_roots=[source_path],
             )
-            v2_sources.append(SourceResult(
-                path=source_path,
-                components=comps,
-                relationships=rels,
-            ))
+            v2_sources.append(
+                SourceResult(
+                    path=source_path,
+                    components=comps,
+                    relationships=rels,
+                )
+            )
     run_metadata["source_outcomes"] = source_outcomes
     scan_result = ScanResult(
         metadata=run_metadata,
@@ -1997,7 +2078,11 @@ def analyze(
     scan_result.risk.flags = annotated_risk_flags
 
     if compliance:
-        from .compliance import ComplianceFramework, evaluate_compliance, parse_compliance_cli_value
+        from .compliance import (
+            ComplianceFramework,
+            evaluate_compliance,
+            parse_compliance_cli_value,
+        )
 
         parsed = parse_compliance_cli_value(compliance)
         frameworks = list(ComplianceFramework) if parsed == "all" else [parsed]
@@ -2014,7 +2099,11 @@ def analyze(
             ctable.add_column("Detail")
             for row in report.results:
                 st = row.status
-                st_style = "green" if st == "pass" else "yellow" if st == "not_applicable" else "red"
+                st_style = (
+                    "green"
+                    if st == "pass"
+                    else "yellow" if st == "not_applicable" else "red"
+                )
                 ctable.add_row(
                     row.requirement_id,
                     row.title,
@@ -2127,7 +2216,8 @@ def analyze(
     if output_format == "api":
         logging.info("--- Starting API Server ---")
         component_map = {
-            source: getattr(output, "components", output) for source, output in all_analysis_outputs.items()
+            source: getattr(output, "components", output)
+            for source, output in all_analysis_outputs.items()
         }
         start_api_server(component_map)
 
@@ -2264,7 +2354,9 @@ def benchmark_run(
 
     allowed = {"table", "json", "csv"}
     if fmt.lower() not in allowed:
-        console.print(f"[red]Invalid --format {fmt!r}.[/] Use: {', '.join(sorted(allowed))}")
+        console.print(
+            f"[red]Invalid --format {fmt!r}.[/] Use: {', '.join(sorted(allowed))}"
+        )
         raise typer.Exit(code=1)
 
     result = benchmark_scan(ground, scan_result, strict_names=strict_names)
@@ -2427,7 +2519,9 @@ def cache_list(
 @cache_app.command("get")
 def cache_get(
     cache_type: str = typer.Argument(..., help="Cache family to inspect."),
-    entry_ref: str = typer.Argument(..., help="Entry id, prefix, or logical reference."),
+    entry_ref: str = typer.Argument(
+        ..., help="Entry id, prefix, or logical reference."
+    ),
     cache_dir: Path = typer.Option(
         resolve_cache_root(),
         "--cache-dir",
@@ -2470,7 +2564,9 @@ def cache_get(
         raise typer.Exit(code=1)
 
     if raw_json:
-        console.print(Syntax(json.dumps(entry["payload"], indent=2), "json", theme="monokai"))
+        console.print(
+            Syntax(json.dumps(entry["payload"], indent=2), "json", theme="monokai")
+        )
         return
 
     summary = Table(title=f"{cache_type.title()} Cache Entry", box=box.SIMPLE_HEAVY)
@@ -2500,15 +2596,11 @@ def cache_get(
             if isinstance(item, dict) and item.get("name")
         ]
         if component_names:
-            console.print(
-                f"[cyan]Components:[/] {', '.join(component_names[:10])}"
-            )
+            console.print(f"[cyan]Components:[/] {', '.join(component_names[:10])}")
     elif cache_type == "model":
         models = payload.get("models", payload)
         if isinstance(models, dict) and models:
-            console.print(
-                f"[cyan]Models:[/] {', '.join(list(models.keys())[:10])}"
-            )
+            console.print(f"[cyan]Models:[/] {', '.join(list(models.keys())[:10])}")
     elif cache_type == "packages":
         if payload.get("summary"):
             console.print(f"[cyan]Summary:[/] {payload['summary']}")
@@ -2518,15 +2610,17 @@ def cache_get(
 # cisco-aibom plugin  — discover and manage plugins
 # ---------------------------------------------------------------------------
 
-plugin_app = typer.Typer(help="Discover and manage AIBOM plugins.", no_args_is_help=True)
+plugin_app = typer.Typer(
+    help="Discover and manage AIBOM plugins.", no_args_is_help=True
+)
 app.add_typer(plugin_app, name="plugin")
+
 
 def _diff_impl(old_report: Path, new_report: Path, fmt: str) -> None:
     allowed = {"table", "json", "markdown"}
     if fmt.lower() not in allowed:
         console.print(
-            f"[red]Invalid --format {fmt!r}.[/] "
-            "Use: table, json, markdown.",
+            f"[red]Invalid --format {fmt!r}.[/] " "Use: table, json, markdown.",
         )
         raise typer.Exit(code=1)
     from pydantic import ValidationError
@@ -2618,7 +2712,12 @@ def plugin_list() -> None:
 
 @kb_app.command("download")
 def kb_download(
-    version: Optional[str] = typer.Option(None, "--version", "-v", help="Specific KB version to download (latest if omitted)."),
+    version: Optional[str] = typer.Option(
+        None,
+        "--version",
+        "-v",
+        help="Specific KB version to download (latest if omitted).",
+    ),
     url: Optional[str] = typer.Option(
         None,
         "--url",
@@ -2686,22 +2785,38 @@ def kb_verify() -> None:
 @kb_app.command("request")
 def kb_request(
     sdk: str = typer.Option(..., "--sdk", help="SDK name (e.g., langchain, openai)."),
-    version: str = typer.Option(..., "--version", "-v", help="SDK version to request KB build for."),
-    language: str = typer.Option("python", "--language", "-l", help="Programming language."),
+    version: str = typer.Option(
+        ..., "--version", "-v", help="SDK version to request KB build for."
+    ),
+    language: str = typer.Option(
+        "python", "--language", "-l", help="Programming language."
+    ),
     api_key: Optional[str] = typer.Option(
-        None, "--api-key", envvar="CISCO_AI_DEFENSE_API_KEY",
+        None,
+        "--api-key",
+        envvar="CISCO_AI_DEFENSE_API_KEY",
         help="Cisco AI Defense API key.",
     ),
     api_base: Optional[str] = typer.Option(
-        None, "--api-base", envvar="CISCO_AI_DEFENSE_API_BASE",
+        None,
+        "--api-base",
+        envvar="CISCO_AI_DEFENSE_API_BASE",
         help="Cisco AI Defense API base URL.",
     ),
 ) -> None:
     """Request a knowledge base build for a specific SDK version."""
     mgr = KBManager()
     try:
-        result = mgr.request_build(sdk=sdk, version=version, language=language, api_key=api_key, api_base=api_base)
-        console.print(f"[green]Request submitted:[/] {result.get('request_id', 'unknown')}")
+        result = mgr.request_build(
+            sdk=sdk,
+            version=version,
+            language=language,
+            api_key=api_key,
+            api_base=api_base,
+        )
+        console.print(
+            f"[green]Request submitted:[/] {result.get('request_id', 'unknown')}"
+        )
         console.print(f"Status: {result.get('status', 'unknown')}")
     except KBError as exc:
         console.print(f"[bold red]Request failed:[/] {exc}")
@@ -2712,10 +2827,14 @@ def kb_request(
 def kb_request_status(
     request_id: str = typer.Argument(..., help="Request ID to check."),
     api_key: Optional[str] = typer.Option(
-        None, "--api-key", envvar="CISCO_AI_DEFENSE_API_KEY",
+        None,
+        "--api-key",
+        envvar="CISCO_AI_DEFENSE_API_KEY",
     ),
     api_base: Optional[str] = typer.Option(
-        None, "--api-base", envvar="CISCO_AI_DEFENSE_API_BASE",
+        None,
+        "--api-base",
+        envvar="CISCO_AI_DEFENSE_API_BASE",
     ),
 ) -> None:
     """Check the status of a KB build request."""
@@ -2732,10 +2851,14 @@ def kb_request_status(
 @kb_app.command("list-requests")
 def kb_list_requests(
     api_key: Optional[str] = typer.Option(
-        None, "--api-key", envvar="CISCO_AI_DEFENSE_API_KEY",
+        None,
+        "--api-key",
+        envvar="CISCO_AI_DEFENSE_API_KEY",
     ),
     api_base: Optional[str] = typer.Option(
-        None, "--api-base", envvar="CISCO_AI_DEFENSE_API_BASE",
+        None,
+        "--api-base",
+        envvar="CISCO_AI_DEFENSE_API_BASE",
     ),
 ) -> None:
     """List all pending KB build requests."""
