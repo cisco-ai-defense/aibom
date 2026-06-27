@@ -265,15 +265,6 @@ class TestExtractStructuredResponseCarriers:
         data = _extract_structured_response({"messages": [msg]})
         assert data == {"enriched_components": [], "new_components": []}
 
-    def test_recovers_token_doubling_that_breaks_json(self):
-        # Token doubling that makes the JSON unparseable (e.g. a doubled
-        # keyword "truetrue") is repaired by collapsing immediately-repeated
-        # alphanumeric runs and re-validating. (Doubling that keeps the JSON
-        # valid is indistinguishable from real content and is not "repaired".)
-        msg = self._Msg(content='{"enabled": truetrue, "new_components": []}')
-        data = _extract_structured_response({"messages": [msg]})
-        assert data == {"enabled": True, "new_components": []}
-
     def test_unrepairable_content_returns_none(self):
         msg = self._Msg(content="this is not json at all")
         assert _extract_structured_response({"messages": [msg]}) is None
@@ -493,6 +484,51 @@ class TestStrategyFallback:
         )
         assert enriched == [clean]
         fallback_agent.invoke.assert_not_called()
+
+    def test_fallback_removal_drops_component(self):
+        # A successful fallback can REMOVE a component (middleware omits it from
+        # the returned list). The merge must drop it, not keep the stale
+        # degraded original.
+        from aibom.agentic.agent import _strategy_fallback_pass
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        degraded = AIComponent(
+            name="not-really-ai",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+            needs_agentic=False,
+            agentic_hint="no_usable_output",
+        )
+        fallback_agent = MagicMock()
+        msg = MagicMock()
+        msg.content = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [],
+                "remove_components": [
+                    {
+                        "instance_id": degraded.instance_id,
+                        "reason": "not an AI component",
+                    }
+                ],
+            }
+        )
+        fallback_agent.invoke.return_value = {"messages": [msg]}
+
+        enriched, _n, _r, _f, _a = _strategy_fallback_pass(
+            fallback_agent,
+            AIBOMScannerMiddleware(allowed_roots=["/tmp"]),
+            [degraded],
+            [],
+            ["/tmp"],
+            None,
+            batch_size=5,
+            timeout_s=30,
+            max_consecutive_failures=3,
+        )
+        assert enriched == []  # removed by fallback, not kept as degraded
 
 
 class TestLazyImport:

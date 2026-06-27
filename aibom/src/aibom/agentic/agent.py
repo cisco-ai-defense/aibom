@@ -27,7 +27,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1568,6 +1567,7 @@ def _strategy_fallback_pass(
     ]
     fb_batches = _locality_aware_batches(fb_inputs, batch_size)
     recovered: dict[str, AIComponent] = {}
+    removed_ids: set[str] = set()
     fb_new: list[AIComponent] = []
     fb_rels: list[ComponentRelationship] = []
     fb_flags: list[RiskFlag] = []
@@ -1595,20 +1595,37 @@ def _strategy_fallback_pass(
         )
         for c in e:
             recovered[c.instance_id] = c
+        if not batch_failed:
+            # A successful fallback can remove components (middleware omits them
+            # from `e`); track those so the merge drops them instead of keeping
+            # the stale degraded original.
+            returned_ids = {c.instance_id for c in e}
+            removed_ids.update(
+                c.instance_id for c in batch if c.instance_id not in returned_ids
+            )
         fb_new.extend(n)
         fb_rels.extend(r)
         fb_flags.extend(f)
         fb_artifacts.append(_BatchArtifact(batch, n, r, f))
         consecutive = consecutive + 1 if batch_failed else 0
 
-    if recovered:
+    if recovered or removed_ids:
         n_ok = sum(1 for c in recovered.values() if not c.agentic_hint)
         _LOGGER.info(
-            "Structured-output fallback: %d/%d component(s) recovered",
+            "Structured-output fallback: %d/%d component(s) recovered, %d removed",
             n_ok,
             len(targets),
+            len(removed_ids),
         )
-        enriched = [recovered.get(c.instance_id, c) for c in enriched]
+        merged: list[AIComponent] = []
+        for c in enriched:
+            if c.instance_id in recovered:
+                merged.append(recovered[c.instance_id])
+            elif c.instance_id in removed_ids:
+                continue  # removed by a successful fallback run
+            else:
+                merged.append(c)
+        enriched = merged
     return enriched, fb_new, fb_rels, fb_flags, fb_artifacts
 
 
@@ -2409,29 +2426,19 @@ def _message_text(message: Any) -> str:
 
 
 def _dedouble_candidates(text: str) -> list[str]:
-    """Return candidate repairs for content corrupted by gateway *doubling*.
+    """Return candidate repairs for content corrupted by gateway character-
+    doubling ("hheelllloo" -> "hello").
 
-    Some OpenAI-compatible gateways echo output doubled — either every character
-    ("hheelllloo") or every token/word ("componentscomponents"). Produces best-
-    effort repaired candidates; the caller re-validates each with ``json.loads``
-    and discards any that does not parse, so an inexact heuristic can never make
-    things worse. Returns an empty list when no repair applies.
+    The caller re-validates each candidate with ``json.loads`` and discards any
+    that does not parse to an object, so an inexact heuristic can never make
+    things worse. Token/word-level collapse is intentionally NOT attempted: it
+    would silently corrupt a legitimate repeated substring inside a JSON string
+    (e.g. a real value "abcabc" -> "abc") while still parsing. Returns an empty
+    list when no repair applies.
     """
-    candidates: list[str] = []
-    # Every-character-doubled.
     if len(text) >= 2 and len(text) % 2 == 0 and text[0::2] == text[1::2]:
-        candidates.append(text[0::2])
-    # Token/word-doubled: collapse immediately-repeated alphanumeric runs,
-    # iterating to a fixed point (handles nested/multi-token doubling).
-    collapsed = text
-    for _ in range(5):
-        nxt = re.sub(r"([A-Za-z0-9_]+)\1", r"\1", collapsed)
-        if nxt == collapsed:
-            break
-        collapsed = nxt
-    if collapsed != text and collapsed not in candidates:
-        candidates.append(collapsed)
-    return candidates
+        return [text[0::2]]
+    return []
 
 
 def _extract_structured_response(result: Any) -> dict[str, Any] | None:
