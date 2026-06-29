@@ -257,12 +257,12 @@ def _build_model(
         api_key=cfg.get("api_key"),
         api_base=cfg.get("api_base"),
         api_version=cfg.get("api_version"),
-        # Pass an explicit, generous cap so a verbose/reasoning model is not
-        # truncated mid-output by a gateway's low default completion budget
-        # (which otherwise yields an empty/partial batch). Overridable via
-        # llm_config["max_tokens"].  build_chat_model maps this to
-        # max_completion_tokens for reasoning-class models.
-        max_tokens=cfg.get("max_tokens", _DEFAULT_AGENTIC_MAX_TOKENS),
+        # No default cap: omit max_tokens so the model may generate up to its
+        # own context limit (proven behavior; standard OpenAI/vLLM semantics).
+        # A fixed default is wrong-in-some-direction — too low truncates verbose
+        # reasoners, too high reserves the whole context window and starves the
+        # input (HTTP 400). Users opt in via --llm-max-tokens / llm_config.
+        max_tokens=cfg.get("max_tokens"),
         rate_limiter=rate_limiter,
     )
 
@@ -299,6 +299,7 @@ def create_aibom_agent(
     system_prompt: str | None = None,
     tools: list[Any] | None = None,
     model: Any | None = None,
+    response_format: Any | None = None,
 ) -> Any:
     """Create a Deep Agents-powered AIBOM scanning agent.
 
@@ -336,10 +337,36 @@ def create_aibom_agent(
         model=model,
         tools=tools if tools is not None else build_tools(),
         system_prompt=system_prompt or AIBOM_AGENT_SYSTEM_PROMPT,
-        response_format=AgentResponse,
+        response_format=(
+            response_format if response_format is not None else AgentResponse
+        ),
         name="aibom-scanner",
     )
     return agent
+
+
+def _build_fallback_agent(model_string: str, model_obj: Any) -> Any | None:
+    """Build an alternate-strategy agent for the structured-output fallback.
+
+    The primary agent uses the default (tool-calling) structured-output
+    strategy; this builds one that uses the provider-native (json_schema)
+    strategy, which recovers models that emit nothing usable via tool calls.
+    Returns ``None`` if the strategy class is unavailable (agentic extras
+    missing) or the agent cannot be built — the caller then skips the fallback.
+    """
+    try:
+        from langchain.agents.structured_output import ProviderStrategy
+    except ImportError:
+        return None
+    try:
+        return create_aibom_agent(
+            model_string,
+            model=model_obj,
+            response_format=ProviderStrategy(AgentResponse),
+        )
+    except Exception:
+        _LOGGER.debug("Could not build structured-output fallback agent", exc_info=True)
+        return None
 
 
 _DEFAULT_BATCH_SIZE = 15
@@ -352,13 +379,11 @@ _RECURSION_LIMIT = 1000
 _DEFAULT_AGENTIC_TIMEOUT_S = 120
 _DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 
-# Generous default completion budget for agentic enrichment. Set explicitly so
-# output length is governed here rather than by an OpenAI-compatible gateway's
-# (often small) default, which can truncate a verbose/reasoning model mid-output
-# and yield an empty batch. This caps *output* tokens only — for reasoning
-# models the budget also covers reasoning tokens, so it is set high. Overridable
-# via llm_config["max_tokens"] (CLI: --llm-max-tokens / AIBOM_LLM_MAX_TOKENS).
-_DEFAULT_AGENTIC_MAX_TOKENS = 128000
+# Hints whose batches produced no usable structured output under the primary
+# strategy and are worth one re-run with the alternate structured-output
+# strategy (see _strategy_fallback_pass). Distinct from _RETRYABLE_HINTS, which
+# re-runs with the SAME strategy.
+_STRATEGY_FALLBACK_HINTS = frozenset({"no_usable_output", "model_refused"})
 
 _SIMPLE_CANDIDATE_TYPES = frozenset({"model", "dependency", "embedding"})
 
@@ -1500,6 +1525,110 @@ def _default_agentic_cache_dir() -> Path | None:
         return None
 
 
+def _strategy_fallback_pass(
+    fallback_agent: Any,
+    middleware: AIBOMScannerMiddleware,
+    enriched: list[AIComponent],
+    relationships: list[ComponentRelationship],
+    scan_paths: list[str],
+    all_components: list[AIComponent] | None,
+    *,
+    batch_size: int,
+    timeout_s: int,
+    max_consecutive_failures: int,
+    dossier_index: DossierIndex | None = None,
+) -> tuple[
+    list[AIComponent],
+    list[AIComponent],
+    list[ComponentRelationship],
+    list[RiskFlag],
+    list[_BatchArtifact],
+]:
+    """Re-run components that produced no usable output under the primary
+    structured-output strategy, using an alternate-strategy *fallback_agent*.
+
+    Models differ in which structured-output method works (some emit a usable
+    tool call, others only the provider-native json_schema object); this gives
+    the failed components a second chance via the other method. Returns the
+    (possibly updated) ``enriched`` list plus any new components / relationships
+    / risk flags and batch artifacts produced by the fallback run.
+    """
+    targets = [c for c in enriched if c.agentic_hint in _STRATEGY_FALLBACK_HINTS]
+    if not targets:
+        return enriched, [], [], [], []
+
+    _LOGGER.info(
+        "Structured-output fallback: retrying %d component(s) via alternate strategy",
+        len(targets),
+    )
+    fb_inputs = [
+        c.model_copy(update={"needs_agentic": True, "agentic_hint": ""})
+        for c in targets
+    ]
+    fb_batches = _locality_aware_batches(fb_inputs, batch_size)
+    recovered: dict[str, AIComponent] = {}
+    removed_ids: set[str] = set()
+    fb_new: list[AIComponent] = []
+    fb_rels: list[ComponentRelationship] = []
+    fb_flags: list[RiskFlag] = []
+    fb_artifacts: list[_BatchArtifact] = []
+    consecutive = 0
+    for idx, batch in enumerate(fb_batches, 1):
+        if consecutive >= max_consecutive_failures:
+            _LOGGER.warning(
+                "Structured-output fallback circuit breaker: skipping batches %d-%d",
+                idx,
+                len(fb_batches),
+            )
+            break
+        e, n, r, f, batch_failed = _run_batch(
+            fallback_agent,
+            middleware,
+            batch,
+            relationships,
+            scan_paths,
+            idx,
+            len(fb_batches),
+            all_components=all_components,
+            timeout_s=timeout_s,
+            dossier_index=dossier_index,
+        )
+        for c in e:
+            recovered[c.instance_id] = c
+        if not batch_failed:
+            # A successful fallback can remove components (middleware omits them
+            # from `e`); track those so the merge drops them instead of keeping
+            # the stale degraded original.
+            returned_ids = {c.instance_id for c in e}
+            removed_ids.update(
+                c.instance_id for c in batch if c.instance_id not in returned_ids
+            )
+        fb_new.extend(n)
+        fb_rels.extend(r)
+        fb_flags.extend(f)
+        fb_artifacts.append(_BatchArtifact(batch, n, r, f))
+        consecutive = consecutive + 1 if batch_failed else 0
+
+    if recovered or removed_ids:
+        n_ok = sum(1 for c in recovered.values() if not c.agentic_hint)
+        _LOGGER.info(
+            "Structured-output fallback: %d/%d component(s) recovered, %d removed",
+            n_ok,
+            len(targets),
+            len(removed_ids),
+        )
+        merged: list[AIComponent] = []
+        for c in enriched:
+            if c.instance_id in recovered:
+                merged.append(recovered[c.instance_id])
+            elif c.instance_id in removed_ids:
+                continue  # removed by a successful fallback run
+            else:
+                merged.append(c)
+        enriched = merged
+    return enriched, fb_new, fb_rels, fb_flags, fb_artifacts
+
+
 def _run_tier(
     agent: Any,
     middleware: AIBOMScannerMiddleware,
@@ -1515,6 +1644,7 @@ def _run_tier(
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
     dossier_index: DossierIndex | None = None,
+    fallback_agent_factory: Any | None = None,
 ) -> tuple[
     list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]
 ]:
@@ -1719,6 +1849,32 @@ def _run_tier(
         rels.extend(retry_rels)
         flags.extend(retry_flags)
 
+    # Structured-output strategy fallback: components that yielded no usable
+    # output under the primary strategy get one re-run via the alternate
+    # (provider-native) strategy. Only fires when such failures exist, so the
+    # happy path makes no extra LLM call.
+    if fallback_agent_factory is not None and any(
+        c.agentic_hint in _STRATEGY_FALLBACK_HINTS for c in enriched
+    ):
+        fb_agent = fallback_agent_factory()
+        if fb_agent is not None:
+            enriched, fb_new, fb_rels, fb_flags, fb_artifacts = _strategy_fallback_pass(
+                fb_agent,
+                middleware,
+                enriched,
+                relationships,
+                scan_paths,
+                all_components,
+                batch_size=batch_size,
+                timeout_s=timeout_s,
+                max_consecutive_failures=max_consecutive_failures,
+                dossier_index=dossier_index,
+            )
+            new.extend(fb_new)
+            rels.extend(fb_rels)
+            flags.extend(fb_flags)
+            batch_artifacts.extend(fb_artifacts)
+
     if cache:
         artifact_key_by_instance_id: dict[str, str] = {}
         for artifact in batch_artifacts:
@@ -1919,6 +2075,12 @@ def run_agentic_enrichment(
         complex_model_obj = _build_model(model_string, llm_config)
         models_to_close = [tier_model_obj, complex_model_obj]
 
+    def _simple_fb_factory(ms=tier_model_name, mo=tier_model_obj):
+        return _build_fallback_agent(ms, mo)
+
+    def _complex_fb_factory(ms=model_string, mo=complex_model_obj):
+        return _build_fallback_agent(ms, mo)
+
     try:
         if simple:
             _LOGGER.info(
@@ -1942,6 +2104,7 @@ def run_agentic_enrichment(
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
                 dossier_index=dossier_index,
+                fallback_agent_factory=_simple_fb_factory,
             )
             all_enriched.extend(e)
             all_new.extend(n)
@@ -1985,6 +2148,7 @@ def run_agentic_enrichment(
                         timeout_s=timeout_s,
                         max_consecutive_failures=max_consecutive_failures,
                         dossier_index=dossier_index,
+                        fallback_agent_factory=_complex_fb_factory,
                     )
                     all_enriched.extend(e)
                     all_new.extend(n)
@@ -2011,6 +2175,7 @@ def run_agentic_enrichment(
                     timeout_s=timeout_s,
                     max_consecutive_failures=max_consecutive_failures,
                     dossier_index=dossier_index,
+                    fallback_agent_factory=_complex_fb_factory,
                 )
                 all_enriched.extend(e)
                 all_new.extend(n)
@@ -2260,17 +2425,20 @@ def _message_text(message: Any) -> str:
     return ""
 
 
-def _dedouble_text(text: str) -> str:
-    """Collapse exact character-doubling ("hheelllloo" -> "hello").
+def _dedouble_candidates(text: str) -> list[str]:
+    """Return candidate repairs for content corrupted by gateway character-
+    doubling ("hheelllloo" -> "hello").
 
-    Handles only the every-character-doubled case (each character repeated once
-    consecutively); returns the input unchanged otherwise. Safe by design: the
-    caller re-validates the result with ``json.loads`` and discards it unless it
-    parses, so an inexact heuristic can never make things worse.
+    The caller re-validates each candidate with ``json.loads`` and discards any
+    that does not parse to an object, so an inexact heuristic can never make
+    things worse. Token/word-level collapse is intentionally NOT attempted: it
+    would silently corrupt a legitimate repeated substring inside a JSON string
+    (e.g. a real value "abcabc" -> "abc") while still parsing. Returns an empty
+    list when no repair applies.
     """
     if len(text) >= 2 and len(text) % 2 == 0 and text[0::2] == text[1::2]:
-        return text[0::2]
-    return text
+        return [text[0::2]]
+    return []
 
 
 def _extract_structured_response(result: Any) -> dict[str, Any] | None:
@@ -2318,16 +2486,15 @@ def _extract_structured_response(result: Any) -> dict[str, Any] | None:
     if isinstance(parsed, dict):
         return parsed
     if parsed is None:
-        # Best-effort: some OpenAI-compatible gateways echo character-doubled
-        # content ("hheelllloo"). Re-validate via json.loads so we never accept
-        # a worse result — only an exactly-doubled payload that parses to an
-        # object.
-        repaired = _dedouble_text(content)
-        if repaired != content:
+        # Best-effort: some OpenAI-compatible gateways echo content doubled
+        # (character- or token/word-level). Re-validate each candidate via
+        # json.loads and accept only one that parses to an object, so we never
+        # accept a worse result.
+        for candidate in _dedouble_candidates(content):
             try:
-                redone = json.loads(repaired)
+                redone = json.loads(candidate)
             except json.JSONDecodeError:
-                redone = None
+                continue
             if isinstance(redone, dict):
                 _LOGGER.info(
                     "Recovered structured output after de-doubling "

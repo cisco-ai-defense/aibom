@@ -348,12 +348,14 @@ class TestFailureClassification:
 class TestBuildModelMaxTokens:
     @patch("aibom.agentic.agent._build_rate_limiter", return_value=None)
     @patch("aibom.llm_factory.build_chat_model")
-    def test_passes_generous_default_max_tokens(self, mock_build, _mock_rl):
-        from aibom.agentic.agent import _DEFAULT_AGENTIC_MAX_TOKENS, _build_model
+    def test_no_default_max_tokens(self, mock_build, _mock_rl):
+        # No cap by default: omit max_tokens so the model generates up to its
+        # context limit (a fixed default would truncate or starve input).
+        from aibom.agentic.agent import _build_model
 
         _build_model("some-model", {"provider": "openai"})
         _, kwargs = mock_build.call_args
-        assert kwargs.get("max_tokens") == _DEFAULT_AGENTIC_MAX_TOKENS
+        assert kwargs.get("max_tokens") is None
 
     @patch("aibom.agentic.agent._build_rate_limiter", return_value=None)
     @patch("aibom.llm_factory.build_chat_model")
@@ -417,6 +419,116 @@ class TestStructuredOutputRecovery:
         assert not comps[0].agentic_hint
         # Token usage from the recovered ai_message is counted, not lost.
         assert usage.total_tokens == 15
+
+
+class TestStrategyFallback:
+    """A component that yields no usable output under the primary structured-
+    output strategy is recovered by re-running via the alternate (fallback)
+    agent; a clean batch never triggers the fallback."""
+
+    def test_fallback_recovers_no_usable_output(self):
+        from aibom.agentic.agent import _strategy_fallback_pass
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        degraded = AIComponent(
+            name="test-model",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+            needs_agentic=False,
+            agentic_hint="no_usable_output",
+        )
+        fallback_agent = MagicMock()
+        msg = MagicMock()
+        msg.content = json.dumps({"enriched_components": [], "new_components": []})
+        fallback_agent.invoke.return_value = {"messages": [msg]}
+
+        enriched, _new, _rels, _flags, _artifacts = _strategy_fallback_pass(
+            fallback_agent,
+            AIBOMScannerMiddleware(allowed_roots=["/tmp"]),
+            [degraded],
+            [],
+            ["/tmp"],
+            None,
+            batch_size=5,
+            timeout_s=30,
+            max_consecutive_failures=3,
+        )
+        assert len(enriched) == 1
+        assert not enriched[0].agentic_hint  # recovered, no longer degraded
+        fallback_agent.invoke.assert_called_once()
+
+    def test_no_targets_is_noop(self):
+        from aibom.agentic.agent import _strategy_fallback_pass
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        clean = AIComponent(
+            name="m",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        fallback_agent = MagicMock()
+        enriched, _n, _r, _f, _a = _strategy_fallback_pass(
+            fallback_agent,
+            AIBOMScannerMiddleware(allowed_roots=["/tmp"]),
+            [clean],
+            [],
+            ["/tmp"],
+            None,
+            batch_size=5,
+            timeout_s=30,
+            max_consecutive_failures=3,
+        )
+        assert enriched == [clean]
+        fallback_agent.invoke.assert_not_called()
+
+    def test_fallback_removal_drops_component(self):
+        # A successful fallback can REMOVE a component (middleware omits it from
+        # the returned list). The merge must drop it, not keep the stale
+        # degraded original.
+        from aibom.agentic.agent import _strategy_fallback_pass
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        degraded = AIComponent(
+            name="not-really-ai",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+            needs_agentic=False,
+            agentic_hint="no_usable_output",
+        )
+        fallback_agent = MagicMock()
+        msg = MagicMock()
+        msg.content = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [],
+                "remove_components": [
+                    {
+                        "instance_id": degraded.instance_id,
+                        "reason": "not an AI component",
+                    }
+                ],
+            }
+        )
+        fallback_agent.invoke.return_value = {"messages": [msg]}
+
+        enriched, _n, _r, _f, _a = _strategy_fallback_pass(
+            fallback_agent,
+            AIBOMScannerMiddleware(allowed_roots=["/tmp"]),
+            [degraded],
+            [],
+            ["/tmp"],
+            None,
+            batch_size=5,
+            timeout_s=30,
+            max_consecutive_failures=3,
+        )
+        assert enriched == []  # removed by fallback, not kept as degraded
 
 
 class TestLazyImport:
