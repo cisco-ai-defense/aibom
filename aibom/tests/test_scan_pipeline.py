@@ -1968,13 +1968,9 @@ class TestATREnrichmentFlag:
 
         self._write_malicious_skill(tmp_path)
         with patch.dict(sys.modules, {"pyatr": self._fake_pyatr()}):
-            result = ScanPipeline(
-                scan_paths=[str(tmp_path)], atr_enrichment=True
-            ).run()
+            result = ScanPipeline(scan_paths=[str(tmp_path)], atr_enrichment=True).run()
         skills = [
-            c
-            for c in result.components
-            if c.component_type == AIComponentType.SKILL
+            c for c in result.components if c.component_type == AIComponentType.SKILL
         ]
         assert skills, "expected the malicious skill to be detected"
         tagged = [c for c in skills if "security_enrichment" in c.metadata]
