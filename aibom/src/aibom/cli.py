@@ -1454,6 +1454,18 @@ def analyze(
             "unchanged."
         ),
     ),
+    atr_enrichment: bool = typer.Option(
+        False,
+        "--atr-enrichment/--no-atr-enrichment",
+        help=(
+            "Optional security enrichment: run the open-source Agent Threat "
+            "Rules engine (pyatr) over detected skill / prompt / agent / MCP "
+            "components and tag any that match a known agent-attack rule with "
+            "its MITRE ATLAS (and ATT&CK where present) technique IDs. "
+            "Off by default; no-op when pyatr is not installed (the 'security' "
+            "extra). Surfaced as per-asset findings, not a coverage score."
+        ),
+    ),
     container_tier: str = typer.Option(
         "auto",
         "--container-extraction-tier",
@@ -1869,6 +1881,7 @@ def analyze(
             agentic_cache_dir=agentic_cache_dir,
             include_code_snippets=include_code_snippets,
             custom_catalog=explicit_config,
+            atr_enrichment=atr_enrichment,
         )
         result = _run_pipeline_with_progress(source, pipeline, progress)
 

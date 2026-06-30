@@ -76,6 +76,11 @@ security = [
     # clean on the ``security``/``all`` installs.
     "cisco-ai-mcp-scanner>=4.7.3",
     "cisco-ai-skill-scanner>=2.0.11",
+    # Optional engine for the --atr-enrichment pass (off by default). Adds the
+    # LLM-I/O / tool-call / agent-config event surface and the per-rule MITRE
+    # ATLAS mappings that the bundled skill-scanner rule-pack does not expose
+    # back to the BOM. Import is guarded, so absence is a no-op.
+    "pyatr>=0.2.6",
 ]
 agentic = [
     "deepagents>=0.4.12",
@@ -184,6 +189,8 @@ module = [
     "mcpscanner.*",
     "skill_scanner",
     "skill_scanner.*",
+    "pyatr",
+    "pyatr.*",
 ]
 ignore_missing_imports = true
 

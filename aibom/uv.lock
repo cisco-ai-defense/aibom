@@ -538,6 +538,7 @@ all = [
     { name = "langchain-core" },
     { name = "langchain-google-genai" },
     { name = "langchain-openai" },
+    { name = "pyatr" },
     { name = "tree-sitter" },
     { name = "tree-sitter-c-sharp" },
     { name = "tree-sitter-go" },
@@ -579,6 +580,7 @@ llm-openai = [
 security = [
     { name = "cisco-ai-mcp-scanner" },
     { name = "cisco-ai-skill-scanner" },
+    { name = "pyatr" },
 ]
 test = [
     { name = "pytest" },
@@ -627,6 +629,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "pathspec", specifier = ">=0.12.0" },
     { name = "platformdirs", specifier = ">=4.0.0" },
+    { name = "pyatr", marker = "extra == 'security'", specifier = ">=0.2.6" },
     { name = "pydantic", specifier = ">=2.6.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.4.1" },
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=1.0.0" },
@@ -2916,6 +2919,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e9/e6/78ebbb10a8c8e4b61a59249394a4a594c1a7af95593dc933a349c8d00964/pyasn1_modules-0.4.2.tar.gz", hash = "sha256:677091de870a80aae844b1ca6134f54652fa2c8c5a52aa396440ac3106e941e6", size = 307892, upload-time = "2025-03-28T02:41:22.17Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl", hash = "sha256:29253a9207ce32b64c3ac6600edc75368f98473906e8fd1043bd6b5b1de2c14a", size = 181259, upload-time = "2025-03-28T02:41:19.028Z" },
+]
+
+[[package]]
+name = "pyatr"
+version = "0.2.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fd/81/cb54aafdf59c9fcab742180ea01fe0eb6bf82e476e9a93410fbef7fa687e/pyatr-0.2.6.tar.gz", hash = "sha256:e2a348bdc1bd43d1e37e3ef731f9065f4593a8e6cf42170bb37571f111e04fe9", size = 405193, upload-time = "2026-06-02T18:08:38.943Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/ab/6fc361822d8697fc4dac37d445505cbf001dcd30be84e7f8795f0c0f2593/pyatr-0.2.6-py3-none-any.whl", hash = "sha256:95ed9bef9bbd47bac27af1190cb4247bde39b3ecd17fd84f3af373863c8748de", size = 401257, upload-time = "2026-06-02T18:08:37.335Z" },
 ]
 
 [[package]]

@@ -1190,6 +1190,7 @@ class ScanPipeline:
         include_code_snippets: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         custom_catalog: CustomCatalogConfig | None = None,
+        atr_enrichment: bool = False,
     ) -> None:
         self.scan_paths = scan_paths
         self.output_format = output_format
@@ -1211,6 +1212,7 @@ class ScanPipeline:
         self.include_code_snippets = include_code_snippets
         self.progress_callback = progress_callback
         self.custom_catalog = custom_catalog
+        self.atr_enrichment = atr_enrichment
 
     def _emit_progress(self, event: str, **payload: Any) -> None:
         """Send a best-effort progress event to the CLI."""
@@ -1260,6 +1262,11 @@ class ScanPipeline:
             elapsed_s=elapsed,
             detail=timings[-1].detail,
         )
+
+        if self.atr_enrichment:
+            from .security_enrichment import enrich_components
+
+            components = enrich_components(components, enabled=True)
 
         self._emit_progress("stage_started", stage="cross_ref", total_stages=4)
         t0 = time.monotonic()
