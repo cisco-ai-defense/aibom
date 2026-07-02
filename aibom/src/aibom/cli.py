@@ -289,6 +289,8 @@ def _scan_cache_settings(
     agentic_concurrency: int,
     agentic_fast_model: Optional[str],
     agentic_timeout: int,
+    agentic_max_consecutive_failures: int,
+    agentic_max_retry_seconds: int,
     include_code_snippets: bool,
     container_tier: str,
     custom_catalog: Optional[Path],
@@ -301,6 +303,8 @@ def _scan_cache_settings(
             "provider": llm_config.get("provider"),
             "api_base": llm_config.get("api_base"),
             "api_version": llm_config.get("api_version"),
+            "reasoning": llm_config.get("reasoning"),
+            "init_kwargs": llm_config.get("init_kwargs"),
         }
     return {
         "strict": strict,
@@ -311,6 +315,8 @@ def _scan_cache_settings(
         "agentic_concurrency": agentic_concurrency,
         "agentic_fast_model": agentic_fast_model,
         "agentic_timeout": agentic_timeout,
+        "agentic_max_consecutive_failures": agentic_max_consecutive_failures,
+        "agentic_max_retry_seconds": agentic_max_retry_seconds,
         "include_code_snippets": include_code_snippets,
         "container_tier": container_tier,
         "custom_catalog": _file_cache_fingerprint(custom_catalog),
@@ -386,6 +392,8 @@ def _gather_analysis_sources(
     llm_api_key: Optional[str],
     llm_api_version: Optional[str],
     llm_max_tokens: Optional[int],
+    llm_reasoning: str = "auto",
+    llm_init_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     sources_to_process = list(sources) if sources else []
     if images_file:
@@ -468,6 +476,10 @@ def _gather_analysis_sources(
             triage_llm_cfg["api_version"] = llm_api_version
         if llm_max_tokens is not None:
             triage_llm_cfg["max_tokens"] = llm_max_tokens
+        if llm_reasoning and llm_reasoning != "auto":
+            triage_llm_cfg["reasoning"] = llm_reasoning
+        if llm_init_kwargs is not None:
+            triage_llm_cfg["init_kwargs"] = llm_init_kwargs
 
         triager = RepoTriager(llm_config=triage_llm_cfg)
         triage_results = triager.triage_repos(sources_to_process)
@@ -1346,6 +1358,30 @@ def analyze(
             "lower it to bound cost."
         ),
     ),
+    llm_reasoning: str = typer.Option(
+        "auto",
+        "--llm-reasoning",
+        envvar="AIBOM_LLM_REASONING",
+        help=(
+            "Control model 'thinking'/reasoning for agentic enrichment: "
+            "'auto' (provider default, no change), 'off' (disable — emits the "
+            "correct per-provider parameter), or 'on'. Use 'off' for "
+            "reasoning-class/self-hosted models whose verbose thinking makes "
+            "every batch exceed --agentic-timeout."
+        ),
+    ),
+    llm_init_kwargs: Optional[str] = typer.Option(
+        None,
+        "--llm-init-kwargs",
+        envvar="AIBOM_LLM_INIT_KWARGS",
+        help=(
+            "JSON object of provider-specific init kwargs merged verbatim into "
+            "the LLM constructor and overriding derived settings. Keys are "
+            "provider-specific (extra_body, model_kwargs, "
+            "additional_model_request_fields, reasoning_effort, ...). "
+            "Escape hatch for advanced tuning."
+        ),
+    ),
     show_summary: bool = typer.Option(
         True,
         "--show-summary/--no-show-summary",
@@ -1433,6 +1469,29 @@ def analyze(
         120,
         "--agentic-timeout",
         help="Wall-clock timeout (seconds) per agentic LLM batch (default 120).",
+    ),
+    agentic_max_consecutive_failures: int = typer.Option(
+        3,
+        "--agentic-max-consecutive-failures",
+        envvar="AIBOM_AGENTIC_MAX_FAILURES",
+        min=1,
+        help=(
+            "Circuit-breaker threshold: skip the rest of a tier after this many "
+            "consecutive batch failures (default 3). Raise it for a flaky "
+            "endpoint you still want to push through."
+        ),
+    ),
+    agentic_max_retry_seconds: int = typer.Option(
+        1200,
+        "--agentic-max-retry-seconds",
+        envvar="AIBOM_AGENTIC_MAX_RETRY_SECONDS",
+        min=0,
+        help=(
+            "Aggregate wall-clock budget (seconds) for all agentic retry "
+            "activity in a run (default 1200). Bounds a persistently-failing "
+            "model so the scan finishes with degraded components instead of "
+            "retrying for hours. 0 disables the retry pass."
+        ),
     ),
     include_code_snippets: bool = typer.Option(
         False,
@@ -1613,6 +1672,34 @@ def analyze(
         )
         raise typer.Exit(code=1)
 
+    reasoning_choice = (llm_reasoning or "auto").lower()
+    if reasoning_choice not in ("auto", "off", "on"):
+        console.print(
+            f"[bold red]Error:[/] Invalid --llm-reasoning value "
+            f"'{escape(llm_reasoning)}'. Must be: auto, off, on.",
+            highlight=False,
+        )
+        raise typer.Exit(code=1)
+
+    parsed_init_kwargs: Optional[Dict[str, Any]] = None
+    if llm_init_kwargs is not None:
+        try:
+            parsed_init_kwargs = json.loads(llm_init_kwargs)
+        except json.JSONDecodeError as exc:
+            console.print(
+                f"[bold red]Error:[/] --llm-init-kwargs is not valid JSON: "
+                f"{escape(str(exc))}",
+                highlight=False,
+            )
+            raise typer.Exit(code=1)
+        if not isinstance(parsed_init_kwargs, dict):
+            console.print(
+                "[bold red]Error:[/] --llm-init-kwargs must be a JSON object "
+                "(e.g. '{\"extra_body\": {...}}').",
+                highlight=False,
+            )
+            raise typer.Exit(code=1)
+
     llm_config = None
     if llm_model:
         llm_config = {
@@ -1621,9 +1708,12 @@ def analyze(
             "api_key": llm_api_key,
             "api_base": llm_api_base,
             "api_version": llm_api_version,
+            "reasoning": reasoning_choice,
         }
         if llm_max_tokens is not None:
             llm_config["max_tokens"] = llm_max_tokens
+        if parsed_init_kwargs is not None:
+            llm_config["init_kwargs"] = parsed_init_kwargs
         try:
             ensure_llm_runtime_available(
                 llm_model,
@@ -1663,6 +1753,8 @@ def analyze(
         llm_api_key=llm_api_key,
         llm_api_version=llm_api_version,
         llm_max_tokens=llm_max_tokens,
+        llm_reasoning=reasoning_choice,
+        llm_init_kwargs=parsed_init_kwargs,
     )
 
     if not sources_to_process:
@@ -1704,6 +1796,8 @@ def analyze(
         agentic_concurrency=agentic_concurrency,
         agentic_fast_model=agentic_fast_model,
         agentic_timeout=agentic_timeout,
+        agentic_max_consecutive_failures=agentic_max_consecutive_failures,
+        agentic_max_retry_seconds=agentic_max_retry_seconds,
         include_code_snippets=include_code_snippets,
         container_tier=container_tier,
         custom_catalog=custom_catalog,
@@ -1866,6 +1960,8 @@ def analyze(
             agentic_concurrency=agentic_concurrency,
             agentic_fast_model=agentic_fast_model,
             agentic_timeout=agentic_timeout,
+            agentic_max_consecutive_failures=agentic_max_consecutive_failures,
+            agentic_max_retry_seconds=agentic_max_retry_seconds,
             agentic_cache_dir=agentic_cache_dir,
             include_code_snippets=include_code_snippets,
             custom_catalog=explicit_config,
