@@ -834,3 +834,81 @@ class TestParseJson:
 
     def test_returns_none_for_no_json(self, mw):
         assert mw._parse_json("no json here") is None
+
+
+class TestMalformedListItems:
+    """partial/malformed structured output can put a bare string
+    (or other non-dict) into a list the middleware iterates. Every ``for item
+    in data.get(...)`` loop must skip non-dict elements instead of raising
+    ``AttributeError: 'str' object has no attribute 'get'`` (which previously
+    aborted the whole agentic stage)."""
+
+    def _existing(self):
+        return [
+            AIComponent(
+                name="my-model",
+                component_type=AIComponentType.MODEL,
+                file_path="app.py",
+                line_number=10,
+                instance_id="comp1_app.py_10",
+            )
+        ]
+
+    def test_apply_enrichments_skips_non_dict_enriched_items(self, mw):
+        # Mirrors the exact malformed shape from the ticket: stray string
+        # elements interleaved with one valid enrichment dict.
+        data = {
+            "enriched_components": [
+                "agent_evidence: null},{",
+                {
+                    "instance_id": "comp1_app.py_10",
+                    "updates": {"model_name": "gpt-4o-2024-08-06"},
+                },
+                "instance_id:langchain-op...pyproject.toml_13",
+            ]
+        }
+        enriched = mw.apply_enrichments_from_dict(self._existing(), data)
+        assert len(enriched) == 1
+        assert enriched[0].model_name == "gpt-4o-2024-08-06"
+
+    def test_apply_enrichments_skips_non_dict_remove_and_reclassify(self, mw):
+        data = {
+            "remove_components": ["stray", 123, {"instance_id": "comp1_app.py_10"}],
+            "reclassify_components": [
+                "stray",
+                {"instance_id": "comp1_app.py_10", "new_type": "embedding"},
+            ],
+        }
+        # Must not raise; the valid removal wins so the component is dropped.
+        enriched = mw.apply_enrichments_from_dict(self._existing(), data)
+        assert enriched == []
+
+    def test_extract_findings_skips_non_dict_items(self, mw):
+        data = {
+            "new_components": [
+                "stray string",
+                {
+                    "name": "secret-model",
+                    "component_type": "model",
+                    "file_path": "hidden.py",
+                    "line_number": 5,
+                    "model_name": "gpt-5",
+                },
+            ],
+            "new_relationships": [
+                42,
+                {
+                    "source_name": "my_agent",
+                    "target_name": "search_tool",
+                    "relationship_type": "USES_TOOL",
+                },
+            ],
+            "risk_findings": [
+                None,
+                {"flag": "deprecated_model", "description": "x", "severity": "medium"},
+            ],
+        }
+        comps, rels, flags = mw.extract_findings_from_dict(data)
+        assert [c.name for c in comps] == ["secret-model"]
+        assert len(rels) == 1
+        assert len(flags) == 1

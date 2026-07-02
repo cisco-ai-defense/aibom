@@ -1095,6 +1095,8 @@ class AIBOMScannerMiddleware:
         remove_ids: set[str] = set()
         remove_keys: set[tuple[str, str]] = set()
         for item in data.get("remove_components", []):
+            if not isinstance(item, dict):
+                continue
             iid = item.get("instance_id", "")
             if not iid:
                 continue
@@ -1178,6 +1180,8 @@ class AIBOMScannerMiddleware:
 
         reclassify_map: dict[str, str] = {}
         for item in data.get("reclassify_components", []):
+            if not isinstance(item, dict):
+                continue
             iid = item.get("instance_id", "")
             new_type = item.get("new_type", "")
             if not (iid and new_type):
@@ -1208,6 +1212,8 @@ class AIBOMScannerMiddleware:
 
         reclassify_evidence: dict[str, dict[str, Any]] = {}
         for item in data.get("reclassify_components", []):
+            if not isinstance(item, dict):
+                continue
             iid = item.get("instance_id", "")
             if iid in reclassify_map:
                 evidence = item.get("agent_evidence")
@@ -1218,6 +1224,8 @@ class AIBOMScannerMiddleware:
         enrichment_evidence: dict[str, dict[str, Any]] = {}
         annotations_by_id: dict[str, DecisionAnnotation] = {}
         for item in data.get("enriched_components", []):
+            if not isinstance(item, dict):
+                continue
             iid = item.get("instance_id", "")
             if not iid:
                 continue
@@ -1364,6 +1372,8 @@ class AIBOMScannerMiddleware:
     def _extract_new_components(self, data: dict[str, Any]) -> list[AIComponent]:
         components: list[AIComponent] = []
         for item in data.get("new_components", []):
+            if not isinstance(item, dict):
+                continue
             try:
                 comp_type = AIComponentType(item.get("component_type", "other"))
             except ValueError:
@@ -1458,6 +1468,8 @@ class AIBOMScannerMiddleware:
     def _extract_relationships(self, data: dict[str, Any]) -> list[ComponentRelationship]:
         relationships: list[ComponentRelationship] = []
         for item in data.get("new_relationships", []):
+            if not isinstance(item, dict):
+                continue
             try:
                 rel_type = RelationshipType(item.get("relationship_type", "CUSTOM"))
             except ValueError:
@@ -1550,6 +1562,8 @@ class AIBOMScannerMiddleware:
 
         flags: list[RiskFlag] = []
         for item in data.get("risk_findings", []):
+            if not isinstance(item, dict):
+                continue
             flag_name = item.get("flag", "")
             try:
                 severity = Severity(item.get("severity", "info"))
