@@ -22,6 +22,7 @@ they test the helper functions and mock the external dependencies.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,6 +37,17 @@ from aibom.models import (
     DecisionAnnotation,
     EvidenceLocation,
 )
+
+# ``deepagents`` is an optional (agentic) extra and is NOT installed in CI's
+# ``uv sync --group dev`` env. Tests that exercise the real ``create_aibom_agent``
+# (which imports deepagents) are skipped there, matching this module's design of
+# not requiring deepagents/langchain; helper-level tests below run everywhere.
+_HAS_DEEPAGENTS = importlib.util.find_spec("deepagents") is not None
+# ``langchain_core`` ships with the same agentic extra. A few helper-level tests
+# call ``_coerce_structured`` directly, which imports ``langchain_core.messages``
+# at call time, so they are gated the same way (skipped in the CI ``--group dev``
+# env). The pure-Python helper tests around them still run everywhere.
+_HAS_LANGCHAIN = importlib.util.find_spec("langchain_core") is not None
 
 
 @pytest.fixture(autouse=True)
@@ -2303,6 +2315,9 @@ class TestTwoPhaseStructuredOutput:
             self.response_metadata = None
             self.content = content
 
+    @pytest.mark.skipif(
+        not _HAS_DEEPAGENTS, reason="requires deepagents (agentic extra)"
+    )
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("deepagents.create_deep_agent")
     def test_create_agent_defaults_to_unforced_phase1(self, mock_cda, _mb):
@@ -2321,6 +2336,9 @@ class TestTwoPhaseStructuredOutput:
         bundle.invoke("x")
         graph.invoke.assert_called_once_with("x")
 
+    @pytest.mark.skipif(
+        not _HAS_DEEPAGENTS, reason="requires deepagents (agentic extra)"
+    )
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("deepagents.create_deep_agent")
     def test_explicit_response_format_not_coerced(self, mock_cda, _mb):
@@ -2332,6 +2350,9 @@ class TestTwoPhaseStructuredOutput:
         assert mock_cda.call_args.kwargs["response_format"] is sentinel
         assert bundle.needs_coercion is False
 
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+    )
     def test_coerce_structured_returns_dict_and_counts_tokens(self):
         from aibom.agentic import agent as agent_mod
         from aibom.agentic.agent import AgentResponse, _coerce_structured
@@ -2365,6 +2386,9 @@ class TestTwoPhaseStructuredOutput:
         # with_structured_output must be tool-less (single coercion call).
         model.with_structured_output.assert_called_once()
 
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+    )
     def test_coerce_structured_none_on_failure(self):
         from aibom.agentic.agent import _coerce_structured
 
