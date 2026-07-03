@@ -154,10 +154,12 @@ indistinguishable from "the model found nothing to add."
 - **Disable/limit thinking first.** Reasoning verbosity is the number-one cause
   of batch timeouts: a model that emits pages of reasoning per batch blows past
   `--agentic-timeout`. Use `--llm-reasoning off`; it emits the correct parameter
-  for each provider (OpenAI/vLLM chat-template flag, `reasoning_effort` for
-  native OpenAI reasoners, Anthropic/Bedrock `thinking` disable, Gemini
-  `thinking_budget=0`). For anything the flag doesn't cover, drop to
-  `--llm-init-kwargs '<json>'`.
+  for each provider: the `chat_template_kwargs` flag for self-hosted
+  OpenAI-compatible endpoints (vLLM — detected by a custom `--llm-api-base`),
+  `reasoning_effort` for native OpenAI/Azure reasoners, Anthropic/Bedrock
+  `thinking` disable, and Gemini `thinking_budget=0`. Non-reasoning native
+  OpenAI/Azure models have no thinking to toggle, so the flag is a no-op there.
+  For anything the flag doesn't cover, drop to `--llm-init-kwargs '<json>'`.
 - **Raise `--agentic-concurrency`** (1–8) when the endpoint has spare capacity
   (e.g. a multi-GPU self-host). The default `1` is sequential/conservative.
 - **Raise `--agentic-timeout`** for verbose models — they emit many tokens and

@@ -47,6 +47,18 @@ from ..models import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _skip_non_dict(field: str, item: Any) -> None:
+    """Log a skipped non-dict list item from a structured-output section.
+
+    Partial/garbled provider output can splice a bare string (or other non-dict)
+    into a list the middleware iterates. Each extractor skips such entries to
+    avoid ``AttributeError``; logging at debug keeps that observable — a provider
+    frequently emitting malformed output is otherwise invisible — without the
+    noise of a warning for a recoverable, per-item condition.
+    """
+    _LOGGER.debug("Skipping non-dict %s item: %r", field, item)
+
+
 def _ckey(c: AIComponent) -> tuple[str, str]:
     """Consolidation key matching ``scan_pipeline._consolidation_key``."""
     canonical = (c.model_name or c.name).lower().strip()
@@ -1096,6 +1108,7 @@ class AIBOMScannerMiddleware:
         remove_keys: set[tuple[str, str]] = set()
         for item in data.get("remove_components", []):
             if not isinstance(item, dict):
+                _skip_non_dict("remove_components", item)
                 continue
             iid = item.get("instance_id", "")
             if not iid:
@@ -1181,6 +1194,7 @@ class AIBOMScannerMiddleware:
         reclassify_map: dict[str, str] = {}
         for item in data.get("reclassify_components", []):
             if not isinstance(item, dict):
+                _skip_non_dict("reclassify_components", item)
                 continue
             iid = item.get("instance_id", "")
             new_type = item.get("new_type", "")
@@ -1213,6 +1227,7 @@ class AIBOMScannerMiddleware:
         reclassify_evidence: dict[str, dict[str, Any]] = {}
         for item in data.get("reclassify_components", []):
             if not isinstance(item, dict):
+                _skip_non_dict("reclassify_components", item)
                 continue
             iid = item.get("instance_id", "")
             if iid in reclassify_map:
@@ -1225,6 +1240,7 @@ class AIBOMScannerMiddleware:
         annotations_by_id: dict[str, DecisionAnnotation] = {}
         for item in data.get("enriched_components", []):
             if not isinstance(item, dict):
+                _skip_non_dict("enriched_components", item)
                 continue
             iid = item.get("instance_id", "")
             if not iid:
@@ -1373,6 +1389,7 @@ class AIBOMScannerMiddleware:
         components: list[AIComponent] = []
         for item in data.get("new_components", []):
             if not isinstance(item, dict):
+                _skip_non_dict("new_components", item)
                 continue
             try:
                 comp_type = AIComponentType(item.get("component_type", "other"))
@@ -1469,6 +1486,7 @@ class AIBOMScannerMiddleware:
         relationships: list[ComponentRelationship] = []
         for item in data.get("new_relationships", []):
             if not isinstance(item, dict):
+                _skip_non_dict("new_relationships", item)
                 continue
             try:
                 rel_type = RelationshipType(item.get("relationship_type", "CUSTOM"))
@@ -1563,6 +1581,7 @@ class AIBOMScannerMiddleware:
         flags: list[RiskFlag] = []
         for item in data.get("risk_findings", []):
             if not isinstance(item, dict):
+                _skip_non_dict("risk_findings", item)
                 continue
             flag_name = item.get("flag", "")
             try:

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -912,3 +913,23 @@ class TestMalformedListItems:
         assert [c.name for c in comps] == ["secret-model"]
         assert len(rels) == 1
         assert len(flags) == 1
+
+    def test_skipped_non_dict_items_are_logged(self, mw, caplog):
+        # Silently dropping malformed items hides a provider emitting garbage;
+        # each skip must be observable at debug level, naming the field.
+        data = {
+            "new_components": ["stray string"],
+            "new_relationships": [42],
+            "risk_findings": [None],
+        }
+        with caplog.at_level(logging.DEBUG, logger="aibom.agentic.middleware"):
+            mw.extract_findings_from_dict(data)
+        skipped = [
+            r.getMessage()
+            for r in caplog.records
+            if "non-dict" in r.getMessage().lower()
+        ]
+        # One debug line per malformed field, each identifying the field name.
+        assert any("new_components" in m for m in skipped)
+        assert any("new_relationships" in m for m in skipped)
+        assert any("risk_findings" in m for m in skipped)

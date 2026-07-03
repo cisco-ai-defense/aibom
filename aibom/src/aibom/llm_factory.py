@@ -125,8 +125,28 @@ def _provider_family(resolved_provider: str | None, model_id: str) -> str:
     return "openai"
 
 
+def _is_openai_compatible_endpoint(
+    resolved_provider: str | None, api_base: str | None
+) -> bool:
+    """True for a self-hosted OpenAI-compatible backend (e.g. vLLM, SGLang).
+
+    The ``chat_template_kwargs`` / ``enable_thinking`` toggle is a self-hosted
+    extension passed through to the server's tokenizer chat template — native
+    OpenAI (``api.openai.com``) and Azure OpenAI both reject it. A custom
+    ``api_base`` is the signal that we are talking to such a compatible server;
+    Azure also sets a custom endpoint but is explicitly excluded because it is
+    not compatible with this field.
+    """
+    if not api_base:
+        return False
+    return (resolved_provider or "").lower() != "azure_openai"
+
+
 def _reasoning_control_kwargs(
-    resolved_provider: str | None, model_id: str, reasoning: str
+    resolved_provider: str | None,
+    model_id: str,
+    reasoning: str,
+    api_base: str | None = None,
 ) -> dict[str, Any]:
     """Provider-correct kwargs to disable/enable model "thinking".
 
@@ -135,8 +155,10 @@ def _reasoning_control_kwargs(
     provider, so it is keyed on the provider family and an OpenAI-only key
     (``extra_body``) never leaks to another provider:
 
-    * openai / azure_openai (and vLLM): native reasoning models →
-      ``reasoning_effort='minimal'``; OpenAI-compatible open models →
+    * openai / azure_openai: native reasoning models →
+      ``reasoning_effort='minimal'``; non-reasoning native OpenAI/Azure models
+      have no thinking toggle → no-op.
+    * vLLM / OpenAI-compatible self-hosted (custom ``api_base``) open models →
       ``extra_body={'chat_template_kwargs': {'enable_thinking': <bool>}}``.
     * anthropic → ``thinking={'type': 'disabled'}``.
     * bedrock → ``model_kwargs={'thinking': {'type': 'disabled'}}`` (InvokeModel body).
@@ -146,12 +168,22 @@ def _reasoning_control_kwargs(
     if reasoning not in ("off", "on"):
         return {}
     family = _provider_family(resolved_provider, model_id)
+    # The chat-template toggle is only valid for a self-hosted OpenAI-compatible
+    # server; native OpenAI/Azure reject the field (and their non-reasoning
+    # models have nothing to toggle), so gate it on the endpoint.
+    compat_toggle = family == "openai" and _is_openai_compatible_endpoint(
+        resolved_provider, api_base
+    )
 
     if reasoning == "off":
         if family == "openai":
             if _is_reasoning_model(model_id):
                 return {"reasoning_effort": "minimal"}
-            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+            if compat_toggle:
+                return {
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}
+                }
+            return {}
         if family == "bedrock":
             # ChatBedrock drives Claude over the InvokeModel path, whose body is
             # the Anthropic Messages format — the thinking control belongs in the
@@ -168,7 +200,7 @@ def _reasoning_control_kwargs(
     # reasoning == "on": only the vLLM/OpenAI-compatible chat-template toggle is
     # safe to force on generically; native reasoners and other providers reason
     # by default, so leave them untouched.
-    if family == "openai" and not _is_reasoning_model(model_id):
+    if compat_toggle and not _is_reasoning_model(model_id):
         return {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
     return {}
 
@@ -329,9 +361,13 @@ def build_chat_model(
     if rate_limiter is not None:
         init_kwargs["rate_limiter"] = rate_limiter
 
-    # Provider-correct reasoning/thinking control (--llm-reasoning).
+    # Provider-correct reasoning/thinking control (--llm-reasoning). ``api_base``
+    # distinguishes a self-hosted OpenAI-compatible endpoint (vLLM) from native
+    # OpenAI/Azure, which reject the chat-template toggle.
     init_kwargs.update(
-        _reasoning_control_kwargs(resolved_provider, model_id, reasoning)
+        _reasoning_control_kwargs(
+            resolved_provider, model_id, reasoning, api_base=api_base
+        )
     )
 
     # Generic per-provider passthrough (--llm-init-kwargs): merged verbatim and

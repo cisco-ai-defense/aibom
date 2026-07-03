@@ -1691,7 +1691,7 @@ def analyze(
                 f"{escape(str(exc))}",
                 highlight=False,
             )
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from exc
         if not isinstance(parsed_init_kwargs, dict):
             console.print(
                 "[bold red]Error:[/] --llm-init-kwargs must be a JSON object "

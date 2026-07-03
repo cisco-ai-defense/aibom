@@ -367,7 +367,12 @@ def test_reasoning_off_openai_vllm_uses_chat_template_kwargs(
     from aibom.llm_factory import build_chat_model
 
     mock_init.return_value = MagicMock()
-    build_chat_model("zai-org/GLM-5.2-FP8", provider="openai", reasoning="off")
+    build_chat_model(
+        "zai-org/GLM-5.2-FP8",
+        provider="openai",
+        api_base="http://localhost:8000/v1",
+        reasoning="off",
+    )
     _, kwargs = mock_init.call_args
     assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 
@@ -384,6 +389,68 @@ def test_reasoning_off_openai_native_reasoning_uses_reasoning_effort(
     _, kwargs = mock_init.call_args
     assert kwargs.get("reasoning_effort") == "minimal"
     assert "extra_body" not in kwargs
+
+
+# ``chat_template_kwargs`` is a vLLM / self-hosted OpenAI-compatible extension
+# (signalled by a custom ``api_base``). Native OpenAI (api.openai.com) and Azure
+# OpenAI reject it, and their non-reasoning models have no thinking to toggle, so
+# --llm-reasoning off/on must be a no-op there — never emit ``extra_body``.
+@patch("aibom.llm_factory.ensure_llm_runtime_available", side_effect=_preflight)
+@patch("aibom.llm_factory.init_chat_model")
+def test_reasoning_off_native_openai_nonreasoning_is_noop(mock_init, _mock_preflight):
+    from aibom.llm_factory import build_chat_model
+
+    mock_init.return_value = MagicMock()
+    # Native OpenAI: no custom api_base -> not a vLLM-compatible endpoint.
+    build_chat_model("gpt-4o", provider="openai", reasoning="off")
+    _, kwargs = mock_init.call_args
+    assert "extra_body" not in kwargs
+    assert "reasoning_effort" not in kwargs
+
+
+@patch("aibom.llm_factory.ensure_llm_runtime_available", side_effect=_preflight)
+@patch("aibom.llm_factory.init_chat_model")
+def test_reasoning_off_azure_nonreasoning_is_noop(mock_init, _mock_preflight):
+    from aibom.llm_factory import build_chat_model
+
+    mock_init.return_value = MagicMock()
+    # Azure has a custom endpoint but is NOT an OpenAI-compatible/vLLM backend.
+    build_chat_model(
+        "gpt-4o",
+        provider="azure_openai",
+        api_base="https://example.openai.azure.com",
+        api_version="2024-12-01-preview",
+        reasoning="off",
+    )
+    _, kwargs = mock_init.call_args
+    assert "extra_body" not in kwargs
+
+
+@patch("aibom.llm_factory.ensure_llm_runtime_available", side_effect=_preflight)
+@patch("aibom.llm_factory.init_chat_model")
+def test_reasoning_on_native_openai_nonreasoning_is_noop(mock_init, _mock_preflight):
+    from aibom.llm_factory import build_chat_model
+
+    mock_init.return_value = MagicMock()
+    build_chat_model("gpt-4o", provider="openai", reasoning="on")
+    _, kwargs = mock_init.call_args
+    assert "extra_body" not in kwargs
+
+
+@patch("aibom.llm_factory.ensure_llm_runtime_available", side_effect=_preflight)
+@patch("aibom.llm_factory.init_chat_model")
+def test_reasoning_on_openai_vllm_uses_chat_template_kwargs(mock_init, _mock_preflight):
+    from aibom.llm_factory import build_chat_model
+
+    mock_init.return_value = MagicMock()
+    build_chat_model(
+        "zai-org/GLM-5.2-FP8",
+        provider="openai",
+        api_base="http://localhost:8000/v1",
+        reasoning="on",
+    )
+    _, kwargs = mock_init.call_args
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
 
 
 @patch("aibom.llm_factory.ensure_llm_runtime_available", side_effect=_preflight)
@@ -491,6 +558,7 @@ def test_init_kwargs_extra_overrides_reasoning(mock_init, _mock_preflight):
     build_chat_model(
         "zai-org/GLM-5.2-FP8",
         provider="openai",
+        api_base="http://localhost:8000/v1",
         reasoning="off",
         init_kwargs_extra={"extra_body": {"custom": 1}},
     )
