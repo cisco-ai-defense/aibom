@@ -22,6 +22,7 @@ they test the helper functions and mock the external dependencies.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,6 +37,17 @@ from aibom.models import (
     DecisionAnnotation,
     EvidenceLocation,
 )
+
+# ``deepagents`` is an optional (agentic) extra and is NOT installed in CI's
+# ``uv sync --group dev`` env. Tests that exercise the real ``create_aibom_agent``
+# (which imports deepagents) are skipped there, matching this module's design of
+# not requiring deepagents/langchain; helper-level tests below run everywhere.
+_HAS_DEEPAGENTS = importlib.util.find_spec("deepagents") is not None
+# ``langchain_core`` ships with the same agentic extra. A few helper-level tests
+# call ``_coerce_structured`` directly, which imports ``langchain_core.messages``
+# at call time, so they are gated the same way (skipped in the CI ``--group dev``
+# env). The pure-Python helper tests around them still run everywhere.
+_HAS_LANGCHAIN = importlib.util.find_spec("langchain_core") is not None
 
 
 @pytest.fixture(autouse=True)
@@ -1975,3 +1987,485 @@ class TestAgenticResultCacheAtomicWrite:
         # Good entry loads; truncated entry is skipped (cache miss), not fatal.
         assert cache.get("good") == {"ok": True}
         assert cache.get("partial") is None
+
+
+class TestApplyBatchFindingsFailOpen:
+    """applying a batch's structured output must fail OPEN per
+    batch. Any unexpected middleware error degrades only that batch instead of
+    propagating up and aborting the whole agentic stage."""
+
+    def _batch(self):
+        return [
+            AIComponent(
+                name="c",
+                component_type=AIComponentType.MODEL,
+                file_path="a.py",
+                line_number=1,
+                instance_id="c_a.py_1",
+            )
+        ]
+
+    def test_degrades_when_middleware_raises(self):
+        from aibom.agentic import agent as agent_mod
+        from aibom.agentic.agent import _apply_batch_findings
+
+        batch = self._batch()
+        mw = MagicMock()
+        mw.extract_findings_from_dict.side_effect = AttributeError(
+            "'str' object has no attribute 'get'"
+        )
+
+        enriched, new_c, new_r, rf, degraded = _apply_batch_findings(
+            mw, batch, {"enriched_components": ["stray"]}, batch_num=1
+        )
+
+        assert degraded is True
+        assert new_c == [] and new_r == [] and rf == []
+        assert len(enriched) == 1
+        # Degraded with a retryable hint so _collect_failed re-queues it for
+        # the retry pass (mirrors batch_timeout / no_usable_output semantics).
+        assert enriched[0].agentic_hint == "structured_output_parse_error"
+        assert enriched[0].agentic_hint in agent_mod._RETRYABLE_HINTS
+
+    def test_happy_path_passes_through(self):
+        from aibom.agentic.agent import _apply_batch_findings
+
+        batch = self._batch()
+        mw = MagicMock()
+        mw.extract_findings_from_dict.return_value = ([], [], [])
+        mw.apply_enrichments_from_dict.return_value = batch
+
+        enriched, new_c, new_r, rf, degraded = _apply_batch_findings(
+            mw, batch, {"enriched_components": []}, batch_num=1
+        )
+
+        assert degraded is False
+        assert enriched == batch
+        assert new_c == [] and new_r == [] and rf == []
+
+
+class TestAccumulateTokenUsage:
+    """usage must be recovered from ``response_metadata`` for
+    providers that don't populate the standardized ``usage_metadata`` field
+    (Bedrock Invoke path; Azure gpt-5.3-codex)."""
+
+    class _Msg:
+        """Minimal AIMessage stand-in carrying the usage fields we read."""
+
+        def __init__(self, usage_metadata=None, response_metadata=None):
+            self.usage_metadata = usage_metadata
+            self.response_metadata = response_metadata
+
+    def _usage(self, *messages):
+        from aibom.agentic import agent as agent_mod
+
+        agent_mod._reset_token_usage()
+        agent_mod._accumulate_token_usage({"messages": list(messages)})
+        u = agent_mod.get_token_usage()
+        return (u.prompt_tokens, u.completion_tokens, u.total_tokens)
+
+    def test_usage_metadata_only(self):
+        msg = self._Msg(
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+            }
+        )
+        assert self._usage(msg) == (100, 20, 120)
+
+    def test_openai_azure_token_usage_fallback(self):
+        # gpt-5.3-codex: no usage_metadata; usage under response_metadata.
+        msg = self._Msg(
+            response_metadata={
+                "token_usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 10,
+                    "total_tokens": 60,
+                }
+            }
+        )
+        assert self._usage(msg) == (50, 10, 60)
+
+    def test_bedrock_response_metadata_usage_fallback(self):
+        # ChatBedrock Converse-style usage block.
+        msg = self._Msg(
+            response_metadata={"usage": {"input_tokens": 200, "output_tokens": 40}}
+        )
+        # total synthesized when the provider omits it.
+        assert self._usage(msg) == (200, 40, 240)
+
+    def test_bedrock_invocation_metrics_fallback(self):
+        # ChatBedrock Invoke-path metrics block.
+        msg = self._Msg(
+            response_metadata={
+                "amazon-bedrock-invocationMetrics": {
+                    "inputTokenCount": 300,
+                    "outputTokenCount": 60,
+                }
+            }
+        )
+        assert self._usage(msg) == (300, 60, 360)
+
+    def test_prefers_usage_metadata_no_double_count(self):
+        # Both carriers present (LangChain often derives one from the other):
+        # count only once.
+        msg = self._Msg(
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+            },
+            response_metadata={
+                "token_usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                }
+            },
+        )
+        assert self._usage(msg) == (100, 20, 120)
+
+    def test_empty_usage_metadata_falls_back(self):
+        msg = self._Msg(
+            usage_metadata={},
+            response_metadata={
+                "token_usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            },
+        )
+        assert self._usage(msg) == (7, 3, 10)
+
+    def test_mixed_messages_summed(self):
+        m1 = self._Msg(
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+            }
+        )
+        m2 = self._Msg(
+            response_metadata={
+                "amazon-bedrock-invocationMetrics": {
+                    "inputTokenCount": 300,
+                    "outputTokenCount": 60,
+                }
+            }
+        )
+        assert self._usage(m1, m2) == (400, 80, 480)
+
+
+class TestAllBatchesFailed:
+    """a total agentic failure (e.g. every batch rejected by the
+    provider) must be distinguishable from 'ran fine, found nothing to add' so
+    the run can report a degraded status instead of 'enrichment complete'."""
+
+    def _comp(self, iid, hint=""):
+        return AIComponent(
+            name=iid,
+            component_type=AIComponentType.MODEL,
+            file_path="a.py",
+            line_number=1,
+            instance_id=iid,
+            agentic_hint=hint,
+        )
+
+    def test_all_degraded_no_findings_is_failure(self):
+        from aibom.agentic.agent import _all_batches_failed
+
+        enriched = [
+            self._comp("c1", "batch_timeout"),
+            self._comp("c2", "batch_recursion_limit"),
+        ]
+        assert _all_batches_failed(enriched, [], [], []) is True
+
+    def test_partial_success_is_not_failure(self):
+        from aibom.agentic.agent import _all_batches_failed
+
+        enriched = [self._comp("c1", "batch_timeout"), self._comp("c2", "")]
+        assert _all_batches_failed(enriched, [], [], []) is False
+
+    def test_all_ok_is_not_failure(self):
+        from aibom.agentic.agent import _all_batches_failed
+
+        enriched = [self._comp("c1", ""), self._comp("c2", "")]
+        assert _all_batches_failed(enriched, [], [], []) is False
+
+    def test_findings_present_is_not_failure(self):
+        from aibom.agentic.agent import _all_batches_failed
+
+        # Even if all inputs degraded, discovering something means the layer
+        # produced usable output.
+        enriched = [self._comp("c1", "batch_timeout")]
+        new = [self._comp("new1", "")]
+        assert _all_batches_failed(enriched, new, [], []) is False
+
+    def test_empty_is_not_failure(self):
+        from aibom.agentic.agent import _all_batches_failed
+
+        assert _all_batches_failed([], [], [], []) is False
+
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_run_reports_degraded_when_every_batch_fails(
+        self, mock_create, _mb, _mc, caplog
+    ):
+        """End-to-end: a run where the provider rejects every batch logs a
+        DEGRADED warning and NOT 'enrichment complete'."""
+        import logging
+
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        mock_agent = MagicMock()
+        mock_agent.invoke.side_effect = RuntimeError("provider rejected request")
+        mock_create.return_value = mock_agent
+
+        comp = AIComponent(
+            name="x",
+            component_type=AIComponentType.AGENT,
+            file_path="b.py",
+            line_number=1,
+        )
+        with caplog.at_level(logging.WARNING, logger="aibom.agentic.agent"):
+            comps, _, _, _ = run_agentic_enrichment(
+                model_string="m",
+                deterministic_components=[comp],
+                deterministic_relationships=[],
+                scan_paths=["/tmp"],
+                timeout_s=5,
+            )
+
+        assert "DEGRADED" in caplog.text
+        assert "Agentic enrichment complete" not in caplog.text
+
+
+class TestDiscoveryWiringIsProviderAgnostic:
+    """Bedrock/Anthropic (Opus 4.8) report 0 new components on every
+    repo while the OpenAI path finds many. This asserts the discovery path IS
+    wired provider-agnostically — ``new_components`` are extracted from the SAME
+    tool-call carrier that ``enriched_components`` use, and enrichment demonstrably
+    works on Bedrock. So a uniform 0-discovery is a model-behavior signal (Opus
+    confirms/prunes but does not propose new components — consistent with the
+    benchmark, where every model except GPT-5.5 discovers 0), NOT an aibom
+    extraction gap. Definitive root cause requires a live Bedrock-vs-OpenAI probe
+    (see the e2e plan); this fixture guards against a real extraction regression.
+    """
+
+    class _ToolMsg:
+        """AIMessage stand-in for a function-calling (tool_use) response, the
+        carrier Anthropic/Bedrock use for structured output."""
+
+        def __init__(self, args):
+            self.tool_calls = [{"name": "AgentResponse", "args": args}]
+            self.content = ""
+            self.additional_kwargs = {}
+
+    def test_discovery_and_enrichment_share_the_same_carrier(self):
+        from aibom.agentic.agent import _extract_structured_response
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        existing = [
+            AIComponent(
+                name="known",
+                component_type=AIComponentType.MODEL,
+                file_path="a.py",
+                line_number=1,
+                instance_id="known_a.py_1",
+            )
+        ]
+        # One AgentResponse tool call carrying BOTH an enrichment and a newly
+        # discovered component — exactly what Bedrock/Anthropic emit.
+        args = {
+            "enriched_components": [
+                {"instance_id": "known_a.py_1", "updates": {"model_name": "gpt-4o"}}
+            ],
+            "new_components": [
+                {
+                    "name": "secret-model",
+                    "component_type": "model",
+                    "file_path": "b.py",
+                    "line_number": 2,
+                    "model_name": "gpt-5",
+                }
+            ],
+        }
+        data = _extract_structured_response({"messages": [self._ToolMsg(args)]})
+        assert data is not None
+
+        mw = AIBOMScannerMiddleware()
+        new_comps, _, _ = mw.extract_findings_from_dict(data)
+        enriched = mw.apply_enrichments_from_dict(existing, data)
+
+        # Enrichment works on this carrier (proven on Bedrock in the eval) ...
+        assert enriched[0].model_name == "gpt-4o"
+        # ... and discovery is read from the very same dict — not dropped.
+        assert any(c.name == "secret-model" for c in new_comps)
+
+
+class TestTwoPhaseStructuredOutput:
+    """provider-general two-phase decouple. Phase 1 runs the tool
+    loop UNFORCED (no response_format -> tool_choice=auto -> natural termination
+    on every provider); Phase 2 coerces the transcript into AgentResponse via a
+    single tool-less with_structured_output call."""
+
+    class _Msg:
+        def __init__(self, usage_metadata=None, content=""):
+            self.usage_metadata = usage_metadata
+            self.response_metadata = None
+            self.content = content
+
+    @pytest.mark.skipif(
+        not _HAS_DEEPAGENTS, reason="requires deepagents (agentic extra)"
+    )
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("deepagents.create_deep_agent")
+    def test_create_agent_defaults_to_unforced_phase1(self, mock_cda, _mb):
+        from aibom.agentic.agent import create_aibom_agent
+
+        graph = MagicMock()
+        mock_cda.return_value = graph
+        bundle = create_aibom_agent("m")
+
+        # Phase 1: no forced structured-output tool.
+        assert mock_cda.call_args.kwargs["response_format"] is None
+        # Bundle carries the chat model for Phase 2 and flags coercion needed.
+        assert bundle.needs_coercion is True
+        assert bundle.aibom_chat_model is not None
+        # Bundle transparently proxies invoke/ainvoke to the graph.
+        bundle.invoke("x")
+        graph.invoke.assert_called_once_with("x")
+
+    @pytest.mark.skipif(
+        not _HAS_DEEPAGENTS, reason="requires deepagents (agentic extra)"
+    )
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("deepagents.create_deep_agent")
+    def test_explicit_response_format_not_coerced(self, mock_cda, _mb):
+        from aibom.agentic.agent import create_aibom_agent
+
+        mock_cda.return_value = MagicMock()
+        sentinel = object()
+        bundle = create_aibom_agent("m", model=MagicMock(), response_format=sentinel)
+        assert mock_cda.call_args.kwargs["response_format"] is sentinel
+        assert bundle.needs_coercion is False
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+    )
+    def test_coerce_structured_returns_dict_and_counts_tokens(self):
+        from aibom.agentic import agent as agent_mod
+        from aibom.agentic.agent import AgentResponse, _coerce_structured
+
+        agent_mod._reset_token_usage()
+        model = MagicMock()
+        raw = self._Msg(
+            usage_metadata={
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+            }
+        )
+        parsed = AgentResponse(
+            new_components=[{"name": "x", "component_type": "model"}]
+        )
+        structured = MagicMock()
+        structured.invoke.return_value = {
+            "raw": raw,
+            "parsed": parsed,
+            "parsing_error": None,
+        }
+        model.with_structured_output.return_value = structured
+
+        data = _coerce_structured(model, [self._Msg(content="findings")])
+
+        assert isinstance(data, dict)
+        assert data["new_components"][0]["name"] == "x"
+        # include_raw lets us keep Phase-2 token accounting.
+        assert agent_mod.get_token_usage().total_tokens == 12
+        # with_structured_output must be tool-less (single coercion call).
+        model.with_structured_output.assert_called_once()
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+    )
+    def test_coerce_structured_none_on_failure(self):
+        from aibom.agentic.agent import _coerce_structured
+
+        model = MagicMock()
+        model.with_structured_output.side_effect = RuntimeError("no structured out")
+        assert _coerce_structured(model, [self._Msg()]) is None
+
+    def test_resolve_batch_data_extractor_first_then_coerce(self):
+        from aibom.agentic.agent import _resolve_batch_data
+
+        # Phase-1 unforced agent whose transcript has NO parseable structured
+        # output -> falls through to Phase-2 coercion.
+        agent = MagicMock()
+        agent.needs_coercion = True
+        coerced = {"enriched_components": [], "new_components": []}
+        with patch(
+            "aibom.agentic.agent._coerce_structured", return_value=coerced
+        ) as mock_coerce:
+            data = _resolve_batch_data(agent, {"messages": [self._Msg(content="prose")]})
+        assert data == coerced
+        mock_coerce.assert_called_once()
+
+    def test_resolve_batch_data_skips_coercion_when_structured_present(self):
+        from aibom.agentic.agent import _resolve_batch_data
+
+        # A result that already carries a usable structured response (e.g. the
+        # ProviderStrategy fallback agent) must NOT trigger a Phase-2 call.
+        agent = MagicMock()
+        agent.needs_coercion = True
+        good = {"enriched_components": [{"instance_id": "a"}], "new_components": []}
+        result = {"structured_response": good, "messages": [self._Msg()]}
+        with patch("aibom.agentic.agent._coerce_structured") as mock_coerce:
+            data = _resolve_batch_data(agent, result)
+        assert data == good
+        mock_coerce.assert_not_called()
+
+
+class TestStructuredOutputCapabilityGate:
+    """capability gate: ProviderStrategy-capable OpenAI-family models
+    keep single-pass native structured output (baseline, full fidelity); every
+    other provider/model uses the two-phase decouple."""
+
+    import pytest as _pytest
+
+    @_pytest.mark.parametrize(
+        "provider,model_id,inloop",
+        [
+            ("openai", "gpt-5.5", True),
+            ("openai", "gpt-4o", True),
+            ("azure_openai", "gpt-5.3-codex", True),
+            ("openai", "o3-mini", True),
+            (None, "gpt-4o", True),  # LangChain-inferred OpenAI
+            ("openai", "zai-org/GLM-5.2-FP8", False),  # vLLM open model
+            ("openai", "mistral-7b-instruct", False),  # vLLM open model
+            ("bedrock", "us.anthropic.claude-opus-4-8", False),
+            ("anthropic", "claude-opus-4-8", False),
+            ("google_genai", "gemini-2.5-pro", False),
+            ("ollama", "llama3.1", False),
+        ],
+    )
+    def test_inloop_capability(self, provider, model_id, inloop):
+        from aibom.agentic.agent import _supports_inloop_structured_output
+
+        assert _supports_inloop_structured_output(provider, model_id) is inloop
+
+    def test_agent_response_format_gpt_is_native(self):
+        from aibom.agentic.agent import AgentResponse, _agent_response_format
+
+        assert _agent_response_format("gpt-5.5", {"provider": "openai"}) is AgentResponse
+
+    def test_agent_response_format_bedrock_is_two_phase(self):
+        from aibom.agentic.agent import _agent_response_format
+
+        # None -> create_aibom_agent runs unforced (two-phase).
+        assert (
+            _agent_response_format(
+                "us.anthropic.claude-opus-4-8", {"provider": "bedrock"}
+            )
+            is None
+        )

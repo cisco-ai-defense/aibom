@@ -981,6 +981,26 @@ Return a SINGLE JSON object:
 """
 
 
+# Phase-2 coercion instruction. The tool-using agent runs UNFORCED
+# in phase 1 (no response_format) so it terminates naturally on every provider;
+# this instruction then drives a single, tool-less ``with_structured_output``
+# call that turns the gathered findings into a schema-valid ``AgentResponse``.
+AGENTIC_COERCION_PROMPT = """\
+Based on your analysis and tool findings above, produce the final AIBOM result now.
+
+Emit a single AgentResponse object capturing everything you determined:
+- enriched_components: field updates / decision annotations for existing candidates
+- new_components: components you discovered that were not in the input
+- remove_components: input candidates that are not real AI components
+- reclassify_components: candidates whose component_type should change
+- new_relationships: relationships between components
+- risk_findings: risks you identified
+
+Use only what the analysis above supports — do NOT invent components, and use
+empty lists for anything with nothing to report. Do not call any tools.
+"""
+
+
 TRIAGE_AGENT_SYSTEM_PROMPT = """\
 You are a repository triage agent for an AI Bill of Materials (AIBOM) scanner.
 Your job: decide whether a repository contains AI/ML assets worth scanning.

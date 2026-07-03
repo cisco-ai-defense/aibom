@@ -130,6 +130,10 @@ Environment variables set in the shell take precedence over `.env` values.
 | `--agentic-concurrency` | `1` | Max parallel LLM batches. Increase for faster scans if your provider allows concurrent requests. |
 | `--agentic-timeout` | `120` | Wall-clock timeout in seconds per batch. Batches exceeding this are marked as `batch_timeout` and skipped. |
 | `--agentic-fast-model` | — | A cheaper/faster model for simple confirmations (e.g. registry lookups, dependency checks). The primary `--llm-model` is used for complex reasoning. |
+| `--agentic-max-consecutive-failures` | `3` | Circuit-breaker threshold: skip the rest of a tier after this many consecutive batch failures. Raise it to push through a flaky endpoint (env `AIBOM_AGENTIC_MAX_FAILURES`). |
+| `--agentic-max-retry-seconds` | `1200` | Aggregate wall-clock budget for all retry activity in a run. Bounds a persistently-failing model so the scan finishes with degraded components instead of retrying for hours; `0` disables the retry pass (env `AIBOM_AGENTIC_MAX_RETRY_SECONDS`). |
+| `--llm-reasoning` | `auto` | `auto` / `off` / `on`. `off` disables model "thinking" using the correct per-provider parameter (env `AIBOM_LLM_REASONING`). See [Self-hosted & reasoning-model tuning](#self-hosted--reasoning-model-tuning). |
+| `--llm-init-kwargs` | — | JSON object of provider-specific init kwargs merged verbatim into the model constructor — an escape hatch for advanced tuning (env `AIBOM_LLM_INIT_KWARGS`). |
 | `--progress` | `auto` | Show live per-stage and per-scanner progress in interactive terminals. |
 | `--include-code-snippets` | `off` | Include raw code snippets inside per-finding decision annotations. |
 
@@ -138,6 +142,51 @@ Environment variables set in the shell take precedence over `.env` values.
 - **Small repos (< 50 components):** Default settings work well.
 - **Medium repos (50–200 components):** Consider `--agentic-concurrency 2` and `--agentic-batch-size 20`.
 - **Large repos (200+ components):** Use `--agentic-concurrency 4` and `--agentic-fast-model` for a two-tier approach.
+
+### Self-hosted & reasoning-model tuning
+
+The defaults (`--agentic-concurrency 1`, `--agentic-timeout 120`) are tuned for
+fast hosted APIs. A slow self-hosted endpoint or a verbose reasoning ("thinking")
+model needs different settings — otherwise batches silently time out, the circuit
+breaker trips, and the run produces **0 agentic enrichment**, which is
+indistinguishable from "the model found nothing to add."
+
+- **Disable/limit thinking first.** Reasoning verbosity is the number-one cause
+  of batch timeouts: a model that emits pages of reasoning per batch blows past
+  `--agentic-timeout`. Use `--llm-reasoning off`; it emits the correct parameter
+  for each provider: the `chat_template_kwargs` flag for self-hosted
+  OpenAI-compatible endpoints (vLLM — detected by a custom `--llm-api-base`),
+  `reasoning_effort` for native OpenAI/Azure reasoners, Anthropic/Bedrock
+  `thinking` disable, and Gemini `thinking_budget=0`. Non-reasoning native
+  OpenAI/Azure models have no thinking to toggle, so the flag is a no-op there.
+  For anything the flag doesn't cover, drop to `--llm-init-kwargs '<json>'`.
+- **Raise `--agentic-concurrency`** (1–8) when the endpoint has spare capacity
+  (e.g. a multi-GPU self-host). The default `1` is sequential/conservative.
+- **Raise `--agentic-timeout`** for verbose models — they emit many tokens and
+  tool calls per batch. The symptom of "too low" is repeated `Batch N timed out`
+  log lines, the circuit breaker tripping, and an `Agentic enrichment DEGRADED`
+  summary.
+- **Bound worst-case runtime** with `--agentic-max-retry-seconds` and tune the
+  breaker via `--agentic-max-consecutive-failures` (see the table above) so a
+  persistently-failing endpoint degrades those components and the scan still
+  finishes.
+
+**Worked example** — an open reasoning model served on vLLM (e.g.
+`zai-org/GLM-5.2-FP8`) needed thinking disabled **plus**
+`--agentic-concurrency 8` **plus** `--agentic-timeout 300` to complete at all;
+with thinking left on, every batch exceeded the 120 s default and the run fell
+back to the deterministic-only floor:
+
+```bash
+cisco-aibom analyze ./my-repo \
+  --output-file report.json \
+  --llm-provider openai \
+  --llm-api-base http://localhost:8000/v1 \
+  --llm-model zai-org/GLM-5.2-FP8 \
+  --llm-reasoning off \
+  --agentic-concurrency 8 \
+  --agentic-timeout 300
+```
 
 ## How Agentic Classification Works
 

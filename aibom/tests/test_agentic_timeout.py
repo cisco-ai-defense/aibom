@@ -190,6 +190,50 @@ class TestAgenticAsyncTimeout:
         assert all(c.agentic_hint == "batch_timeout" for c in out)
 
 
+class TestAgenticRetryBudget:
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_retry_budget_exhausted_finishes_and_degrades(
+        self, mock_create: MagicMock, _mb: MagicMock, _mc: MagicMock, caplog
+    ) -> None:
+        """an exhausted retry budget aborts further retries — the
+        remaining components are degraded (retry_budget_exhausted) and the scan
+        finishes instead of looping for hours, even with the breaker relaxed."""
+        import logging
+
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        mock_agent = MagicMock()
+        mock_agent.invoke.side_effect = RuntimeError("always fails")
+        mock_create.return_value = mock_agent
+
+        comp = AIComponent(
+            name="x",
+            component_type=AIComponentType.AGENT,
+            file_path="b.py",
+            line_number=1,
+        )
+        with caplog.at_level(logging.WARNING, logger="aibom.agentic.agent"):
+            out, _, _, _ = run_agentic_enrichment(
+                model_string="m",
+                deterministic_components=[comp],
+                deterministic_relationships=[],
+                scan_paths=["/tmp"],
+                timeout_s=5,
+                max_consecutive_failures=99,  # breaker relaxed: budget is the bound
+                max_retry_seconds=0,  # zero budget -> retries abort immediately
+            )
+
+        assert len(out) == 1
+        assert out[0].agentic_hint == "retry_budget_exhausted"
+        assert "budget exhausted" in caplog.text.lower()
+        # A budget-exhausted component is NOT "recovered" — the retry-pass
+        # summary must not mislabel it (accuracy of the operator log).
+        assert "1/1 recovered" not in caplog.text
+
+
 class TestInvokeAgentBounded:
     """Unit tests for the shared daemon-thread deadline helper used by every
     synchronous ``agent.invoke`` site."""
