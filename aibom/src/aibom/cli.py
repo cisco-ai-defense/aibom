@@ -1821,6 +1821,7 @@ def analyze(
         "total_tokens": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
+        "cached_tokens": 0,
     }
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
@@ -2080,9 +2081,11 @@ def analyze(
         source_summary["prompt_tokens"] = result.prompt_tokens
         source_summary["completion_tokens"] = result.completion_tokens
         source_summary["total_tokens"] = result.total_tokens
+        source_summary["cached_tokens"] = result.cached_tokens
         run_metadata["total_tokens"] += result.total_tokens
         run_metadata["prompt_tokens"] += result.prompt_tokens
         run_metadata["completion_tokens"] += result.completion_tokens
+        run_metadata["cached_tokens"] += result.cached_tokens
         if source_summary["status"] == "in_progress":
             source_summary["status"] = "completed"
 

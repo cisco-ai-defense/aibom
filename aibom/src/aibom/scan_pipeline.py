@@ -105,6 +105,7 @@ class PipelineResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cached_tokens: int = 0
 
 
 def _service_dir(file_path: str) -> str:
@@ -1380,6 +1381,7 @@ class ScanPipeline:
             prompt_tokens=tu.prompt_tokens if tu else 0,
             completion_tokens=tu.completion_tokens if tu else 0,
             total_tokens=tu.total_tokens if tu else 0,
+            cached_tokens=tu.cached_tokens if tu else 0,
         )
 
     # ------------------------------------------------------------------

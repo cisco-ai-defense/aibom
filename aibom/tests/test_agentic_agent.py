@@ -30,9 +30,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aibom.agentic.agent import (
+    TokenUsage,
     _build_context_message,
     _build_rate_limiter,
     _extract_structured_response,
+    _resolve_message_usage,
 )
 from aibom.models import (
     AIComponent,
@@ -2520,3 +2522,55 @@ class TestRateLimiterConfig:
         )
         _build_model("gpt-5.5", {})
         assert captured["rate_limiter"].requests_per_second == 1.0
+
+
+class TestCachedTokenAccounting:
+    """Cache-read tokens must be captured so prompt-cache savings
+    are measurable (Azure/OpenAI cache automatically for stable prompts)."""
+
+    def _msg(self, usage_metadata=None, response_metadata=None):
+        m = MagicMock()
+        m.usage_metadata = usage_metadata
+        m.response_metadata = response_metadata or {}
+        return m
+
+    def test_token_usage_sums_cached_tokens(self):
+        a = TokenUsage(prompt_tokens=100, cached_tokens=80)
+        b = TokenUsage(prompt_tokens=50, cached_tokens=30)
+        a.add(b)
+        assert a.cached_tokens == 110
+
+    def test_reads_cache_read_from_usage_metadata(self):
+        msg = self._msg(
+            usage_metadata={
+                "input_tokens": 12000,
+                "output_tokens": 40,
+                "total_tokens": 12040,
+                "input_token_details": {"cache_read": 8000},
+            }
+        )
+        prompt, completion, total, cached = _resolve_message_usage(msg)
+        assert prompt == 12000
+        assert cached == 8000
+
+    def test_reads_cached_tokens_from_response_metadata(self):
+        msg = self._msg(
+            response_metadata={
+                "token_usage": {
+                    "prompt_tokens": 5000,
+                    "completion_tokens": 20,
+                    "total_tokens": 5020,
+                    "prompt_tokens_details": {"cached_tokens": 3000},
+                }
+            }
+        )
+        prompt, completion, total, cached = _resolve_message_usage(msg)
+        assert prompt == 5000
+        assert cached == 3000
+
+    def test_no_cache_fields_yields_zero_cached(self):
+        msg = self._msg(
+            usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+        )
+        _, _, _, cached = _resolve_message_usage(msg)
+        assert cached == 0

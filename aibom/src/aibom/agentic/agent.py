@@ -65,11 +65,16 @@ class TokenUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Subset of prompt_tokens served from the provider's prompt cache (cache
+    # read). Lets us measure prompt-caching savings — Azure/OpenAI cache stable
+    # prompts automatically, but the win is invisible without this.
+    cached_tokens: int = 0
 
     def add(self, other: "TokenUsage") -> None:
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens
         self.total_tokens += other.total_tokens
+        self.cached_tokens += other.cached_tokens
 
 
 _token_accumulator = TokenUsage()
@@ -87,6 +92,15 @@ def get_token_usage() -> TokenUsage:
 def _as_int(value: Any) -> int:
     """Coerce a token count to int, treating missing/invalid as 0."""
     return value if isinstance(value, int) else 0
+
+
+def _nested_int(d: Any, *path: str) -> int:
+    """Read a nested int (e.g. cache-read tokens), 0 if any level is missing."""
+    for key in path:
+        if not isinstance(d, dict):
+            return 0
+        d = d.get(key)
+    return _as_int(d)
 
 
 def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
@@ -114,8 +128,9 @@ def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
         prompt = _as_int(um.get("input_tokens"))
         completion = _as_int(um.get("output_tokens"))
         total = _as_int(um.get("total_tokens"))
+        cached = _nested_int(um, "input_token_details", "cache_read")
         if prompt or completion or total:
-            return prompt, completion, total or (prompt + completion)
+            return prompt, completion, total or (prompt + completion), cached
 
     rm = getattr(msg, "response_metadata", None)
     if isinstance(rm, dict):
@@ -124,25 +139,27 @@ def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
             prompt = _as_int(token_usage.get("prompt_tokens"))
             completion = _as_int(token_usage.get("completion_tokens"))
             total = _as_int(token_usage.get("total_tokens"))
+            cached = _nested_int(token_usage, "prompt_tokens_details", "cached_tokens")
             if prompt or completion or total:
-                return prompt, completion, total or (prompt + completion)
+                return prompt, completion, total or (prompt + completion), cached
 
         usage = rm.get("usage")
         if isinstance(usage, dict):
             prompt = _as_int(usage.get("input_tokens"))
             completion = _as_int(usage.get("output_tokens"))
             total = _as_int(usage.get("total_tokens"))
+            cached = _as_int(usage.get("cache_read_input_tokens"))
             if prompt or completion or total:
-                return prompt, completion, total or (prompt + completion)
+                return prompt, completion, total or (prompt + completion), cached
 
         metrics = rm.get("amazon-bedrock-invocationMetrics")
         if isinstance(metrics, dict):
             prompt = _as_int(metrics.get("inputTokenCount"))
             completion = _as_int(metrics.get("outputTokenCount"))
             if prompt or completion:
-                return prompt, completion, prompt + completion
+                return prompt, completion, prompt + completion, 0
 
-    return 0, 0, 0
+    return 0, 0, 0, 0
 
 
 def _accumulate_token_usage(result: Any) -> None:
@@ -154,7 +171,7 @@ def _accumulate_token_usage(result: Any) -> None:
     """
     messages = result.get("messages", []) if isinstance(result, dict) else []
     for msg in messages:
-        prompt, completion, total = _resolve_message_usage(msg)
+        prompt, completion, total, cached = _resolve_message_usage(msg)
         if not (prompt or completion or total):
             um = getattr(msg, "usage_metadata", None)
             rm = getattr(msg, "response_metadata", None)
@@ -170,6 +187,7 @@ def _accumulate_token_usage(result: Any) -> None:
         _token_accumulator.prompt_tokens += prompt
         _token_accumulator.completion_tokens += completion
         _token_accumulator.total_tokens += total
+        _token_accumulator.cached_tokens += cached
 
 
 class _EvidenceLocation(BaseModel):
