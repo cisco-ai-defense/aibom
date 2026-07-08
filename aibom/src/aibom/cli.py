@@ -294,6 +294,7 @@ def _scan_cache_settings(
     include_code_snippets: bool,
     container_tier: str,
     custom_catalog: Optional[Path],
+    atr_enrichment: bool,
 ) -> Dict[str, Any]:
     """Build a stable settings payload for persistent scan-cache keys."""
     safe_llm = None
@@ -320,6 +321,11 @@ def _scan_cache_settings(
         "include_code_snippets": include_code_snippets,
         "container_tier": container_tier,
         "custom_catalog": _file_cache_fingerprint(custom_catalog),
+        # ATR enrichment changes the output shape (security_enrichment metadata /
+        # ATR tags), so it MUST namespace the cache key — otherwise a cached
+        # default run is served to an --atr-enrichment run (tags suppressed) and
+        # a cached enriched run leaks security_enrichment into default output.
+        "atr_enrichment": atr_enrichment,
     }
 
 
@@ -1513,6 +1519,18 @@ def analyze(
             "unchanged."
         ),
     ),
+    atr_enrichment: bool = typer.Option(
+        False,
+        "--atr-enrichment/--no-atr-enrichment",
+        help=(
+            "Optional security enrichment: run the open-source Agent Threat "
+            "Rules engine (pyatr) over detected skill / prompt / agent / MCP "
+            "components and tag any that match a known agent-attack rule with "
+            "its MITRE ATLAS (and ATT&CK where present) technique IDs. "
+            "Off by default; no-op when pyatr is not installed (the 'security' "
+            "extra). Surfaced as per-asset findings, not a coverage score."
+        ),
+    ),
     container_tier: str = typer.Option(
         "auto",
         "--container-extraction-tier",
@@ -1801,6 +1819,7 @@ def analyze(
         include_code_snippets=include_code_snippets,
         container_tier=container_tier,
         custom_catalog=custom_catalog,
+        atr_enrichment=atr_enrichment,
     )
     agentic_cache_dir = resolve_cache_type_dir("agentic", cache_root)
 
@@ -1904,7 +1923,17 @@ def analyze(
 
         scan_path = str(path_to_analyze)
 
-        if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
+        # The org cache is keyed on (repo path, HEAD sha) with no settings, so it
+        # cannot distinguish an enriched result from a default one. Rather than
+        # widen its key, skip it entirely when ATR enrichment is on: enriched
+        # runs never read a default entry (no suppressed tags) and never store an
+        # enriched entry (no leak into default-off output).
+        if (
+            skip_unchanged
+            and not is_container
+            and not atr_enrichment
+            and (path_to_analyze / ".git").exists()
+        ):
             from .incremental import OrgCache
 
             org_cache = OrgCache()
@@ -1965,6 +1994,7 @@ def analyze(
             agentic_cache_dir=agentic_cache_dir,
             include_code_snippets=include_code_snippets,
             custom_catalog=explicit_config,
+            atr_enrichment=atr_enrichment,
         )
         result = _run_pipeline_with_progress(source, pipeline, progress)
 
@@ -1992,7 +2022,12 @@ def analyze(
                 _serializable_scan_cache_payload(result),
             )
 
-        if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
+        if (
+            skip_unchanged
+            and not is_container
+            and not atr_enrichment
+            and (path_to_analyze / ".git").exists()
+        ):
             from .incremental import OrgCache
             from .models import ScanResult, SourceResult
 

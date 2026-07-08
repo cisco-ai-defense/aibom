@@ -79,6 +79,17 @@ class TestCacheKey:
         k2 = cache_key([str(tmp_path)], {"strict": True, "llm_config": {"model": "gpt-5.4"}})
         assert k1 != k2
 
+    def test_atr_enrichment_namespaces_the_key(self, tmp_path: Path) -> None:
+        # ATR enrichment changes the output shape, so a default run and an
+        # --atr-enrichment run must not share a scan-cache entry: otherwise a
+        # cached default is served to an enriched run (tags suppressed) or a
+        # cached enriched result leaks security_enrichment into default output.
+        f = tmp_path / "app.py"
+        f.write_text("x = 1\n")
+        default = cache_key([str(tmp_path)], {"strict": False, "atr_enrichment": False})
+        enriched = cache_key([str(tmp_path)], {"strict": False, "atr_enrichment": True})
+        assert default != enriched
+
     def test_analysis_settings_are_order_insensitive(self, tmp_path: Path) -> None:
         f = tmp_path / "app.py"
         f.write_text("x = 1\n")
