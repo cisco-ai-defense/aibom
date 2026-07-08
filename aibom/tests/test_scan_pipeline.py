@@ -188,6 +188,40 @@ class TestAgenticScope:
         mock_runtime.assert_called_once()
         assert mock_enrich.call_args.kwargs["include_code_snippets"] is True
 
+    def test_max_consecutive_failures_is_forwarded(self, tmp_path: Path) -> None:
+        # the configurable circuit-breaker threshold must reach
+        # run_agentic_enrichment (previously it was never passed -> stuck at 3).
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake", "api_base": "http://x"}
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config=llm_cfg,
+            agentic_max_consecutive_failures=7,
+        )
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([], [], [], _stub_token_usage())
+                pipeline.run()
+        assert mock_enrich.call_args.kwargs["max_consecutive_failures"] == 7
+
+    def test_max_retry_seconds_is_forwarded(self, tmp_path: Path) -> None:
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake", "api_base": "http://x"}
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config=llm_cfg,
+            agentic_max_retry_seconds=42,
+        )
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([], [], [], _stub_token_usage())
+                pipeline.run()
+        assert mock_enrich.call_args.kwargs["max_retry_seconds"] == 42
+
 
 class TestFileCache:
     def test_cache_deduplicates(self, tmp_path: Path) -> None:

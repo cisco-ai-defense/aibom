@@ -199,6 +199,122 @@ class TestAgenticEnrichmentViaCLI:
         assert result.exit_code != 0
         assert "max-tokens" in clean.lower() or "range" in clean.lower()
 
+    # --- --llm-reasoning / --llm-init-kwargs -------------------
+
+    def test_llm_reasoning_and_init_kwargs_help_listed(self):
+        import re
+
+        result = runner.invoke(app, ["analyze", "--help"])
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--llm-reasoning" in clean
+        assert "--llm-init-kwargs" in clean
+
+    def test_agentic_breaker_and_retry_budget_help_listed(self):
+        import re
+
+        # Wide width so Rich doesn't truncate the long option names.
+        result = runner.invoke(
+            app, ["analyze", "--help"], env={"COLUMNS": "200"}
+        )
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--agentic-max-consecutive-failures" in clean
+        assert "--agentic-max-retry-seconds" in clean
+
+    @patch("aibom.scan_pipeline.ensure_llm_runtime_available", return_value=None)
+    @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_llm_reasoning_and_init_kwargs_threaded_into_config(
+        self,
+        mock_create,
+        mock_build,
+        _mock_close,
+        _mock_cli_preflight,
+        _mock_pipeline_preflight,
+        sample_dir,
+        tmp_path,
+    ):
+        out = tmp_path / "report.txt"
+        mock_msg = MagicMock()
+        mock_msg.content = json.dumps({"enriched_components": [], "new_components": []})
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {"messages": [mock_msg]}
+        mock_create.return_value = mock_agent
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--output-format",
+                "plaintext",
+                "--output-file",
+                str(out),
+                "--llm-model",
+                "test-model",
+                "--llm-api-base",
+                "http://localhost:11434",
+                "--llm-reasoning",
+                "off",
+                "--llm-init-kwargs",
+                '{"top_p": 0.9}',
+            ],
+        )
+        assert result.exit_code == 0
+        reasoning_ok = False
+        init_kwargs_ok = False
+        for call in mock_build.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                if isinstance(arg, dict) and arg.get("reasoning") == "off":
+                    reasoning_ok = True
+                if isinstance(arg, dict) and arg.get("init_kwargs") == {"top_p": 0.9}:
+                    init_kwargs_ok = True
+        assert reasoning_ok, "llm_config['reasoning']='off' not passed to _build_model"
+        assert init_kwargs_ok, "llm_config['init_kwargs'] not passed to _build_model"
+
+    def test_llm_reasoning_rejects_invalid_value(self, sample_dir, tmp_path):
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--llm-model",
+                "test-model",
+                "--llm-reasoning",
+                "bogus",
+            ],
+        )
+        assert result.exit_code != 0
+
+    def test_llm_init_kwargs_rejects_invalid_json(self, sample_dir, tmp_path):
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--llm-model",
+                "test-model",
+                "--llm-init-kwargs",
+                "not json",
+            ],
+        )
+        assert result.exit_code != 0
+
+    def test_llm_init_kwargs_rejects_non_object(self, sample_dir, tmp_path):
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--llm-model",
+                "test-model",
+                "--llm-init-kwargs",
+                "[1, 2, 3]",
+            ],
+        )
+        assert result.exit_code != 0
+
     @patch("aibom.repo_triage.RepoTriager")
     def test_triage_config_includes_max_tokens(self, mock_triager_cls):
         from aibom.cli import _gather_analysis_sources

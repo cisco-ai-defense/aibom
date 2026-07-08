@@ -239,8 +239,14 @@ All LLM options can also be set via environment variables or a `.env` file. See 
 | `--agentic-concurrency` | `1` | Max parallel LLM batches. |
 | `--agentic-timeout` | `120` | Wall-clock seconds per batch before timeout. |
 | `--agentic-fast-model` | — | Cheaper model for simple confirmations (model lookups, dependency checks). |
+| `--agentic-max-consecutive-failures` | `3` | Circuit-breaker threshold before skipping the rest of a tier. |
+| `--agentic-max-retry-seconds` | `1200` | Aggregate wall-clock budget for retries; bounds a failing model so the scan finishes (`0` disables retries). |
+| `--llm-reasoning` | `auto` | `off` disables model "thinking" per provider — use for verbose reasoning/self-hosted models that otherwise time out. |
+| `--llm-init-kwargs` | — | JSON of provider-specific init kwargs (advanced escape hatch). |
 | `--progress` | `auto` | Show live per-stage and per-scanner progress in interactive terminals. |
 | `--include-code-snippets` | `off` | Include raw code snippets inside per-finding decision annotations. |
+
+Running a slow self-hosted or verbose reasoning model? See [Self-hosted & reasoning-model tuning](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md#self-hosted--reasoning-model-tuning) — disabling "thinking" and raising the timeout/concurrency is usually the difference between real enrichment and a silent deterministic-only fallback.
 
 ### Report and cache utilities
 

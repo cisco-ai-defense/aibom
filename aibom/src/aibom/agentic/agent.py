@@ -49,7 +49,7 @@ from ..models import (
 )
 from .evidence_injection import DossierIndex, build_dossier_index
 from .middleware import AIBOMScannerMiddleware
-from .prompts import AIBOM_AGENT_SYSTEM_PROMPT
+from .prompts import AGENTIC_COERCION_PROMPT, AIBOM_AGENT_SYSTEM_PROMPT
 
 _IID_DESC = (
     "The EXACT instance_id string as provided in the input — "
@@ -84,15 +84,92 @@ def get_token_usage() -> TokenUsage:
     return _token_accumulator
 
 
+def _as_int(value: Any) -> int:
+    """Coerce a token count to int, treating missing/invalid as 0."""
+    return value if isinstance(value, int) else 0
+
+
+def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
+    """Resolve ``(prompt, completion, total)`` tokens for one AI message.
+
+    LangChain's standardized ``usage_metadata`` is preferred, but several
+    providers do not populate it and instead surface usage under
+    ``response_metadata``:
+
+    * OpenAI / Azure (incl. the ``gpt-5.3-codex`` deployment):
+      ``response_metadata['token_usage']`` with
+      ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``.
+    * AWS Bedrock Converse: ``response_metadata['usage']`` with
+      ``input_tokens`` / ``output_tokens``.
+    * AWS Bedrock Invoke: ``response_metadata['amazon-bedrock-invocationMetrics']``
+      with ``inputTokenCount`` / ``outputTokenCount``.
+
+    The first populated carrier wins, so ``usage_metadata`` (which LangChain
+    often derives from ``response_metadata``) is never double-counted. ``total``
+    is synthesized from prompt+completion when the provider omits it. Returns
+    ``(0, 0, 0)`` — logged at debug — when no carrier resolves.
+    """
+    um = getattr(msg, "usage_metadata", None)
+    if isinstance(um, dict):
+        prompt = _as_int(um.get("input_tokens"))
+        completion = _as_int(um.get("output_tokens"))
+        total = _as_int(um.get("total_tokens"))
+        if prompt or completion or total:
+            return prompt, completion, total or (prompt + completion)
+
+    rm = getattr(msg, "response_metadata", None)
+    if isinstance(rm, dict):
+        token_usage = rm.get("token_usage")
+        if isinstance(token_usage, dict):
+            prompt = _as_int(token_usage.get("prompt_tokens"))
+            completion = _as_int(token_usage.get("completion_tokens"))
+            total = _as_int(token_usage.get("total_tokens"))
+            if prompt or completion or total:
+                return prompt, completion, total or (prompt + completion)
+
+        usage = rm.get("usage")
+        if isinstance(usage, dict):
+            prompt = _as_int(usage.get("input_tokens"))
+            completion = _as_int(usage.get("output_tokens"))
+            total = _as_int(usage.get("total_tokens"))
+            if prompt or completion or total:
+                return prompt, completion, total or (prompt + completion)
+
+        metrics = rm.get("amazon-bedrock-invocationMetrics")
+        if isinstance(metrics, dict):
+            prompt = _as_int(metrics.get("inputTokenCount"))
+            completion = _as_int(metrics.get("outputTokenCount"))
+            if prompt or completion:
+                return prompt, completion, prompt + completion
+
+    return 0, 0, 0
+
+
 def _accumulate_token_usage(result: Any) -> None:
-    """Sum ``usage_metadata`` from all AI messages in a LangGraph result."""
+    """Sum token usage across all AI messages in a LangGraph result.
+
+    Reads ``usage_metadata`` when present and falls back to
+    ``response_metadata`` carriers for providers that omit it (see
+    :func:`_resolve_message_usage`).
+    """
     messages = result.get("messages", []) if isinstance(result, dict) else []
     for msg in messages:
-        um = getattr(msg, "usage_metadata", None)
-        if um and isinstance(um, dict):
-            _token_accumulator.prompt_tokens += um.get("input_tokens", 0)
-            _token_accumulator.completion_tokens += um.get("output_tokens", 0)
-            _token_accumulator.total_tokens += um.get("total_tokens", 0)
+        prompt, completion, total = _resolve_message_usage(msg)
+        if not (prompt or completion or total):
+            um = getattr(msg, "usage_metadata", None)
+            rm = getattr(msg, "response_metadata", None)
+            if um or rm:
+                _LOGGER.debug(
+                    "No resolvable token usage for %s message "
+                    "(usage_metadata=%s, response_metadata keys=%s)",
+                    type(msg).__name__,
+                    bool(um),
+                    sorted(rm) if isinstance(rm, dict) else None,
+                )
+            continue
+        _token_accumulator.prompt_tokens += prompt
+        _token_accumulator.completion_tokens += completion
+        _token_accumulator.total_tokens += total
 
 
 class _EvidenceLocation(BaseModel):
@@ -264,6 +341,8 @@ def _build_model(
         # input (HTTP 400). Users opt in via --llm-max-tokens / llm_config.
         max_tokens=cfg.get("max_tokens"),
         rate_limiter=rate_limiter,
+        reasoning=cfg.get("reasoning", "auto"),
+        init_kwargs_extra=cfg.get("init_kwargs"),
     )
 
 
@@ -290,6 +369,27 @@ def _close_model_clients(*models: Any) -> None:
                 sc.close()
         except Exception:
             pass
+
+
+class _AgentBundle:
+    """Wraps a compiled deep-agent graph and carries the underlying chat model.
+
+    The batch runners invoke the graph via ``.invoke()`` / ``.ainvoke()``; those
+    (and any other graph attribute) are transparently proxied. The extra
+    ``aibom_chat_model`` and ``needs_coercion`` attributes let the two-phase
+    structured-output path run a tool-less coercion call without
+    threading the model through every batch/tier signature.
+    """
+
+    def __init__(self, graph: Any, chat_model: Any, *, needs_coercion: bool):
+        self._graph = graph
+        self.aibom_chat_model = chat_model
+        self.needs_coercion = needs_coercion
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for attributes not set on the bundle itself → proxy to the
+        # underlying compiled graph (invoke, ainvoke, get_state, …).
+        return getattr(self._graph, name)
 
 
 def create_aibom_agent(
@@ -324,7 +424,22 @@ def create_aibom_agent(
 
     Returns
     -------
-    A compiled LangGraph ``CompiledStateGraph`` ready for ``.invoke()``.
+    An :class:`_AgentBundle` wrapping the compiled LangGraph agent. It proxies
+    ``.invoke()`` / ``.ainvoke()`` to the graph and also carries the underlying
+    chat model so the two-phase structured-output path can run a
+    tool-less coercion call.
+
+    Two-phase structured output
+    ----------------------------------------
+    By default (``response_format is None``) the agent runs the tool loop
+    **unforced** — no structured-output tool is bound, so LangChain uses
+    ``tool_choice="auto"`` and the loop terminates naturally on every provider
+    (instead of ``ToolStrategy``'s per-turn ``tool_choice="any"``, which
+    tool-eager Claude-on-Bedrock never escapes). The structured ``AgentResponse``
+    is then produced by a separate, tool-less coercion call (see
+    :func:`_coerce_structured`). Callers that want the legacy in-loop structured
+    output (e.g. the provider-native fallback agent) pass an explicit
+    *response_format*.
     """
     from deepagents import create_deep_agent
 
@@ -333,16 +448,58 @@ def create_aibom_agent(
     if model is None:
         model = _build_model(model_string, llm_config)
 
-    agent = create_deep_agent(
+    graph = create_deep_agent(
         model=model,
         tools=tools if tools is not None else build_tools(),
         system_prompt=system_prompt or AIBOM_AGENT_SYSTEM_PROMPT,
-        response_format=(
-            response_format if response_format is not None else AgentResponse
-        ),
+        response_format=response_format,
         name="aibom-scanner",
     )
-    return agent
+    return _AgentBundle(graph, model, needs_coercion=response_format is None)
+
+
+def _supports_inloop_structured_output(
+    resolved_provider: str | None, model_id: str
+) -> bool:
+    """True when the model's LangChain integration reliably supports NATIVE
+    in-loop structured output (``create_agent`` ProviderStrategy).
+
+    Capability gate for the two-phase decouple. When True, aibom
+    keeps the single-pass agent (``response_format=AgentResponse`` → native
+    json_schema terminal — the proven, full-fidelity path for GPT). When False,
+    it uses the provider-general two-phase decouple, because LangChain's
+    ``AutoStrategy`` would otherwise route the model to ``ToolStrategy`` and bind
+    ``tool_choice="any"`` on every turn — the trap that makes tool-eager
+    Claude-on-Bedrock (and self-hosted/vLLM open models) never terminate.
+
+    Mirrors ``create_agent``'s ProviderStrategy capability for the OpenAI family
+    (gpt-*, o-series, grok, gpt-oss) on the ``openai``/``azure_openai`` providers
+    (or LangChain-inferred). Bedrock Claude (InvokeModel), native Anthropic on
+    pinned ids, Google, Ollama, and non-GPT open models served via an
+    OpenAI-compatible endpoint all fall to the two-phase path.
+    """
+    prov = (resolved_provider or "").lower()
+    if prov not in ("openai", "azure_openai", ""):
+        return False
+    leaf = model_id.rsplit("/", 1)[-1].strip().lower()
+    if leaf.startswith(("gpt-", "grok", "gpt-oss")):
+        return True
+    # o-series reasoning models: o1 / o3-mini / o4-… (an ``o`` then a digit).
+    return len(leaf) >= 2 and leaf[0] == "o" and leaf[1].isdigit()
+
+
+def _agent_response_format(model_id: str, llm_config: dict[str, Any] | None) -> Any:
+    """Pick the ``create_aibom_agent`` ``response_format`` for *model_id*.
+
+    ``AgentResponse`` (single-pass native structured output) for
+    ProviderStrategy-capable models; ``None`` (two-phase decouple) otherwise.
+    """
+    from ..llm_factory import resolve_provider
+
+    provider = resolve_provider(model_id, (llm_config or {}).get("provider"))
+    if _supports_inloop_structured_output(provider, model_id):
+        return AgentResponse
+    return None
 
 
 def _build_fallback_agent(model_string: str, model_obj: Any) -> Any | None:
@@ -378,6 +535,12 @@ _RECURSION_LIMIT = 1000
 
 _DEFAULT_AGENTIC_TIMEOUT_S = 120
 _DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
+
+# Aggregate wall-clock budget (seconds) for ALL retry activity across a single
+# enrichment run. Bounds the retry pass so a persistently-failing model/gateway
+# degrades the affected components and the scan finishes, instead of retrying in
+# ever-smaller batches for hours. 0 disables the retry pass.
+_DEFAULT_MAX_RETRY_SECONDS = 1200
 
 # Hints whose batches produced no usable structured output under the primary
 # strategy and are worth one re-run with the alternate structured-output
@@ -985,6 +1148,157 @@ def _circuit_breaker_skipped_batch(batch: list[AIComponent]) -> list[AIComponent
     return _degraded_batch_components(batch, hint="circuit_breaker_tripped")
 
 
+def _apply_batch_findings(
+    middleware: AIBOMScannerMiddleware,
+    batch: list[AIComponent],
+    data: dict[str, Any],
+    batch_num: int,
+) -> tuple[
+    list[AIComponent],
+    list[AIComponent],
+    list[ComponentRelationship],
+    list[RiskFlag],
+    bool,
+]:
+    """Apply a parsed structured response to *batch*, failing OPEN per batch.
+
+    ``extract_findings_from_dict`` / ``apply_enrichments_from_dict`` operate on
+    model-supplied data that can be partial or malformed after structured-output
+    recovery. Any unexpected error here must degrade only this batch — never
+    propagate up and abort the whole agentic stage. The batch is
+    marked with a retryable hint so a later pass can still recover it.
+
+    Returns ``(enriched, new_components, new_relationships, risk_flags,
+    degraded)`` matching the batch-runner contract.
+    """
+    try:
+        new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(
+            data
+        )
+        enriched = middleware.apply_enrichments_from_dict(batch, data)
+        return enriched, new_components, new_rels, risk_flags, False
+    except Exception:
+        _LOGGER.warning(
+            "Batch %d: could not apply structured output (malformed/partial "
+            "recovered data); degrading this batch only",
+            batch_num,
+            exc_info=True,
+        )
+        degraded = _degraded_batch_components(
+            batch, hint="structured_output_parse_error"
+        )
+        return degraded, [], [], [], True
+
+
+def _all_batches_failed(
+    enriched: list[AIComponent],
+    new: list[AIComponent],
+    rels: list[ComponentRelationship],
+    flags: list[RiskFlag],
+) -> bool:
+    """True when the agentic layer produced no usable output at all.
+
+    Distinguishes a *total* failure — every returned component degraded and
+    nothing discovered (e.g. a provider rejecting every batch) —
+    from the benign "examined everything and found nothing to add". Lets the
+    run surface a degraded status instead of logging "enrichment complete".
+    """
+    if new or rels or flags:
+        return False
+    considered = [c for c in enriched if c.instance_id]
+    if not considered:
+        return False
+    return all(c.agentic_hint for c in considered)
+
+
+def _coerce_structured(model: Any, messages: list[Any]) -> dict[str, Any] | None:
+    """Phase 2 of the two-phase decouple.
+
+    Turn the unforced agent's finished transcript into a schema-valid
+    ``AgentResponse`` via a single, tool-less ``with_structured_output`` call.
+    This uses each provider's *native* structured-output mechanism (OpenAI/Azure
+    json_schema, Anthropic output_config, Google response_json_schema, Bedrock a
+    single forced tool call, Ollama format=json_schema) and, having no tools,
+    cannot loop — so it terminates cleanly on every provider.
+
+    ``include_raw=True`` keeps the raw ``AIMessage`` so Phase-2 token usage is
+    still accounted and a parse error can be recovered from the message carriers.
+    Returns the response dict, or ``None`` if coercion is unavailable/failed.
+    """
+    if model is None:
+        return None
+    from langchain_core.messages import HumanMessage
+
+    try:
+        structured = model.with_structured_output(AgentResponse, include_raw=True)
+    except Exception:
+        # Some wrappers don't accept include_raw; retry without it.
+        try:
+            structured = model.with_structured_output(AgentResponse)
+        except Exception:
+            _LOGGER.debug(
+                "with_structured_output unavailable for Phase-2 coercion",
+                exc_info=True,
+            )
+            return None
+
+    prompt = list(messages) + [HumanMessage(content=AGENTIC_COERCION_PROMPT)]
+    try:
+        out = structured.invoke(prompt)
+    except Exception as exc:
+        # StructuredOutputValidationError and friends carry the offending message.
+        ai_message = getattr(exc, "ai_message", None)
+        if ai_message is not None:
+            _accumulate_token_usage({"messages": [ai_message]})
+            return _extract_structured_response({"messages": [ai_message]})
+        _LOGGER.warning("Phase-2 structured coercion failed: %s", exc)
+        return None
+
+    # include_raw shape: {"raw": AIMessage, "parsed": <model|None>, "parsing_error"}
+    if isinstance(out, dict) and ("raw" in out or "parsed" in out):
+        raw = out.get("raw")
+        if raw is not None:
+            _accumulate_token_usage({"messages": [raw]})
+        parsed = out.get("parsed")
+        if isinstance(parsed, BaseModel):
+            return parsed.model_dump()
+        if isinstance(parsed, dict):
+            return parsed
+        if raw is not None:
+            return _extract_structured_response({"messages": [raw]})
+        return None
+
+    # No include_raw: a direct model / dict.
+    if isinstance(out, BaseModel):
+        return out.model_dump()
+    if isinstance(out, dict):
+        return out
+    return None
+
+
+def _resolve_batch_data(agent: Any, result: Any) -> dict[str, Any] | None:
+    """Get the structured ``AgentResponse`` dict from a finished batch.
+
+    Prefers the cheap multi-carrier extractor (``structured_response`` / tool
+    calls / parsed / JSON-in-text) — which already yields data for legacy or
+    provider-native (ProviderStrategy fallback) agents, and for unforced agents
+    whose final message is clean JSON. Only when that finds nothing AND the agent
+    is an unforced Phase-1 agent does it spend a Phase-2 ``_coerce_structured``
+    call. Keeps ``recursion_limit`` untouched and adds no extra call on the happy
+    path.
+    """
+    data = _extract_structured_response(result)
+    if data:
+        return data
+    # ``is True`` (not just truthy) so an incidental MagicMock agent in unrelated
+    # tests never trips Phase 2 — only a real unforced bundle sets a bool True.
+    if getattr(agent, "needs_coercion", False) is True:
+        model = getattr(agent, "aibom_chat_model", None)
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        return _coerce_structured(model, messages)
+    return None
+
+
 class _InvokeTimeout(Exception):
     """Raised when a synchronous ``agent.invoke`` exceeds its wall-clock deadline.
 
@@ -1222,9 +1536,7 @@ def _run_batch(
             _LOGGER.info(
                 "Batch %d: recovering partial results from failed run", batch_num
             )
-            new_c, new_r, rf = middleware.extract_findings_from_dict(data)
-            enriched = middleware.apply_enrichments_from_dict(batch, data)
-            return enriched, new_c, new_r, rf, False
+            return _apply_batch_findings(middleware, batch, data, batch_num)
         hint = _classify_failure_hint(exc)
         enriched = _degraded_batch_components(batch, hint=hint)
         return enriched, [], [], [], True
@@ -1244,7 +1556,7 @@ def _run_batch(
         json.dumps(stats),
     )
 
-    data = _extract_structured_response(result)
+    data = _resolve_batch_data(agent, result)
     if not data:
         if _refusal_present(result):
             _LOGGER.warning("Batch %d: model refused", batch_num)
@@ -1264,9 +1576,7 @@ def _run_batch(
             True,
         )
 
-    new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
-    enriched = middleware.apply_enrichments_from_dict(batch, data)
-    return enriched, new_components, new_rels, risk_flags, False
+    return _apply_batch_findings(middleware, batch, data, batch_num)
 
 
 async def _run_batch_async(
@@ -1358,9 +1668,7 @@ async def _run_batch_async(
             _LOGGER.info(
                 "Batch %d: recovering partial results from failed run", batch_num
             )
-            new_c, new_r, rf = middleware.extract_findings_from_dict(data)
-            enriched = middleware.apply_enrichments_from_dict(batch, data)
-            return enriched, new_c, new_r, rf, False
+            return _apply_batch_findings(middleware, batch, data, batch_num)
         hint = _classify_failure_hint(exc)
         enriched = _degraded_batch_components(batch, hint=hint)
         return enriched, [], [], [], True
@@ -1380,7 +1688,7 @@ async def _run_batch_async(
         json.dumps(stats),
     )
 
-    data = _extract_structured_response(result)
+    data = _resolve_batch_data(agent, result)
     if not data:
         if _refusal_present(result):
             _LOGGER.warning("Batch %d: model refused", batch_num)
@@ -1400,9 +1708,7 @@ async def _run_batch_async(
             True,
         )
 
-    new_components, new_rels, risk_flags = middleware.extract_findings_from_dict(data)
-    enriched = middleware.apply_enrichments_from_dict(batch, data)
-    return enriched, new_components, new_rels, risk_flags, False
+    return _apply_batch_findings(middleware, batch, data, batch_num)
 
 
 async def _run_batches_parallel(
@@ -1643,6 +1949,7 @@ def _run_tier(
     memo: _DecisionMemo | None = None,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    retry_deadline: float | None = None,
     dossier_index: DossierIndex | None = None,
     fallback_agent_factory: Any | None = None,
 ) -> tuple[
@@ -1797,6 +2104,18 @@ def _run_tier(
         retry_flags: list[RiskFlag] = []
         retry_consecutive = 0
         for idx, batch in enumerate(retry_batches, 1):
+            if retry_deadline is not None and time.monotonic() >= retry_deadline:
+                remaining = sum(len(b) for b in retry_batches[idx - 1 :])
+                _LOGGER.warning(
+                    "Aborting retries after budget exhausted; "
+                    "%d component(s) left degraded",
+                    remaining,
+                )
+                for b in retry_batches[idx - 1 :]:
+                    retry_enriched.extend(
+                        _degraded_batch_components(b, hint="retry_budget_exhausted")
+                    )
+                break
             if retry_consecutive >= max_consecutive_failures:
                 _LOGGER.warning(
                     "Retry circuit breaker: skipping retry batches %d–%d",
@@ -1830,12 +2149,11 @@ def _run_tier(
             else:
                 retry_consecutive = 0
 
-        recovered = sum(
-            1
-            for c in retry_enriched
-            if c.agentic_hint not in _RETRYABLE_HINTS
-            and c.agentic_hint != "retry_failed"
-        )
+        # A component is genuinely recovered only when it comes back with no
+        # failure hint. Degraded terminal states (retry_failed,
+        # retry_budget_exhausted) or a still-set retryable hint are NOT
+        # recovered, so they are not counted here.
+        recovered = sum(1 for c in retry_enriched if not c.agentic_hint)
         still_degraded = len(retry_candidates) - recovered
         _LOGGER.info(
             "Retry pass complete: %d/%d recovered, %d still degraded",
@@ -1852,9 +2170,13 @@ def _run_tier(
     # Structured-output strategy fallback: components that yielded no usable
     # output under the primary strategy get one re-run via the alternate
     # (provider-native) strategy. Only fires when such failures exist, so the
-    # happy path makes no extra LLM call.
-    if fallback_agent_factory is not None and any(
-        c.agentic_hint in _STRATEGY_FALLBACK_HINTS for c in enriched
+    # happy path makes no extra LLM call. Skipped once the retry budget is
+    # exhausted so it cannot extend a runaway.
+    budget_left = retry_deadline is None or time.monotonic() < retry_deadline
+    if (
+        fallback_agent_factory is not None
+        and budget_left
+        and any(c.agentic_hint in _STRATEGY_FALLBACK_HINTS for c in enriched)
     ):
         fb_agent = fallback_agent_factory()
         if fb_agent is not None:
@@ -1972,6 +2294,7 @@ def run_agentic_enrichment(
     fast_model: str | None = None,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    max_retry_seconds: int = _DEFAULT_MAX_RETRY_SECONDS,
     cache_dir: Path | None = None,
     include_code_snippets: bool = False,
     agent_signature_catalog: AgentSignatureCatalog | None = None,
@@ -2022,6 +2345,10 @@ def run_agentic_enrichment(
 
     set_allowed_search_roots([str(Path(p).resolve()) for p in scan_paths])
     _reset_token_usage()
+
+    # Shared retry deadline for the whole run: bounds total retry wall-clock
+    # across every tier / sub-agent / strategy-fallback pass.
+    retry_deadline = time.monotonic() + max_retry_seconds
 
     simple, complex_ = _classify_candidates(deterministic_components)
 
@@ -2089,7 +2416,11 @@ def run_agentic_enrichment(
                 tier_model_name,
                 simple_batch_size,
             )
-            agent = create_aibom_agent(tier_model_name, model=tier_model_obj)
+            agent = create_aibom_agent(
+                tier_model_name,
+                model=tier_model_obj,
+                response_format=_agent_response_format(tier_model_name, llm_config),
+            )
             e, n, r, f = _run_tier(
                 agent,
                 middleware,
@@ -2103,6 +2434,7 @@ def run_agentic_enrichment(
                 memo=memo,
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
+                retry_deadline=retry_deadline,
                 dossier_index=dossier_index,
                 fallback_agent_factory=_simple_fb_factory,
             )
@@ -2133,7 +2465,13 @@ def run_agentic_enrichment(
                         len(group),
                         model_string,
                     )
-                    agent = create_aibom_agent(model_string, model=complex_model_obj)
+                    agent = create_aibom_agent(
+                        model_string,
+                        model=complex_model_obj,
+                        response_format=_agent_response_format(
+                            model_string, llm_config
+                        ),
+                    )
                     e, n, r, f = _run_tier(
                         agent,
                         middleware,
@@ -2147,6 +2485,7 @@ def run_agentic_enrichment(
                         memo=memo,
                         timeout_s=timeout_s,
                         max_consecutive_failures=max_consecutive_failures,
+                        retry_deadline=retry_deadline,
                         dossier_index=dossier_index,
                         fallback_agent_factory=_complex_fb_factory,
                     )
@@ -2160,7 +2499,11 @@ def run_agentic_enrichment(
                     len(complex_),
                     model_string,
                 )
-                agent = create_aibom_agent(model_string, model=complex_model_obj)
+                agent = create_aibom_agent(
+                    model_string,
+                    model=complex_model_obj,
+                    response_format=_agent_response_format(model_string, llm_config),
+                )
                 e, n, r, f = _run_tier(
                     agent,
                     middleware,
@@ -2174,6 +2517,7 @@ def run_agentic_enrichment(
                     memo=memo,
                     timeout_s=timeout_s,
                     max_consecutive_failures=max_consecutive_failures,
+                    retry_deadline=retry_deadline,
                     dossier_index=dossier_index,
                     fallback_agent_factory=_complex_fb_factory,
                 )
@@ -2187,17 +2531,36 @@ def run_agentic_enrichment(
     all_components = all_enriched + all_new
 
     usage = get_token_usage()
-    _LOGGER.info(
-        "Agentic enrichment complete: %d enriched, %d new components, "
-        "%d new relationships, %d risk flags, tokens=%d (prompt=%d, completion=%d)",
-        len(all_enriched),
-        len(all_new),
-        len(all_rels),
-        len(all_flags),
-        usage.total_tokens,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-    )
+    if _all_batches_failed(all_enriched, all_new, all_rels, all_flags):
+        from collections import Counter
+
+        hints = Counter(c.agentic_hint for c in all_enriched if c.agentic_hint)
+        dominant = hints.most_common(1)[0][0] if hints else "unknown"
+        _LOGGER.warning(
+            "Agentic enrichment DEGRADED: all %d components failed enrichment "
+            "(dominant hint: %s); the LLM added nothing, so the BOM is "
+            "deterministic-only. Check the provider/model configuration "
+            "(credentials, model access, request params). "
+            "tokens=%d (prompt=%d, completion=%d)",
+            len(all_enriched),
+            dominant,
+            usage.total_tokens,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        )
+    else:
+        _LOGGER.info(
+            "Agentic enrichment complete: %d enriched, %d new components, "
+            "%d new relationships, %d risk flags, "
+            "tokens=%d (prompt=%d, completion=%d)",
+            len(all_enriched),
+            len(all_new),
+            len(all_rels),
+            len(all_flags),
+            usage.total_tokens,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        )
 
     return all_components, all_rels, all_flags, usage
 

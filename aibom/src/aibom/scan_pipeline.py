@@ -1186,6 +1186,8 @@ class ScanPipeline:
         agentic_concurrency: int = 1,
         agentic_fast_model: str | None = None,
         agentic_timeout: int = 120,
+        agentic_max_consecutive_failures: int = 3,
+        agentic_max_retry_seconds: int = 1200,
         agentic_cache_dir: str | Path | None = None,
         include_code_snippets: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -1206,6 +1208,8 @@ class ScanPipeline:
         self.agentic_concurrency = agentic_concurrency
         self.agentic_fast_model = agentic_fast_model
         self.agentic_timeout = agentic_timeout
+        self.agentic_max_consecutive_failures = agentic_max_consecutive_failures
+        self.agentic_max_retry_seconds = agentic_max_retry_seconds
         self.agentic_cache_dir = (
             Path(agentic_cache_dir) if agentic_cache_dir is not None else None
         )
@@ -1514,6 +1518,8 @@ class ScanPipeline:
                     max_concurrent=self.agentic_concurrency,
                     fast_model=self.agentic_fast_model,
                     timeout_s=self.agentic_timeout,
+                    max_consecutive_failures=self.agentic_max_consecutive_failures,
+                    max_retry_seconds=self.agentic_max_retry_seconds,
                     cache_dir=self.agentic_cache_dir,
                     include_code_snippets=self.include_code_snippets,
                     agent_signature_catalog=agent_catalog,
