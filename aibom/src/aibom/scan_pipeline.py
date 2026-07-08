@@ -97,6 +97,7 @@ class PipelineResult:
     relationships: list[ComponentRelationship] = field(default_factory=list)
     agentic_risk_flags: list[Any] = field(default_factory=list)
     agentic_candidate_count: int = 0
+    agentic_degraded_count: int = 0
     env_index: CrossRefIndex | None = None
     pkg_index: CrossRefIndex | None = None
     external_deps: list[ExternalRepoDep] = field(default_factory=list)
@@ -1373,6 +1374,7 @@ class ScanPipeline:
             relationships=relationships,
             agentic_risk_flags=agentic_flags,
             agentic_candidate_count=agentic_count,
+            agentic_degraded_count=getattr(self, "_agentic_degraded_count", 0),
             env_index=env_idx,
             pkg_index=pkg_idx,
             external_deps=ext_deps,
@@ -1502,7 +1504,7 @@ class ScanPipeline:
         )
 
         try:
-            from .agentic.agent import run_agentic_enrichment
+            from .agentic.agent import _count_degraded, run_agentic_enrichment
         except ImportError as exc:
             raise ImportError(
                 "Agentic classification requires the agentic runtime. "
@@ -1567,6 +1569,10 @@ class ScanPipeline:
                     agent_signature_catalog=agent_catalog,
                 )
             )
+            # Count degraded components from the raw agentic output, before
+            # post-filters below may strip components (and their hints) from the
+            # BOM.
+            self._agentic_degraded_count = _count_degraded(enriched)
             deduped_ids = {c.instance_id for c in deduped}
             enriched_deduped_ids = {
                 c.instance_id for c in enriched if c.instance_id in deduped_ids

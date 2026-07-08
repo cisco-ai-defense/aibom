@@ -594,6 +594,21 @@ _RETRYABLE_HINTS = frozenset(
     }
 )
 
+# Degraded hints that indicate the provider/deployment couldn't keep up with the
+# offered load (timeouts, 429s, tripped circuit breaker, exhausted retry budget).
+# When these dominate a partial degradation, lowering --agentic-concurrency /
+# --agentic-rate-limit is the actionable remedy.
+_DEGRADED_LOAD_HINTS = frozenset(
+    {
+        "batch_timeout",
+        "rate_limited",
+        "provider_outage",
+        "circuit_breaker_tripped",
+        "retry_budget_exhausted",
+        "retry_failed",
+    }
+)
+
 
 def _classify_failure_hint(exc: Exception) -> str:
     """Classify a batch-invocation exception into a precise agentic hint.
@@ -1238,6 +1253,23 @@ def _all_batches_failed(
     if not considered:
         return False
     return all(c.agentic_hint for c in considered)
+
+
+def _count_degraded(components: list[AIComponent]) -> int:
+    """Number of components left degraded (a non-empty ``agentic_hint`` in the
+    agentic-output set marks a failed enrichment — same convention as
+    ``_all_batches_failed``). Successful enrichment clears the hint to ``""``.
+    """
+    return sum(1 for c in components if c.agentic_hint)
+
+
+def _dominant_degraded_hint(components: list[AIComponent]) -> str | None:
+    """Most common degraded ``agentic_hint`` among *components*, or ``None`` when
+    none are degraded. Used to pick the remediation message."""
+    from collections import Counter
+
+    hints = Counter(c.agentic_hint for c in components if c.agentic_hint)
+    return hints.most_common(1)[0][0] if hints else None
 
 
 def _coerce_structured(model: Any, messages: list[Any]) -> dict[str, Any] | None:
@@ -2590,6 +2622,23 @@ def run_agentic_enrichment(
             usage.prompt_tokens,
             usage.completion_tokens,
         )
+        degraded = _count_degraded(all_enriched)
+        if degraded:
+            dominant = _dominant_degraded_hint(all_enriched)
+            remedy = (
+                " Consider lowering --agentic-concurrency / --agentic-rate-limit "
+                "(or raising --agentic-timeout) if your provider is overloaded."
+                if dominant in _DEGRADED_LOAD_HINTS
+                else ""
+            )
+            _LOGGER.warning(
+                "%d component(s) left degraded after enrichment "
+                "(dominant hint: %s); the BOM may be incomplete for those "
+                "components.%s",
+                degraded,
+                dominant,
+                remedy,
+            )
 
     return all_components, all_rels, all_flags, usage
 

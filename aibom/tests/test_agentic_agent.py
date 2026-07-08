@@ -2246,6 +2246,123 @@ class TestAllBatchesFailed:
         assert "Agentic enrichment complete" not in caplog.text
 
 
+class TestPartialDegradedWarning:
+    """When SOME (but not all) components fail enrichment, the run still logs
+    'enrichment complete' — but must ALSO warn that N components were left
+    degraded, so a raised --agentic-concurrency/--agentic-rate-limit that
+    silently drops components does not read as a clean run."""
+
+    def _comp(self, iid, hint=""):
+        return AIComponent(
+            name=iid,
+            component_type=AIComponentType.MODEL,
+            file_path="a.py",
+            line_number=1,
+            instance_id=iid,
+            agentic_hint=hint,
+        )
+
+    def test_count_degraded_counts_only_hinted(self):
+        from aibom.agentic.agent import _count_degraded
+
+        comps = [
+            self._comp("c1", "batch_timeout"),
+            self._comp("c2", ""),
+            self._comp("c3", "retry_failed"),
+        ]
+        assert _count_degraded(comps) == 2
+
+    def test_count_degraded_zero_when_all_clean(self):
+        from aibom.agentic.agent import _count_degraded
+
+        comps = [self._comp("c1", ""), self._comp("c2", "")]
+        assert _count_degraded(comps) == 0
+
+    def test_dominant_degraded_hint_returns_most_common(self):
+        from aibom.agentic.agent import _dominant_degraded_hint
+
+        comps = [
+            self._comp("c1", "batch_timeout"),
+            self._comp("c2", "batch_timeout"),
+            self._comp("c3", "retry_failed"),
+            self._comp("c4", ""),
+        ]
+        assert _dominant_degraded_hint(comps) == "batch_timeout"
+
+    def test_dominant_degraded_hint_none_when_all_clean(self):
+        from aibom.agentic.agent import _dominant_degraded_hint
+
+        assert _dominant_degraded_hint([self._comp("c1", "")]) is None
+
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_run_warns_on_partial_degradation(self, mock_create, _mb, _mc, caplog):
+        """A run that enriches one component but leaves another degraded logs
+        BOTH 'enrichment complete' and a degraded-components warning."""
+        import logging
+
+        from aibom.agentic.agent import _DEGRADED_LOAD_HINTS, run_agentic_enrichment
+
+        # Batch 1 succeeds (discovers a component so the run is not a total
+        # failure); batch 2 raises -> its component is left degraded.
+        agent_response = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [
+                    {
+                        "name": "discovered",
+                        "component_type": "tool",
+                        "file_path": "b.py",
+                        "line_number": 2,
+                    }
+                ],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
+        good_msg = MagicMock()
+        good_msg.content = agent_response
+        mock_agent = MagicMock()
+        mock_agent.invoke.side_effect = [
+            {"messages": [good_msg]},
+            TimeoutError("batch 2 timed out"),
+        ]
+        mock_create.return_value = mock_agent
+
+        comps = [
+            AIComponent(
+                name="ok",
+                component_type=AIComponentType.AGENT,
+                file_path="b.py",
+                line_number=1,
+                instance_id="ok",
+            ),
+            AIComponent(
+                name="fails",
+                component_type=AIComponentType.AGENT,
+                file_path="b.py",
+                line_number=3,
+                instance_id="fails",
+            ),
+        ]
+        with caplog.at_level(logging.WARNING, logger="aibom.agentic.agent"):
+            run_agentic_enrichment(
+                model_string="m",
+                deterministic_components=comps,
+                deterministic_relationships=[],
+                scan_paths=["/tmp"],
+                batch_size=1,
+                timeout_s=5,
+                max_retry_seconds=0,
+            )
+
+        assert "left degraded" in caplog.text
+        # load-related hints belong to the remediation set
+        assert "batch_timeout" in _DEGRADED_LOAD_HINTS
+
+
 class TestDiscoveryWiringIsProviderAgnostic:
     """Bedrock/Anthropic (Opus 4.8) report 0 new components on every
     repo while the OpenAI path finds many. This asserts the discovery path IS

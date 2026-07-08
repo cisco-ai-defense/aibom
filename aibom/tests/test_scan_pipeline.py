@@ -265,6 +265,54 @@ class TestAgenticScope:
                 pipeline.run()
         assert mock_enrich.call_args.kwargs["max_retry_seconds"] == 42
 
+    def test_degraded_count_propagates_to_result(self, tmp_path: Path) -> None:
+        # A component left degraded by the agentic stage (non-empty
+        # agentic_hint) must be counted onto PipelineResult so the CLI can warn
+        # the operator the BOM may be incomplete.
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake", "api_base": "http://x"}
+        pipeline = ScanPipeline(scan_paths=[str(tmp_path)], llm_config=llm_cfg)
+        degraded = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path=str(tmp_path / "app.py"),
+            line_number=2,
+            model_name="gpt-4o",
+            agentic_hint="batch_timeout",
+        )
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = (
+                    [degraded],
+                    [],
+                    [],
+                    _stub_token_usage(),
+                )
+                result = pipeline.run()
+        assert result.agentic_degraded_count == 1
+
+    def test_degraded_count_zero_when_clean(self, tmp_path: Path) -> None:
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake", "api_base": "http://x"}
+        pipeline = ScanPipeline(scan_paths=[str(tmp_path)], llm_config=llm_cfg)
+        clean = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path=str(tmp_path / "app.py"),
+            line_number=2,
+            model_name="gpt-4o",
+            agentic_hint="",
+        )
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([clean], [], [], _stub_token_usage())
+                result = pipeline.run()
+        assert result.agentic_degraded_count == 0
+
 
 class TestFileCache:
     def test_cache_deduplicates(self, tmp_path: Path) -> None:

@@ -2032,6 +2032,14 @@ def analyze(
                 f"{len(result.agentic_risk_flags)} risk flags[/]"
             )
 
+        if llm_config and result.agentic_degraded_count:
+            console.print(
+                f"  [yellow]⚠ {result.agentic_degraded_count} component(s) left "
+                f"degraded — the BOM may be incomplete. If your provider is "
+                f"overloaded, lower --agentic-concurrency / --agentic-rate-limit "
+                f"or raise --agentic-timeout.[/]"
+            )
+
         _print_missing_repositories_panel(result)
 
         if timing and result.timings:
