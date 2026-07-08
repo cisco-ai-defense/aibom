@@ -138,6 +138,49 @@ class TestPipelineTiming:
 
 
 class TestAgenticScope:
+    def test_secrets_held_back_from_agentic_by_default(self) -> None:
+        """SECRET candidates are not sent to the LLM by default."""
+        from aibom.scan_pipeline import _partition_agentic_secrets
+
+        comps = [
+            AIComponent(
+                name="openai",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="app.py",
+                line_number=1,
+            ),
+            AIComponent(
+                name="base64_high_entropy_string",
+                component_type=AIComponentType.SECRET,
+                file_path="app.py",
+                line_number=2,
+            ),
+        ]
+        to_agentic, held = _partition_agentic_secrets(comps, review_secrets=False)
+        assert [c.name for c in to_agentic] == ["openai"]
+        assert [c.name for c in held] == ["base64_high_entropy_string"]
+
+    def test_secrets_sent_to_agentic_when_review_enabled(self) -> None:
+        from aibom.scan_pipeline import _partition_agentic_secrets
+
+        comps = [
+            AIComponent(
+                name="openai",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="app.py",
+                line_number=1,
+            ),
+            AIComponent(
+                name="sk-secret",
+                component_type=AIComponentType.SECRET,
+                file_path="app.py",
+                line_number=2,
+            ),
+        ]
+        to_agentic, held = _partition_agentic_secrets(comps, review_secrets=True)
+        assert len(to_agentic) == 2
+        assert held == []
+
     def test_all_components_sent_to_agent(self, tmp_path: Path) -> None:
         """All components are sent to the agent for classification."""
         (tmp_path / "app.py").write_text(

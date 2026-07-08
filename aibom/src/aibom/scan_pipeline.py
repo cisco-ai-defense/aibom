@@ -145,6 +145,29 @@ _CONTEXT_FREE_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _partition_agentic_secrets(
+    components: list["AIComponent"],
+    review_secrets: bool = False,
+) -> tuple[list["AIComponent"], list["AIComponent"]]:
+    """Split components into ``(to_agentic, held_back)``.
+
+    ``SECRET`` detections (e.g. detect-secrets high-entropy strings) are
+    false-positive-prone and are not a core AI component. By default they are
+    held back from the agentic LLM stage rather than spending frontier-LLM
+    budget adjudicating hundreds of high-entropy strings, which can be a
+    substantial cost on secret-heavy repos. Pass ``review_secrets=True`` to
+    route them through the agent as before.
+    """
+    if review_secrets:
+        return list(components), []
+    to_agentic: list["AIComponent"] = []
+    held: list["AIComponent"] = []
+    for c in components:
+        target = held if c.component_type == AIComponentType.SECRET else to_agentic
+        target.append(c)
+    return to_agentic, held
+
+
 def _dedup_for_agentic(
     components: list["AIComponent"],
 ) -> tuple[list["AIComponent"], dict[str, list["AIComponent"]]]:
@@ -1189,6 +1212,7 @@ class ScanPipeline:
         agentic_max_consecutive_failures: int = 3,
         agentic_max_retry_seconds: int = 1200,
         agentic_cache_dir: str | Path | None = None,
+        agentic_review_secrets: bool = False,
         include_code_snippets: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         custom_catalog: CustomCatalogConfig | None = None,
@@ -1214,6 +1238,7 @@ class ScanPipeline:
             Path(agentic_cache_dir) if agentic_cache_dir is not None else None
         )
         self.include_code_snippets = include_code_snippets
+        self.agentic_review_secrets = agentic_review_secrets
         self.progress_callback = progress_callback
         self.custom_catalog = custom_catalog
         self.atr_enrichment = atr_enrichment
@@ -1483,6 +1508,21 @@ class ScanPipeline:
             ) from exc
 
         try:
+            components, held_secrets = _partition_agentic_secrets(
+                components, review_secrets=self.agentic_review_secrets
+            )
+            if held_secrets:
+                # Held-back secrets are intentionally NOT merged back into the
+                # final BOM: the success path below returns the agentic-enriched
+                # set only. This preserves the prior post-agentic output, where
+                # the agent already pruned SECRET detections as false positives.
+                # Pass --agentic-review-secrets to route them through the agent
+                # (and keep any it confirms) instead.
+                _LOGGER.info(
+                    "Held %d secret candidate(s) back from the agentic stage "
+                    "(pass --agentic-review-secrets to include them).",
+                    len(held_secrets),
+                )
             deduped, fanout = _dedup_for_agentic(components)
             if len(deduped) < len(components):
                 _LOGGER.info(

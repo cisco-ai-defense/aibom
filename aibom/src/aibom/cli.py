@@ -292,6 +292,7 @@ def _scan_cache_settings(
     agentic_max_consecutive_failures: int,
     agentic_max_retry_seconds: int,
     include_code_snippets: bool,
+    agentic_review_secrets: bool,
     container_tier: str,
     custom_catalog: Optional[Path],
     atr_enrichment: bool,
@@ -319,6 +320,7 @@ def _scan_cache_settings(
         "agentic_max_consecutive_failures": agentic_max_consecutive_failures,
         "agentic_max_retry_seconds": agentic_max_retry_seconds,
         "include_code_snippets": include_code_snippets,
+        "agentic_review_secrets": agentic_review_secrets,
         "container_tier": container_tier,
         "custom_catalog": _file_cache_fingerprint(custom_catalog),
         # ATR enrichment changes the output shape (security_enrichment metadata /
@@ -1474,6 +1476,17 @@ def analyze(
             "sustains it — a higher rate risks HTTP 429s."
         ),
     ),
+    agentic_review_secrets: bool = typer.Option(
+        False,
+        "--agentic-review-secrets",
+        envvar="AIBOM_AGENTIC_REVIEW_SECRETS",
+        help=(
+            "Send secret/high-entropy-string detections through the agentic LLM "
+            "for adjudication. Off by default: secrets are false-positive-prone "
+            "and not a core AI component, so they are held back from the LLM to "
+            "save cost."
+        ),
+    ),
     agentic_fast_model: Optional[str] = typer.Option(
         None,
         "--agentic-fast-model",
@@ -1829,6 +1842,7 @@ def analyze(
         agentic_max_consecutive_failures=agentic_max_consecutive_failures,
         agentic_max_retry_seconds=agentic_max_retry_seconds,
         include_code_snippets=include_code_snippets,
+        agentic_review_secrets=agentic_review_secrets,
         container_tier=container_tier,
         custom_catalog=custom_catalog,
         atr_enrichment=atr_enrichment,
@@ -2005,6 +2019,7 @@ def analyze(
             agentic_max_retry_seconds=agentic_max_retry_seconds,
             agentic_cache_dir=agentic_cache_dir,
             include_code_snippets=include_code_snippets,
+            agentic_review_secrets=agentic_review_secrets,
             custom_catalog=explicit_config,
             atr_enrichment=atr_enrichment,
         )
