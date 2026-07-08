@@ -24,12 +24,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - language: actions
+            build-mode: none
           - language: python
             build-mode: none
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
