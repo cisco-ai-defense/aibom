@@ -292,6 +292,7 @@ def _scan_cache_settings(
     include_code_snippets: bool,
     container_tier: str,
     custom_catalog: Optional[Path],
+    atr_enrichment: bool,
 ) -> Dict[str, Any]:
     """Build a stable settings payload for persistent scan-cache keys."""
     safe_llm = None
@@ -314,6 +315,11 @@ def _scan_cache_settings(
         "include_code_snippets": include_code_snippets,
         "container_tier": container_tier,
         "custom_catalog": _file_cache_fingerprint(custom_catalog),
+        # ATR enrichment changes the output shape (security_enrichment metadata /
+        # ATR tags), so it MUST namespace the cache key — otherwise a cached
+        # default run is served to an --atr-enrichment run (tags suppressed) and
+        # a cached enriched run leaks security_enrichment into default output.
+        "atr_enrichment": atr_enrichment,
     }
 
 
@@ -1719,6 +1725,7 @@ def analyze(
         include_code_snippets=include_code_snippets,
         container_tier=container_tier,
         custom_catalog=custom_catalog,
+        atr_enrichment=atr_enrichment,
     )
     agentic_cache_dir = resolve_cache_type_dir("agentic", cache_root)
 
@@ -1822,7 +1829,17 @@ def analyze(
 
         scan_path = str(path_to_analyze)
 
-        if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
+        # The org cache is keyed on (repo path, HEAD sha) with no settings, so it
+        # cannot distinguish an enriched result from a default one. Rather than
+        # widen its key, skip it entirely when ATR enrichment is on: enriched
+        # runs never read a default entry (no suppressed tags) and never store an
+        # enriched entry (no leak into default-off output).
+        if (
+            skip_unchanged
+            and not is_container
+            and not atr_enrichment
+            and (path_to_analyze / ".git").exists()
+        ):
             from .incremental import OrgCache
 
             org_cache = OrgCache()
@@ -1909,7 +1926,12 @@ def analyze(
                 _serializable_scan_cache_payload(result),
             )
 
-        if skip_unchanged and not is_container and (path_to_analyze / ".git").exists():
+        if (
+            skip_unchanged
+            and not is_container
+            and not atr_enrichment
+            and (path_to_analyze / ".git").exists()
+        ):
             from .incremental import OrgCache
             from .models import ScanResult, SourceResult
 
