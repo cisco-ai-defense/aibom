@@ -29,7 +29,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aibom.agentic.agent import _build_context_message, _extract_structured_response
+from aibom.agentic.agent import (
+    _build_context_message,
+    _build_rate_limiter,
+    _extract_structured_response,
+)
 from aibom.models import (
     AIComponent,
     AIComponentType,
@@ -2469,3 +2473,50 @@ class TestStructuredOutputCapabilityGate:
             )
             is None
         )
+
+
+@pytest.mark.skipif(
+    not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+)
+class TestRateLimiterConfig:
+    """The agentic request rate must be configurable, default 1/sec."""
+
+    def test_defaults_unchanged(self):
+        rl = _build_rate_limiter()
+        assert rl.requests_per_second == 1.0
+        assert rl.max_bucket_size == 10
+
+    def test_accepts_configured_rate_and_bucket(self):
+        rl = _build_rate_limiter(requests_per_second=5.0, max_bucket_size=20)
+        assert rl.requests_per_second == 5.0
+        assert rl.max_bucket_size == 20
+
+    def test_build_model_threads_rate_from_llm_config(self, monkeypatch):
+        from aibom.agentic.agent import _build_model
+
+        captured = {}
+
+        def fake_build_chat_model(model_string, **kwargs):
+            captured["rate_limiter"] = kwargs.get("rate_limiter")
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "aibom.llm_factory.build_chat_model", fake_build_chat_model
+        )
+        _build_model("gpt-5.5", {"rate_limit_rps": 5.0})
+        assert captured["rate_limiter"].requests_per_second == 5.0
+
+    def test_build_model_defaults_to_one_rps_when_unset(self, monkeypatch):
+        from aibom.agentic.agent import _build_model
+
+        captured = {}
+
+        def fake_build_chat_model(model_string, **kwargs):
+            captured["rate_limiter"] = kwargs.get("rate_limiter")
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "aibom.llm_factory.build_chat_model", fake_build_chat_model
+        )
+        _build_model("gpt-5.5", {})
+        assert captured["rate_limiter"].requests_per_second == 1.0

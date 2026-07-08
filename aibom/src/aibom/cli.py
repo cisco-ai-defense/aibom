@@ -1463,6 +1463,17 @@ def analyze(
         min=1,
         max=8,
     ),
+    agentic_rate_limit: float = typer.Option(
+        1.0,
+        "--agentic-rate-limit",
+        envvar="AIBOM_AGENTIC_RATE_LIMIT",
+        min=0.1,
+        help=(
+            "Client-side LLM request rate cap in requests/second (default 1.0). "
+            "Raise ONLY if you have confirmed your provider/deployment quota "
+            "sustains it — a higher rate risks HTTP 429s."
+        ),
+    ),
     agentic_fast_model: Optional[str] = typer.Option(
         None,
         "--agentic-fast-model",
@@ -1727,6 +1738,7 @@ def analyze(
             "api_base": llm_api_base,
             "api_version": llm_api_version,
             "reasoning": reasoning_choice,
+            "rate_limit_rps": agentic_rate_limit,
         }
         if llm_max_tokens is not None:
             llm_config["max_tokens"] = llm_max_tokens

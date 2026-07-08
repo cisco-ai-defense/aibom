@@ -301,7 +301,10 @@ class AgenticEnrichmentError(Exception):
     """Raised when the agentic enrichment pipeline fails."""
 
 
-def _build_rate_limiter() -> Any:
+def _build_rate_limiter(
+    requests_per_second: float = 1.0,
+    max_bucket_size: int = 10,
+) -> Any:
     """Return a client-side rate limiter for LLM calls.
 
     ``rate_limiter`` is a first-class field on LangChain's ``BaseChatModel``,
@@ -309,13 +312,18 @@ def _build_rate_limiter() -> Any:
     Ollama, etc.) without provider-specific branching.  It proactively
     throttles outgoing requests so the provider never sees a burst — preventing
     rate-limit errors rather than recovering from them after the fact.
+
+    ``requests_per_second`` / ``max_bucket_size`` default to a conservative
+    1 req/s (burst 10) — safe for the tightest provider quotas. Operators who
+    have confirmed a higher quota can raise the rate via ``--agentic-rate-limit``;
+    the default is intentionally left unchanged.
     """
     from langchain_core.rate_limiters import InMemoryRateLimiter
 
     return InMemoryRateLimiter(
-        requests_per_second=1.0,
+        requests_per_second=requests_per_second,
         check_every_n_seconds=0.1,
-        max_bucket_size=10,
+        max_bucket_size=max_bucket_size,
     )
 
 
@@ -327,7 +335,10 @@ def _build_model(
     from ..llm_factory import build_chat_model
 
     cfg = llm_config or {}
-    rate_limiter = _build_rate_limiter()
+    rate_limiter = _build_rate_limiter(
+        requests_per_second=cfg.get("rate_limit_rps") or 1.0,
+        max_bucket_size=cfg.get("rate_limit_bucket") or 10,
+    )
     return build_chat_model(
         model_string,
         provider=cfg.get("provider"),
