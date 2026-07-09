@@ -29,7 +29,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aibom.agentic.agent import _build_context_message, _extract_structured_response
+from aibom.agentic.agent import (
+    TokenUsage,
+    _build_context_message,
+    _build_rate_limiter,
+    _extract_structured_response,
+    _resolve_message_usage,
+)
 from aibom.models import (
     AIComponent,
     AIComponentType,
@@ -2240,6 +2246,123 @@ class TestAllBatchesFailed:
         assert "Agentic enrichment complete" not in caplog.text
 
 
+class TestPartialDegradedWarning:
+    """When SOME (but not all) components fail enrichment, the run still logs
+    'enrichment complete' — but must ALSO warn that N components were left
+    degraded, so a raised --agentic-concurrency/--agentic-rate-limit that
+    silently drops components does not read as a clean run."""
+
+    def _comp(self, iid, hint=""):
+        return AIComponent(
+            name=iid,
+            component_type=AIComponentType.MODEL,
+            file_path="a.py",
+            line_number=1,
+            instance_id=iid,
+            agentic_hint=hint,
+        )
+
+    def test_count_degraded_counts_only_hinted(self):
+        from aibom.agentic.agent import _count_degraded
+
+        comps = [
+            self._comp("c1", "batch_timeout"),
+            self._comp("c2", ""),
+            self._comp("c3", "retry_failed"),
+        ]
+        assert _count_degraded(comps) == 2
+
+    def test_count_degraded_zero_when_all_clean(self):
+        from aibom.agentic.agent import _count_degraded
+
+        comps = [self._comp("c1", ""), self._comp("c2", "")]
+        assert _count_degraded(comps) == 0
+
+    def test_dominant_degraded_hint_returns_most_common(self):
+        from aibom.agentic.agent import _dominant_degraded_hint
+
+        comps = [
+            self._comp("c1", "batch_timeout"),
+            self._comp("c2", "batch_timeout"),
+            self._comp("c3", "retry_failed"),
+            self._comp("c4", ""),
+        ]
+        assert _dominant_degraded_hint(comps) == "batch_timeout"
+
+    def test_dominant_degraded_hint_none_when_all_clean(self):
+        from aibom.agentic.agent import _dominant_degraded_hint
+
+        assert _dominant_degraded_hint([self._comp("c1", "")]) is None
+
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("aibom.agentic.agent.create_aibom_agent")
+    def test_run_warns_on_partial_degradation(self, mock_create, _mb, _mc, caplog):
+        """A run that enriches one component but leaves another degraded logs
+        BOTH 'enrichment complete' and a degraded-components warning."""
+        import logging
+
+        from aibom.agentic.agent import _DEGRADED_LOAD_HINTS, run_agentic_enrichment
+
+        # Batch 1 succeeds (discovers a component so the run is not a total
+        # failure); batch 2 raises -> its component is left degraded.
+        agent_response = json.dumps(
+            {
+                "enriched_components": [],
+                "new_components": [
+                    {
+                        "name": "discovered",
+                        "component_type": "tool",
+                        "file_path": "b.py",
+                        "line_number": 2,
+                    }
+                ],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+        )
+        good_msg = MagicMock()
+        good_msg.content = agent_response
+        mock_agent = MagicMock()
+        mock_agent.invoke.side_effect = [
+            {"messages": [good_msg]},
+            TimeoutError("batch 2 timed out"),
+        ]
+        mock_create.return_value = mock_agent
+
+        comps = [
+            AIComponent(
+                name="ok",
+                component_type=AIComponentType.AGENT,
+                file_path="b.py",
+                line_number=1,
+                instance_id="ok",
+            ),
+            AIComponent(
+                name="fails",
+                component_type=AIComponentType.AGENT,
+                file_path="b.py",
+                line_number=3,
+                instance_id="fails",
+            ),
+        ]
+        with caplog.at_level(logging.WARNING, logger="aibom.agentic.agent"):
+            run_agentic_enrichment(
+                model_string="m",
+                deterministic_components=comps,
+                deterministic_relationships=[],
+                scan_paths=["/tmp"],
+                batch_size=1,
+                timeout_s=5,
+                max_retry_seconds=0,
+            )
+
+        assert "left degraded" in caplog.text
+        # load-related hints belong to the remediation set
+        assert "batch_timeout" in _DEGRADED_LOAD_HINTS
+
+
 class TestDiscoveryWiringIsProviderAgnostic:
     """Bedrock/Anthropic (Opus 4.8) report 0 new components on every
     repo while the OpenAI path finds many. This asserts the discovery path IS
@@ -2469,3 +2592,102 @@ class TestStructuredOutputCapabilityGate:
             )
             is None
         )
+
+
+@pytest.mark.skipif(
+    not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+)
+class TestRateLimiterConfig:
+    """The agentic request rate must be configurable, default 1/sec."""
+
+    def test_defaults_unchanged(self):
+        rl = _build_rate_limiter()
+        assert rl.requests_per_second == 1.0
+        assert rl.max_bucket_size == 10
+
+    def test_accepts_configured_rate_and_bucket(self):
+        rl = _build_rate_limiter(requests_per_second=5.0, max_bucket_size=20)
+        assert rl.requests_per_second == 5.0
+        assert rl.max_bucket_size == 20
+
+    def test_build_model_threads_rate_from_llm_config(self, monkeypatch):
+        from aibom.agentic.agent import _build_model
+
+        captured = {}
+
+        def fake_build_chat_model(model_string, **kwargs):
+            captured["rate_limiter"] = kwargs.get("rate_limiter")
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "aibom.llm_factory.build_chat_model", fake_build_chat_model
+        )
+        _build_model("gpt-5.5", {"rate_limit_rps": 5.0})
+        assert captured["rate_limiter"].requests_per_second == 5.0
+
+    def test_build_model_defaults_to_one_rps_when_unset(self, monkeypatch):
+        from aibom.agentic.agent import _build_model
+
+        captured = {}
+
+        def fake_build_chat_model(model_string, **kwargs):
+            captured["rate_limiter"] = kwargs.get("rate_limiter")
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "aibom.llm_factory.build_chat_model", fake_build_chat_model
+        )
+        _build_model("gpt-5.5", {})
+        assert captured["rate_limiter"].requests_per_second == 1.0
+
+
+class TestCachedTokenAccounting:
+    """Cache-read tokens must be captured so prompt-cache savings
+    are measurable (Azure/OpenAI cache automatically for stable prompts)."""
+
+    def _msg(self, usage_metadata=None, response_metadata=None):
+        m = MagicMock()
+        m.usage_metadata = usage_metadata
+        m.response_metadata = response_metadata or {}
+        return m
+
+    def test_token_usage_sums_cached_tokens(self):
+        a = TokenUsage(prompt_tokens=100, cached_tokens=80)
+        b = TokenUsage(prompt_tokens=50, cached_tokens=30)
+        a.add(b)
+        assert a.cached_tokens == 110
+
+    def test_reads_cache_read_from_usage_metadata(self):
+        msg = self._msg(
+            usage_metadata={
+                "input_tokens": 12000,
+                "output_tokens": 40,
+                "total_tokens": 12040,
+                "input_token_details": {"cache_read": 8000},
+            }
+        )
+        prompt, completion, total, cached = _resolve_message_usage(msg)
+        assert prompt == 12000
+        assert cached == 8000
+
+    def test_reads_cached_tokens_from_response_metadata(self):
+        msg = self._msg(
+            response_metadata={
+                "token_usage": {
+                    "prompt_tokens": 5000,
+                    "completion_tokens": 20,
+                    "total_tokens": 5020,
+                    "prompt_tokens_details": {"cached_tokens": 3000},
+                }
+            }
+        )
+        prompt, completion, total, cached = _resolve_message_usage(msg)
+        assert prompt == 5000
+        assert cached == 3000
+
+    def test_no_cache_fields_yields_zero_cached(self):
+        msg = self._msg(
+            usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+        )
+        _, _, _, cached = _resolve_message_usage(msg)
+        assert cached == 0

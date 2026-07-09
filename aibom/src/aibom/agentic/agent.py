@@ -65,11 +65,16 @@ class TokenUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Subset of prompt_tokens served from the provider's prompt cache (cache
+    # read). Lets us measure prompt-caching savings — Azure/OpenAI cache stable
+    # prompts automatically, but the win is invisible without this.
+    cached_tokens: int = 0
 
     def add(self, other: "TokenUsage") -> None:
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens
         self.total_tokens += other.total_tokens
+        self.cached_tokens += other.cached_tokens
 
 
 _token_accumulator = TokenUsage()
@@ -87,6 +92,15 @@ def get_token_usage() -> TokenUsage:
 def _as_int(value: Any) -> int:
     """Coerce a token count to int, treating missing/invalid as 0."""
     return value if isinstance(value, int) else 0
+
+
+def _nested_int(d: Any, *path: str) -> int:
+    """Read a nested int (e.g. cache-read tokens), 0 if any level is missing."""
+    for key in path:
+        if not isinstance(d, dict):
+            return 0
+        d = d.get(key)
+    return _as_int(d)
 
 
 def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
@@ -114,8 +128,9 @@ def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
         prompt = _as_int(um.get("input_tokens"))
         completion = _as_int(um.get("output_tokens"))
         total = _as_int(um.get("total_tokens"))
+        cached = _nested_int(um, "input_token_details", "cache_read")
         if prompt or completion or total:
-            return prompt, completion, total or (prompt + completion)
+            return prompt, completion, total or (prompt + completion), cached
 
     rm = getattr(msg, "response_metadata", None)
     if isinstance(rm, dict):
@@ -124,25 +139,27 @@ def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
             prompt = _as_int(token_usage.get("prompt_tokens"))
             completion = _as_int(token_usage.get("completion_tokens"))
             total = _as_int(token_usage.get("total_tokens"))
+            cached = _nested_int(token_usage, "prompt_tokens_details", "cached_tokens")
             if prompt or completion or total:
-                return prompt, completion, total or (prompt + completion)
+                return prompt, completion, total or (prompt + completion), cached
 
         usage = rm.get("usage")
         if isinstance(usage, dict):
             prompt = _as_int(usage.get("input_tokens"))
             completion = _as_int(usage.get("output_tokens"))
             total = _as_int(usage.get("total_tokens"))
+            cached = _as_int(usage.get("cache_read_input_tokens"))
             if prompt or completion or total:
-                return prompt, completion, total or (prompt + completion)
+                return prompt, completion, total or (prompt + completion), cached
 
         metrics = rm.get("amazon-bedrock-invocationMetrics")
         if isinstance(metrics, dict):
             prompt = _as_int(metrics.get("inputTokenCount"))
             completion = _as_int(metrics.get("outputTokenCount"))
             if prompt or completion:
-                return prompt, completion, prompt + completion
+                return prompt, completion, prompt + completion, 0
 
-    return 0, 0, 0
+    return 0, 0, 0, 0
 
 
 def _accumulate_token_usage(result: Any) -> None:
@@ -154,7 +171,7 @@ def _accumulate_token_usage(result: Any) -> None:
     """
     messages = result.get("messages", []) if isinstance(result, dict) else []
     for msg in messages:
-        prompt, completion, total = _resolve_message_usage(msg)
+        prompt, completion, total, cached = _resolve_message_usage(msg)
         if not (prompt or completion or total):
             um = getattr(msg, "usage_metadata", None)
             rm = getattr(msg, "response_metadata", None)
@@ -170,6 +187,7 @@ def _accumulate_token_usage(result: Any) -> None:
         _token_accumulator.prompt_tokens += prompt
         _token_accumulator.completion_tokens += completion
         _token_accumulator.total_tokens += total
+        _token_accumulator.cached_tokens += cached
 
 
 class _EvidenceLocation(BaseModel):
@@ -301,7 +319,10 @@ class AgenticEnrichmentError(Exception):
     """Raised when the agentic enrichment pipeline fails."""
 
 
-def _build_rate_limiter() -> Any:
+def _build_rate_limiter(
+    requests_per_second: float = 1.0,
+    max_bucket_size: int = 10,
+) -> Any:
     """Return a client-side rate limiter for LLM calls.
 
     ``rate_limiter`` is a first-class field on LangChain's ``BaseChatModel``,
@@ -309,13 +330,18 @@ def _build_rate_limiter() -> Any:
     Ollama, etc.) without provider-specific branching.  It proactively
     throttles outgoing requests so the provider never sees a burst — preventing
     rate-limit errors rather than recovering from them after the fact.
+
+    ``requests_per_second`` / ``max_bucket_size`` default to a conservative
+    1 req/s (burst 10) — safe for the tightest provider quotas. Operators who
+    have confirmed a higher quota can raise the rate via ``--agentic-rate-limit``;
+    the default is intentionally left unchanged.
     """
     from langchain_core.rate_limiters import InMemoryRateLimiter
 
     return InMemoryRateLimiter(
-        requests_per_second=1.0,
+        requests_per_second=requests_per_second,
         check_every_n_seconds=0.1,
-        max_bucket_size=10,
+        max_bucket_size=max_bucket_size,
     )
 
 
@@ -327,7 +353,10 @@ def _build_model(
     from ..llm_factory import build_chat_model
 
     cfg = llm_config or {}
-    rate_limiter = _build_rate_limiter()
+    rate_limiter = _build_rate_limiter(
+        requests_per_second=cfg.get("rate_limit_rps") or 1.0,
+        max_bucket_size=cfg.get("rate_limit_bucket") or 10,
+    )
     return build_chat_model(
         model_string,
         provider=cfg.get("provider"),
@@ -562,6 +591,21 @@ _RETRYABLE_HINTS = frozenset(
         "provider_outage",
         "rate_limited",
         "structured_output_parse_error",
+    }
+)
+
+# Degraded hints that indicate the provider/deployment couldn't keep up with the
+# offered load (timeouts, 429s, tripped circuit breaker, exhausted retry budget).
+# When these dominate a partial degradation, lowering --agentic-concurrency /
+# --agentic-rate-limit is the actionable remedy.
+_DEGRADED_LOAD_HINTS = frozenset(
+    {
+        "batch_timeout",
+        "rate_limited",
+        "provider_outage",
+        "circuit_breaker_tripped",
+        "retry_budget_exhausted",
+        "retry_failed",
     }
 )
 
@@ -1209,6 +1253,23 @@ def _all_batches_failed(
     if not considered:
         return False
     return all(c.agentic_hint for c in considered)
+
+
+def _count_degraded(components: list[AIComponent]) -> int:
+    """Number of components left degraded (a non-empty ``agentic_hint`` in the
+    agentic-output set marks a failed enrichment — same convention as
+    ``_all_batches_failed``). Successful enrichment clears the hint to ``""``.
+    """
+    return sum(1 for c in components if c.agentic_hint)
+
+
+def _dominant_degraded_hint(components: list[AIComponent]) -> str | None:
+    """Most common degraded ``agentic_hint`` among *components*, or ``None`` when
+    none are degraded. Used to pick the remediation message."""
+    from collections import Counter
+
+    hints = Counter(c.agentic_hint for c in components if c.agentic_hint)
+    return hints.most_common(1)[0][0] if hints else None
 
 
 def _coerce_structured(model: Any, messages: list[Any]) -> dict[str, Any] | None:
@@ -2561,6 +2622,23 @@ def run_agentic_enrichment(
             usage.prompt_tokens,
             usage.completion_tokens,
         )
+        degraded = _count_degraded(all_enriched)
+        if degraded:
+            dominant = _dominant_degraded_hint(all_enriched)
+            remedy = (
+                " Consider lowering --agentic-concurrency / --agentic-rate-limit "
+                "(or raising --agentic-timeout) if your provider is overloaded."
+                if dominant in _DEGRADED_LOAD_HINTS
+                else ""
+            )
+            _LOGGER.warning(
+                "%d component(s) left degraded after enrichment "
+                "(dominant hint: %s); the BOM may be incomplete for those "
+                "components.%s",
+                degraded,
+                dominant,
+                remedy,
+            )
 
     return all_components, all_rels, all_flags, usage
 

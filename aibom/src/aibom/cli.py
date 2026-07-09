@@ -292,6 +292,7 @@ def _scan_cache_settings(
     agentic_max_consecutive_failures: int,
     agentic_max_retry_seconds: int,
     include_code_snippets: bool,
+    agentic_review_secrets: bool,
     container_tier: str,
     custom_catalog: Optional[Path],
     atr_enrichment: bool,
@@ -319,6 +320,7 @@ def _scan_cache_settings(
         "agentic_max_consecutive_failures": agentic_max_consecutive_failures,
         "agentic_max_retry_seconds": agentic_max_retry_seconds,
         "include_code_snippets": include_code_snippets,
+        "agentic_review_secrets": agentic_review_secrets,
         "container_tier": container_tier,
         "custom_catalog": _file_cache_fingerprint(custom_catalog),
         # ATR enrichment changes the output shape (security_enrichment metadata /
@@ -1463,6 +1465,28 @@ def analyze(
         min=1,
         max=8,
     ),
+    agentic_rate_limit: float = typer.Option(
+        1.0,
+        "--agentic-rate-limit",
+        envvar="AIBOM_AGENTIC_RATE_LIMIT",
+        min=0.1,
+        help=(
+            "Client-side LLM request rate cap in requests/second (default 1.0). "
+            "Raise ONLY if you have confirmed your provider/deployment quota "
+            "sustains it — a higher rate risks HTTP 429s."
+        ),
+    ),
+    agentic_review_secrets: bool = typer.Option(
+        False,
+        "--agentic-review-secrets",
+        envvar="AIBOM_AGENTIC_REVIEW_SECRETS",
+        help=(
+            "Send secret/high-entropy-string detections through the agentic LLM "
+            "for adjudication. Off by default: secrets are false-positive-prone "
+            "and not a core AI component, so they are held back from the LLM to "
+            "save cost."
+        ),
+    ),
     agentic_fast_model: Optional[str] = typer.Option(
         None,
         "--agentic-fast-model",
@@ -1727,6 +1751,7 @@ def analyze(
             "api_base": llm_api_base,
             "api_version": llm_api_version,
             "reasoning": reasoning_choice,
+            "rate_limit_rps": agentic_rate_limit,
         }
         if llm_max_tokens is not None:
             llm_config["max_tokens"] = llm_max_tokens
@@ -1796,6 +1821,7 @@ def analyze(
         "total_tokens": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
+        "cached_tokens": 0,
     }
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
@@ -1817,6 +1843,7 @@ def analyze(
         agentic_max_consecutive_failures=agentic_max_consecutive_failures,
         agentic_max_retry_seconds=agentic_max_retry_seconds,
         include_code_snippets=include_code_snippets,
+        agentic_review_secrets=agentic_review_secrets,
         container_tier=container_tier,
         custom_catalog=custom_catalog,
         atr_enrichment=atr_enrichment,
@@ -1993,6 +2020,7 @@ def analyze(
             agentic_max_retry_seconds=agentic_max_retry_seconds,
             agentic_cache_dir=agentic_cache_dir,
             include_code_snippets=include_code_snippets,
+            agentic_review_secrets=agentic_review_secrets,
             custom_catalog=explicit_config,
             atr_enrichment=atr_enrichment,
         )
@@ -2002,6 +2030,14 @@ def analyze(
             console.print(
                 f"  [magenta]Agentic enrichment added "
                 f"{len(result.agentic_risk_flags)} risk flags[/]"
+            )
+
+        if llm_config and result.agentic_degraded_count:
+            console.print(
+                f"  [yellow]⚠ {result.agentic_degraded_count} component(s) left "
+                f"degraded — the BOM may be incomplete. If your provider is "
+                f"overloaded, lower --agentic-concurrency / --agentic-rate-limit "
+                f"or raise --agentic-timeout.[/]"
             )
 
         _print_missing_repositories_panel(result)
@@ -2053,9 +2089,11 @@ def analyze(
         source_summary["prompt_tokens"] = result.prompt_tokens
         source_summary["completion_tokens"] = result.completion_tokens
         source_summary["total_tokens"] = result.total_tokens
+        source_summary["cached_tokens"] = result.cached_tokens
         run_metadata["total_tokens"] += result.total_tokens
         run_metadata["prompt_tokens"] += result.prompt_tokens
         run_metadata["completion_tokens"] += result.completion_tokens
+        run_metadata["cached_tokens"] += result.cached_tokens
         if source_summary["status"] == "in_progress":
             source_summary["status"] = "completed"
 

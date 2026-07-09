@@ -200,7 +200,13 @@ def _aibom_payload(
             "source_ref_canonical": attribution["source_ref_canonical"],
             "source_ref_version": attribution["source_ref_version"],
         }
-        for mk in ("elapsed_s", "prompt_tokens", "completion_tokens", "total_tokens"):
+        for mk in (
+            "elapsed_s",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cached_tokens",
+        ):
             val = detail.get(mk)
             if val is not None:
                 per_source_meta[mk] = val
