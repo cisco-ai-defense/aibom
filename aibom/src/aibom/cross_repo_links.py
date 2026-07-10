@@ -590,16 +590,25 @@ def _augment_env_index_with_image_env(
     ``source_path`` is set to the image's scan-path root so
     :func:`_repo_for_file` attributes it to that source. Returns the
     number of env vars added.
+
+    Security: image ``ENV`` values are frequently baked-in secrets (API
+    keys, tokens, DB passwords). Only the variable *name* is needed for
+    the binding signal, so the value is intentionally NOT stored — it
+    would otherwise flow into ``CrossRepoLink.resolved_value`` and be
+    emitted verbatim by the JSON reporter / ``--post-url``. Repo-config
+    producers are inserted first (via :func:`build_env_index`), so when a
+    var also has a non-image producer that real value still wins for
+    ``resolved_value``; an image-only var resolves to empty.
     """
     added = 0
     for scan_path, meta in source_metadata.items():
         image_env = meta.get("image_env") or {}
         if not isinstance(image_env, dict):
             continue
-        for name, value in image_env.items():
+        for name in image_env:
             env_index.env.setdefault(str(name), []).append(EnvVarEntry(
                 name=str(name),
-                value="" if value is None else str(value),
+                value="",  # redacted: never surface a baked image-ENV secret
                 source_type="image-env",
                 source_path=scan_path,
             ))

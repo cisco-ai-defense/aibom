@@ -1922,61 +1922,89 @@ def analyze(
         else:
             deferred_extraction_dirs.append(td)
 
-    for source in sources_to_process:
-        console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
-        temp_dir = None
-        clone_ctx = None
+    try:
+        for source in sources_to_process:
+            console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
+            temp_dir = None
+            clone_ctx = None
 
-        from .multi_repo import ClonedRepo, is_git_url
+            from .multi_repo import ClonedRepo, is_git_url
 
-        is_git = is_git_url(source)
-        if is_git:
-            is_container = False
-        else:
-            is_container = is_container_image(source)
+            is_git = is_git_url(source)
+            if is_git:
+                is_container = False
+            else:
+                is_container = is_container_image(source)
 
-        source_summary = {
-            "source_kind": (
-                "git-url" if is_git else "container" if is_container else "local-path"
-            ),
-            "status": "in_progress",
-            "status_detail": None,
-            "assets_discovered": 0,
-            "branches_scanned": None,
-            "last_generated_at": None,
-            "errors": [],
-            "source_name": str(source),
-            "source_path": str(source),
-        }
-        source_outcomes[source] = source_summary
+            source_summary = {
+                "source_kind": (
+                    "git-url" if is_git else "container" if is_container else "local-path"
+                ),
+                "status": "in_progress",
+                "status_detail": None,
+                "assets_discovered": 0,
+                "branches_scanned": None,
+                "last_generated_at": None,
+                "errors": [],
+                "source_name": str(source),
+                "source_path": str(source),
+            }
+            source_outcomes[source] = source_summary
 
-        if is_git:
-            try:
-                clone_ctx = ClonedRepo(source)
-                cloned_path = clone_ctx.__enter__()
-                clone_managers.append(clone_ctx)
-                path_to_analyze = cloned_path
-            except RuntimeError as exc:
-                message = f"Clone failed: {exc}"
-                console.print(f"[red]{message}[/]")
-                _record_analysis_error(
-                    run_errors,
-                    source_summary,
-                    source,
-                    message,
-                    severity="fatal",
+            if is_git:
+                try:
+                    clone_ctx = ClonedRepo(source)
+                    cloned_path = clone_ctx.__enter__()
+                    clone_managers.append(clone_ctx)
+                    path_to_analyze = cloned_path
+                except RuntimeError as exc:
+                    message = f"Clone failed: {exc}"
+                    console.print(f"[red]{message}[/]")
+                    _record_analysis_error(
+                        run_errors,
+                        source_summary,
+                        source,
+                        message,
+                        severity="fatal",
+                    )
+                    continue
+            else:
+                path_to_analyze = Path(source)
+
+            if is_container:
+                logging.info(f"Source '{source}' detected as a container image.")
+                extraction = extract_source_from_image(
+                    source, llm_config=llm_config, tier=container_tier
                 )
-                continue
-        else:
-            path_to_analyze = Path(source)
+                if extraction.error or extraction.extracted_dir is None:
+                    message = f"Error extracting from container image: {extraction.error or 'unknown'}"
+                    logging.error(message)
+                    _record_analysis_error(
+                        run_errors,
+                        source_summary,
+                        source,
+                        message,
+                        severity="fatal",
+                    )
+                    continue
+                temp_dir = str(extraction.extracted_dir)
+                path_to_analyze = extraction.extracted_dir
 
-        if is_container:
-            logging.info(f"Source '{source}' detected as a container image.")
-            extraction = extract_source_from_image(
-                source, llm_config=llm_config, tier=container_tier
-            )
-            if extraction.error or extraction.extracted_dir is None:
-                message = f"Error extracting from container image: {extraction.error or 'unknown'}"
+            if is_container:
+                source_summary["source_path"] = (
+                    "/app" if path_to_analyze.name == "app" else str(path_to_analyze)
+                )
+                source_summary["source_name"] = str(source)
+            else:
+                source_summary["source_path"] = str(path_to_analyze.resolve())
+                from .reporters.json_reporter import _friendly_source_name
+
+                source_summary["source_name"] = _friendly_source_name(
+                    str(path_to_analyze.resolve())
+                )
+
+            if not path_to_analyze.exists():
+                message = f"Path or image '{source}' not found or could not be processed."
                 logging.error(message)
                 _record_analysis_error(
                     run_errors,
@@ -1985,602 +2013,576 @@ def analyze(
                     message,
                     severity="fatal",
                 )
+                if temp_dir:
+                    shutil.rmtree(temp_dir)
                 continue
-            temp_dir = str(extraction.extracted_dir)
-            path_to_analyze = extraction.extracted_dir
 
-        if is_container:
-            source_summary["source_path"] = (
-                "/app" if path_to_analyze.name == "app" else str(path_to_analyze)
-            )
-            source_summary["source_name"] = str(source)
-        else:
-            source_summary["source_path"] = str(path_to_analyze.resolve())
-            from .reporters.json_reporter import _friendly_source_name
+            from .scan_pipeline import ScanPipeline
 
-            source_summary["source_name"] = _friendly_source_name(
-                str(path_to_analyze.resolve())
-            )
+            scan_path = str(path_to_analyze)
 
-        if not path_to_analyze.exists():
-            message = f"Path or image '{source}' not found or could not be processed."
-            logging.error(message)
-            _record_analysis_error(
-                run_errors,
-                source_summary,
-                source,
-                message,
-                severity="fatal",
-            )
-            if temp_dir:
-                shutil.rmtree(temp_dir)
-            continue
-
-        from .scan_pipeline import ScanPipeline
-
-        scan_path = str(path_to_analyze)
-
-        # Record the source → real-disk-path mapping and per-source image
-        # metadata so cross-source correlation (after the loop) can index the
-        # actual filesystem and reason about base image / SBOM / baked ENV.
-        source_to_scan_path[source] = scan_path
-        if is_container:
-            _img_cfg = extraction.config
-            source_image_meta[source] = {
-                "kind": "container",
-                "source_name": str(source),
-                "base_image": extraction.base_image,
-                "sbom_packages": list(extraction.sbom_packages),
-                "image_env": dict(_img_cfg.env) if _img_cfg else {},
-                "source_repo_url": extraction.source_repo_url,
-                # A container has no git identity of its own; its provenance is
-                # source_repo_url (the OCI source label), handled separately.
-                "repo_url": "",
-            }
-        else:
-            # Resolve the source's git remote so a locally-scanned checkout is
-            # recognized as "scanned" by the derived-from-repo advisory: for a
-            # git-URL source it is the URL itself; for a local path it is the
-            # checkout's origin remote (empty when the path is not a git tree).
-            if is_git:
-                _repo_url = str(source)
+            # Record the source → real-disk-path mapping and per-source image
+            # metadata so cross-source correlation (after the loop) can index the
+            # actual filesystem and reason about base image / SBOM / baked ENV.
+            source_to_scan_path[source] = scan_path
+            if is_container:
+                _img_cfg = extraction.config
+                source_image_meta[source] = {
+                    "kind": "container",
+                    "source_name": str(source),
+                    "base_image": extraction.base_image,
+                    "sbom_packages": list(extraction.sbom_packages),
+                    "image_env": dict(_img_cfg.env) if _img_cfg else {},
+                    "source_repo_url": extraction.source_repo_url,
+                    # A container has no git identity of its own; its provenance is
+                    # source_repo_url (the OCI source label), handled separately.
+                    "repo_url": "",
+                }
             else:
-                from .source_attribution import capture_git_remote
+                # Resolve the source's git remote so a locally-scanned checkout is
+                # recognized as "scanned" by the derived-from-repo advisory: for a
+                # git-URL source it is the URL itself; for a local path it is the
+                # checkout's origin remote (empty when the path is not a git tree).
+                if is_git:
+                    _repo_url = str(source)
+                else:
+                    from .source_attribution import capture_git_remote
 
-                _repo_url = capture_git_remote(scan_path) or ""
-            source_image_meta[source] = {
-                "kind": source_summary["source_kind"],
-                "source_name": str(source),
-                "base_image": "",
-                "sbom_packages": [],
-                "image_env": {},
-                "source_repo_url": "",
-                "repo_url": _repo_url,
-            }
+                    _repo_url = capture_git_remote(scan_path) or ""
+                source_image_meta[source] = {
+                    "kind": source_summary["source_kind"],
+                    "source_name": str(source),
+                    "base_image": "",
+                    "sbom_packages": [],
+                    "image_env": {},
+                    "source_repo_url": "",
+                    "repo_url": _repo_url,
+                }
 
-        # The org cache is keyed on (repo path, HEAD sha) with no settings, so it
-        # cannot distinguish an enriched result from a default one. Rather than
-        # widen its key, skip it entirely when ATR enrichment is on: enriched
-        # runs never read a default entry (no suppressed tags) and never store an
-        # enriched entry (no leak into default-off output).
-        if (
-            skip_unchanged
-            and not is_container
-            and not atr_enrichment
-            and (path_to_analyze / ".git").exists()
-        ):
-            from .incremental import OrgCache
+            # The org cache is keyed on (repo path, HEAD sha) with no settings, so it
+            # cannot distinguish an enriched result from a default one. Rather than
+            # widen its key, skip it entirely when ATR enrichment is on: enriched
+            # runs never read a default entry (no suppressed tags) and never store an
+            # enriched entry (no leak into default-off output).
+            if (
+                skip_unchanged
+                and not is_container
+                and not atr_enrichment
+                and (path_to_analyze / ".git").exists()
+            ):
+                from .incremental import OrgCache
 
-            org_cache = OrgCache()
-            cached_sr = org_cache.get_cached(str(path_to_analyze.resolve()))
-            if cached_sr is not None:
-                console.print(
-                    f"[green]Org cache hit[/] for {source} " f"(~/.aibom/cache/org)"
+                org_cache = OrgCache()
+                cached_sr = org_cache.get_cached(str(path_to_analyze.resolve()))
+                if cached_sr is not None:
+                    console.print(
+                        f"[green]Org cache hit[/] for {source} " f"(~/.aibom/cache/org)"
+                    )
+                    cached_v2_output = _v2_output_from_org_cache(cached_sr)
+                    all_analysis_outputs[source] = cached_v2_output
+                    source_summary["assets_discovered"] = len(
+                        cached_v2_output["components"]
+                    )
+                    source_summary["last_generated_at"] = _utcnow_iso()
+                    if source_summary["status"] == "in_progress":
+                        source_summary["status"] = "completed"
+                    _dispose_extraction(temp_dir)
+                    continue
+
+            _scan_cache_hit = False
+            if scan_cache_dir:
+                from .scan_cache import cache_key, load_cached
+
+                _ck = cache_key([scan_path], scan_cache_settings)
+                cached = load_cached(
+                    scan_cache_dir,
+                    _ck,
+                    search_dirs=scan_cache_read_dirs,
                 )
-                cached_v2_output = _v2_output_from_org_cache(cached_sr)
-                all_analysis_outputs[source] = cached_v2_output
-                source_summary["assets_discovered"] = len(
-                    cached_v2_output["components"]
-                )
-                source_summary["last_generated_at"] = _utcnow_iso()
-                if source_summary["status"] == "in_progress":
-                    source_summary["status"] = "completed"
-                _dispose_extraction(temp_dir)
-                continue
+                if cached:
+                    _scan_cache_hit = True
+                    console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
+                    all_analysis_outputs[source] = cached
+                    source_summary["assets_discovered"] = len(cached.get("components", []))
+                    source_summary["last_generated_at"] = _utcnow_iso()
+                    if source_summary["status"] == "in_progress":
+                        source_summary["status"] = "completed"
+                    _dispose_extraction(temp_dir)
+                    continue
 
-        _scan_cache_hit = False
-        if scan_cache_dir:
-            from .scan_cache import cache_key, load_cached
-
-            _ck = cache_key([scan_path], scan_cache_settings)
-            cached = load_cached(
-                scan_cache_dir,
-                _ck,
-                search_dirs=scan_cache_read_dirs,
-            )
-            if cached:
-                _scan_cache_hit = True
-                console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
-                all_analysis_outputs[source] = cached
-                source_summary["assets_discovered"] = len(cached.get("components", []))
-                source_summary["last_generated_at"] = _utcnow_iso()
-                if source_summary["status"] == "in_progress":
-                    source_summary["status"] = "completed"
-                _dispose_extraction(temp_dir)
-                continue
-
-        pipeline = ScanPipeline(
-            scan_paths=[scan_path],
-            output_format=output_format,
-            output_file=str(output_file) if output_file else None,
-            llm_config=llm_config,
-            fail_on=fail_on_severity,
-            min_severity=severity_filter,
-            strict=strict,
-            agentic_scope=agentic_scope,
-            agentic_batch_size=agentic_batch_size,
-            agentic_concurrency=agentic_concurrency,
-            agentic_fast_model=agentic_fast_model,
-            agentic_timeout=agentic_timeout,
-            agentic_max_consecutive_failures=agentic_max_consecutive_failures,
-            agentic_max_retry_seconds=agentic_max_retry_seconds,
-            agentic_cache_dir=agentic_cache_dir,
-            include_code_snippets=include_code_snippets,
-            agentic_review_secrets=agentic_review_secrets,
-            custom_catalog=explicit_config,
-            atr_enrichment=atr_enrichment,
-        )
-        result = _run_pipeline_with_progress(source, pipeline, progress)
-
-        if llm_config and result.agentic_risk_flags:
-            console.print(
-                f"  [magenta]Agentic enrichment added "
-                f"{len(result.agentic_risk_flags)} risk flags[/]"
-            )
-
-        if llm_config and result.agentic_degraded_count:
-            console.print(
-                f"  [yellow]⚠ {result.agentic_degraded_count} component(s) left "
-                f"degraded — the BOM may be incomplete. If your provider is "
-                f"overloaded, lower --agentic-concurrency / --agentic-rate-limit "
-                f"or raise --agentic-timeout.[/]"
-            )
-
-        _print_missing_repositories_panel(result)
-
-        if timing and result.timings:
-            _print_timing_table(console, result)
-
-        output_data = _v2_output_from_pipeline_result(result)
-        all_analysis_outputs[source] = output_data
-
-        if scan_cache_dir and not _scan_cache_hit:
-            from .scan_cache import cache_key, save_cached
-
-            _ck = cache_key([scan_path], scan_cache_settings)
-            save_cached(
-                scan_cache_dir,
-                _ck,
-                _serializable_scan_cache_payload(result),
-            )
-
-        if (
-            skip_unchanged
-            and not is_container
-            and not atr_enrichment
-            and (path_to_analyze / ".git").exists()
-        ):
-            from .incremental import OrgCache
-            from .models import ScanResult, SourceResult
-
-            org_cache = OrgCache()
-            org_cache.store(
-                str(path_to_analyze.resolve()),
-                ScanResult(
-                    metadata=run_metadata,
-                    sources=[
-                        SourceResult(
-                            path=scan_path,
-                            components=result.components,
-                            relationships=result.relationships,
-                        )
-                    ],
-                    errors=[],
-                ),
-            )
-
-        source_summary["assets_discovered"] = len(result.components)
-        source_summary["last_generated_at"] = _utcnow_iso()
-        source_summary["elapsed_s"] = round(result.total_elapsed_s, 2)
-        source_summary["prompt_tokens"] = result.prompt_tokens
-        source_summary["completion_tokens"] = result.completion_tokens
-        source_summary["total_tokens"] = result.total_tokens
-        source_summary["cached_tokens"] = result.cached_tokens
-        run_metadata["total_tokens"] += result.total_tokens
-        run_metadata["prompt_tokens"] += result.prompt_tokens
-        run_metadata["completion_tokens"] += result.completion_tokens
-        run_metadata["cached_tokens"] += result.cached_tokens
-        if source_summary["status"] == "in_progress":
-            source_summary["status"] = "completed"
-
-        _dispose_extraction(temp_dir)
-
-    run_metadata["completed_at"] = _utcnow_iso()
-    run_metadata["error_count"] = len(run_errors)
-    run_metadata["sources_analyzed"] = len(source_outcomes)
-    sources_with_errors = sum(
-        1
-        for info in source_outcomes.values()
-        if info.get("status") in {"completed_with_errors", "failed"}
-    )
-    run_metadata["sources_with_errors"] = sources_with_errors
-    if any(info.get("status") == "failed" for info in source_outcomes.values()):
-        run_metadata["status"] = "failed"
-    elif run_errors:
-        run_metadata["status"] = "completed_with_errors"
-    else:
-        run_metadata["status"] = "completed"
-
-    v2_outputs = {
-        k: v
-        for k, v in all_analysis_outputs.items()
-        if isinstance(v, dict) and v.get("_v2")
-    }
-    _cross_repo_links: list = []
-    _cross_repo_risk_flags: list = []
-    _links_dropped = 0
-
-    if len(v2_outputs) > 1:
-        from .cross_repo_links import build_deterministic_cross_repo_links
-
-        # Correlate over REAL on-disk paths (extracted image dirs / clone
-        # dirs), not the raw source strings (image refs / git URLs). Without
-        # this re-keying the env / dependency indexers walk non-existent paths
-        # and env-var / shared-dependency links come back silently empty for
-        # image and remote-git sources (§18.5).
-        xrepo_results: dict[str, Any] = {}
-        disk_to_source: dict[str, str] = {}
-        xrepo_source_meta: dict[str, dict[str, Any]] = {}
-        for src, out in v2_outputs.items():
-            disk = source_to_scan_path.get(src, src)
-            xrepo_results[disk] = out
-            disk_to_source[disk] = src
-            if src in source_image_meta:
-                xrepo_source_meta[disk] = source_image_meta[src]
-        scan_paths_for_xrepo = list(xrepo_results.keys())
-        _cross_repo_links = build_deterministic_cross_repo_links(
-            xrepo_results,
-            scan_paths_for_xrepo,
-            xrepo_source_meta,
-        )
-        # Remap occurrence repo paths from internal disk paths back to the
-        # user-facing source names so reports never leak temp directories.
-        for _link in _cross_repo_links:
-            for _occ in _link.occurrences:
-                if _occ.repo_path in disk_to_source:
-                    _occ.repo_path = disk_to_source[_occ.repo_path]
-        if _cross_repo_links:
-            console.print(
-                f"  [magenta]Deterministic cross-source links: "
-                f"{len(_cross_repo_links)}[/]"
-            )
-
-    if llm_config and len(v2_outputs) > 1:
-        try:
-            extra_links, extra_flags = _cross_repo_llm_enrichment(
-                llm_config, v2_outputs
-            )
-            _cross_repo_links.extend(extra_links)
-            _cross_repo_risk_flags.extend(extra_flags)
-        except ImportError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Cross-repo coordination failed: %s", exc)
-
-    if _cross_repo_links:
-        from .cross_repo_links import (
-            _filter_intra_repo_links,
-            _filter_quality_bar,
-        )
-
-        before = len(_cross_repo_links)
-        _cross_repo_links = _filter_intra_repo_links(_cross_repo_links)
-        _cross_repo_links = _filter_quality_bar(_cross_repo_links)
-        _links_dropped = before - len(_cross_repo_links)
-        if _links_dropped:
-            console.print(
-                f"  [dim]Filtered {_links_dropped} intra-repo / low-quality "
-                f"cross-source links[/]"
-            )
-
-    # §18.6 cross-source observability: counters into run_metadata plus a
-    # one-line run-log summary and a console panel for multi-source runs.
-    if len(v2_outputs) > 1:
-        sources_by_kind: dict[str, int] = {}
-        for _meta in source_image_meta.values():
-            _k = _meta.get("kind", "unknown")
-            sources_by_kind[_k] = sources_by_kind.get(_k, 0) + 1
-        links_by_type: dict[str, int] = {}
-        for _link in _cross_repo_links:
-            _lt = _link.link_type.value
-            links_by_type[_lt] = links_by_type.get(_lt, 0) + 1
-        cross_source_stats = {
-            "sources_by_kind": sources_by_kind,
-            "links_total": len(_cross_repo_links),
-            "links_by_type": links_by_type,
-            "links_dropped": _links_dropped,
-        }
-        run_metadata["cross_source_stats"] = cross_source_stats
-        _LOGGER.info(
-            "Cross-source summary: sources=%s, links=%d by_type=%s, dropped=%d",
-            sources_by_kind, len(_cross_repo_links), links_by_type, _links_dropped,
-        )
-        _print_cross_source_panel(console, cross_source_stats)
-
-    report_data = None
-    if output_format == "json" and component_summary:
-        from .reporters.json_reporter import JsonReporter
-
-        reporter: Optional[Any] = JsonReporter(include_component_summary=True)
-    else:
-        reporter = get_reporter(output_format)
-
-    from .finding_annotations import annotate_findings
-    from .models import AIComponent as V2Component
-    from .models import (
-        AIComponentType,
-    )
-    from .models import ComponentRelationship as V2Relationship
-    from .models import (
-        ScanResult,
-        SourceResult,
-    )
-    from .models.scan import RiskFlag
-    from .risk import RiskScorer
-
-    v2_sources = []
-    for source_path, output in all_analysis_outputs.items():
-        if isinstance(output, dict) and output.get("_v2"):
-            comps = [
-                V2Component.model_validate(c) if isinstance(c, dict) else c
-                for c in output["components"]
-            ]
-            rels = [
-                V2Relationship.model_validate(r) if isinstance(r, dict) else r
-                for r in output["relationships"]
-            ]
-            comps, rels, _ = annotate_findings(
-                comps,
-                rels,
-                [],
+            pipeline = ScanPipeline(
+                scan_paths=[scan_path],
+                output_format=output_format,
+                output_file=str(output_file) if output_file else None,
+                llm_config=llm_config,
+                fail_on=fail_on_severity,
+                min_severity=severity_filter,
+                strict=strict,
+                agentic_scope=agentic_scope,
+                agentic_batch_size=agentic_batch_size,
+                agentic_concurrency=agentic_concurrency,
+                agentic_fast_model=agentic_fast_model,
+                agentic_timeout=agentic_timeout,
+                agentic_max_consecutive_failures=agentic_max_consecutive_failures,
+                agentic_max_retry_seconds=agentic_max_retry_seconds,
+                agentic_cache_dir=agentic_cache_dir,
                 include_code_snippets=include_code_snippets,
-                allowed_roots=[source_path],
+                agentic_review_secrets=agentic_review_secrets,
+                custom_catalog=explicit_config,
+                atr_enrichment=atr_enrichment,
             )
-            v2_sources.append(
-                SourceResult(
-                    path=source_path,
-                    components=comps,
-                    relationships=rels,
+            result = _run_pipeline_with_progress(source, pipeline, progress)
+
+            if llm_config and result.agentic_risk_flags:
+                console.print(
+                    f"  [magenta]Agentic enrichment added "
+                    f"{len(result.agentic_risk_flags)} risk flags[/]"
                 )
-            )
-    run_metadata["source_outcomes"] = source_outcomes
-    scan_result = ScanResult(
-        metadata=run_metadata,
-        sources=v2_sources,
-        cross_repo_links=_cross_repo_links,
-        errors=[e.get("message", str(e)) for e in run_errors],
-    )
 
-    scorer = RiskScorer()
-    scan_result.risk = scorer.score(scan_result)
+            if llm_config and result.agentic_degraded_count:
+                console.print(
+                    f"  [yellow]⚠ {result.agentic_degraded_count} component(s) left "
+                    f"degraded — the BOM may be incomplete. If your provider is "
+                    f"overloaded, lower --agentic-concurrency / --agentic-rate-limit "
+                    f"or raise --agentic-timeout.[/]"
+                )
 
-    for output in all_analysis_outputs.values():
-        if isinstance(output, dict):
-            for rf in output.get("_agentic_risk_flags", []):
-                if isinstance(rf, RiskFlag):
-                    scan_result.risk.add_flag(rf)
-                elif isinstance(rf, dict):
-                    scan_result.risk.add_flag(RiskFlag.model_validate(rf))
+            _print_missing_repositories_panel(result)
 
-    for rf in _cross_repo_risk_flags:
-        if isinstance(rf, RiskFlag):
-            scan_result.risk.add_flag(rf)
-        elif isinstance(rf, dict):
-            scan_result.risk.add_flag(RiskFlag.model_validate(rf))
+            if timing and result.timings:
+                _print_timing_table(console, result)
 
-    _, _, annotated_risk_flags = annotate_findings(
-        [],
-        [],
-        scan_result.risk.flags,
-        include_code_snippets=include_code_snippets,
-        allowed_roots=list(all_analysis_outputs.keys()),
-    )
-    scan_result.risk.flags = annotated_risk_flags
+            output_data = _v2_output_from_pipeline_result(result)
+            all_analysis_outputs[source] = output_data
 
-    if compliance:
-        from .compliance import (
-            ComplianceFramework,
-            evaluate_compliance,
-            parse_compliance_cli_value,
+            if scan_cache_dir and not _scan_cache_hit:
+                from .scan_cache import cache_key, save_cached
+
+                _ck = cache_key([scan_path], scan_cache_settings)
+                save_cached(
+                    scan_cache_dir,
+                    _ck,
+                    _serializable_scan_cache_payload(result),
+                )
+
+            if (
+                skip_unchanged
+                and not is_container
+                and not atr_enrichment
+                and (path_to_analyze / ".git").exists()
+            ):
+                from .incremental import OrgCache
+                from .models import ScanResult, SourceResult
+
+                org_cache = OrgCache()
+                org_cache.store(
+                    str(path_to_analyze.resolve()),
+                    ScanResult(
+                        metadata=run_metadata,
+                        sources=[
+                            SourceResult(
+                                path=scan_path,
+                                components=result.components,
+                                relationships=result.relationships,
+                            )
+                        ],
+                        errors=[],
+                    ),
+                )
+
+            source_summary["assets_discovered"] = len(result.components)
+            source_summary["last_generated_at"] = _utcnow_iso()
+            source_summary["elapsed_s"] = round(result.total_elapsed_s, 2)
+            source_summary["prompt_tokens"] = result.prompt_tokens
+            source_summary["completion_tokens"] = result.completion_tokens
+            source_summary["total_tokens"] = result.total_tokens
+            source_summary["cached_tokens"] = result.cached_tokens
+            run_metadata["total_tokens"] += result.total_tokens
+            run_metadata["prompt_tokens"] += result.prompt_tokens
+            run_metadata["completion_tokens"] += result.completion_tokens
+            run_metadata["cached_tokens"] += result.cached_tokens
+            if source_summary["status"] == "in_progress":
+                source_summary["status"] = "completed"
+
+            _dispose_extraction(temp_dir)
+
+        run_metadata["completed_at"] = _utcnow_iso()
+        run_metadata["error_count"] = len(run_errors)
+        run_metadata["sources_analyzed"] = len(source_outcomes)
+        sources_with_errors = sum(
+            1
+            for info in source_outcomes.values()
+            if info.get("status") in {"completed_with_errors", "failed"}
         )
+        run_metadata["sources_with_errors"] = sources_with_errors
+        if any(info.get("status") == "failed" for info in source_outcomes.values()):
+            run_metadata["status"] = "failed"
+        elif run_errors:
+            run_metadata["status"] = "completed_with_errors"
+        else:
+            run_metadata["status"] = "completed"
 
-        parsed = parse_compliance_cli_value(compliance)
-        frameworks = list(ComplianceFramework) if parsed == "all" else [parsed]
-        for fw in frameworks:
-            report = evaluate_compliance(scan_result, fw)
-            ctable = Table(
-                title=f"Compliance — {fw.value}",
-                box=box.MINIMAL_DOUBLE_HEAD,
-                header_style="bold cyan",
+        v2_outputs = {
+            k: v
+            for k, v in all_analysis_outputs.items()
+            if isinstance(v, dict) and v.get("_v2")
+        }
+        _cross_repo_links: list = []
+        _cross_repo_risk_flags: list = []
+        _links_dropped = 0
+
+        if len(v2_outputs) > 1:
+            from .cross_repo_links import build_deterministic_cross_repo_links
+
+            # Correlate over REAL on-disk paths (extracted image dirs / clone
+            # dirs), not the raw source strings (image refs / git URLs). Without
+            # this re-keying the env / dependency indexers walk non-existent paths
+            # and env-var / shared-dependency links come back silently empty for
+            # image and remote-git sources (§18.5).
+            xrepo_results: dict[str, Any] = {}
+            disk_to_source: dict[str, str] = {}
+            xrepo_source_meta: dict[str, dict[str, Any]] = {}
+            for src, out in v2_outputs.items():
+                disk = source_to_scan_path.get(src, src)
+                xrepo_results[disk] = out
+                disk_to_source[disk] = src
+                if src in source_image_meta:
+                    xrepo_source_meta[disk] = source_image_meta[src]
+            scan_paths_for_xrepo = list(xrepo_results.keys())
+            _cross_repo_links = build_deterministic_cross_repo_links(
+                xrepo_results,
+                scan_paths_for_xrepo,
+                xrepo_source_meta,
             )
-            ctable.add_column("ID", style="dim")
-            ctable.add_column("Requirement")
-            ctable.add_column("Status")
-            ctable.add_column("Detail")
-            for row in report.results:
-                st = row.status
-                st_style = (
-                    "green"
-                    if st == "pass"
-                    else "yellow" if st == "not_applicable" else "red"
+            # Remap occurrence repo paths from internal disk paths back to the
+            # user-facing source names so reports never leak temp directories.
+            for _link in _cross_repo_links:
+                for _occ in _link.occurrences:
+                    if _occ.repo_path in disk_to_source:
+                        _occ.repo_path = disk_to_source[_occ.repo_path]
+            if _cross_repo_links:
+                console.print(
+                    f"  [magenta]Deterministic cross-source links: "
+                    f"{len(_cross_repo_links)}[/]"
                 )
-                ctable.add_row(
-                    row.requirement_id,
-                    row.title,
-                    f"[{st_style}]{st}[/{st_style}]",
-                    row.message,
+
+        if llm_config and len(v2_outputs) > 1:
+            try:
+                extra_links, extra_flags = _cross_repo_llm_enrichment(
+                    llm_config, v2_outputs
                 )
-            console.print(ctable)
-            summ = report.summary
-            sum_table = Table(box=box.SIMPLE, title=f"Summary — {fw.value}")
-            sum_table.add_column("Metric")
-            sum_table.add_column("Value", justify="right")
-            sum_table.add_row("Total requirements", str(summ["total_requirements"]))
-            sum_table.add_row("Passed", str(summ["passed"]))
-            sum_table.add_row("Failed", str(summ["failed"]))
-            sum_table.add_row("Not applicable", str(summ["not_applicable"]))
-            sum_table.add_row("Coverage %", f"{summ['coverage_pct']:.1f}")
-            console.print(sum_table)
+                _cross_repo_links.extend(extra_links)
+                _cross_repo_risk_flags.extend(extra_flags)
+            except ImportError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("Cross-repo coordination failed: %s", exc)
 
-    if policy:
-        from .policy import evaluate_policy, load_policy
-
-        pol = load_policy(Path(policy))
-        pr = evaluate_policy(pol, scan_result)
-        if pr.violations:
-            vtable = Table(
-                "Rule",
-                "Severity",
-                "Message",
-                title="Policy violations",
-                header_style="bold red",
-                box=box.MINIMAL_DOUBLE_HEAD,
+        if _cross_repo_links:
+            from .cross_repo_links import (
+                _filter_intra_repo_links,
+                _filter_quality_bar,
             )
-            for v in pr.violations:
-                extra = ""
-                if v.component_name:
-                    extra = f" ({v.component_name})"
-                if v.file_path:
-                    extra += f" @ {v.file_path}"
-                vtable.add_row(
-                    v.rule,
-                    v.severity.value,
-                    v.message + extra,
-                )
-            console.print(vtable)
-        if not pr.passed:
-            console.print("[bold red]Policy check failed.[/]")
-            raise typer.Exit(code=1)
 
-    if not reporter:
+            before = len(_cross_repo_links)
+            _cross_repo_links = _filter_intra_repo_links(_cross_repo_links)
+            _cross_repo_links = _filter_quality_bar(_cross_repo_links)
+            _links_dropped = before - len(_cross_repo_links)
+            if _links_dropped:
+                console.print(
+                    f"  [dim]Filtered {_links_dropped} intra-repo / low-quality "
+                    f"cross-source links[/]"
+                )
+
+        # §18.6 cross-source observability: counters into run_metadata plus a
+        # one-line run-log summary and a console panel for multi-source runs.
+        if len(v2_outputs) > 1:
+            sources_by_kind: dict[str, int] = {}
+            for _meta in source_image_meta.values():
+                _k = _meta.get("kind", "unknown")
+                sources_by_kind[_k] = sources_by_kind.get(_k, 0) + 1
+            links_by_type: dict[str, int] = {}
+            for _link in _cross_repo_links:
+                _lt = _link.link_type.value
+                links_by_type[_lt] = links_by_type.get(_lt, 0) + 1
+            cross_source_stats = {
+                "sources_by_kind": sources_by_kind,
+                "links_total": len(_cross_repo_links),
+                "links_by_type": links_by_type,
+                "links_dropped": _links_dropped,
+            }
+            run_metadata["cross_source_stats"] = cross_source_stats
+            _LOGGER.info(
+                "Cross-source summary: sources=%s, links=%d by_type=%s, dropped=%d",
+                sources_by_kind, len(_cross_repo_links), links_by_type, _links_dropped,
+            )
+            _print_cross_source_panel(console, cross_source_stats)
+
+        report_data = None
         if output_format == "json" and component_summary:
             from .reporters.json_reporter import JsonReporter
 
-            reporter = JsonReporter(include_component_summary=True)
+            reporter: Optional[Any] = JsonReporter(include_component_summary=True)
         else:
             reporter = get_reporter(output_format)
 
-    if reporter:
-        if validate:
-            errors = reporter.validate(scan_result)
-            if errors:
-                for err in errors:
-                    console.print(f"[yellow]Validation: {err}[/]")
-            else:
-                console.print("[green]Validation passed.[/]")
-
-        if output_file:
-            buf = io.StringIO()
-            reporter.render(scan_result, buf)
-            output_file.write_text(buf.getvalue(), encoding="utf-8")
-            console.print(f"[green]Report written to {output_file}[/]")
-        else:
-            reporter.render(scan_result, sys.stdout)
-
-    if fail_on_severity and scorer.should_fail(scan_result.risk, fail_on_severity):
-        console.print(
-            f"[bold red]Risk threshold exceeded: {scan_result.risk.severity.value} "
-            f">= {fail_on_severity.value}[/]"
+        from .finding_annotations import annotate_findings
+        from .models import AIComponent as V2Component
+        from .models import (
+            AIComponentType,
         )
-        raise typer.Exit(code=2)
+        from .models import ComponentRelationship as V2Relationship
+        from .models import (
+            ScanResult,
+            SourceResult,
+        )
+        from .models.scan import RiskFlag
+        from .risk import RiskScorer
 
-    if post_url and output_format == "json":
-        if component_summary:
-            from .reporters.json_reporter import JsonReporter
-
-            json_rep = JsonReporter(include_component_summary=True)
-        else:
-            json_rep = get_reporter("json")
-        if json_rep:
-            buf = io.StringIO()
-            json_rep.render(scan_result, buf)
-            report_data = json.loads(buf.getvalue())
-            try:
-                submission_payloads = _build_submission_payloads(
-                    report_data, source_outcomes
+        v2_sources = []
+        for source_path, output in all_analysis_outputs.items():
+            if isinstance(output, dict) and output.get("_v2"):
+                comps = [
+                    V2Component.model_validate(c) if isinstance(c, dict) else c
+                    for c in output["components"]
+                ]
+                rels = [
+                    V2Relationship.model_validate(r) if isinstance(r, dict) else r
+                    for r in output["relationships"]
+                ]
+                comps, rels, _ = annotate_findings(
+                    comps,
+                    rels,
+                    [],
+                    include_code_snippets=include_code_snippets,
+                    allowed_roots=[source_path],
                 )
-                logging.info("Sending %d report(s)", len(submission_payloads))
-                for submission_payload in submission_payloads:
-                    post_report_with_retries(
-                        post_url,
-                        submission_payload,
-                        api_key=ai_defense_api_key,
-                        verify_tls=post_verify_tls,
-                        timeout_seconds=post_timeout,
+                v2_sources.append(
+                    SourceResult(
+                        path=source_path,
+                        components=comps,
+                        relationships=rels,
                     )
-                logging.info("Report uploaded to %s", post_url)
-            except Exception as exc:  # noqa: BLE001
-                logging.error("Failed to POST report: %s", exc)
+                )
+        run_metadata["source_outcomes"] = source_outcomes
+        scan_result = ScanResult(
+            metadata=run_metadata,
+            sources=v2_sources,
+            cross_repo_links=_cross_repo_links,
+            errors=[e.get("message", str(e)) for e in run_errors],
+        )
+
+        scorer = RiskScorer()
+        scan_result.risk = scorer.score(scan_result)
+
+        for output in all_analysis_outputs.values():
+            if isinstance(output, dict):
+                for rf in output.get("_agentic_risk_flags", []):
+                    if isinstance(rf, RiskFlag):
+                        scan_result.risk.add_flag(rf)
+                    elif isinstance(rf, dict):
+                        scan_result.risk.add_flag(RiskFlag.model_validate(rf))
+
+        for rf in _cross_repo_risk_flags:
+            if isinstance(rf, RiskFlag):
+                scan_result.risk.add_flag(rf)
+            elif isinstance(rf, dict):
+                scan_result.risk.add_flag(RiskFlag.model_validate(rf))
+
+        _, _, annotated_risk_flags = annotate_findings(
+            [],
+            [],
+            scan_result.risk.flags,
+            include_code_snippets=include_code_snippets,
+            allowed_roots=list(all_analysis_outputs.keys()),
+        )
+        scan_result.risk.flags = annotated_risk_flags
+
+        if compliance:
+            from .compliance import (
+                ComplianceFramework,
+                evaluate_compliance,
+                parse_compliance_cli_value,
+            )
+
+            parsed = parse_compliance_cli_value(compliance)
+            frameworks = list(ComplianceFramework) if parsed == "all" else [parsed]
+            for fw in frameworks:
+                report = evaluate_compliance(scan_result, fw)
+                ctable = Table(
+                    title=f"Compliance — {fw.value}",
+                    box=box.MINIMAL_DOUBLE_HEAD,
+                    header_style="bold cyan",
+                )
+                ctable.add_column("ID", style="dim")
+                ctable.add_column("Requirement")
+                ctable.add_column("Status")
+                ctable.add_column("Detail")
+                for row in report.results:
+                    st = row.status
+                    st_style = (
+                        "green"
+                        if st == "pass"
+                        else "yellow" if st == "not_applicable" else "red"
+                    )
+                    ctable.add_row(
+                        row.requirement_id,
+                        row.title,
+                        f"[{st_style}]{st}[/{st_style}]",
+                        row.message,
+                    )
+                console.print(ctable)
+                summ = report.summary
+                sum_table = Table(box=box.SIMPLE, title=f"Summary — {fw.value}")
+                sum_table.add_column("Metric")
+                sum_table.add_column("Value", justify="right")
+                sum_table.add_row("Total requirements", str(summ["total_requirements"]))
+                sum_table.add_row("Passed", str(summ["passed"]))
+                sum_table.add_row("Failed", str(summ["failed"]))
+                sum_table.add_row("Not applicable", str(summ["not_applicable"]))
+                sum_table.add_row("Coverage %", f"{summ['coverage_pct']:.1f}")
+                console.print(sum_table)
+
+        if policy:
+            from .policy import evaluate_policy, load_policy
+
+            pol = load_policy(Path(policy))
+            pr = evaluate_policy(pol, scan_result)
+            if pr.violations:
+                vtable = Table(
+                    "Rule",
+                    "Severity",
+                    "Message",
+                    title="Policy violations",
+                    header_style="bold red",
+                    box=box.MINIMAL_DOUBLE_HEAD,
+                )
+                for v in pr.violations:
+                    extra = ""
+                    if v.component_name:
+                        extra = f" ({v.component_name})"
+                    if v.file_path:
+                        extra += f" @ {v.file_path}"
+                    vtable.add_row(
+                        v.rule,
+                        v.severity.value,
+                        v.message + extra,
+                    )
+                console.print(vtable)
+            if not pr.passed:
+                console.print("[bold red]Policy check failed.[/]")
                 raise typer.Exit(code=1)
 
-    if output_format == "api":
-        logging.info("--- Starting API Server ---")
-        component_map = {
-            source: getattr(output, "components", output)
-            for source, output in all_analysis_outputs.items()
-        }
-        start_api_server(component_map)
+        if not reporter:
+            if output_format == "json" and component_summary:
+                from .reporters.json_reporter import JsonReporter
 
-    for cm in clone_managers:
-        cm.__exit__(None, None, None)
+                reporter = JsonReporter(include_component_summary=True)
+            else:
+                reporter = get_reporter(output_format)
 
-    # Extracted container filesystems were retained through cross-source
-    # correlation; remove them now unless the operator asked to keep them.
-    if keep_extractions:
-        if deferred_extraction_dirs:
+        if reporter:
+            if validate:
+                errors = reporter.validate(scan_result)
+                if errors:
+                    for err in errors:
+                        console.print(f"[yellow]Validation: {err}[/]")
+                else:
+                    console.print("[green]Validation passed.[/]")
+
+            if output_file:
+                buf = io.StringIO()
+                reporter.render(scan_result, buf)
+                output_file.write_text(buf.getvalue(), encoding="utf-8")
+                console.print(f"[green]Report written to {output_file}[/]")
+            else:
+                reporter.render(scan_result, sys.stdout)
+
+        if fail_on_severity and scorer.should_fail(scan_result.risk, fail_on_severity):
             console.print(
-                f"  [dim]Kept {len(deferred_extraction_dirs)} extracted "
-                f"container filesystem(s) on disk (--keep-extractions):[/]"
+                f"[bold red]Risk threshold exceeded: {scan_result.risk.severity.value} "
+                f">= {fail_on_severity.value}[/]"
             )
-            for _d in deferred_extraction_dirs:
-                console.print(f"    [dim]{_d}[/]")
-    else:
-        for _d in deferred_extraction_dirs:
-            shutil.rmtree(_d, ignore_errors=True)
-    deferred_extraction_dirs.clear()
+            raise typer.Exit(code=2)
 
-    total_agentic = sum(
-        v.get("_agentic_candidate_count", 0)
-        for v in all_analysis_outputs.values()
-        if isinstance(v, dict)
-    )
-    if total_agentic > 0 and not llm_config:
-        console.print()
-        console.print(
-            Panel.fit(
-                f"[yellow bold]{total_agentic} detection(s) need agentic reasoning[/]\n\n"
-                "These are ambiguous patterns (e.g., model names in IaC values,\n"
-                ".fit() calls without ML imports, generic Agent/Tool usage)\n"
-                "that require LLM reasoning to confirm or discard.\n\n"
-                "[green]Re-run with --llm-model <model> to resolve them.[/]\n"
-                "[dim]Use --strict to suppress these from the report.[/]",
-                title="[bold]Agentic Reasoning Recommended[/]",
-                border_style="yellow",
-            )
+        if post_url and output_format == "json":
+            if component_summary:
+                from .reporters.json_reporter import JsonReporter
+
+                json_rep = JsonReporter(include_component_summary=True)
+            else:
+                json_rep = get_reporter("json")
+            if json_rep:
+                buf = io.StringIO()
+                json_rep.render(scan_result, buf)
+                report_data = json.loads(buf.getvalue())
+                try:
+                    submission_payloads = _build_submission_payloads(
+                        report_data, source_outcomes
+                    )
+                    logging.info("Sending %d report(s)", len(submission_payloads))
+                    for submission_payload in submission_payloads:
+                        post_report_with_retries(
+                            post_url,
+                            submission_payload,
+                            api_key=ai_defense_api_key,
+                            verify_tls=post_verify_tls,
+                            timeout_seconds=post_timeout,
+                        )
+                    logging.info("Report uploaded to %s", post_url)
+                except Exception as exc:  # noqa: BLE001
+                    logging.error("Failed to POST report: %s", exc)
+                    raise typer.Exit(code=1)
+
+        if output_format == "api":
+            logging.info("--- Starting API Server ---")
+            component_map = {
+                source: getattr(output, "components", output)
+                for source, output in all_analysis_outputs.items()
+            }
+            start_api_server(component_map)
+
+
+        total_agentic = sum(
+            v.get("_agentic_candidate_count", 0)
+            for v in all_analysis_outputs.values()
+            if isinstance(v, dict)
         )
+        if total_agentic > 0 and not llm_config:
+            console.print()
+            console.print(
+                Panel.fit(
+                    f"[yellow bold]{total_agentic} detection(s) need agentic reasoning[/]\n\n"
+                    "These are ambiguous patterns (e.g., model names in IaC values,\n"
+                    ".fit() calls without ML imports, generic Agent/Tool usage)\n"
+                    "that require LLM reasoning to confirm or discard.\n\n"
+                    "[green]Re-run with --llm-model <model> to resolve them.[/]\n"
+                    "[dim]Use --strict to suppress these from the report.[/]",
+                    title="[bold]Agentic Reasoning Recommended[/]",
+                    border_style="yellow",
+                )
+            )
 
-    if show_summary:
-        _display_analysis_summary(all_analysis_outputs)
+        if show_summary:
+            _display_analysis_summary(all_analysis_outputs)
+    finally:
+        for cm in clone_managers:
+            cm.__exit__(None, None, None)
+
+        # Extracted container filesystems were retained through cross-source
+        # correlation; remove them now unless the operator asked to keep them.
+        if keep_extractions:
+            if deferred_extraction_dirs:
+                console.print(
+                    f"  [dim]Kept {len(deferred_extraction_dirs)} extracted "
+                    f"container filesystem(s) on disk (--keep-extractions):[/]"
+                )
+                for _d in deferred_extraction_dirs:
+                    console.print(f"    [dim]{_d}[/]")
+        else:
+            for _d in deferred_extraction_dirs:
+                shutil.rmtree(_d, ignore_errors=True)
+        deferred_extraction_dirs.clear()
 
 
 @app.command("watch")

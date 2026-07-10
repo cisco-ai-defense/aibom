@@ -45,11 +45,12 @@ class TestImageBakedEnvProducer:
                 "relationships": [],
             },
         }
+        secret = "sk-super-secret-baked-key"
         source_metadata = {
             str(img): {
                 "kind": "container",
                 "source_name": "svc:latest",
-                "image_env": {"MODEL_ENDPOINT_URL": "https://llm.internal"},
+                "image_env": {"MODEL_ENDPOINT_URL": secret},
                 "base_image": "",
                 "sbom_packages": [],
                 "source_repo_url": "",
@@ -67,6 +68,10 @@ class TestImageBakedEnvProducer:
         roles = {o.role for o in binding.occurrences}
         assert "producer" in roles
         assert "consumer" in roles
+        # Security: a baked image-ENV value must never surface in the emitted
+        # link (it would be serialized into the JSON report / --post-url output).
+        assert secret not in binding.resolved_value
+        assert secret not in binding.evidence
 
     def test_no_binding_without_image_env(self, tmp_path: Path) -> None:
         img = tmp_path / "img"
