@@ -30,11 +30,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aibom.agentic.agent import (
+    AgentEvidence,
+    AgentResponse,
     TokenUsage,
     _build_context_message,
     _build_rate_limiter,
+    _EnrichedComponent,
     _extract_structured_response,
     _resolve_message_usage,
+    _RiskFinding,
 )
 from aibom.models import (
     AIComponent,
@@ -2691,3 +2695,73 @@ class TestCachedTokenAccounting:
         )
         _, _, _, cached = _resolve_message_usage(msg)
         assert cached == 0
+
+
+class TestNullTolerantDefaults:
+    """LLMs routinely emit an explicit ``null`` for a field that has a default
+    instead of omitting it. Pydantic rejects ``null`` for a non-Optional
+    defaulted field, and because the whole batch is validated against a single
+    ``AgentResponse`` schema, one stray ``null`` would discard every component
+    in the batch and force a cooldown retry. The structured-output models must
+    coerce an explicit ``null`` on a defaulted field back to its default."""
+
+    def test_null_scalar_coerced_to_default(self):
+        ev = AgentEvidence(evidence_snippet=None, justification=None)
+        assert ev.evidence_snippet == ""
+        assert ev.justification == ""
+
+    def test_null_literal_coerced_to_default(self):
+        ev = AgentEvidence(pattern=None)
+        assert ev.pattern == "other"
+
+    def test_null_int_coerced_to_default(self):
+        ev = AgentEvidence(definition_start_line=None)
+        assert ev.definition_start_line == 0
+
+    def test_null_list_field_coerced_to_default(self):
+        resp = AgentResponse(enriched_components=None, risk_findings=None)
+        assert resp.enriched_components == []
+        assert resp.risk_findings == []
+
+    def test_null_dict_field_coerced_to_default(self):
+        comp = _EnrichedComponent(instance_id="x", updates=None)
+        assert comp.updates == {}
+
+    def test_explicitly_optional_field_still_accepts_none(self):
+        # ``model_name`` is genuinely ``str | None`` and its default is None,
+        # so an explicit null must be preserved, not coerced.
+        comp = _EnrichedComponent(instance_id="x", decision_annotation=None)
+        assert comp.decision_annotation is None
+
+    def test_provided_value_is_untouched(self):
+        finding = _RiskFinding(severity="high", flag="secret")
+        assert finding.severity == "high"
+        assert finding.flag == "secret"
+
+    def test_one_null_does_not_invalidate_whole_batch(self):
+        # A single component carrying a stray ``null`` must not discard the
+        # other components in the same batch response.
+        resp = AgentResponse.model_validate(
+            {
+                "risk_findings": [
+                    {"flag": "a", "severity": None},
+                    {"flag": "b", "severity": "high"},
+                ]
+            }
+        )
+        assert len(resp.risk_findings) == 2
+        assert resp.risk_findings[0].severity == "info"
+        assert resp.risk_findings[1].severity == "high"
+
+    def test_nested_null_in_batch_component_is_tolerated(self):
+        resp = AgentResponse.model_validate(
+            {
+                "enriched_components": [
+                    {
+                        "instance_id": "x",
+                        "agent_evidence": {"evidence_snippet": None},
+                    }
+                ]
+            }
+        )
+        assert resp.enriched_components[0].agent_evidence.evidence_snippet == ""
