@@ -82,6 +82,7 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 |--------|-------------|
 | `--custom-catalog` | Path to a custom catalog file (`.aibom.yaml`/`.yml`/`.json`). Auto-discovered from the source directory if not set. |
 | `--container-extraction-tier` | Force a container extraction tier: `auto`, `syft`, `docker`, `podman`, `nerdctl`, `buildah`, `crane`, `skopeo`, `tarball` (default `auto`). |
+| `--keep-extractions` / `--no-keep-extractions` | Keep extracted container filesystems on disk after the run for inspection, and force retention even on large multi-image runs. Extractions are always kept long enough for cross-source correlation regardless of this flag; runs of more than 20 sources otherwise clean them eagerly to protect temp space. Off by default. |
 | `--severity` | Minimum severity of findings to include (default `info`). |
 | `--strict` | Only emit high-confidence detections; suppress items needing agentic reasoning. |
 | `--fail-on` | Exit non-zero if risk severity meets or exceeds: `critical`, `high`, `medium`, `low`. |

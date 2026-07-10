@@ -145,6 +145,34 @@ def _utcnow_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+def _print_cross_source_panel(
+    console: "rich.console.Console",  # type: ignore[name-defined]
+    stats: dict,
+) -> None:
+    """Render the §18.6 cross-source correlation summary panel."""
+    sources_by_kind = stats.get("sources_by_kind", {})
+    links_by_type = stats.get("links_by_type", {})
+    lines: list[str] = []
+    src_bits = ", ".join(f"{k}={v}" for k, v in sorted(sources_by_kind.items()))
+    lines.append(f"Sources: {src_bits}" if src_bits else "Sources: (none)")
+    lines.append(f"Cross-source links: {stats.get('links_total', 0)}")
+    if links_by_type:
+        for lt, n in sorted(links_by_type.items()):
+            lines.append(f"  • {lt}: {n}")
+    else:
+        lines.append("  (no links detected)")
+    if stats.get("links_dropped"):
+        lines.append(f"Filtered (intra-source / low-quality): {stats['links_dropped']}")
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="Cross-Source Correlation",
+            border_style="magenta",
+            box=box.ROUNDED,
+        )
+    )
+
+
 def _print_timing_table(console: "rich.console.Console", result: "PipelineResult") -> None:  # type: ignore[name-defined]
     from .scanners import scanner_timings
 
@@ -1564,6 +1592,18 @@ def analyze(
         ),
         callback=lambda v: validate_tier(v),
     ),
+    keep_extractions: bool = typer.Option(
+        False,
+        "--keep-extractions/--no-keep-extractions",
+        help=(
+            "Keep extracted container filesystems on disk after the run instead "
+            "of deleting them. Extractions are always retained in memory long "
+            "enough for cross-source correlation; this flag additionally leaves "
+            "them on disk for inspection and forces retention even for large "
+            "multi-image runs (which otherwise auto-fall back to eager cleanup "
+            "to protect temp space)."
+        ),
+    ),
     cache_dir: Optional[Path] = typer.Option(
         None,
         "--cache-dir",
@@ -1852,6 +1892,36 @@ def analyze(
 
     clone_managers: list[Any] = []
 
+    # §18.5 multi-source correlation plumbing. Map each source to the real
+    # on-disk path the pipeline scanned (extracted dir for images, clone dir
+    # for git URLs, the path itself for local sources) and stash per-source
+    # image metadata (base image, SBOM, baked ENV, upstream repo). Container
+    # extractions are retained until after cross-source correlation instead of
+    # being deleted inside the loop. For very large multi-image runs we
+    # auto-fall back to eager cleanup to protect temp space, unless
+    # --keep-extractions forces retention.
+    source_to_scan_path: dict[str, str] = {}
+    source_image_meta: dict[str, dict[str, Any]] = {}
+    deferred_extraction_dirs: list[str] = []
+    eager_extraction_cleanup = (
+        len(sources_to_process) > 20 and not keep_extractions
+    )
+    if eager_extraction_cleanup:
+        console.print(
+            "  [yellow]>20 sources: extracted container filesystems are cleaned "
+            "eagerly, so cross-source correlation across images is limited. "
+            "Pass --keep-extractions to retain them.[/]"
+        )
+
+    def _dispose_extraction(td: Optional[str]) -> None:
+        """Delete an extracted image dir now, or defer it past correlation."""
+        if not td:
+            return
+        if eager_extraction_cleanup:
+            shutil.rmtree(td, ignore_errors=True)
+        else:
+            deferred_extraction_dirs.append(td)
+
     for source in sources_to_process:
         console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
         temp_dir = None
@@ -1950,6 +2020,30 @@ def analyze(
 
         scan_path = str(path_to_analyze)
 
+        # Record the source → real-disk-path mapping and per-source image
+        # metadata so cross-source correlation (after the loop) can index the
+        # actual filesystem and reason about base image / SBOM / baked ENV.
+        source_to_scan_path[source] = scan_path
+        if is_container:
+            _img_cfg = extraction.config
+            source_image_meta[source] = {
+                "kind": "container",
+                "source_name": str(source),
+                "base_image": extraction.base_image,
+                "sbom_packages": list(extraction.sbom_packages),
+                "image_env": dict(_img_cfg.env) if _img_cfg else {},
+                "source_repo_url": extraction.source_repo_url,
+            }
+        else:
+            source_image_meta[source] = {
+                "kind": source_summary["source_kind"],
+                "source_name": str(source),
+                "base_image": "",
+                "sbom_packages": [],
+                "image_env": {},
+                "source_repo_url": "",
+            }
+
         # The org cache is keyed on (repo path, HEAD sha) with no settings, so it
         # cannot distinguish an enriched result from a default one. Rather than
         # widen its key, skip it entirely when ATR enrichment is on: enriched
@@ -1977,8 +2071,7 @@ def analyze(
                 source_summary["last_generated_at"] = _utcnow_iso()
                 if source_summary["status"] == "in_progress":
                     source_summary["status"] = "completed"
-                if temp_dir:
-                    shutil.rmtree(temp_dir)
+                _dispose_extraction(temp_dir)
                 continue
 
         _scan_cache_hit = False
@@ -1999,8 +2092,7 @@ def analyze(
                 source_summary["last_generated_at"] = _utcnow_iso()
                 if source_summary["status"] == "in_progress":
                     source_summary["status"] = "completed"
-                if temp_dir:
-                    shutil.rmtree(temp_dir)
+                _dispose_extraction(temp_dir)
                 continue
 
         pipeline = ScanPipeline(
@@ -2097,8 +2189,7 @@ def analyze(
         if source_summary["status"] == "in_progress":
             source_summary["status"] = "completed"
 
-        if temp_dir:
-            shutil.rmtree(temp_dir)
+        _dispose_extraction(temp_dir)
 
     run_metadata["completed_at"] = _utcnow_iso()
     run_metadata["error_count"] = len(run_errors)
@@ -2123,18 +2214,40 @@ def analyze(
     }
     _cross_repo_links: list = []
     _cross_repo_risk_flags: list = []
+    _links_dropped = 0
 
     if len(v2_outputs) > 1:
         from .cross_repo_links import build_deterministic_cross_repo_links
 
-        scan_paths_for_xrepo = list(v2_outputs.keys())
+        # Correlate over REAL on-disk paths (extracted image dirs / clone
+        # dirs), not the raw source strings (image refs / git URLs). Without
+        # this re-keying the env / dependency indexers walk non-existent paths
+        # and env-var / shared-dependency links come back silently empty for
+        # image and remote-git sources (§18.5).
+        xrepo_results: dict[str, Any] = {}
+        disk_to_source: dict[str, str] = {}
+        xrepo_source_meta: dict[str, dict[str, Any]] = {}
+        for src, out in v2_outputs.items():
+            disk = source_to_scan_path.get(src, src)
+            xrepo_results[disk] = out
+            disk_to_source[disk] = src
+            if src in source_image_meta:
+                xrepo_source_meta[disk] = source_image_meta[src]
+        scan_paths_for_xrepo = list(xrepo_results.keys())
         _cross_repo_links = build_deterministic_cross_repo_links(
-            v2_outputs,
+            xrepo_results,
             scan_paths_for_xrepo,
+            xrepo_source_meta,
         )
+        # Remap occurrence repo paths from internal disk paths back to the
+        # user-facing source names so reports never leak temp directories.
+        for _link in _cross_repo_links:
+            for _occ in _link.occurrences:
+                if _occ.repo_path in disk_to_source:
+                    _occ.repo_path = disk_to_source[_occ.repo_path]
         if _cross_repo_links:
             console.print(
-                f"  [magenta]Deterministic cross-repo links: "
+                f"  [magenta]Deterministic cross-source links: "
                 f"{len(_cross_repo_links)}[/]"
             )
 
@@ -2159,12 +2272,36 @@ def analyze(
         before = len(_cross_repo_links)
         _cross_repo_links = _filter_intra_repo_links(_cross_repo_links)
         _cross_repo_links = _filter_quality_bar(_cross_repo_links)
-        dropped = before - len(_cross_repo_links)
-        if dropped:
+        _links_dropped = before - len(_cross_repo_links)
+        if _links_dropped:
             console.print(
-                f"  [dim]Filtered {dropped} intra-repo / low-quality "
-                f"cross-repo links[/]"
+                f"  [dim]Filtered {_links_dropped} intra-repo / low-quality "
+                f"cross-source links[/]"
             )
+
+    # §18.6 cross-source observability: counters into run_metadata plus a
+    # one-line run-log summary and a console panel for multi-source runs.
+    if len(v2_outputs) > 1:
+        sources_by_kind: dict[str, int] = {}
+        for _meta in source_image_meta.values():
+            _k = _meta.get("kind", "unknown")
+            sources_by_kind[_k] = sources_by_kind.get(_k, 0) + 1
+        links_by_type: dict[str, int] = {}
+        for _link in _cross_repo_links:
+            _lt = _link.link_type.value
+            links_by_type[_lt] = links_by_type.get(_lt, 0) + 1
+        cross_source_stats = {
+            "sources_by_kind": sources_by_kind,
+            "links_total": len(_cross_repo_links),
+            "links_by_type": links_by_type,
+            "links_dropped": _links_dropped,
+        }
+        run_metadata["cross_source_stats"] = cross_source_stats
+        _LOGGER.info(
+            "Cross-source summary: sources=%s, links=%d by_type=%s, dropped=%d",
+            sources_by_kind, len(_cross_repo_links), links_by_type, _links_dropped,
+        )
+        _print_cross_source_panel(console, cross_source_stats)
 
     report_data = None
     if output_format == "json" and component_summary:
@@ -2392,6 +2529,21 @@ def analyze(
 
     for cm in clone_managers:
         cm.__exit__(None, None, None)
+
+    # Extracted container filesystems were retained through cross-source
+    # correlation; remove them now unless the operator asked to keep them.
+    if keep_extractions:
+        if deferred_extraction_dirs:
+            console.print(
+                f"  [dim]Kept {len(deferred_extraction_dirs)} extracted "
+                f"container filesystem(s) on disk (--keep-extractions):[/]"
+            )
+            for _d in deferred_extraction_dirs:
+                console.print(f"    [dim]{_d}[/]")
+    else:
+        for _d in deferred_extraction_dirs:
+            shutil.rmtree(_d, ignore_errors=True)
+    deferred_extraction_dirs.clear()
 
     total_agentic = sum(
         v.get("_agentic_candidate_count", 0)

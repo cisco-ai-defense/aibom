@@ -264,6 +264,7 @@ class CrossRepoLink(BaseModel):
     resolved_value: str = ""
     occurrences: list[RepoOccurrence] = Field(default_factory=list)
     evidence: str = ""
+    evidence_type: str = ""
     decision_annotation: DecisionAnnotation | None = None
 
 

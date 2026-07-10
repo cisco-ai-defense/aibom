@@ -108,6 +108,36 @@ When a container image has an ambiguous directory structure, the agentic enrichm
 
 The agent examines file listings, Dockerfile metadata, and directory naming patterns to select the correct application root.
 
+## Multi-Source Correlation (repos + images together)
+
+A single `analyze` invocation can mix local repos, remote git URLs, and container images:
+
+```bash
+cisco-aibom analyze ./api-repo https://github.com/org/ops-repo app:latest base:latest \
+  -o json -O report.json --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
+```
+
+When two or more sources are scanned together, the analyzer emits deterministic
+cross-source links (surfaced in `cross_repo_links` and summarized in the
+"Cross-Source Correlation" console panel and `metadata.cross_source_stats`):
+
+- **`ENV_VAR_BINDING`** — an environment variable defined in one source (including
+  a variable baked into an image's `ENV`) and consumed in another.
+- **`SHARED_MODEL`** — the same model identifier used across sources.
+- **`SHARED_DEPENDENCY`** — a package present in multiple sources' manifests, plus
+  SBOM-backed matches across image sources (`evidence_type=sbom`, from the Syft
+  catalog captured during extraction).
+- **`SHARED_BASE_IMAGE`** — two or more images built on the same OCI base image
+  (`org.opencontainers.image.base.name`).
+- **`DERIVED_FROM_REPO`** — an advisory noting an image whose declared upstream
+  source repo (`org.opencontainers.image.source`) was not included in the scan.
+
+For correlation to see an image's files, its extracted filesystem is retained
+until after correlation runs (previously it was deleted per-source, which made
+image env/dependency links come back empty). Runs of more than 20 sources clean
+extractions eagerly to protect temp space; pass `--keep-extractions` to force
+retention (and to leave the extracted filesystems on disk for inspection).
+
 ## Troubleshooting
 
 - **"No container runtime found"** — Install Docker, Podman, or another supported runtime. Alternatively, use `--container-extraction-tier syft` for metadata-only analysis.
