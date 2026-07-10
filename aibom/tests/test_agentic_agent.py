@@ -2765,3 +2765,45 @@ class TestNullTolerantDefaults:
             }
         )
         assert resp.enriched_components[0].agent_evidence.evidence_snippet == ""
+
+    def test_mixed_batch_with_null_yields_all_finding_kinds(self):
+        # A realistic full batch: a stray ``null`` on a defaulted field in one
+        # entry must not discard the enrichments, new components, relationships,
+        # or risk findings that share the same response.
+        resp = AgentResponse.model_validate(
+            {
+                "enriched_components": [
+                    {"instance_id": "keep_me", "agent_evidence": None}
+                ],
+                "new_components": [{"name": "n1", "framework": None}],
+                "new_relationships": [
+                    {"source_name": "a", "target_name": "b", "source_type": None}
+                ],
+                "risk_findings": [{"flag": "leak", "severity": None}],
+            }
+        )
+        assert resp.enriched_components[0].instance_id == "keep_me"
+        assert resp.new_components[0].framework == ""
+        assert resp.new_relationships[0].source_type == ""
+        assert resp.risk_findings[0].severity == "info"
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+    )
+    def test_langchain_parser_tolerates_null_on_defaulted_field(self):
+        # The production structured-output path validates the model's raw JSON
+        # through langchain's parser (``response_format=AgentResponse``), not a
+        # direct ``model_validate`` call. Drive that real entrypoint to prove the
+        # before-validator is wired into it and a stray null no longer discards
+        # the sibling entries in the batch.
+        from langchain_core.output_parsers import PydanticOutputParser
+
+        parser = PydanticOutputParser(pydantic_object=AgentResponse)
+        resp = parser.parse(
+            '{"risk_findings": [{"flag": "a", "severity": null}, '
+            '{"flag": "b", "severity": "high"}]}'
+        )
+        assert isinstance(resp, AgentResponse)
+        assert len(resp.risk_findings) == 2
+        assert resp.risk_findings[0].severity == "info"
+        assert resp.risk_findings[1].severity == "high"
