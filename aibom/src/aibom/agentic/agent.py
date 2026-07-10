@@ -33,7 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic_core import PydanticUndefined
 
 from ..agent_signatures import AgentSignatureCatalog
 from ..cache_paths import cache_read_dirs, ensure_cache_dir
@@ -190,21 +191,61 @@ def _accumulate_token_usage(result: Any) -> None:
         _token_accumulator.cached_tokens += cached
 
 
-class _EvidenceLocation(BaseModel):
+class _NullTolerantModel(BaseModel):
+    """Base for the agent's structured-output schemas.
+
+    LLMs routinely emit an explicit ``null`` for a field that carries a
+    default (e.g. ``{"evidence_snippet": null}``) instead of omitting it.
+    Pydantic rejects ``null`` for a non-Optional defaulted field, and because
+    an entire batch reply is validated against a single ``AgentResponse``
+    schema, one stray ``null`` from the model would invalidate the whole
+    response — discarding every component in the batch and forcing a
+    cooldown retry.
+
+    This validator drops any explicit ``null`` for a field that has a
+    non-``None`` default, so the field falls back to that default. Fields
+    that are genuinely ``Optional`` with a ``None`` default keep the ``null``,
+    and any provided non-null value is left untouched.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_for_defaulted_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        cleaned = data
+        for name, field_info in cls.model_fields.items():
+            if data.get(name, PydanticUndefined) is not None:
+                continue
+            has_default = field_info.default is not PydanticUndefined
+            has_factory = field_info.default_factory is not None
+            if not (has_default or has_factory):
+                continue
+            # A ``None`` default means the field is legitimately nullable;
+            # preserve the explicit ``null`` rather than dropping it.
+            if has_default and field_info.default is None:
+                continue
+            if cleaned is data:
+                cleaned = dict(data)
+            cleaned.pop(name)
+        return cleaned
+
+
+class _EvidenceLocation(_NullTolerantModel):
     file_path: str = ""
     start_line: int = 0
     end_line: int = 0
     role: str = ""
 
 
-class _DecisionAnnotation(BaseModel):
+class _DecisionAnnotation(_NullTolerantModel):
     decision: str = ""
     justification: str = ""
     evidence_kinds: list[str] = Field(default_factory=list)
     evidence_locations: list[_EvidenceLocation] = Field(default_factory=list)
 
 
-class AgentEvidence(BaseModel):
+class AgentEvidence(_NullTolerantModel):
     """Structured evidence that a component is truly an agent.
 
     Every classification that results in ``component_type == "agent"`` MUST
@@ -252,14 +293,14 @@ class AgentEvidence(BaseModel):
     justification: str = ""
 
 
-class _EnrichedComponent(BaseModel):
+class _EnrichedComponent(_NullTolerantModel):
     instance_id: str = Field(default="", description=_IID_DESC)
     updates: dict[str, Any] = Field(default_factory=dict)
     decision_annotation: _DecisionAnnotation | None = None
     agent_evidence: AgentEvidence | None = None
 
 
-class _NewComponent(BaseModel):
+class _NewComponent(_NullTolerantModel):
     name: str = ""
     component_type: str = "other"
     file_path: str = ""
@@ -271,19 +312,19 @@ class _NewComponent(BaseModel):
     agent_evidence: AgentEvidence | None = None
 
 
-class _RemoveComponent(BaseModel):
+class _RemoveComponent(_NullTolerantModel):
     instance_id: str = Field(default="", description=_IID_DESC)
     reason: str = ""
 
 
-class _ReclassifyComponent(BaseModel):
+class _ReclassifyComponent(_NullTolerantModel):
     instance_id: str = Field(default="", description=_IID_DESC)
     new_type: str = ""
     reason: str = ""
     agent_evidence: AgentEvidence | None = None
 
 
-class _Relationship(BaseModel):
+class _Relationship(_NullTolerantModel):
     source_name: str = ""
     target_name: str = ""
     relationship_type: str = ""
@@ -292,7 +333,7 @@ class _Relationship(BaseModel):
     decision_annotation: _DecisionAnnotation | None = None
 
 
-class _RiskFinding(BaseModel):
+class _RiskFinding(_NullTolerantModel):
     flag: str = ""
     description: str = ""
     file_path: str = ""
@@ -301,7 +342,7 @@ class _RiskFinding(BaseModel):
     decision_annotation: _DecisionAnnotation | None = None
 
 
-class AgentResponse(BaseModel):
+class AgentResponse(_NullTolerantModel):
     """Structured output schema for the AIBOM agent."""
 
     enriched_components: list[_EnrichedComponent] = Field(default_factory=list)
@@ -3264,12 +3305,12 @@ def run_cross_repo_coordination(
 # ---------------------------------------------------------------------------
 
 
-class _SelectedDirectory(BaseModel):
+class _SelectedDirectory(_NullTolerantModel):
     path: str = ""
     reason: str = ""
 
 
-class ContainerLayoutResponse(BaseModel):
+class ContainerLayoutResponse(_NullTolerantModel):
     """Structured output for container app directory identification."""
 
     selected_directories: list[_SelectedDirectory] = Field(default_factory=list)
