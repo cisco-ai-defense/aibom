@@ -60,10 +60,10 @@ class TestImageBakedEnvProducer:
             per_repo_results, [str(img), str(api)], source_metadata
         )
         env_links = [
-            l for l in links if l.link_type == CrossRepoLinkType.ENV_VAR_BINDING
+            link for link in links if link.link_type == CrossRepoLinkType.ENV_VAR_BINDING
         ]
-        assert any(l.identifier == "MODEL_ENDPOINT_URL" for l in env_links)
-        binding = next(l for l in env_links if l.identifier == "MODEL_ENDPOINT_URL")
+        assert any(link.identifier == "MODEL_ENDPOINT_URL" for link in env_links)
+        binding = next(link for link in env_links if link.identifier == "MODEL_ENDPOINT_URL")
         roles = {o.role for o in binding.occurrences}
         assert "producer" in roles
         assert "consumer" in roles
@@ -86,7 +86,7 @@ class TestImageBakedEnvProducer:
             per_repo_results, [str(img), str(api)], source_metadata={}
         )
         assert not [
-            l for l in links if l.link_type == CrossRepoLinkType.ENV_VAR_BINDING
+            link for link in links if link.link_type == CrossRepoLinkType.ENV_VAR_BINDING
         ]
 
 
@@ -112,7 +112,7 @@ class TestSharedBaseImage:
             per_repo_results, [str(a), str(b)], source_metadata
         )
         base_links = [
-            l for l in links if l.link_type == CrossRepoLinkType.SHARED_BASE_IMAGE
+            link for link in links if link.link_type == CrossRepoLinkType.SHARED_BASE_IMAGE
         ]
         assert len(base_links) == 1
         assert base_links[0].identifier == "python:3.12-slim"
@@ -139,7 +139,7 @@ class TestSharedBaseImage:
             per_repo_results, [str(a), str(b)], source_metadata
         )
         assert not [
-            l for l in links if l.link_type == CrossRepoLinkType.SHARED_BASE_IMAGE
+            link for link in links if link.link_type == CrossRepoLinkType.SHARED_BASE_IMAGE
         ]
 
 
@@ -166,9 +166,9 @@ class TestSbomSharedDependency:
             per_repo_results, [str(a), str(b)], source_metadata
         )
         sbom_deps = [
-            l for l in links
-            if l.link_type == CrossRepoLinkType.SHARED_DEPENDENCY
-            and l.evidence_type == "sbom"
+            link for link in links
+            if link.link_type == CrossRepoLinkType.SHARED_DEPENDENCY
+            and link.evidence_type == "sbom"
         ]
         assert len(sbom_deps) == 1
         assert sbom_deps[0].identifier == "pkg:deb/debian/openssl@3.0"
@@ -195,7 +195,7 @@ class TestDerivedFromRepo:
             per_repo_results, [str(a), str(b)], source_metadata
         )
         derived = [
-            l for l in links if l.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
+            link for link in links if link.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
         ]
         assert len(derived) == 1
         assert derived[0].evidence_type == "unscanned_upstream_repo"
@@ -224,7 +224,38 @@ class TestDerivedFromRepo:
             per_repo_results, [str(a), str(b)], source_metadata
         )
         assert not [
-            l for l in links if l.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
+            link for link in links if link.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
+        ]
+
+    def test_no_advisory_when_upstream_scanned_as_local_checkout(
+        self, tmp_path: Path
+    ) -> None:
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        per_repo_results = {
+            str(a): {"components": [], "relationships": []},
+            str(b): {"components": [], "relationships": []},
+        }
+        # Upstream is scanned as a LOCAL checkout (kind=local-path) whose resolved
+        # git remote (repo_url, SSH spelling) matches the image's HTTPS source
+        # label — canonicalization must treat them as the same repo, so no
+        # advisory fires.
+        source_metadata = {
+            str(a): {"kind": "container", "source_name": "a:1", "base_image": "",
+                     "sbom_packages": [], "image_env": {},
+                     "source_repo_url": "https://github.com/org/upstream"},
+            str(b): {"kind": "local-path", "source_name": str(b),
+                     "base_image": "", "sbom_packages": [], "image_env": {},
+                     "source_repo_url": "",
+                     "repo_url": "git@github.com:org/upstream.git"},
+        }
+        links = build_deterministic_cross_repo_links(
+            per_repo_results, [str(a), str(b)], source_metadata
+        )
+        assert not [
+            link for link in links if link.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
         ]
 
 

@@ -146,7 +146,7 @@ def _utcnow_iso() -> str:
 
 
 def _print_cross_source_panel(
-    console: "rich.console.Console",  # type: ignore[name-defined]
+    console: Console,
     stats: dict,
 ) -> None:
     """Render the §18.6 cross-source correlation summary panel."""
@@ -2033,8 +2033,21 @@ def analyze(
                 "sbom_packages": list(extraction.sbom_packages),
                 "image_env": dict(_img_cfg.env) if _img_cfg else {},
                 "source_repo_url": extraction.source_repo_url,
+                # A container has no git identity of its own; its provenance is
+                # source_repo_url (the OCI source label), handled separately.
+                "repo_url": "",
             }
         else:
+            # Resolve the source's git remote so a locally-scanned checkout is
+            # recognized as "scanned" by the derived-from-repo advisory: for a
+            # git-URL source it is the URL itself; for a local path it is the
+            # checkout's origin remote (empty when the path is not a git tree).
+            if is_git:
+                _repo_url = str(source)
+            else:
+                from .source_attribution import capture_git_remote
+
+                _repo_url = capture_git_remote(scan_path) or ""
             source_image_meta[source] = {
                 "kind": source_summary["source_kind"],
                 "source_name": str(source),
@@ -2042,6 +2055,7 @@ def analyze(
                 "sbom_packages": [],
                 "image_env": {},
                 "source_repo_url": "",
+                "repo_url": _repo_url,
             }
 
         # The org cache is keyed on (repo path, HEAD sha) with no settings, so it

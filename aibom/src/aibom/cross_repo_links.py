@@ -32,16 +32,34 @@ from .cross_ref import CrossRefIndex, EnvVarEntry, build_env_index, build_packag
 from .models.enums import AIComponentType, CrossRepoLinkType
 from .models.scan import CrossRepoLink, RepoOccurrence
 from .scanners.remote_agent_resolver import _normalize_url_for_index
+from .source_attribution import canonicalize_git_remote
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _normalize_repo_url(url: str) -> str:
-    """Normalize a git repo URL/ref for set membership comparison."""
-    s = url.strip().lower()
-    if s.endswith(".git"):
-        s = s[: -len(".git")]
-    return s.rstrip("/")
+def _scanned_repo_identities(
+    source_metadata: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Canonical git identities of every scanned source.
+
+    Uses each source's ``repo_url`` (the git remote the CLI resolved — set for
+    git-URL sources AND local checkouts of a git repo), falling back to the
+    ``source_name`` for git-URL sources when ``repo_url`` is absent. Canonicalized
+    via :func:`canonicalize_git_remote` so SSH/HTTPS spellings and ``.git``
+    suffixes compare equal. A local checkout therefore counts as "scanned" and
+    suppresses a spurious derived-from-repo advisory for an image built from it.
+    """
+    scanned: set[str] = set()
+    for meta in source_metadata.values():
+        url = (meta.get("repo_url") or "").strip()
+        if not url and meta.get("kind") == "git-url":
+            url = (meta.get("source_name") or "").strip()
+        if not url:
+            continue
+        canon = canonicalize_git_remote(url)
+        if canon:
+            scanned.add(canon)
+    return scanned
 
 
 def _repo_for_file(file_path: str, scan_paths: list[str]) -> str | None:
@@ -657,18 +675,17 @@ def _build_derived_from_repo_links(
     link (``evidence_type='unscanned_upstream_repo'``) so the operator
     knows the image's provenance repo is unscanned.
     """
-    scanned_urls: set[str] = {
-        _normalize_repo_url(meta["source_name"])
-        for meta in source_metadata.values()
-        if meta.get("kind") == "git-url" and meta.get("source_name")
-    }
+    scanned_urls = _scanned_repo_identities(source_metadata)
 
     links: list[CrossRepoLink] = []
     for scan_path, meta in source_metadata.items():
         url = (meta.get("source_repo_url") or "").strip()
         if not url:
             continue
-        if _normalize_repo_url(url) in scanned_urls:
+        # A local checkout of this same repo (kind=local-path) counts as scanned
+        # via its resolved git remote, so canonicalize both sides before the
+        # membership test to avoid a false "unscanned upstream" advisory.
+        if canonicalize_git_remote(url) in scanned_urls:
             continue
         links.append(CrossRepoLink(
             link_type=CrossRepoLinkType.DERIVED_FROM_REPO,
@@ -754,12 +771,12 @@ def build_deterministic_cross_repo_links(
     links = _resolve_colon_prefixed_repo_paths(links, scan_paths)
     links = _filter_intra_repo_links(links)
     links = _filter_quality_bar(links)
-    n_env = sum(1 for l in links if l.link_type == CrossRepoLinkType.ENV_VAR_BINDING)
-    n_model = sum(1 for l in links if l.link_type == CrossRepoLinkType.SHARED_MODEL)
-    n_dep = sum(1 for l in links if l.link_type == CrossRepoLinkType.SHARED_DEPENDENCY)
-    n_base = sum(1 for l in links if l.link_type == CrossRepoLinkType.SHARED_BASE_IMAGE)
+    n_env = sum(1 for link in links if link.link_type == CrossRepoLinkType.ENV_VAR_BINDING)
+    n_model = sum(1 for link in links if link.link_type == CrossRepoLinkType.SHARED_MODEL)
+    n_dep = sum(1 for link in links if link.link_type == CrossRepoLinkType.SHARED_DEPENDENCY)
+    n_base = sum(1 for link in links if link.link_type == CrossRepoLinkType.SHARED_BASE_IMAGE)
     n_derived = sum(
-        1 for l in links if l.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
+        1 for link in links if link.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
     )
     _LOGGER.info(
         "Deterministic cross-repo links: %d total (%d env-var/endpoint, "
