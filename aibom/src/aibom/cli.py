@@ -978,6 +978,7 @@ def _build_submission_payload(
     )
     return {
         "run_id": metadata.get("run_id"),
+        "scan_batch_id": metadata.get("scan_batch_id"),
         "analyzer_version": metadata.get("analyzer_version") or ANALYZER_VERSION,
         "submitted_at": submitted_at,
         "source_kind": source_kind,
@@ -1053,6 +1054,13 @@ def _build_submission_payloads(
         return [_build_submission_payload(report, source_outcomes)]
 
     base_run_id = analysis.get("metadata", {}).get("run_id")
+    # One shared co-scan batch id for the whole invocation, stamped on every
+    # fanned-out upload so consumers can regroup them into one scan. Prefer the
+    # id the analyzer already recorded; mint one for legacy reports that predate
+    # the field so re-uploads still group.
+    scan_batch_id = analysis.get("metadata", {}).get("scan_batch_id") or str(
+        uuid.uuid4()
+    )
     total = len(sources)
     payloads: List[Dict[str, Any]] = []
     for source_key, entry in sources.items():
@@ -1064,6 +1072,9 @@ def _build_submission_payloads(
         run_id = base_run_id if total <= 1 else str(uuid.uuid4())
         scoped_report = _scope_report_to_source(report, source_key, entry, run_id)
         payload = _build_submission_payload(scoped_report)
+        # Every upload in this invocation carries the same batch id (run_id
+        # differs per source; batch id does not).
+        payload["scan_batch_id"] = scan_batch_id
         attribution = _attribution_from_source_entry(entry)
         if attribution is not None:
             payload["source_attribution"] = attribution
@@ -1853,6 +1864,10 @@ def analyze(
     source_outcomes: Dict[str, Dict[str, Any]] = {}
     run_metadata: Dict[str, Any] = {
         "run_id": str(uuid.uuid4()),
+        # One id per CLI invocation, shared across every per-source upload of
+        # this run (each upload keeps its own distinct run_id). Lets consumers
+        # regroup a multi-source run's fanned-out uploads back into one scan.
+        "scan_batch_id": str(uuid.uuid4()),
         "analyzer_version": ANALYZER_VERSION,
         "started_at": _utcnow_iso(),
         "output_format": output_format,
