@@ -214,16 +214,16 @@ class _NullTolerantModel(BaseModel):
         if not isinstance(data, dict):
             return data
         cleaned = data
-        for name, field in cls.model_fields.items():
+        for name, field_info in cls.model_fields.items():
             if data.get(name, PydanticUndefined) is not None:
                 continue
-            has_default = field.default is not PydanticUndefined
-            has_factory = field.default_factory is not None
+            has_default = field_info.default is not PydanticUndefined
+            has_factory = field_info.default_factory is not None
             if not (has_default or has_factory):
                 continue
             # A ``None`` default means the field is legitimately nullable;
             # preserve the explicit ``null`` rather than dropping it.
-            if has_default and field.default is None:
+            if has_default and field_info.default is None:
                 continue
             if cleaned is data:
                 cleaned = dict(data)
