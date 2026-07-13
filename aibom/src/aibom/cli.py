@@ -149,7 +149,7 @@ def _print_cross_source_panel(
     console: Console,
     stats: dict,
 ) -> None:
-    """Render the §18.6 cross-source correlation summary panel."""
+    """Render the cross-source correlation summary panel."""
     sources_by_kind = stats.get("sources_by_kind", {})
     links_by_type = stats.get("links_by_type", {})
     lines: list[str] = []
@@ -1892,7 +1892,7 @@ def analyze(
 
     clone_managers: list[Any] = []
 
-    # §18.5 multi-source correlation plumbing. Map each source to the real
+    # Multi-source correlation plumbing. Map each source to the real
     # on-disk path the pipeline scanned (extracted dir for images, clone dir
     # for git URLs, the path itself for local sources) and stash per-source
     # image metadata (base image, SBOM, baked ENV, upstream repo). Container
@@ -2238,7 +2238,7 @@ def analyze(
             # dirs), not the raw source strings (image refs / git URLs). Without
             # this re-keying the env / dependency indexers walk non-existent paths
             # and env-var / shared-dependency links come back silently empty for
-            # image and remote-git sources (§18.5).
+            # image and remote-git sources.
             xrepo_results: dict[str, Any] = {}
             disk_to_source: dict[str, str] = {}
             xrepo_source_meta: dict[str, dict[str, Any]] = {}
@@ -2294,7 +2294,7 @@ def analyze(
                     f"cross-source links[/]"
                 )
 
-        # §18.6 cross-source observability: counters into run_metadata plus a
+        # Cross-source observability: counters into run_metadata plus a
         # one-line run-log summary and a console panel for multi-source runs.
         if len(v2_outputs) > 1:
             sources_by_kind: dict[str, int] = {}

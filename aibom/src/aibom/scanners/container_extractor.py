@@ -131,7 +131,7 @@ class ExtractionResult:
     tier_used: str = "none"
     needs_agentic: bool = False
     agentic_hint: str = ""
-    # Multi-source correlation metadata (§18.5). ``sbom_packages`` holds
+    # Multi-source correlation metadata. ``sbom_packages`` holds
     # package URLs (purls) discovered by Syft during extraction, used for
     # SBOM-backed shared-dependency correlation. ``base_image`` and
     # ``source_repo_url`` are surfaced from OCI image labels

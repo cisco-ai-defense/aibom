@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for §18 multi-source (repo + image) correlation.
+"""Tests for multi-source (repo + image) correlation.
 
 Covers the container-aware cross-source link builders: image-baked ENV
 producers, shared base image, SBOM-backed shared dependencies, and the
