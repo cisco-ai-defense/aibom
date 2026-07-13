@@ -2532,7 +2532,7 @@ def analyze(
                     logging.info("Report uploaded to %s", post_url)
                 except Exception as exc:  # noqa: BLE001
                     logging.error("Failed to POST report: %s", exc)
-                    raise typer.Exit(code=1)
+                    raise typer.Exit(code=1) from exc
 
         if output_format == "api":
             logging.info("--- Starting API Server ---")
