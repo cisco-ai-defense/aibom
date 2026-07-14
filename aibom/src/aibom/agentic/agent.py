@@ -506,18 +506,44 @@ def _build_bedrock_cache_middleware() -> Any:
             ).lower()
             if not any(m in model_id for m in _BEDROCK_CACHEABLE_MODEL_MARKERS):
                 return None
-            text = sm.text
-            if not text:
-                return None
-            return SystemMessage(
-                content=[
+
+            content = sm.content
+            if isinstance(content, str):
+                # Plain-string system prompt → a single cache-tagged text block.
+                if not content:
+                    return None
+                new_content: list[Any] = [
                     {
                         "type": "text",
-                        "text": text,
+                        "text": content,
                         "cache_control": _BEDROCK_CACHE_CONTROL,
                     }
                 ]
-            )
+            elif isinstance(content, list) and content:
+                # Structured content (the deep agent delivers the system prompt as
+                # a content-block list): copy every block verbatim and add the
+                # breakpoint to the LAST text block only — never flatten or drop
+                # blocks. Anthropic caches everything up to that breakpoint.
+                new_content = [dict(b) if isinstance(b, dict) else b for b in content]
+                last_text = next(
+                    (
+                        i
+                        for i in range(len(new_content) - 1, -1, -1)
+                        if isinstance(new_content[i], dict)
+                        and new_content[i].get("type") == "text"
+                    ),
+                    None,
+                )
+                if last_text is None:
+                    return None
+                new_content[last_text] = {
+                    **new_content[last_text],
+                    "cache_control": _BEDROCK_CACHE_CONTROL,
+                }
+            else:
+                return None
+
+            return SystemMessage(content=new_content)
 
         def wrap_model_call(self, request: ModelRequest, handler: Any) -> Any:
             new_sm = self._cache_tagged_system(request)

@@ -2937,6 +2937,44 @@ class TestPromptCachingMiddleware:
     @pytest.mark.skipif(
         not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
     )
+    def test_preserves_system_content_block_boundaries(self):
+        # The deep agent delivers the system message as a LIST of content blocks.
+        # We must not flatten it (``sm.text`` would collapse boundaries and drop
+        # non-text blocks) — copy every block and tag only the LAST text block.
+        from langchain.agents.middleware import ModelRequest
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        mw = _prompt_caching_middleware(
+            None, "bedrock/us.anthropic.claude-opus-4-8", None
+        )[0]
+        model = MagicMock()
+        model.model_id = "us.anthropic.claude-opus-4-8"
+        request = ModelRequest(
+            model=model,
+            messages=[HumanMessage(content="candidates")],
+            system_message=SystemMessage(
+                content=[
+                    {"type": "text", "text": "AIBOM SYSTEM"},
+                    {"type": "text", "text": "BASE PROMPT"},
+                ]
+            ),
+        )
+
+        seen = {}
+        mw.wrap_model_call(request, lambda req: seen.setdefault("req", req))
+        content = seen["req"].system_message.content
+
+        # Both blocks preserved (not flattened into one).
+        assert [b["text"] for b in content] == ["AIBOM SYSTEM", "BASE PROMPT"]
+        # cache_control only on the LAST text block; earlier blocks untouched.
+        assert "cache_control" not in content[0]
+        assert content[1]["cache_control"]["type"] == "ephemeral"
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
+    )
     def test_passthrough_for_unsupported_bedrock_model(self):
         # A non-Claude/Nova Bedrock model (e.g. Llama) must not be poked with a
         # cache_control block it may reject — the system prompt passes through
