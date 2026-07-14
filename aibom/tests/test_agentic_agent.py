@@ -58,6 +58,16 @@ _HAS_DEEPAGENTS = importlib.util.find_spec("deepagents") is not None
 # at call time, so they are gated the same way (skipped in the CI ``--group dev``
 # env). The pure-Python helper tests around them still run everywhere.
 _HAS_LANGCHAIN = importlib.util.find_spec("langchain_core") is not None
+# ``langchain`` (the agents/middleware framework) ships with the same agentic
+# extra. The Bedrock system-prompt cache middleware subclasses
+# ``langchain.agents.middleware.AgentMiddleware``, so tests that build or exercise
+# it are gated on ``langchain``; the provider-gating tests that expect ``[]`` need
+# no import and run everywhere.
+_HAS_LANGCHAIN_AGENTS = importlib.util.find_spec("langchain") is not None
+# ``langchain_aws`` (the ``llm-aws`` extra) ships ``BedrockPromptCachingMiddleware``,
+# which the Converse (``ChatBedrockConverse``) path reuses. Tests that assert that
+# concrete middleware is built are gated on it.
+_HAS_LANGCHAIN_AWS = importlib.util.find_spec("langchain_aws") is not None
 
 
 @pytest.fixture(autouse=True)
@@ -2807,3 +2817,269 @@ class TestNullTolerantDefaults:
         assert len(resp.risk_findings) == 2
         assert resp.risk_findings[0].severity == "info"
         assert resp.risk_findings[1].severity == "high"
+
+
+class TestPromptCachingMiddleware:
+    """Explicit Bedrock prompt-caching wiring.
+
+    Anthropic-on-Bedrock does not cache automatically. langchain_aws's built-in
+    ``BedrockPromptCachingMiddleware`` places the breakpoint on the LAST message,
+    but aibom re-sends an identical ~12k-token system prompt + tool schema with a
+    DIFFERENT last message on every batch, so that breakpoint never matches across
+    batches (verified live: cached_tokens=0). Tagging the stable SYSTEM block with
+    ``cache_control`` instead caches the whole tools+system prefix every batch
+    shares (verified live: cross-call cache_read). The gate is strictly by resolved
+    provider: only the Bedrock family gets the middleware. Native Anthropic is
+    already cached by deepagents' built-in ``AnthropicPromptCachingMiddleware`` (so
+    aibom adds nothing there); OpenAI/Azure stay untouched (server-side automatic
+    caching).
+    """
+
+    @pytest.mark.parametrize(
+        "model_string,provider",
+        [
+            ("gpt-5.5", "openai"),
+            ("openai/gpt-5.5", None),
+            ("gpt-5.5", "azure_openai"),
+            # Native Anthropic — deepagents already injects the Anthropic caching
+            # middleware, so aibom must NOT add its own (no duplicate breakpoints).
+            ("claude-opus-4-8", "anthropic"),
+            ("claude-opus-4-8", None),
+            ("gemini-2.5-pro", "google_genai"),
+            ("llama3", "ollama"),
+        ],
+    )
+    def test_no_middleware_for_non_bedrock_providers(self, model_string, provider):
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        llm_config = {"provider": provider} if provider else None
+        assert _prompt_caching_middleware(None, model_string, llm_config) == []
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
+    )
+    @pytest.mark.parametrize(
+        "model_string,provider",
+        [
+            ("bedrock/us.anthropic.claude-opus-4-8", None),
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "bedrock"),
+        ],
+    )
+    def test_bedrock_gets_single_caching_middleware(self, model_string, provider):
+        from langchain.agents.middleware import AgentMiddleware
+
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        llm_config = {"provider": provider} if provider else None
+        mw = _prompt_caching_middleware(None, model_string, llm_config)
+
+        assert len(mw) == 1
+        assert isinstance(mw[0], AgentMiddleware)
+        assert hasattr(mw[0], "wrap_model_call")
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
+    )
+    def test_bedrock_gated_by_model_object_when_provider_absent(self):
+        # Regression: the tier runners call create_aibom_agent with a pre-built
+        # model and a BARE model id (``us.anthropic.…``, no ``bedrock/`` prefix)
+        # and WITHOUT llm_config, so the provider is resolvable only from the
+        # model object. The gate must detect Bedrock from the built ChatBedrock
+        # instance, not just the string/config — otherwise caching silently
+        # never engages (observed live as cached_tokens=0).
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        fake_bedrock = type(
+            "ChatBedrock", (), {"model_id": "us.anthropic.claude-sonnet-5"}
+        )()
+        mw = _prompt_caching_middleware(
+            fake_bedrock, "us.anthropic.claude-sonnet-5", None
+        )
+        assert len(mw) == 1
+
+        fake_openai = type("ChatOpenAI", (), {"model_name": "gpt-5.5"})()
+        assert _prompt_caching_middleware(fake_openai, "gpt-5.5", None) == []
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AWS, reason="requires langchain_aws (llm-aws extra)"
+    )
+    def test_bedrock_converse_uses_builtin_cachepoint_middleware(self):
+        # ChatBedrockConverse (Converse API) expresses caching with a ``cachePoint``
+        # block, not the InvokeModel ``cache_control`` shape. The built-in
+        # BedrockPromptCachingMiddleware passes the setting via model_settings and
+        # ChatBedrockConverse serializes a system+tools cachePoint (surviving
+        # deepagents' block stripping), so Converse reuses it — detected both by
+        # model class and by the ``bedrock_converse`` provider.
+        from langchain_aws.middleware import BedrockPromptCachingMiddleware
+
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        fake_converse = type(
+            "ChatBedrockConverse", (), {"model_id": "us.anthropic.claude-sonnet-5"}
+        )()
+        by_class = _prompt_caching_middleware(
+            fake_converse, "us.anthropic.claude-sonnet-5", None
+        )
+        assert len(by_class) == 1
+        assert isinstance(by_class[0], BedrockPromptCachingMiddleware)
+
+        by_provider = _prompt_caching_middleware(
+            None, "bedrock_converse/us.anthropic.claude-sonnet-5", None
+        )
+        assert len(by_provider) == 1
+        assert isinstance(by_provider[0], BedrockPromptCachingMiddleware)
+
+    def _make_request(self, model_id, system_prompt):
+        from langchain.agents.middleware import ModelRequest
+        from langchain_core.messages import HumanMessage
+
+        model = MagicMock()
+        model.model_id = model_id
+        return ModelRequest(
+            model=model,
+            messages=[HumanMessage(content="batch-specific candidates")],
+            system_prompt=system_prompt,
+        )
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
+    )
+    def test_tags_system_block_with_cache_control_for_bedrock_claude(self):
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        mw = _prompt_caching_middleware(
+            None, "bedrock/us.anthropic.claude-opus-4-8", None
+        )[0]
+        request = self._make_request("us.anthropic.claude-opus-4-8", "SYSTEM PREFIX")
+
+        seen = {}
+        mw.wrap_model_call(request, lambda req: seen.setdefault("req", req))
+        got = seen["req"]
+
+        # System prefix rewritten to a content-block list whose (last) block
+        # carries an ephemeral cache_control breakpoint — this is what makes the
+        # stable tools+system prefix cacheable across batches.
+        assert isinstance(got.system_message.content, list)
+        last = got.system_message.content[-1]
+        assert last["type"] == "text"
+        assert last["text"] == "SYSTEM PREFIX"
+        assert last["cache_control"]["type"] == "ephemeral"
+        # The variable, per-batch messages must be left untouched.
+        assert got.messages == request.messages
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
+    )
+    def test_preserves_system_content_block_boundaries(self):
+        # The deep agent delivers the system message as a LIST of content blocks.
+        # We must not flatten it (``sm.text`` would collapse boundaries and drop
+        # non-text blocks) — copy every block and tag only the LAST text block.
+        from langchain.agents.middleware import ModelRequest
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        mw = _prompt_caching_middleware(
+            None, "bedrock/us.anthropic.claude-opus-4-8", None
+        )[0]
+        model = MagicMock()
+        model.model_id = "us.anthropic.claude-opus-4-8"
+        request = ModelRequest(
+            model=model,
+            messages=[HumanMessage(content="candidates")],
+            system_message=SystemMessage(
+                content=[
+                    {"type": "text", "text": "AIBOM SYSTEM"},
+                    {"type": "text", "text": "BASE PROMPT"},
+                ]
+            ),
+        )
+
+        seen = {}
+        mw.wrap_model_call(request, lambda req: seen.setdefault("req", req))
+        content = seen["req"].system_message.content
+
+        # Both blocks preserved (not flattened into one).
+        assert [b["text"] for b in content] == ["AIBOM SYSTEM", "BASE PROMPT"]
+        # cache_control only on the LAST text block; earlier blocks untouched.
+        assert "cache_control" not in content[0]
+        assert content[1]["cache_control"]["type"] == "ephemeral"
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
+    )
+    def test_passthrough_for_unsupported_bedrock_model(self):
+        # A non-Claude/Nova Bedrock model (e.g. Llama) must not be poked with a
+        # cache_control block it may reject — the system prompt passes through
+        # unchanged (still a plain string).
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        llama = "bedrock/meta.llama3-70b-instruct-v1:0"
+        mw = _prompt_caching_middleware(None, llama, None)[0]
+        request = self._make_request("meta.llama3-70b-instruct-v1:0", "SYSTEM PREFIX")
+
+        seen = {}
+        mw.wrap_model_call(request, lambda req: seen.setdefault("req", req))
+        assert seen["req"].system_message.content == "SYSTEM PREFIX"
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AGENTS, reason="requires langchain (agentic extra)"
+    )
+    def test_passthrough_when_no_system_message(self):
+        from langchain.agents.middleware import ModelRequest
+        from langchain_core.messages import HumanMessage
+
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        mw = _prompt_caching_middleware(
+            None, "bedrock/us.anthropic.claude-opus-4-8", None
+        )[0]
+        model = MagicMock()
+        model.model_id = "us.anthropic.claude-opus-4-8"
+        request = ModelRequest(
+            model=model, messages=[HumanMessage(content="x")], system_prompt=None
+        )
+
+        seen = {}
+        mw.wrap_model_call(request, lambda req: seen.setdefault("req", req))
+        assert seen["req"].system_message is None
+
+    def test_bedrock_graceful_when_langchain_missing(self):
+        # If the agentic extra is absent, the Bedrock path must degrade to a no-op
+        # (empty list), never raise — a scan without caching still works.
+        import sys
+
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        with patch.dict(sys.modules, {"langchain.agents.middleware": None}):
+            assert (
+                _prompt_caching_middleware(
+                    None, "bedrock/us.anthropic.claude-opus-4-8", None
+                )
+                == []
+            )
+
+    @pytest.mark.skipif(
+        not (_HAS_DEEPAGENTS and _HAS_LANGCHAIN_AGENTS),
+        reason="requires deepagents + langchain (agentic extra)",
+    )
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    @patch("deepagents.create_deep_agent")
+    def test_create_aibom_agent_forwards_caching_middleware(self, mock_cda, _mb):
+        from langchain.agents.middleware import AgentMiddleware
+
+        from aibom.agentic.agent import create_aibom_agent
+
+        mock_cda.return_value = MagicMock()
+
+        create_aibom_agent(
+            "bedrock/us.anthropic.claude-opus-4-8",
+            llm_config={"provider": "bedrock"},
+        )
+        bedrock_mw = mock_cda.call_args.kwargs["middleware"]
+        assert len(bedrock_mw) == 1
+        assert isinstance(bedrock_mw[0], AgentMiddleware)
+
+        mock_cda.reset_mock()
+        create_aibom_agent("gpt-5.5", llm_config={"provider": "openai"})
+        assert mock_cda.call_args.kwargs["middleware"] == []

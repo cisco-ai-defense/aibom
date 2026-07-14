@@ -462,6 +462,192 @@ class _AgentBundle:
         return getattr(self._graph, name)
 
 
+# Ephemeral cache breakpoint (5m default TTL). aibom's batches run seconds apart,
+# and every cache hit refreshes the 5m window for free, so 5m comfortably covers a
+# whole multi-batch run without paying the higher 1h write premium.
+_BEDROCK_CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
+
+# Model-id substrings whose Bedrock family supports Anthropic-style prompt caching.
+# Mirrors langchain_aws's ``_is_supported_model`` so a non-Claude/Nova Bedrock
+# model (e.g. Llama) is never poked with a ``cache_control`` block it may reject.
+_BEDROCK_CACHEABLE_MODEL_MARKERS = ("anthropic", "amazon.nova")
+
+
+def _build_bedrock_cache_middleware() -> Any:
+    """Build the middleware that caches the stable system+tools prefix on Bedrock.
+
+    ``langchain_aws``'s built-in ``BedrockPromptCachingMiddleware`` places the
+    breakpoint on the LAST message. aibom re-sends an identical ~12k-token system
+    prompt and tool schema with a DIFFERENT last message on every batch (there can
+    be dozens), so a last-message breakpoint never matches across batches — no
+    cache read (verified live: ``cached_tokens=0``). Tagging the stable SYSTEM
+    block instead caches the whole tools+system prefix (Anthropic caches
+    everything before the breakpoint, and ``ChatBedrock`` prepends the tool schema
+    ahead of the system text), which every batch shares — verified live to yield
+    cross-batch ``cache_read`` on Bedrock Claude via the InvokeModel path.
+
+    Defined lazily (the ``AgentMiddleware`` base ships with the agentic extra) so
+    importing this module never requires deepagents/langchain.
+    """
+    from langchain.agents.middleware import AgentMiddleware, ModelRequest
+    from langchain_core.messages import SystemMessage
+
+    class _BedrockSystemPromptCacheMiddleware(AgentMiddleware):
+        """Tag the system prompt's last block with an ephemeral cache breakpoint."""
+
+        def _cache_tagged_system(self, request: ModelRequest) -> Any | None:
+            sm = request.system_message
+            if sm is None:
+                return None
+            model_id = (
+                getattr(request.model, "model_id", "")
+                or getattr(request.model, "model", "")
+                or ""
+            ).lower()
+            if not any(m in model_id for m in _BEDROCK_CACHEABLE_MODEL_MARKERS):
+                return None
+
+            content = sm.content
+            if isinstance(content, str):
+                # Plain-string system prompt → a single cache-tagged text block.
+                if not content:
+                    return None
+                new_content: list[Any] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": _BEDROCK_CACHE_CONTROL,
+                    }
+                ]
+            elif isinstance(content, list) and content:
+                # Structured content (the deep agent delivers the system prompt as
+                # a content-block list): copy every block verbatim and add the
+                # breakpoint to the LAST text block only — never flatten or drop
+                # blocks. Anthropic caches everything up to that breakpoint.
+                new_content = [dict(b) if isinstance(b, dict) else b for b in content]
+                last_text = next(
+                    (
+                        i
+                        for i in range(len(new_content) - 1, -1, -1)
+                        if isinstance(new_content[i], dict)
+                        and new_content[i].get("type") == "text"
+                    ),
+                    None,
+                )
+                if last_text is None:
+                    return None
+                new_content[last_text] = {
+                    **new_content[last_text],
+                    "cache_control": _BEDROCK_CACHE_CONTROL,
+                }
+            else:
+                return None
+
+            return SystemMessage(content=new_content)
+
+        def wrap_model_call(self, request: ModelRequest, handler: Any) -> Any:
+            new_sm = self._cache_tagged_system(request)
+            if new_sm is not None:
+                return handler(request.override(system_message=new_sm))
+            return handler(request)
+
+        async def awrap_model_call(self, request: ModelRequest, handler: Any) -> Any:
+            new_sm = self._cache_tagged_system(request)
+            if new_sm is not None:
+                return await handler(request.override(system_message=new_sm))
+            return await handler(request)
+
+    return _BedrockSystemPromptCacheMiddleware()
+
+
+def _bedrock_flavor(
+    model: Any, model_string: str, llm_config: dict[str, Any] | None
+) -> str | None:
+    """Classify the Bedrock API a model uses: ``"invoke"``, ``"converse"``, or None.
+
+    The two Bedrock chat models express prompt caching differently, so the
+    caching wiring must know which one it is:
+
+    * ``ChatBedrock`` (``provider=bedrock``) drives the **InvokeModel** API — the
+      Anthropic Messages format, where a breakpoint is a ``cache_control`` key on a
+      content block.
+    * ``ChatBedrockConverse`` (``provider=bedrock_converse``) drives the
+      **Converse** API — the model-agnostic path used for tool-calling with
+      non-Anthropic Bedrock models (Nova, Llama, Mistral, Cohere) — where a
+      breakpoint is a standalone ``cachePoint`` block.
+
+    The built *model* object is the authoritative signal (the tier runners pass a
+    pre-built model and a BARE model id without ``llm_config``); provider
+    resolution is the fallback for callers that pass a ``bedrock[_converse]/``
+    prefix or an explicit provider but no model.
+    """
+    cls = type(model).__name__
+    if cls == "ChatBedrockConverse":
+        return "converse"
+    if cls == "ChatBedrock":
+        return "invoke"
+    from ..llm_factory import resolve_provider
+
+    provider = (
+        resolve_provider(model_string, (llm_config or {}).get("provider")) or ""
+    ).lower()
+    if provider == "bedrock_converse":
+        return "converse"
+    if provider == "bedrock":
+        return "invoke"
+    return None
+
+
+def _prompt_caching_middleware(
+    model: Any, model_string: str, llm_config: dict[str, Any] | None
+) -> list[Any]:
+    """Explicit prompt-caching middleware, gated strictly to the Bedrock path.
+
+    aibom re-sends its ~12k-token system prompt and stable tool schema on every
+    agentic batch; a cache breakpoint on that prefix earns the Bedrock cache-read
+    discount. The marker differs per Bedrock API:
+
+    * **InvokeModel** (``ChatBedrock``) → a custom middleware that puts a
+      ``cache_control`` breakpoint on the system block (see
+      :func:`_build_bedrock_cache_middleware`). The built-in
+      ``BedrockPromptCachingMiddleware`` only breakpoints the *last* message here,
+      which never matches across batches (verified live: ``cached_tokens=0``).
+    * **Converse** (``ChatBedrockConverse``) → the built-in
+      ``BedrockPromptCachingMiddleware``. It passes the setting via
+      ``model_settings``, and ``ChatBedrockConverse`` appends a ``cachePoint`` to
+      the system *and* tools at request-serialization time — so it caches the
+      stable prefix AND survives deepagents stripping non-standard content blocks
+      (a raw ``cachePoint`` block injected into the message list would be removed).
+
+    Everything else → ``[]``: native Anthropic (``ChatAnthropic``) is already cached
+    by deepagents' built-in ``AnthropicPromptCachingMiddleware``, and OpenAI/Azure
+    cache server-side. Cache-read tokens surface in ``usage_metadata`` and are
+    tallied by :func:`_resolve_message_usage` for both Bedrock APIs.
+
+    Returns ``[]`` (a graceful no-op) if the required extra is not installed.
+    """
+    flavor = _bedrock_flavor(model, model_string, llm_config)
+    if flavor is None:
+        return []
+    try:
+        if flavor == "converse":
+            from langchain_aws.middleware import BedrockPromptCachingMiddleware
+
+            return [
+                BedrockPromptCachingMiddleware(
+                    ttl="5m", unsupported_model_behavior="ignore"
+                )
+            ]
+        return [_build_bedrock_cache_middleware()]
+    except ImportError:
+        _LOGGER.debug(
+            "Bedrock caching middleware unavailable (%s); skipping prompt caching",
+            flavor,
+            exc_info=True,
+        )
+        return []
+
+
 def create_aibom_agent(
     model_string: str,
     *,
@@ -523,6 +709,11 @@ def create_aibom_agent(
         tools=tools if tools is not None else build_tools(),
         system_prompt=system_prompt or AIBOM_AGENT_SYSTEM_PROMPT,
         response_format=response_format,
+        # Explicit Bedrock prompt caching on the stable system+tools prefix; a
+        # no-op ([]) for every non-Bedrock provider (see
+        # :func:`_prompt_caching_middleware`). Gated on the built ``model`` object
+        # because the tier runners pass a bare model id and no llm_config.
+        middleware=_prompt_caching_middleware(model, model_string, llm_config),
         name="aibom-scanner",
     )
     return _AgentBundle(graph, model, needs_coercion=response_format is None)
