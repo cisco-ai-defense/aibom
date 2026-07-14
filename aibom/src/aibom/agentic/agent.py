@@ -560,34 +560,42 @@ def _build_bedrock_cache_middleware() -> Any:
     return _BedrockSystemPromptCacheMiddleware()
 
 
-def _is_bedrock_model(
+def _bedrock_flavor(
     model: Any, model_string: str, llm_config: dict[str, Any] | None
-) -> bool:
-    """True when the model is ``ChatBedrock`` — the Bedrock InvokeModel path.
+) -> str | None:
+    """Classify the Bedrock API a model uses: ``"invoke"``, ``"converse"``, or None.
 
-    Scoped deliberately to InvokeModel: the breakpoint we inject uses the
-    Anthropic ``cache_control`` shape, which is how ``ChatBedrock`` (InvokeModel)
-    expresses caching. ``ChatBedrockConverse`` (Converse API) needs a ``cachePoint``
-    content block instead, so tagging it with ``cache_control`` would silently fail
-    to cache — and aibom builds only ``ChatBedrock`` today, so Converse is excluded
-    rather than mis-tagged.
+    The two Bedrock chat models express prompt caching differently, so the
+    caching wiring must know which one it is:
 
-    The built *model* object is the authoritative signal: the tier runners call
-    :func:`create_aibom_agent` with a pre-built model and a BARE model id
-    (``us.anthropic.…``, no ``bedrock/`` prefix) and WITHOUT ``llm_config``. Fall
-    back to provider resolution — matching the ``bedrock`` provider exactly, so
-    ``bedrock_converse`` is not swept in — for callers that pass a ``bedrock/``
+    * ``ChatBedrock`` (``provider=bedrock``) drives the **InvokeModel** API — the
+      Anthropic Messages format, where a breakpoint is a ``cache_control`` key on a
+      content block.
+    * ``ChatBedrockConverse`` (``provider=bedrock_converse``) drives the
+      **Converse** API — the model-agnostic path used for tool-calling with
+      non-Anthropic Bedrock models (Nova, Llama, Mistral, Cohere) — where a
+      breakpoint is a standalone ``cachePoint`` block.
+
+    The built *model* object is the authoritative signal (the tier runners pass a
+    pre-built model and a BARE model id without ``llm_config``); provider
+    resolution is the fallback for callers that pass a ``bedrock[_converse]/``
     prefix or an explicit provider but no model.
     """
     cls = type(model).__name__
-    if cls == "ChatBedrock":
-        return True
     if cls == "ChatBedrockConverse":
-        return False
+        return "converse"
+    if cls == "ChatBedrock":
+        return "invoke"
     from ..llm_factory import resolve_provider
 
-    provider = resolve_provider(model_string, (llm_config or {}).get("provider")) or ""
-    return provider.lower() == "bedrock"
+    provider = (
+        resolve_provider(model_string, (llm_config or {}).get("provider")) or ""
+    ).lower()
+    if provider == "bedrock_converse":
+        return "converse"
+    if provider == "bedrock":
+        return "invoke"
+    return None
 
 
 def _prompt_caching_middleware(
@@ -595,26 +603,46 @@ def _prompt_caching_middleware(
 ) -> list[Any]:
     """Explicit prompt-caching middleware, gated strictly to the Bedrock path.
 
-    * **bedrock** → one middleware that puts an ephemeral ``cache_control``
-      breakpoint on the stable system+tools prefix aibom re-sends every batch
-      (see :func:`_build_bedrock_cache_middleware`). Anthropic-on-Bedrock does not
-      cache automatically, and the cache-read tokens it earns already surface in
-      ``usage_metadata`` and are tallied by :func:`_resolve_message_usage`.
-    * **everything else** → ``[]``. Native Anthropic (``ChatAnthropic``) is
-      already cached by deepagents' built-in ``AnthropicPromptCachingMiddleware``
-      — adding our own would duplicate breakpoints against the 4-breakpoint
-      budget. OpenAI/Azure cache server-side automatically and reject/ignore an
-      explicit breakpoint, so they stay untouched.
+    aibom re-sends its ~12k-token system prompt and stable tool schema on every
+    agentic batch; a cache breakpoint on that prefix earns the Bedrock cache-read
+    discount. The marker differs per Bedrock API:
 
-    Returns ``[]`` (a graceful no-op) if the agentic extra is not installed.
+    * **InvokeModel** (``ChatBedrock``) → a custom middleware that puts a
+      ``cache_control`` breakpoint on the system block (see
+      :func:`_build_bedrock_cache_middleware`). The built-in
+      ``BedrockPromptCachingMiddleware`` only breakpoints the *last* message here,
+      which never matches across batches (verified live: ``cached_tokens=0``).
+    * **Converse** (``ChatBedrockConverse``) → the built-in
+      ``BedrockPromptCachingMiddleware``. It passes the setting via
+      ``model_settings``, and ``ChatBedrockConverse`` appends a ``cachePoint`` to
+      the system *and* tools at request-serialization time — so it caches the
+      stable prefix AND survives deepagents stripping non-standard content blocks
+      (a raw ``cachePoint`` block injected into the message list would be removed).
+
+    Everything else → ``[]``: native Anthropic (``ChatAnthropic``) is already cached
+    by deepagents' built-in ``AnthropicPromptCachingMiddleware``, and OpenAI/Azure
+    cache server-side. Cache-read tokens surface in ``usage_metadata`` and are
+    tallied by :func:`_resolve_message_usage` for both Bedrock APIs.
+
+    Returns ``[]`` (a graceful no-op) if the required extra is not installed.
     """
-    if not _is_bedrock_model(model, model_string, llm_config):
+    flavor = _bedrock_flavor(model, model_string, llm_config)
+    if flavor is None:
         return []
     try:
+        if flavor == "converse":
+            from langchain_aws.middleware import BedrockPromptCachingMiddleware
+
+            return [
+                BedrockPromptCachingMiddleware(
+                    ttl="5m", unsupported_model_behavior="ignore"
+                )
+            ]
         return [_build_bedrock_cache_middleware()]
     except ImportError:
         _LOGGER.debug(
-            "langchain agents middleware unavailable; skipping Bedrock prompt caching",
+            "Bedrock caching middleware unavailable (%s); skipping prompt caching",
+            flavor,
             exc_info=True,
         )
         return []

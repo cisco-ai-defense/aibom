@@ -64,6 +64,10 @@ _HAS_LANGCHAIN = importlib.util.find_spec("langchain_core") is not None
 # it are gated on ``langchain``; the provider-gating tests that expect ``[]`` need
 # no import and run everywhere.
 _HAS_LANGCHAIN_AGENTS = importlib.util.find_spec("langchain") is not None
+# ``langchain_aws`` (the ``llm-aws`` extra) ships ``BedrockPromptCachingMiddleware``,
+# which the Converse (``ChatBedrockConverse``) path reuses. Tests that assert that
+# concrete middleware is built are gated on it.
+_HAS_LANGCHAIN_AWS = importlib.util.find_spec("langchain_aws") is not None
 
 
 @pytest.fixture(autouse=True)
@@ -2896,29 +2900,34 @@ class TestPromptCachingMiddleware:
         fake_openai = type("ChatOpenAI", (), {"model_name": "gpt-5.5"})()
         assert _prompt_caching_middleware(fake_openai, "gpt-5.5", None) == []
 
-    def test_excludes_bedrock_converse(self):
-        # ChatBedrockConverse uses the Converse API, whose cache marker is a
-        # ``cachePoint`` block — NOT the InvokeModel ``cache_control`` shape this
-        # middleware injects. aibom builds only ChatBedrock (InvokeModel), so
-        # Converse must be excluded rather than mis-tagged (would silently fail to
-        # cache), both by model class and by the ``bedrock_converse`` provider.
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN_AWS, reason="requires langchain_aws (llm-aws extra)"
+    )
+    def test_bedrock_converse_uses_builtin_cachepoint_middleware(self):
+        # ChatBedrockConverse (Converse API) expresses caching with a ``cachePoint``
+        # block, not the InvokeModel ``cache_control`` shape. The built-in
+        # BedrockPromptCachingMiddleware passes the setting via model_settings and
+        # ChatBedrockConverse serializes a system+tools cachePoint (surviving
+        # deepagents' block stripping), so Converse reuses it — detected both by
+        # model class and by the ``bedrock_converse`` provider.
+        from langchain_aws.middleware import BedrockPromptCachingMiddleware
+
         from aibom.agentic.agent import _prompt_caching_middleware
 
         fake_converse = type(
             "ChatBedrockConverse", (), {"model_id": "us.anthropic.claude-sonnet-5"}
         )()
-        assert (
-            _prompt_caching_middleware(
-                fake_converse, "us.anthropic.claude-sonnet-5", None
-            )
-            == []
+        by_class = _prompt_caching_middleware(
+            fake_converse, "us.anthropic.claude-sonnet-5", None
         )
-        assert (
-            _prompt_caching_middleware(
-                None, "bedrock_converse/us.anthropic.claude-sonnet-5", None
-            )
-            == []
+        assert len(by_class) == 1
+        assert isinstance(by_class[0], BedrockPromptCachingMiddleware)
+
+        by_provider = _prompt_caching_middleware(
+            None, "bedrock_converse/us.anthropic.claude-sonnet-5", None
         )
+        assert len(by_provider) == 1
+        assert isinstance(by_provider[0], BedrockPromptCachingMiddleware)
 
     def _make_request(self, model_id, system_prompt):
         from langchain.agents.middleware import ModelRequest
