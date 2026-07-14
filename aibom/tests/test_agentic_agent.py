@@ -2896,6 +2896,30 @@ class TestPromptCachingMiddleware:
         fake_openai = type("ChatOpenAI", (), {"model_name": "gpt-5.5"})()
         assert _prompt_caching_middleware(fake_openai, "gpt-5.5", None) == []
 
+    def test_excludes_bedrock_converse(self):
+        # ChatBedrockConverse uses the Converse API, whose cache marker is a
+        # ``cachePoint`` block — NOT the InvokeModel ``cache_control`` shape this
+        # middleware injects. aibom builds only ChatBedrock (InvokeModel), so
+        # Converse must be excluded rather than mis-tagged (would silently fail to
+        # cache), both by model class and by the ``bedrock_converse`` provider.
+        from aibom.agentic.agent import _prompt_caching_middleware
+
+        fake_converse = type(
+            "ChatBedrockConverse", (), {"model_id": "us.anthropic.claude-sonnet-5"}
+        )()
+        assert (
+            _prompt_caching_middleware(
+                fake_converse, "us.anthropic.claude-sonnet-5", None
+            )
+            == []
+        )
+        assert (
+            _prompt_caching_middleware(
+                None, "bedrock_converse/us.anthropic.claude-sonnet-5", None
+            )
+            == []
+        )
+
     def _make_request(self, model_id, system_prompt):
         from langchain.agents.middleware import ModelRequest
         from langchain_core.messages import HumanMessage

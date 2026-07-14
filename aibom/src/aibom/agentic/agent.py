@@ -563,21 +563,31 @@ def _build_bedrock_cache_middleware() -> Any:
 def _is_bedrock_model(
     model: Any, model_string: str, llm_config: dict[str, Any] | None
 ) -> bool:
-    """True when the resolved chat model is served via AWS Bedrock.
+    """True when the model is ``ChatBedrock`` — the Bedrock InvokeModel path.
+
+    Scoped deliberately to InvokeModel: the breakpoint we inject uses the
+    Anthropic ``cache_control`` shape, which is how ``ChatBedrock`` (InvokeModel)
+    expresses caching. ``ChatBedrockConverse`` (Converse API) needs a ``cachePoint``
+    content block instead, so tagging it with ``cache_control`` would silently fail
+    to cache — and aibom builds only ``ChatBedrock`` today, so Converse is excluded
+    rather than mis-tagged.
 
     The built *model* object is the authoritative signal: the tier runners call
     :func:`create_aibom_agent` with a pre-built model and a BARE model id
-    (``us.anthropic.…``, no ``bedrock/`` prefix) and WITHOUT ``llm_config`` — so
-    the provider is knowable only from the ``ChatBedrock`` / ``ChatBedrockConverse``
-    instance, not from the string or config. Fall back to provider resolution for
-    callers that pass a ``bedrock/`` prefix or an explicit provider but no model.
+    (``us.anthropic.…``, no ``bedrock/`` prefix) and WITHOUT ``llm_config``. Fall
+    back to provider resolution — matching the ``bedrock`` provider exactly, so
+    ``bedrock_converse`` is not swept in — for callers that pass a ``bedrock/``
+    prefix or an explicit provider but no model.
     """
-    if type(model).__name__ in ("ChatBedrock", "ChatBedrockConverse"):
+    cls = type(model).__name__
+    if cls == "ChatBedrock":
         return True
+    if cls == "ChatBedrockConverse":
+        return False
     from ..llm_factory import resolve_provider
 
     provider = resolve_provider(model_string, (llm_config or {}).get("provider")) or ""
-    return "bedrock" in provider.lower()
+    return provider.lower() == "bedrock"
 
 
 def _prompt_caching_middleware(
