@@ -90,3 +90,36 @@ def test_fan_out_mints_batch_id_for_legacy_report():
     batch_ids = {p["scan_batch_id"] for p in payloads}
     assert len(batch_ids) == 1
     assert batch_ids != {None}
+
+
+def _legacy_no_sources_report() -> dict:
+    return {
+        "aibom_analysis": {
+            "metadata": {
+                "run_id": "run-123",
+                "analyzer_version": "1.2.3",
+                "completed_at": "2025-01-01T12:00:00Z",
+            },
+            "sources": {},
+            "summary": {},
+        }
+    }
+
+
+def test_legacy_no_sources_report_mints_batch_id():
+    # A pre-field report with no per-source breakdown still gets a minted batch
+    # id on its single upload, consistent with the fan-out path.
+    payloads = _build_submission_payloads(_legacy_no_sources_report())
+
+    assert len(payloads) == 1
+    assert payloads[0]["scan_batch_id"]
+
+
+def test_legacy_no_sources_report_preserves_existing_batch_id():
+    report = _legacy_no_sources_report()
+    report["aibom_analysis"]["metadata"]["scan_batch_id"] = "batch-abc"
+
+    payloads = _build_submission_payloads(report)
+
+    assert len(payloads) == 1
+    assert payloads[0]["scan_batch_id"] == "batch-abc"

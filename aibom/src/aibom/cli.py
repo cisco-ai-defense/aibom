@@ -1050,8 +1050,13 @@ def _build_submission_payloads(
     sources = analysis.get("sources", {})
     if not isinstance(sources, dict) or not sources:
         # No per-source breakdown (e.g. a legacy report); fall back to a single
-        # combined submission so the upload still happens.
-        return [_build_submission_payload(report, source_outcomes)]
+        # combined submission so the upload still happens. Mint a batch id when
+        # the report predates the field so a re-upload still carries one,
+        # consistent with the fan-out path below.
+        payload = _build_submission_payload(report, source_outcomes)
+        if not payload.get("scan_batch_id"):
+            payload["scan_batch_id"] = str(uuid.uuid4())
+        return [payload]
 
     base_run_id = analysis.get("metadata", {}).get("run_id")
     # One shared co-scan batch id for the whole invocation, stamped on every
