@@ -118,6 +118,7 @@ class ImageConfig:
     entrypoint: list[str] = field(default_factory=list)
     cmd: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,6 +131,17 @@ class ExtractionResult:
     tier_used: str = "none"
     needs_agentic: bool = False
     agentic_hint: str = ""
+    # Multi-source correlation metadata. ``sbom_packages`` holds
+    # package URLs (purls) discovered by Syft during extraction, used for
+    # SBOM-backed shared-dependency correlation. ``base_image`` and
+    # ``source_repo_url`` are surfaced from OCI image labels
+    # (``org.opencontainers.image.base.name`` /
+    # ``org.opencontainers.image.source``) for base-image lineage and
+    # derived-from-repo advisories. Populated best-effort; empty when the
+    # discovery tier does not provide them (e.g. Syft absent → no SBOM).
+    sbom_packages: list[str] = field(default_factory=list)
+    base_image: str = ""
+    source_repo_url: str = ""
 
 
 def _find_runtime() -> Optional[_RuntimeInfo]:
@@ -174,7 +186,19 @@ def _parse_image_config(config_json: dict | str) -> ImageConfig:
         if isinstance(entry, str) and "=" in entry:
             k, _, v = entry.partition("=")
             env_dict[k] = v
-    return ImageConfig(workdir=workdir, entrypoint=entrypoint, cmd=cmd, env=env_dict)
+    labels_raw = cfg.get("Labels") or {}
+    labels: dict[str, str] = {}
+    if isinstance(labels_raw, dict):
+        for k, v in labels_raw.items():
+            if isinstance(k, str):
+                labels[k] = "" if v is None else str(v)
+    return ImageConfig(
+        workdir=workdir,
+        entrypoint=entrypoint,
+        cmd=cmd,
+        env=env_dict,
+        labels=labels,
+    )
 
 
 def _entrypoint_target_dir(config: ImageConfig) -> Optional[str]:
@@ -249,7 +273,35 @@ def _identify_app_dirs(
 # Tier 1: Syft discovery
 # ---------------------------------------------------------------------------
 
-def _discover_with_syft(image_ref: str, syft_path: str) -> tuple[ImageConfig, list[str]]:
+def _sbom_packages_from_syft(data: dict) -> list[str]:
+    """Extract package URLs (purls) from a Syft JSON catalog.
+
+    Falls back to a ``type/name@version`` synthetic identifier when an
+    artifact has no purl, so SBOM-backed correlation still has a stable
+    key. Duplicates are removed while preserving first-seen order.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for art in data.get("artifacts", []):
+        if not isinstance(art, dict):
+            continue
+        purl = art.get("purl")
+        if not purl:
+            name = art.get("name") or ""
+            if not name:
+                continue
+            version = art.get("version") or ""
+            atype = art.get("type") or "pkg"
+            purl = f"{atype}/{name}@{version}" if version else f"{atype}/{name}"
+        if purl not in seen:
+            seen.add(purl)
+            out.append(purl)
+    return out
+
+
+def _discover_with_syft(
+    image_ref: str, syft_path: str
+) -> tuple[ImageConfig, list[str], list[str]]:
     result = subprocess.run(
         [syft_path, image_ref, "-o", "syft-json", "-q"],
         capture_output=True, text=True, timeout=300,
@@ -269,7 +321,9 @@ def _discover_with_syft(image_ref: str, syft_path: str) -> tuple[ImageConfig, li
         if path:
             file_listing.append(path)
 
-    return config, file_listing
+    sbom_packages = _sbom_packages_from_syft(data)
+
+    return config, file_listing, sbom_packages
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +643,10 @@ def _run_discovery(
         if syft_path:
             try:
                 _LOGGER.info("Container discovery: using Syft")
-                config, file_listing = _discover_with_syft(image_ref, syft_path)
+                config, file_listing, sbom_packages = _discover_with_syft(
+                    image_ref, syft_path
+                )
+                result.sbom_packages = sbom_packages
                 result.tier_used = "syft"
             except Exception:
                 if tier == "syft":
@@ -897,6 +954,12 @@ def extract_source_from_image(
         return result
 
     result.config = config
+    # Surface OCI base-image lineage + upstream source repo from standard
+    # image annotations (present regardless of discovery tier, since every
+    # tier parses the image config). Used by cross-source correlation for
+    # SHARED_BASE_IMAGE links and the unscanned-upstream-repo advisory.
+    result.base_image = config.labels.get("org.opencontainers.image.base.name", "")
+    result.source_repo_url = config.labels.get("org.opencontainers.image.source", "")
     app_dirs, needs_agentic, hint = _identify_app_dirs(config, file_listing)
     result.needs_agentic = needs_agentic
     result.agentic_hint = hint

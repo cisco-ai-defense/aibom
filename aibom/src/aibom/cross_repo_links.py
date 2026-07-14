@@ -28,12 +28,38 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
-from .cross_ref import CrossRefIndex, build_env_index, build_package_index
+from .cross_ref import CrossRefIndex, EnvVarEntry, build_env_index, build_package_index
 from .models.enums import AIComponentType, CrossRepoLinkType
 from .models.scan import CrossRepoLink, RepoOccurrence
 from .scanners.remote_agent_resolver import _normalize_url_for_index
+from .source_attribution import canonicalize_git_remote
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _scanned_repo_identities(
+    source_metadata: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Canonical git identities of every scanned source.
+
+    Uses each source's ``repo_url`` (the git remote the CLI resolved — set for
+    git-URL sources AND local checkouts of a git repo), falling back to the
+    ``source_name`` for git-URL sources when ``repo_url`` is absent. Canonicalized
+    via :func:`canonicalize_git_remote` so SSH/HTTPS spellings and ``.git``
+    suffixes compare equal. A local checkout therefore counts as "scanned" and
+    suppresses a spurious derived-from-repo advisory for an image built from it.
+    """
+    scanned: set[str] = set()
+    for meta in source_metadata.values():
+        url = (meta.get("repo_url") or "").strip()
+        if not url and meta.get("kind") == "git-url":
+            url = (meta.get("source_name") or "").strip()
+        if not url:
+            continue
+        canon = canonicalize_git_remote(url)
+        if canon:
+            scanned.add(canon)
+    return scanned
 
 
 def _repo_for_file(file_path: str, scan_paths: list[str]) -> str | None:
@@ -553,19 +579,166 @@ def _build_a2a_agent_cross_links(
     return links
 
 
+def _augment_env_index_with_image_env(
+    env_index: CrossRefIndex,
+    source_metadata: dict[str, dict[str, Any]],
+) -> int:
+    """Fold image-baked ``ENV`` vars into *env_index* as producers.
+
+    A container image whose config bakes ``ENV FOO=bar`` acts as a
+    producer of ``FOO`` for cross-source ``ENV_VAR_BINDING``. The entry's
+    ``source_path`` is set to the image's scan-path root so
+    :func:`_repo_for_file` attributes it to that source. Returns the
+    number of env vars added.
+
+    Security: image ``ENV`` values are frequently baked-in secrets (API
+    keys, tokens, DB passwords). Only the variable *name* is needed for
+    the binding signal, so the value is intentionally NOT stored — it
+    would otherwise flow into ``CrossRepoLink.resolved_value`` and be
+    emitted verbatim by the JSON reporter / ``--post-url``. Repo-config
+    producers are inserted first (via :func:`build_env_index`), so when a
+    var also has a non-image producer that real value still wins for
+    ``resolved_value``; an image-only var resolves to empty.
+    """
+    added = 0
+    for scan_path, meta in source_metadata.items():
+        image_env = meta.get("image_env") or {}
+        if not isinstance(image_env, dict):
+            continue
+        for name in image_env:
+            env_index.env.setdefault(str(name), []).append(EnvVarEntry(
+                name=str(name),
+                value="",  # redacted: never surface a baked image-ENV secret
+                source_type="image-env",
+                source_path=scan_path,
+            ))
+            added += 1
+    return added
+
+
+def _build_shared_base_image_links(
+    source_metadata: dict[str, dict[str, Any]],
+) -> list[CrossRepoLink]:
+    """Link two or more image sources that share the same base image."""
+    base_to_paths: dict[str, list[str]] = {}
+    for scan_path, meta in source_metadata.items():
+        base = (meta.get("base_image") or "").strip()
+        if not base:
+            continue
+        base_to_paths.setdefault(base, []).append(scan_path)
+
+    links: list[CrossRepoLink] = []
+    for base, paths in sorted(base_to_paths.items()):
+        if len(set(paths)) < 2:
+            continue
+        links.append(CrossRepoLink(
+            link_type=CrossRepoLinkType.SHARED_BASE_IMAGE,
+            identifier=base,
+            resolved_value=base,
+            occurrences=[
+                RepoOccurrence(repo_path=p, role="shares base image")
+                for p in sorted(set(paths))
+            ],
+            evidence=f"Base image '{base}' shared by {len(set(paths))} image sources",
+        ))
+    return links
+
+
+def _build_sbom_shared_dependency_links(
+    source_metadata: dict[str, dict[str, Any]],
+) -> list[CrossRepoLink]:
+    """SBOM-backed ``SHARED_DEPENDENCY`` links from Syft package sets.
+
+    Distinct from manifest-based shared deps: identifiers are package
+    URLs (purls) and links carry ``evidence_type='sbom'``.
+    """
+    pkg_to_paths: dict[str, set[str]] = {}
+    for scan_path, meta in source_metadata.items():
+        for pkg in meta.get("sbom_packages") or []:
+            pkg_to_paths.setdefault(str(pkg), set()).add(scan_path)
+
+    links: list[CrossRepoLink] = []
+    for pkg, paths in sorted(pkg_to_paths.items()):
+        if len(paths) < 2:
+            continue
+        links.append(CrossRepoLink(
+            link_type=CrossRepoLinkType.SHARED_DEPENDENCY,
+            identifier=pkg,
+            evidence_type="sbom",
+            occurrences=[
+                RepoOccurrence(repo_path=p, role="shared")
+                for p in sorted(paths)
+            ],
+            evidence=f"Package '{pkg}' present in {len(paths)} image SBOMs",
+        ))
+    return links
+
+
+def _build_derived_from_repo_links(
+    source_metadata: dict[str, dict[str, Any]],
+) -> list[CrossRepoLink]:
+    """Advisory ``DERIVED_FROM_REPO`` links from image source labels.
+
+    When an image declares ``org.opencontainers.image.source`` and that
+    upstream repo was **not** among the scanned sources, emit an advisory
+    link (``evidence_type='unscanned_upstream_repo'``) so the operator
+    knows the image's provenance repo is unscanned.
+    """
+    scanned_urls = _scanned_repo_identities(source_metadata)
+
+    links: list[CrossRepoLink] = []
+    for scan_path, meta in source_metadata.items():
+        url = (meta.get("source_repo_url") or "").strip()
+        if not url:
+            continue
+        # A local checkout of this same repo (kind=local-path) counts as scanned
+        # via its resolved git remote, so canonicalize both sides before the
+        # membership test to avoid a false "unscanned upstream" advisory.
+        if canonicalize_git_remote(url) in scanned_urls:
+            continue
+        links.append(CrossRepoLink(
+            link_type=CrossRepoLinkType.DERIVED_FROM_REPO,
+            identifier=url,
+            resolved_value=url,
+            evidence_type="unscanned_upstream_repo",
+            occurrences=[
+                RepoOccurrence(repo_path=scan_path, role="derived image"),
+                RepoOccurrence(repo_path=url, role="unscanned upstream"),
+            ],
+            evidence=(
+                f"Image derived from upstream repo '{url}' "
+                f"(not included in this scan)"
+            ),
+        ))
+    return links
+
+
 def build_deterministic_cross_repo_links(
     per_repo_results: dict[str, dict[str, Any]],
     scan_paths: list[str],
+    source_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> list[CrossRepoLink]:
     """Build cross-repo links deterministically (no LLM).
 
     Detects:
-    - ``ENV_VAR_BINDING``: env vars defined in one repo, consumed in another.
+    - ``ENV_VAR_BINDING``: env vars defined in one repo, consumed in another
+      (image-baked ``ENV`` vars participate as producers when
+      *source_metadata* supplies them).
     - ``SHARED_MODEL``: identical model IDs across repos.
-    - ``SHARED_DEPENDENCY``: packages in multiple repos' manifests.
+    - ``SHARED_DEPENDENCY``: packages in multiple repos' manifests, plus
+      SBOM-backed matches (``evidence_type='sbom'``) across image sources.
+    - ``SHARED_BASE_IMAGE``: image sources sharing an OCI base image.
+    - ``DERIVED_FROM_REPO``: advisory for an image whose upstream source
+      repo was not scanned.
     - ``SHARED_ENDPOINT``: identical endpoint URLs across repos.
     - ``A2A_AGENT_CLIENT_SERVER``: an ``AGENT_PROXY`` in one repo whose
       URL matches an ``AGENT`` card's A2A endpoint in another repo.
+
+    *source_metadata* (optional) maps each scan-path to per-source image
+    metadata (``kind``, ``source_name``, ``base_image``, ``sbom_packages``,
+    ``image_env``, ``source_repo_url``) and enables the container-aware
+    correlations. ``scan_paths`` must be **real on-disk paths** — image
+    refs / git URLs will not resolve and are warned about.
 
     Also propagates resolved env-var values to consumer components and
     upgrades unverified A2A proxies to ``verified_cross_repo_card``.
@@ -573,7 +746,22 @@ def build_deterministic_cross_repo_links(
     if len(per_repo_results) < 2:
         return []
 
+    for sp in scan_paths:
+        if not Path(sp).exists():
+            _LOGGER.warning(
+                "Cross-source correlation: scan path not found on disk, "
+                "env/dependency indexing will skip it: %s", sp,
+            )
+
+    source_metadata = source_metadata or {}
+
     env_index = build_env_index(scan_paths)
+    n_image_env = _augment_env_index_with_image_env(env_index, source_metadata)
+    if n_image_env:
+        _LOGGER.info(
+            "Cross-source correlation: folded %d image-baked ENV var(s) into "
+            "the env index as producers", n_image_env,
+        )
 
     links: list[CrossRepoLink] = []
     env_links = _build_env_var_binding_links(per_repo_results, env_index, scan_paths)
@@ -584,17 +772,25 @@ def build_deterministic_cross_repo_links(
     links.extend(_build_agent_model_cross_links(shared_model_links, per_repo_results))
     links.extend(_build_shared_endpoint_links(per_repo_results))
     links.extend(_build_shared_dependency_links(scan_paths))
+    links.extend(_build_sbom_shared_dependency_links(source_metadata))
+    links.extend(_build_shared_base_image_links(source_metadata))
+    links.extend(_build_derived_from_repo_links(source_metadata))
     links.extend(_build_a2a_agent_cross_links(per_repo_results))
 
     links = _resolve_colon_prefixed_repo_paths(links, scan_paths)
     links = _filter_intra_repo_links(links)
     links = _filter_quality_bar(links)
-    n_env = sum(1 for l in links if l.link_type == CrossRepoLinkType.ENV_VAR_BINDING)
-    n_model = sum(1 for l in links if l.link_type == CrossRepoLinkType.SHARED_MODEL)
-    n_dep = sum(1 for l in links if l.link_type == CrossRepoLinkType.SHARED_DEPENDENCY)
+    n_env = sum(1 for link in links if link.link_type == CrossRepoLinkType.ENV_VAR_BINDING)
+    n_model = sum(1 for link in links if link.link_type == CrossRepoLinkType.SHARED_MODEL)
+    n_dep = sum(1 for link in links if link.link_type == CrossRepoLinkType.SHARED_DEPENDENCY)
+    n_base = sum(1 for link in links if link.link_type == CrossRepoLinkType.SHARED_BASE_IMAGE)
+    n_derived = sum(
+        1 for link in links if link.link_type == CrossRepoLinkType.DERIVED_FROM_REPO
+    )
     _LOGGER.info(
-        "Deterministic cross-repo links: %d total (%d env-var/endpoint, %d model, %d dep)",
-        len(links), n_env, n_model, n_dep,
+        "Deterministic cross-repo links: %d total (%d env-var/endpoint, "
+        "%d model, %d dep, %d base-image, %d derived-from-repo)",
+        len(links), n_env, n_model, n_dep, n_base, n_derived,
     )
     return links
 

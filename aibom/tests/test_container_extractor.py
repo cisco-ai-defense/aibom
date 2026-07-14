@@ -75,6 +75,67 @@ class TestImageConfigParsing:
         assert config.workdir == "/"
         assert config.entrypoint == []
 
+    def test_parses_oci_labels(self):
+        raw = {
+            "config": {
+                "WorkingDir": "/app",
+                "Labels": {
+                    "org.opencontainers.image.base.name": "python:3.12-slim",
+                    "org.opencontainers.image.source": "https://github.com/org/svc",
+                    "maintainer": None,
+                },
+            }
+        }
+        config = _parse_image_config(raw)
+        assert config.labels["org.opencontainers.image.base.name"] == "python:3.12-slim"
+        assert config.labels["org.opencontainers.image.source"] == "https://github.com/org/svc"
+        assert config.labels["maintainer"] == ""
+
+    def test_missing_labels_default_empty(self):
+        config = _parse_image_config({"config": {"WorkingDir": "/app"}})
+        assert config.labels == {}
+
+
+class TestSyftSbomParsing:
+    def test_extracts_purls(self):
+        from aibom.scanners.container_extractor import _sbom_packages_from_syft
+
+        data = {
+            "artifacts": [
+                {"name": "openssl", "version": "3.0", "type": "deb",
+                 "purl": "pkg:deb/debian/openssl@3.0"},
+                {"name": "requests", "version": "2.31", "type": "python",
+                 "purl": "pkg:pypi/requests@2.31"},
+            ]
+        }
+        pkgs = _sbom_packages_from_syft(data)
+        assert "pkg:deb/debian/openssl@3.0" in pkgs
+        assert "pkg:pypi/requests@2.31" in pkgs
+
+    def test_synthesizes_id_when_no_purl(self):
+        from aibom.scanners.container_extractor import _sbom_packages_from_syft
+
+        data = {"artifacts": [{"name": "libfoo", "version": "1.2", "type": "deb"}]}
+        assert _sbom_packages_from_syft(data) == ["deb/libfoo@1.2"]
+
+    def test_dedups_and_ignores_malformed(self):
+        from aibom.scanners.container_extractor import _sbom_packages_from_syft
+
+        data = {
+            "artifacts": [
+                {"purl": "pkg:pypi/x@1"},
+                {"purl": "pkg:pypi/x@1"},
+                "not-a-dict",
+                {"version": "1"},
+            ]
+        }
+        assert _sbom_packages_from_syft(data) == ["pkg:pypi/x@1"]
+
+    def test_empty_when_no_artifacts(self):
+        from aibom.scanners.container_extractor import _sbom_packages_from_syft
+
+        assert _sbom_packages_from_syft({}) == []
+
 
 class TestEntrypointTargetDir:
     def test_python_script(self):
