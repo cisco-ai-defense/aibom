@@ -365,3 +365,17 @@ def test_find_ids_by_path_and_concept_ignores_parameter_rows():
 
         assert "pkg.Agent" in ids
         assert "pkg.Agent.name" not in ids
+
+
+def test_stale_parameter_ignored_full_path_branch():
+    """A full dotted suffix exercises the ``id IN (...)`` branch, which applies
+    the guard directly against kb.component_catalog (not the token table)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog_with_parameter_rows(db_file)
+
+        with CatalogDB(db_file) as connector:
+            results = connector.find_components_by_suffixes(["pkg.Tool.run.query"])
+
+        ids = {row["id"] for row in results}
+        assert "pkg.Tool.run.query" not in ids
