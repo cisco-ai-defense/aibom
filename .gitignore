@@ -101,3 +101,8 @@ node_modules
 
 # Benchmark cloned repos
 aibom/benchmarks/_repos/
+
+# Claude Code personal config #
+###############################
+.claude/settings.local.json
+CLAUDE.local.md
