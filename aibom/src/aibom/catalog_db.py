@@ -23,8 +23,6 @@ LOGGER = logging.getLogger(__name__)
 
 _CATALOG_COLS = "id, label, concept, framework, sig_name, type, catalog_label"
 
-_LABEL_BLOCKLIST: tuple[str, ...] = ("parameter",)
-
 
 def is_excluded(name: str, patterns: List[str]) -> bool:
     """Return True if *name* suffix-matches or equals any pattern in *patterns*."""
@@ -85,25 +83,25 @@ class CatalogDB:
 
         If the catalog already ships a pre-built
         ``component_catalog_last_seg`` table (new KBs), use it directly but
-        join against ``kb.component_catalog`` so we can filter out low-signal
-        ``label`` rows (currently ``parameter``) that pollute the suffix
-        index.  Otherwise build a temporary table from
-        ``kb.component_catalog`` with the blocklist applied.
+        join against ``kb.component_catalog`` so stale ``label='parameter'``
+        rows (only present in pre-M1 KBs) are ignored and never pollute the
+        suffix index.  Otherwise build a temporary table from
+        ``kb.component_catalog`` with the same guard applied.
 
         Returns the qualified table name to use in queries.
         """
         if self._token_table is not None:
             return self._token_table
 
-        label_filter_sql = self._label_filter_sql("cc")
-        build_filter_sql = self._label_filter_sql()
+        label_filter_sql = self._ignore_stale_parameter_sql("cc")
+        build_filter_sql = self._ignore_stale_parameter_sql()
 
         try:
             self._connection.execute(
                 "SELECT 1 FROM kb.component_catalog_last_seg LIMIT 1"
             )
             LOGGER.debug(
-                "Pre-built token table found; filtering blocklisted labels in temp view"
+                "Pre-built token table found; ignoring stale parameter rows in temp view"
             )
             self._connection.execute(
                 "CREATE TEMP TABLE _last_seg AS "
@@ -126,17 +124,18 @@ class CatalogDB:
         return self._token_table
 
     @staticmethod
-    def _label_filter_sql(alias: str = "") -> str:
-        """SQL fragment rejecting rows whose ``label`` is in the blocklist.
+    def _ignore_stale_parameter_sql(alias: str = "") -> str:
+        """SQL fragment that ignores stale ``label='parameter'`` rows.
 
-        Applying this filter at query time (rather than post-processing
-        Python-side) keeps the hot path off 1M+ parameter rows that never
-        represent top-level AI components and are a major source of
-        false positives during suffix matching.
+        The server-side KB pipeline now strips parameter rows at build time, so
+        a current KB never contains them and this guard is a no-op there. It is
+        retained purely as a defensive fallback: if a stale KB that still
+        carries parameter rows is loaded, those rows are silently ignored so
+        scan output matches a current KB. Parameter rows are never top-level AI
+        components and were a source of suffix-match false positives.
         """
         col = f"{alias}.label" if alias else "label"
-        literals = ",".join(f"'{lbl}'" for lbl in _LABEL_BLOCKLIST)
-        return f"COALESCE({col}, '') NOT IN ({literals})"
+        return f"COALESCE({col}, '') <> 'parameter'"
 
     # ------------------------------------------------------------------
     # Public API
@@ -217,7 +216,7 @@ class CatalogDB:
         if not concepts:
             return []
         placeholders = ",".join("?" for _ in concepts)
-        label_filter = self._label_filter_sql()
+        label_filter = self._ignore_stale_parameter_sql()
         query = f"""
             SELECT DISTINCT id FROM component_catalog
             WHERE id LIKE ? AND LOWER(concept) IN ({placeholders})
@@ -228,7 +227,8 @@ class CatalogDB:
         return [r[0] for r in rows]
 
     def find_components_by_suffixes(
-        self, suffixes: Sequence[str],
+        self,
+        suffixes: Sequence[str],
     ) -> List[Dict[str, Any]]:
         """Return catalog entries whose IDs match any of the provided suffixes.
 
@@ -256,7 +256,7 @@ class CatalogDB:
                 tokens.add(s)
 
         matched_ids: set[str] = set()
-        label_filter = self._label_filter_sql()
+        label_filter = self._ignore_stale_parameter_sql()
 
         if full_paths:
             rows = self._connection.execute(
@@ -300,9 +300,7 @@ class CatalogDB:
                     seen_ids.add(entry_id)
 
         if self._excludes:
-            db_results = [
-                r for r in db_results if not self._is_excluded(r["id"])
-            ]
+            db_results = [r for r in db_results if not self._is_excluded(r["id"])]
 
         return db_results
 
