@@ -218,6 +218,62 @@ _PROVIDER_IMPORT_HINTS: dict[str, tuple[str, str]] = {
     "google_genai": ("langchain_google_genai", "cisco-aibom[agentic,llm-google]"),
 }
 
+# Inverted view of the hints above, keyed by the integration *module* whose
+# import fails. This is how a missing provider binding is translated into the
+# right ``cisco-aibom`` extra WITHOUT this code inferring the provider from the
+# model name: ``init_chat_model`` performs the model->provider inference and
+# then imports the integration package, so a missing binding surfaces as an
+# ``ImportError`` naming the exact module (e.g. ``langchain_openai``). We map
+# that module back to its install target.
+_MODULE_INSTALL_TARGETS: dict[str, str] = {
+    module: install_target for module, install_target in _PROVIDER_IMPORT_HINTS.values()
+}
+
+
+def _missing_binding_module(exc: BaseException) -> str | None:
+    """Return the top-level module a failed import was looking for.
+
+    Walks the exception's cause/context chain for the original
+    ``ModuleNotFoundError`` (``init_chat_model`` re-raises ``ImportError``
+    ``from`` it) and returns its top-level module name — e.g. ``langchain_openai``
+    for a failed ``import langchain_openai.chat_models``. Returns ``None`` when no
+    module name can be recovered.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        name = getattr(current, "name", None)
+        if isinstance(current, ModuleNotFoundError) and name:
+            return name.split(".", 1)[0]
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _provider_runtime_hint(exc: ImportError) -> str:
+    """Translate a provider-binding import failure into an actionable message.
+
+    Maps the missing integration module to the ``cisco-aibom`` extra that ships
+    it. Falls back to listing the bundled provider extras when the module is one
+    this project does not package (a provider ``langchain`` supports but the AI
+    BOM CLI does not bundle an extra for).
+    """
+    module = _missing_binding_module(exc)
+    install_target = _MODULE_INSTALL_TARGETS.get(module or "")
+    if install_target:
+        return (
+            f"The LLM provider integration for this model is not installed "
+            f"(missing '{module}'). "
+            f'Install it with: uv tool install "{install_target}"'
+        )
+    bundled = ", ".join(sorted(set(_MODULE_INSTALL_TARGETS.values())))
+    missing = f" (missing '{module}')" if module else ""
+    return (
+        "The LLM provider integration for this model is not installed"
+        f"{missing}. Install the provider extra that matches your "
+        f"--llm-model — one of: {bundled}."
+    )
+
 
 def resolve_provider(model_string: str, provider: str | None = None) -> str | None:
     """Resolve the effective model provider from explicit or legacy syntax."""
@@ -242,22 +298,39 @@ def ensure_llm_runtime_available(
         )
 
     resolved_provider = resolve_provider(model_string, provider)
-    if not resolved_provider:
-        return None
 
-    provider_hint = _PROVIDER_IMPORT_HINTS.get(resolved_provider)
-    if not provider_hint:
+    if resolved_provider:
+        # Provider is known explicitly (``--llm-provider`` or a ``provider/``
+        # prefix). For a provider we bundle an extra for, do a cheap targeted
+        # import check with a precise hint. Providers we do not bundle (e.g.
+        # ``ollama``) are the caller's responsibility — don't second-guess them.
+        provider_hint = _PROVIDER_IMPORT_HINTS.get(resolved_provider)
+        if provider_hint:
+            module_name, install_target = provider_hint
+            try:
+                importlib.import_module(module_name)
+            except ImportError as exc:
+                raise ImportError(
+                    f"LLM provider '{resolved_provider}' requires additional "
+                    f"runtime support. "
+                    f'Install with: uv tool install "{install_target}"'
+                ) from exc
         return resolved_provider
 
-    module_name, install_target = provider_hint
+    # No provider we can resolve ourselves — a name-inferred model such as a
+    # bare ``gpt-4o``. Rather than re-implement langchain's model->provider
+    # inference here, let ``init_chat_model`` infer the provider and import its
+    # integration package; that import happens before the model is constructed,
+    # so no credentials are needed. Only a *missing binding* (ImportError) is
+    # ours to translate — any other error (e.g. an un-inferable name) means the
+    # binding is present and is surfaced later with the real configuration.
     try:
-        importlib.import_module(module_name)
+        init_chat_model(model_string, model_provider=provider)
     except ImportError as exc:
-        raise ImportError(
-            f"LLM provider '{resolved_provider}' requires additional runtime support. "
-            f'Install with: uv tool install "{install_target}"'
-        ) from exc
-    return resolved_provider
+        raise ImportError(_provider_runtime_hint(exc)) from exc
+    except Exception:  # noqa: BLE001 - binding imported; other failures handled later
+        pass
+    return None
 
 
 def build_chat_model(
@@ -375,4 +448,12 @@ def build_chat_model(
     if init_kwargs_extra:
         init_kwargs.update(init_kwargs_extra)
 
-    return init_chat_model(model_id, **init_kwargs)
+    try:
+        return init_chat_model(model_id, **init_kwargs)
+    except ImportError as exc:
+        # Definitive guard covering every resolution path: a name-inferred
+        # provider whose integration package is missing reaches us here. The
+        # pre-flight in ``ensure_llm_runtime_available`` catches the common case
+        # earlier, but translating here too keeps ``build_chat_model``
+        # self-contained. Map the missing module to the matching extra.
+        raise ImportError(_provider_runtime_hint(exc)) from exc

@@ -566,5 +566,125 @@ def test_init_kwargs_extra_overrides_reasoning(mock_init, _mock_preflight):
     assert kwargs["extra_body"] == {"custom": 1}
 
 
+# --- Missing provider-binding translation (name-inferred models) ------------
+#
+# A bare model name like ``gpt-4o`` carries no provider prefix, so this code
+# never classifies it. ``init_chat_model`` infers the provider and imports the
+# integration package; when that package is absent it raises an ImportError
+# whose cause names the exact missing module. We translate that module into the
+# matching ``cisco-aibom`` extra — no model-name matching on our side.
+
+
+def _import_error_missing(module_name: str) -> ImportError:
+    """Build an ImportError shaped like langchain's missing-binding failure.
+
+    langchain's ``_import_module`` catches the ``ModuleNotFoundError`` and
+    re-raises an ``ImportError`` ``from`` it, so the original module name lives
+    on ``__cause__``.
+    """
+    cause = ModuleNotFoundError(f"No module named '{module_name}'", name=module_name)
+    pkg = module_name.replace("_", "-")
+    err = ImportError(
+        f"Initializing chat model requires the {pkg} package. "
+        f"Please install it with `pip install {pkg}`"
+    )
+    err.__cause__ = cause
+    return err
+
+
+def test_missing_binding_module_reads_cause_chain():
+    from aibom.llm_factory import _missing_binding_module
+
+    exc = _import_error_missing("langchain_openai")
+    assert _missing_binding_module(exc) == "langchain_openai"
+
+
+def test_missing_binding_module_returns_none_without_name():
+    from aibom.llm_factory import _missing_binding_module
+
+    assert _missing_binding_module(ImportError("no module name here")) is None
+
+
+def test_provider_runtime_hint_maps_known_module_to_extra():
+    from aibom.llm_factory import _provider_runtime_hint
+
+    msg = _provider_runtime_hint(_import_error_missing("langchain_openai"))
+    assert "cisco-aibom[agentic,llm-openai]" in msg
+
+
+def test_provider_runtime_hint_falls_back_for_unbundled_module():
+    from aibom.llm_factory import _provider_runtime_hint
+
+    # No bundled extra for cohere -> list the ones we do ship.
+    msg = _provider_runtime_hint(_import_error_missing("langchain_cohere"))
+    assert "cisco-aibom[agentic,llm-openai]" in msg
+    assert "cisco-aibom[agentic,llm-aws]" in msg
+
+
+@patch("aibom.llm_factory.ensure_llm_runtime_available", return_value=None)
+@patch("aibom.llm_factory.init_chat_model")
+def test_build_chat_model_translates_missing_binding(mock_init, _mock_preflight):
+    """A name-inferred model whose binding is missing yields the extra hint at
+    the construction site, not a raw ModuleNotFoundError."""
+    from aibom.llm_factory import build_chat_model
+
+    mock_init.side_effect = _import_error_missing("langchain_openai")
+    with pytest.raises(ImportError) as excinfo:
+        build_chat_model("gpt-4o")
+    assert "cisco-aibom[agentic,llm-openai]" in str(excinfo.value)
+
+
+@patch("aibom.llm_factory.init_chat_model")
+def test_preflight_name_inferred_missing_binding_raises_hint(mock_init):
+    """Pre-flight fails fast for a bare model whose binding is missing — it lets
+    langchain infer + import, then translates the ImportError."""
+    from aibom.llm_factory import ensure_llm_runtime_available
+
+    mock_init.side_effect = _import_error_missing("langchain_openai")
+    with pytest.raises(ImportError) as excinfo:
+        ensure_llm_runtime_available("gpt-4o")
+    assert "cisco-aibom[agentic,llm-openai]" in str(excinfo.value)
+
+
+@patch("aibom.llm_factory.init_chat_model")
+def test_preflight_name_inferred_present_binding_passes(mock_init):
+    """Binding present (no ImportError) -> pre-flight passes and returns None."""
+    from aibom.llm_factory import ensure_llm_runtime_available
+
+    mock_init.return_value = MagicMock()
+    assert ensure_llm_runtime_available("gpt-4o") is None
+
+
+def test_preflight_explicit_provider_missing_binding_raises_hint():
+    """Explicit provider keeps its precise, provider-named hint.
+
+    A delegating fake makes *only* ``langchain_openai`` fail to import — patching
+    ``importlib.import_module`` to raise unconditionally would break pytest's own
+    import machinery.
+    """
+    import importlib as _importlib
+
+    from aibom.llm_factory import ensure_llm_runtime_available
+
+    real_import = _importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == "langchain_openai":
+            raise ModuleNotFoundError(
+                "No module named 'langchain_openai'", name="langchain_openai"
+            )
+        return real_import(name, *args, **kwargs)
+
+    with (
+        patch("aibom.llm_factory.init_chat_model", new=MagicMock()),
+        patch("aibom.llm_factory.importlib.import_module", side_effect=fake_import),
+    ):
+        with pytest.raises(ImportError) as excinfo:
+            ensure_llm_runtime_available("gpt-4o", provider="openai")
+    msg = str(excinfo.value)
+    assert "openai" in msg
+    assert "cisco-aibom[agentic,llm-openai]" in msg
+
+
 if __name__ == "__main__":
     unittest.main()
