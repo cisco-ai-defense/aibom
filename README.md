@@ -146,6 +146,32 @@ The `analyze` command always runs the agentic pipeline, so it requires the `agen
 
 ## Quick Start
 
+The fastest path from install to seeing assets in AI Inventory:
+
+```bash
+# 1. Install with the agentic pipeline + your LLM provider (OpenAI shown)
+uv tool install --python 3.13 "cisco-aibom[agentic,llm-openai]"
+
+# 2. Scan a git repo or container image (--llm-model is always required)
+cisco-aibom analyze /path/to/repo \
+  --output-format json --output-file report.json \
+  --llm-model gpt-5.4 --llm-api-key $OPENAI_API_KEY
+
+# 3. Upload to AI Defense — assets appear in AI Inventory
+cisco-aibom report upload report.json --format json \
+  --post-url "$AIBOM_POST_URL" --ai-defense-api-key "$AI_DEFENSE_API_KEY"
+```
+
+> **What appears in AI Inventory?** A scan of a **git working tree** or a
+> **container image** is automatically attributed (repo URL + commit SHA, or
+> image ref + digest) and projected as an inventory asset — no extra flags
+> needed. A scan of a plain local directory that is *not* a git checkout still
+> uploads successfully, but has no stable identity to project, so it will
+> **not** appear in AI Inventory. To populate the inventory, scan a git repo or
+> a container image.
+
+More examples:
+
 ```bash
 # Scan a local project (--llm-model is required)
 cisco-aibom analyze /path/to/project -o json -O report.json \
@@ -501,7 +527,8 @@ uv run pytest tests -v
 - **DuckDB catalog errors:** Run `cisco-aibom kb download` to fetch the latest catalog, or set `AIBOM_DB_PATH` to point at an existing file. Use `cisco-aibom kb verify` to check integrity.
 - **Container extraction fails:** Ensure Docker or an alternative runtime is installed and running. Use `--container-extraction-tier` to force a specific tool. See [docs/CONTAINER_SCANNING.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CONTAINER_SCANNING.md).
 - **Missing `--llm-model`:** The LLM agent is required. Install the agentic extra (`uv tool install "cisco-aibom[agentic,llm-openai]"`) and supply `--llm-model` or set `AIBOM_LLM_MODEL`. See [docs/AGENTIC_MODE.md](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md).
-- **LLM provider errors:** Ensure `--llm-provider` matches the installed LangChain integration package. For Azure OpenAI, `--llm-api-version` is required.
+- **LLM provider errors / missing provider package:** Each provider needs its integration extra (`llm-openai`, `llm-aws`, `llm-anthropic`, `llm-google`). If it is missing, the CLI fails fast with the exact `uv tool install "cisco-aibom[agentic,llm-…]"` command to run — including when the model is given by bare name (e.g. `--llm-model gpt-4o`). For Azure OpenAI, `--llm-api-version` is required.
 - **Slow scans on large repos:** Use `--timing` to identify bottlenecks. Use `--agentic-fast-model` for a cheaper model on simple confirmations, or increase `--agentic-concurrency` for parallel batches.
 - **Missing output files:** `--output-file` / `-O` is required for all file-based formats.
 - **Report submission:** Set `AIBOM_POST_URL` and `AI_DEFENSE_API_KEY`. Regional endpoints: US (`api.security.cisco.com`), APJ (`api.apj.security.cisco.com`), EU (`api.eu.security.cisco.com`), UAE (`api.uae.security.cisco.com`).
+- **Upload succeeded but nothing appears in AI Inventory:** Only **git** and **container-image** scans are projected into the inventory; the CLI auto-captures their source attribution (repo URL + commit SHA, or image ref + digest). A scan of a plain local path (not a git checkout) uploads successfully but is not projected, because it has no stable asset identity. Re-run the scan against a git working tree or a container image.
