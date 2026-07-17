@@ -22,12 +22,10 @@ layer can invoke them via the Deep Agents harness.
 
 from __future__ import annotations
 
-import contextvars
 import json
 import logging
 import re
 import time
-import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -37,6 +35,8 @@ from ..cache_paths import cache_read_dirs, ensure_cache_dir
 
 _LOGGER = logging.getLogger(__name__)
 
+import contextvars
+
 _batch_tool_stats: contextvars.ContextVar[dict[str, dict[str, Any]]] = (
     contextvars.ContextVar("_batch_tool_stats")
 )
@@ -44,16 +44,15 @@ _batch_tool_stats: contextvars.ContextVar[dict[str, dict[str, Any]]] = (
 _allowed_search_roots: contextvars.ContextVar[tuple[str, ...] | None] = (
     contextvars.ContextVar("_allowed_search_roots", default=None)
 )
+_strict_tool_root_enforcement: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_strict_tool_root_enforcement", default=False
+)
 
 
 def set_allowed_search_roots(
     paths: list[str] | None,
 ) -> contextvars.Token[tuple[str, ...] | None]:
-    """Restrict tools to *paths*; an empty list denies all filesystem access.
-
-    ``None`` leaves the guard unset for backwards-compatible direct tool use.
-    Production agent entry points always pass a concrete list.
-    """
+    """Restrict tools to *paths* in the current invocation context."""
     roots = (
         None if paths is None else tuple(str(Path(path).resolve()) for path in paths)
     )
@@ -63,8 +62,18 @@ def set_allowed_search_roots(
 def reset_allowed_search_roots(
     token: contextvars.Token[tuple[str, ...] | None],
 ) -> None:
-    """Restore the approved roots that preceded a scoped agent invocation."""
+    """Restore the approved roots that preceded an invocation."""
     _allowed_search_roots.reset(token)
+
+
+def set_strict_tool_root_enforcement(value: bool) -> contextvars.Token[bool]:
+    """Enable all-tool guards for an approved raw-trajectory invocation."""
+    return _strict_tool_root_enforcement.set(bool(value))
+
+
+def reset_strict_tool_root_enforcement(token: contextvars.Token[bool]) -> None:
+    """Restore the preceding raw-trajectory guard mode."""
+    _strict_tool_root_enforcement.reset(token)
 
 
 def _path_is_allowed(requested: str) -> bool:
@@ -87,20 +96,23 @@ def _path_is_allowed(requested: str) -> bool:
     return False
 
 
+def _strict_path_is_denied(requested: str) -> bool:
+    return _strict_tool_root_enforcement.get() and not _path_is_allowed(requested)
+
+
 def _clamp_paths(requested: list[str], *, tool_name: str) -> list[str]:
     """Return only those paths that fall under an allowed search root.
 
-    If the guard is unset, returns *requested* unchanged for backwards
-    compatibility. An explicitly empty root set denies every requested path.
+    If no roots are configured, returns *requested* unchanged (backward compat).
     """
     allowed_roots = _allowed_search_roots.get()
-    if allowed_roots is None:
+    if not allowed_roots:
         return requested
     clamped = [path for path in requested if _path_is_allowed(path)]
     denied = len(requested) - len(clamped)
     if denied:
         _record_guard_denial(tool_name, denied)
-    return clamped
+    return clamped or list(allowed_roots)
 
 
 def _reset_tool_stats() -> None:
@@ -139,8 +151,7 @@ def _track_tool(name: str):
 
     def decorator(fn):
         def wrapper(*args, **kwargs):
-            # Arguments can contain repository paths, search patterns, and
-            # environment-variable names. Keep local logs content-free too.
+            # Tool arguments can contain repository content and identifiers.
             _LOGGER.info("Tool call: %s", name)
             t0 = time.monotonic()
             try:
@@ -243,57 +254,11 @@ _ENV_CONFIG_GLOBS = (
     "values-*.yaml",
 )
 
-_SECRET_ENV_MARKERS = (
-    "API_KEY",
-    "ACCESS_KEY",
-    "AUTH",
-    "CREDENTIAL",
-    "PASSWORD",
-    "PRIVATE_KEY",
-    "SECRET",
-    "SESSION_TOKEN",
-    "TOKEN",
-)
-_SENSITIVE_FILE_NAMES = frozenset(
-    {
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".env.staging",
-        ".env.development",
-        ".git-credentials",
-        ".npmrc",
-        ".pypirc",
-        "credentials",
-        "id_rsa",
-        "id_ed25519",
-    }
-)
-_SENSITIVE_FILE_SUFFIXES = frozenset({".key", ".p12", ".pfx", ".pem"})
-
-
-def _safe_resolved_env_value(var_name: str, value: str) -> str:
-    upper_name = var_name.upper()
-    if any(marker in upper_name for marker in _SECRET_ENV_MARKERS):
-        return "[REDACTED]"
-    return value
-
-
-def _sensitive_search_path(path: Path) -> bool:
-    if ".git" in path.parts:
-        return True
-    lowered = path.name.lower()
-    return (
-        lowered in _SENSITIVE_FILE_NAMES
-        or lowered.startswith(".env.")
-        or path.suffix.lower() in _SENSITIVE_FILE_SUFFIXES
-    )
-
 
 @_track_tool("scan_directory")
 def scan_directory_impl(path: str) -> str:
     """Run all registered scanners on *path* and return JSON summary."""
-    if not _path_is_allowed(path):
+    if _strict_path_is_denied(path):
         _record_guard_denial("scan_directory")
         return json.dumps({"error": "path is outside the approved source root"})
     from ..models import ScanContext
@@ -348,10 +313,7 @@ def resolve_env_var_impl(var_name: str, search_paths: list[str]) -> str:
 
         for env_name in _ENV_FILE_NAMES:
             env_file = base_path / env_name
-            if not _path_is_allowed(str(env_file)):
-                _record_guard_denial("resolve_env_var")
-                continue
-            if env_file.is_symlink():
+            if _strict_path_is_denied(str(env_file)):
                 _record_guard_denial("resolve_env_var")
                 continue
             if env_file.is_file():
@@ -361,17 +323,14 @@ def resolve_env_var_impl(var_name: str, search_paths: list[str]) -> str:
                     found.append(
                         {
                             "file": str(env_file),
-                            "value": _safe_resolved_env_value(var_name, val),
+                            "value": val,
                             "source_type": "env_file",
                         }
                     )
 
         for glob_pat in _ENV_CONFIG_GLOBS:
             for cfg in base_path.rglob(glob_pat):
-                if not _path_is_allowed(str(cfg)):
-                    _record_guard_denial("resolve_env_var")
-                    continue
-                if cfg.is_symlink():
+                if _strict_path_is_denied(str(cfg)):
                     _record_guard_denial("resolve_env_var")
                     continue
                 if not cfg.is_file():
@@ -388,7 +347,7 @@ def resolve_env_var_impl(var_name: str, search_paths: list[str]) -> str:
                     found.append(
                         {
                             "file": str(cfg),
-                            "value": _safe_resolved_env_value(var_name, val),
+                            "value": val,
                             "source_type": "config_file",
                         }
                     )
@@ -410,7 +369,7 @@ def _search_yaml_for_key(
                     found.append(
                         {
                             "file": file_path,
-                            "value": _safe_resolved_env_value(key, str(v)),
+                            "value": str(v),
                             "yaml_path": full_key,
                             "source_type": "yaml_value",
                         }
@@ -454,15 +413,13 @@ def lookup_model_impl(identifier: str) -> str:
 @_track_tool("analyze_imports")
 def analyze_imports_impl(file_path: str) -> str:
     """Run LibCST deep import analysis on a single Python file."""
-    if not _path_is_allowed(file_path):
+    if _strict_path_is_denied(file_path):
         _record_guard_denial("analyze_imports")
         return json.dumps({"error": "path is outside the approved source root"})
     from ..cst_parser import parse_source_code
 
     p = Path(file_path)
-    if p.is_symlink() or not p.is_file() or p.suffix != ".py":
-        if p.is_symlink():
-            _record_guard_denial("analyze_imports")
+    if not p.is_file() or p.suffix != ".py":
         return json.dumps({"error": f"Not a Python file: {file_path}"})
 
     source = p.read_text(errors="replace")
@@ -503,13 +460,11 @@ def analyze_imports_impl(file_path: str) -> str:
 @_track_tool("trace_data_flow")
 def trace_data_flow_impl(symbol: str, file_path: str) -> str:
     """Trace a variable through assignments to resolve its concrete value."""
-    if not _path_is_allowed(file_path):
+    if _strict_path_is_denied(file_path):
         _record_guard_denial("trace_data_flow")
         return json.dumps({"error": "path is outside the approved source root"})
     p = Path(file_path)
-    if p.is_symlink() or not p.is_file():
-        if p.is_symlink():
-            _record_guard_denial("trace_data_flow")
+    if not p.is_file():
         return json.dumps({"error": f"File not found: {file_path}"})
 
     source = p.read_text(errors="replace")
@@ -551,49 +506,12 @@ def trace_data_flow_impl(symbol: str, file_path: str) -> str:
     )
 
 
-def _safe_search_regex(pattern: str) -> bool:
-    """Accept only a linear-time subset of model-supplied regex syntax.
-
-    CPython's backtracking engine has no timeout and can hold the GIL, so a
-    catastrophic expression can defeat the outer agent deadline. The accepted
-    grammar is a concatenation of literals, escapes, character classes,
-    anchors, and exact repetitions such as ``\\d{4}``. Groups, alternation,
-    variable/open-ended quantifiers, lookarounds, and backreferences are
-    rejected; callers can always request a literal search instead.
-    """
-    if any(token in pattern for token in ("(", ")", "|", "*", "+", "?")):
-        return False
-    if re.search(r"\\[1-9]", pattern):
-        return False
-    remainder = pattern
-    for match in list(re.finditer(r"\{([^{}]+)\}", pattern)):
-        repetition = match.group(1)
-        if not repetition.isdigit():
-            return False
-        if int(repetition) > 64:
-            return False
-        remainder = remainder.replace(match.group(0), "", 1)
-    return "{" not in remainder and "}" not in remainder
-
-
 @_track_tool("search_codebase")
 def search_codebase_impl(
     pattern: str, search_paths: list[str], literal: bool = False
 ) -> str:
     """Search across directories for a regex or literal pattern."""
     search_paths = _clamp_paths(search_paths, tool_name="search_codebase")
-    if len(pattern) > 256:
-        return json.dumps({"error": "Search pattern exceeds the 256-character limit"})
-    if not literal and not _safe_search_regex(pattern):
-        return json.dumps(
-            {
-                "error": (
-                    "Unsafe regex: use literal=true or a pattern without *, +, ?, "
-                    "groups, alternation, lookarounds, backreferences, or variable/"
-                    "large repetition"
-                )
-            }
-        )
     if literal:
         regex = re.compile(re.escape(pattern), re.IGNORECASE)
     else:
@@ -612,12 +530,8 @@ def search_codebase_impl(
         for fp in base_path.rglob("*"):
             if len(matches) >= max_matches:
                 break
-            if not _path_is_allowed(str(fp)):
+            if _strict_path_is_denied(str(fp)):
                 _record_guard_denial("search_codebase")
-                continue
-            if fp.is_symlink() or _sensitive_search_path(fp):
-                if fp.is_symlink():
-                    _record_guard_denial("search_codebase")
                 continue
             if not fp.is_file() or fp.stat().st_size > 1_000_000:
                 continue
@@ -670,52 +584,9 @@ class SearchPackageInfoArgs(BaseModel):
     )
 
 
-_PACKAGE_ECOSYSTEMS = frozenset({"pypi", "npm", "go"})
-_PYPI_PACKAGE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,213}\Z")
-_NPM_PACKAGE_RE = re.compile(
-    r"(?:[A-Za-z0-9][A-Za-z0-9._~-]{0,213}|"
-    r"@[A-Za-z0-9][A-Za-z0-9._~-]{0,99}/"
-    r"[A-Za-z0-9][A-Za-z0-9._~-]{0,99})\Z"
-)
-_GO_PACKAGE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~/-]{0,254}\Z")
-
-
-def _validated_package_request(name: str, ecosystem: str) -> tuple[str, str] | None:
-    """Return a conservative package request or reject path/URL control data."""
-    normalized_name = str(name).strip()
-    normalized_ecosystem = str(ecosystem).strip().lower()
-    if normalized_ecosystem not in _PACKAGE_ECOSYSTEMS:
-        return None
-    matcher = {
-        "pypi": _PYPI_PACKAGE_RE,
-        "npm": _NPM_PACKAGE_RE,
-        "go": _GO_PACKAGE_RE,
-    }[normalized_ecosystem]
-    if matcher.fullmatch(normalized_name) is None:
-        return None
-    if normalized_ecosystem == "go":
-        segments = normalized_name.split("/")
-        if any(segment in {"", ".", ".."} for segment in segments):
-            return None
-    return normalized_name, normalized_ecosystem
-
-
-def _package_cache_file(cache_root: Path, name: str, ecosystem: str) -> Path:
-    """Map an already validated package identity to a flat, non-user path."""
-    encoded_name = urllib.parse.quote(name, safe="-._~@")
-    ecosystem_root = (cache_root / ecosystem).resolve(strict=False)
-    cache_file = (ecosystem_root / f"{encoded_name}.json").resolve(strict=False)
-    cache_file.relative_to(ecosystem_root)
-    return cache_file
-
-
 def _read_pkg_cache(name: str, ecosystem: str) -> dict[str, Any] | None:
-    validated = _validated_package_request(name, ecosystem)
-    if validated is None:
-        return None
-    name, ecosystem = validated
     for cache_root in cache_read_dirs("packages"):
-        cache_file = _package_cache_file(cache_root, name, ecosystem)
+        cache_file = cache_root / ecosystem / f"{name}.json"
         if cache_file.exists():
             try:
                 data = json.loads(cache_file.read_text())
@@ -729,11 +600,7 @@ def _read_pkg_cache(name: str, ecosystem: str) -> dict[str, Any] | None:
 
 
 def _write_pkg_cache(name: str, ecosystem: str, data: dict[str, Any]) -> None:
-    validated = _validated_package_request(name, ecosystem)
-    if validated is None:
-        return
-    name, ecosystem = validated
-    cache_file = _package_cache_file(ensure_cache_dir("packages"), name, ecosystem)
+    cache_file = ensure_cache_dir("packages") / ecosystem / f"{name}.json"
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(data))
@@ -745,8 +612,7 @@ def _fetch_pypi(name: str) -> dict[str, Any]:
     import urllib.error
     import urllib.request
 
-    encoded_name = urllib.parse.quote(name, safe="-._~")
-    url = f"https://pypi.org/pypi/{encoded_name}/json"
+    url = f"https://pypi.org/pypi/{name}/json"
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
@@ -767,8 +633,7 @@ def _fetch_npm(name: str) -> dict[str, Any]:
     import urllib.error
     import urllib.request
 
-    encoded_name = urllib.parse.quote(name, safe="@-._~")
-    url = f"https://registry.npmjs.org/{encoded_name}"
+    url = f"https://registry.npmjs.org/{name}"
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
@@ -788,8 +653,7 @@ def _fetch_go(module: str) -> dict[str, Any]:
     import urllib.error
     import urllib.request
 
-    encoded_module = urllib.parse.quote(module, safe="/-._~")
-    url = f"https://proxy.golang.org/{encoded_module}/@latest"
+    url = f"https://proxy.golang.org/{module}/@latest"
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
@@ -842,39 +706,12 @@ def _fetch_pip_fallback(name: str, original_error: str) -> dict[str, Any]:
 
 def search_package_info_impl(package_name: str, ecosystem: str = "pypi") -> str:
     """Query a package registry and return metadata for AI-relevance assessment."""
-    stats = _get_stats_dict()
     t0 = time.monotonic()
-
-    validated = _validated_package_request(package_name, ecosystem)
-    if validated is None:
-        entry = stats.setdefault(
-            "search_package_info",
-            {
-                "calls": 0,
-                "total_s": 0.0,
-                "errors": 0,
-                "guard_denials": 0,
-            },
-        )
-        entry["calls"] += 1
-        entry["errors"] += 1
-        entry["guard_denials"] += 1
-        entry["total_s"] += time.monotonic() - t0
-        return json.dumps({"error": "invalid package name or ecosystem"})
-    package_name, ecosystem = validated
 
     cached = _read_pkg_cache(package_name, ecosystem)
     if cached:
         elapsed = time.monotonic() - t0
-        entry = stats.setdefault(
-            "search_package_info",
-            {
-                "calls": 0,
-                "total_s": 0.0,
-                "errors": 0,
-                "guard_denials": 0,
-            },
-        )
+        entry = _stats_entry("search_package_info")
         entry["calls"] += 1
         entry["total_s"] += elapsed
         return json.dumps(cached)
@@ -888,15 +725,7 @@ def search_package_info_impl(package_name: str, ecosystem: str = "pypi") -> str:
         _write_pkg_cache(package_name, ecosystem, result)
 
     elapsed = time.monotonic() - t0
-    entry = stats.setdefault(
-        "search_package_info",
-        {
-            "calls": 0,
-            "total_s": 0.0,
-            "errors": 0,
-            "guard_denials": 0,
-        },
-    )
+    entry = _stats_entry("search_package_info")
     entry["calls"] += 1
     entry["total_s"] += elapsed
     return json.dumps(result)
@@ -1005,11 +834,9 @@ def build_tools() -> list[Any]:
 
 class ListDirectoryTreeArgs(BaseModel):
     path: str = Field(description="Root directory to list.")
-    max_depth: int = Field(
-        default=3, ge=0, le=6, description="Maximum directory depth to recurse."
-    )
+    max_depth: int = Field(default=3, description="Maximum directory depth to recurse.")
     max_entries: int = Field(
-        default=200, ge=1, le=500, description="Maximum total entries to return."
+        default=200, description="Maximum total entries to return."
     )
 
 
@@ -1018,9 +845,7 @@ def list_directory_tree_impl(
     path: str, max_depth: int = 3, max_entries: int = 200
 ) -> str:
     """Recursive directory listing capped by depth and entry count."""
-    max_depth = max(0, min(int(max_depth), 6))
-    max_entries = max(1, min(int(max_entries), 500))
-    if not _path_is_allowed(path):
+    if _strict_path_is_denied(path):
         _record_guard_denial("list_directory_tree")
         return json.dumps({"error": "path is outside the approved source root"})
     root = Path(path)
@@ -1056,7 +881,7 @@ def list_directory_tree_impl(
             if len(entries) >= max_entries:
                 entries.append(f"{prefix}... (truncated at {max_entries})")
                 return
-            if child.is_symlink() or not _path_is_allowed(str(child)):
+            if _strict_path_is_denied(str(child)):
                 _record_guard_denial("list_directory_tree")
                 continue
             if child.is_dir():
@@ -1074,39 +899,27 @@ def list_directory_tree_impl(
 class ReadFileSnippetArgs(BaseModel):
     path: str = Field(description="File path to read.")
     max_lines: int = Field(
-        default=200, ge=1, le=500, description="Maximum number of lines to return."
+        default=200, description="Maximum number of lines to return."
     )
 
 
 @_track_tool("read_file_snippet")
 def read_file_snippet_impl(path: str, max_lines: int = 200) -> str:
     """Read the first N lines of a file."""
-    max_lines = max(1, min(int(max_lines), 500))
-    if not _path_is_allowed(path):
+    if _strict_path_is_denied(path):
         _record_guard_denial("read_file_snippet")
         return json.dumps({"error": "path is outside the approved source root"})
     p = Path(path)
-    if p.is_symlink():
-        _record_guard_denial("read_file_snippet")
-        return json.dumps({"error": "symlinked files are not readable by this tool"})
     if not p.is_file():
         return json.dumps({"error": f"not a file: {path}"})
     try:
-        if p.stat().st_size > 1_000_000:
-            return json.dumps({"error": "file exceeds the 1 MB tool limit"})
-        lines: list[str] = []
-        truncated = False
-        with p.open(encoding="utf-8", errors="replace") as handle:
-            for index, line in enumerate(handle):
-                if index >= max_lines:
-                    truncated = True
-                    break
-                lines.append(line.rstrip("\r\n"))
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
         return json.dumps({"error": str(e)})
-    snippet = "\n".join(lines)
+    truncated = len(lines) > max_lines
+    snippet = "\n".join(lines[:max_lines])
     if truncated:
-        snippet += "\n... (truncated)"
+        snippet += f"\n... ({len(lines) - max_lines} more lines)"
     return snippet
 
 

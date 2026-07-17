@@ -36,18 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, Mapping
 
-_TOOL_NAMES = frozenset(
-    {
-        "analyze_imports",
-        "list_directory_tree",
-        "lookup_model",
-        "read_file_snippet",
-        "resolve_env_var",
-        "search_codebase",
-        "search_package_info",
-        "trace_data_flow",
-    }
-)
+from .telemetry_tool_names import TOOL_NAMES as _TOOL_NAMES
 
 
 def _non_negative_int(value: Any) -> int:
@@ -113,25 +102,33 @@ def _usage_from_message(message: Any) -> tuple[int, int, int, int]:
 
 
 def _usage_from_llm_result(response: Any) -> tuple[int, int, int, int]:
-    prompt = completion = total = cached = 0
-    for group in getattr(response, "generations", ()) or ():
-        for generation in group or ():
-            message = getattr(generation, "message", generation)
-            current = _usage_from_message(message)
-            prompt += current[0]
-            completion += current[1]
-            total += current[2]
-            cached += current[3]
-    if prompt or completion or total or cached:
-        return prompt, completion, total or prompt + completion, cached
-
+    # LangChain's ``llm_output`` is the response-level carrier. Providers such
+    # as OpenAI may also copy those counters onto every generated message, so
+    # this authoritative carrier must take precedence over choice metadata.
     llm_output = getattr(response, "llm_output", None)
     if isinstance(llm_output, Mapping):
         for key in ("token_usage", "usage", "amazon-bedrock-invocationMetrics"):
             current = _usage_from_mapping(llm_output.get(key))
             if any(current):
                 return current
-        return _usage_from_mapping(llm_output)
+        current = _usage_from_mapping(llm_output)
+        if any(current):
+            return current
+
+    prompt = completion = total = cached = 0
+    for group in getattr(response, "generations", ()) or ():
+        for generation in group or ():
+            message = getattr(generation, "message", generation)
+            current = _usage_from_message(message)
+            # Without a response-level carrier, each generation is an
+            # independent usage carrier. Equal numeric values do not prove
+            # that two choices refer to the same provider response.
+            prompt += current[0]
+            completion += current[1]
+            total += current[2]
+            cached += current[3]
+    if prompt or completion or total or cached:
+        return prompt, completion, total or prompt + completion, cached
     return 0, 0, 0, 0
 
 

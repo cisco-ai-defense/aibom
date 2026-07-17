@@ -19,12 +19,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import IO, Any
 
 from ..models import AIComponent, ScanResult
-from ..source_attribution import capture_git_remote
 from .base import BaseReporter
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,15 +36,20 @@ REPORT_SCHEMA_VERSION = "2"
 def _friendly_source_name(path: str) -> str:
     """Derive a short, meaningful source label from a local filesystem path.
 
-    Reads the raw repository-local ``remote.origin.url`` to extract
-    ``org/repo`` from the actual remote. Falls back to the last path component.
+    Tries ``git remote get-url origin`` to extract ``org/repo`` from the
+    actual remote.  Falls back to the last path component.
     """
     resolved = Path(path).resolve()
     if resolved.is_dir():
         try:
-            remote = capture_git_remote(str(resolved))
-            if remote:
-                m = _REMOTE_ORG_REPO_RE.search(remote)
+            result = subprocess.run(
+                ["git", "-C", str(resolved), "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                m = _REMOTE_ORG_REPO_RE.search(result.stdout.strip())
                 if m:
                     return f"{m.group(1)}/{m.group(2)}"
         except Exception:
@@ -70,6 +75,7 @@ def _source_attribution(path: str, detail: dict[str, Any]) -> dict[str, str]:
         SOURCE_KIND_CONTAINER_IMAGE,
         SOURCE_KIND_GIT,
         canonicalize_source_ref,
+        capture_git_remote,
         capture_source_ref_version,
         detect_source_kind,
     )

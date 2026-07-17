@@ -49,6 +49,7 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 from urllib.parse import urlparse
 from uuid import UUID
 
+from aibom.agentic.telemetry_tool_names import TOOL_NAMES as _TOOL_NAMES
 from aibom.models.enums import AIComponentType
 
 _LOGGER = logging.getLogger(__name__)
@@ -185,33 +186,6 @@ _DECISION_KEYS = frozenset(
 _COMPONENT_DECISION_KEYS = frozenset(
     {"kept", "removed", "reclassified", "discovered", "enriched"}
 )
-_TOOL_NAMES = frozenset(
-    {
-        # AIBOM detection tools (see agentic/tools.py build_tools()).
-        "analyze_imports",
-        "list_directory_tree",
-        "lookup_model",
-        "read_file_snippet",
-        "resolve_env_var",
-        "search_codebase",
-        "search_package_info",
-        "trace_data_flow",
-        # deepagents scaffolding tools injected by create_deep_agent(); these
-        # are framework built-ins, not AIBOM detectors, but naming them keeps
-        # them out of the opaque "other" bucket for per-tool visibility.
-        "compact_conversation",
-        "edit_file",
-        "execute",
-        "glob",
-        "grep",
-        "ls",
-        "read_file",
-        "task",
-        "write_file",
-        "write_todos",
-    }
-)
-
 LoggerFactory = Callable[[str, str], Any]
 FlushSubmitter = Callable[[Any], bool]
 DeferredTraceStarter = Callable[[], Any | None]
@@ -1193,6 +1167,7 @@ class _FlushDispatcher:
         self._capacity = max(1, int(capacity))
         self._queue: deque[Any] = deque()
         self._pending = 0
+        self._closed = False
         self._condition = threading.Condition()
         self._worker: threading.Thread | None = None
 
@@ -1202,7 +1177,10 @@ class _FlushDispatcher:
             _discard_logger(logger)
             return False
         with self._condition:
-            if self._pending >= self._capacity:
+            if self._closed:
+                _LOGGER.warning("Galileo flush dispatcher is closed; trace dropped")
+                accepted = False
+            elif self._pending >= self._capacity:
                 _LOGGER.warning("Galileo flush queue is full; telemetry trace dropped")
                 accepted = False
             else:
@@ -1250,7 +1228,13 @@ class _FlushDispatcher:
                     self._condition.notify_all()
 
     def drain(self, timeout_s: float) -> bool:
-        """Wait up to one global deadline for all accepted flushes to finish."""
+        """Close ingestion and wait up to one deadline for accepted flushes.
+
+        Once drain begins, new submissions are rejected. If the deadline is
+        reached, queued loggers that have not started are discarded. A flush
+        already executing inside the SDK cannot be cancelled safely, but it
+        remains on the daemon worker and cannot delay process shutdown.
+        """
         try:
             timeout = float(timeout_s)
         except (TypeError, ValueError, OverflowError):
@@ -1258,13 +1242,23 @@ class _FlushDispatcher:
         if not math.isfinite(timeout) or timeout < 0:
             timeout = 0.0
         deadline = time.monotonic() + timeout
+        dropped: list[Any] = []
         with self._condition:
+            self._closed = True
             while self._pending:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return False
+                    dropped = list(self._queue)
+                    self._queue.clear()
+                    self._pending -= len(dropped)
+                    if dropped:
+                        self._condition.notify_all()
+                    break
                 self._condition.wait(timeout=remaining)
-            return True
+            completed = self._pending == 0 and not dropped
+        for logger in dropped:
+            _discard_logger(logger)
+        return completed
 
 
 def _parse_enabled(value: str | None) -> bool:

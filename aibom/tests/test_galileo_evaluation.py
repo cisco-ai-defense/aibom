@@ -14,6 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import builtins
 import copy
 import json
@@ -2072,6 +2073,117 @@ def test_approved_callback_uses_the_galileo_2_4_signature(monkeypatch):
     assert captured["ingestion_hook"] is None
 
 
+def _build_real_sdk_callback(monkeypatch, *, async_flush=None):
+    """Build with the pinned SDK class while replacing every network edge."""
+    pytest.importorskip("galileo.handlers.langchain")
+    from galileo import GalileoLogger
+
+    _approve_full_trajectory_evaluation(monkeypatch)
+    monkeypatch.setenv("GALILEO_CONSOLE_URL", "https://app.galileo.ai")
+    monkeypatch.setenv(ALLOW_PUBLIC_CLOUD_ENV_VAR, "true")
+    monkeypatch.setattr(
+        "aibom.galileo_evaluation._verify_loaded_galileo_destination",
+        lambda _url: None,
+    )
+    monkeypatch.setattr(
+        GalileoLogger,
+        "_create_traces_client",
+        lambda _logger: object(),
+    )
+    monkeypatch.setattr(
+        GalileoLogger,
+        "_auto_enable_agent_control_if_available",
+        lambda _logger: None,
+    )
+    if async_flush is not None:
+        monkeypatch.setattr(GalileoLogger, "async_flush", async_flush)
+
+    callback = create_galileo_async_callback(approved_fixture=True)
+    return GalileoLogger, callback, callback._handler._galileo_logger
+
+
+def test_real_galileo_2_4_logger_uses_class_level_one_shot_flush(monkeypatch):
+    GalileoLogger, _callback, logger = _build_real_sdk_callback(monkeypatch)
+
+    assert isinstance(logger, GalileoLogger)
+    assert type(logger) is not GalileoLogger
+    assert "async_flush" not in logger.__dict__
+    # This is the Galileo 2.4 failure mode that the integration must avoid:
+    # Pydantic rejects replacing a model method on an individual logger.
+    with pytest.raises(ValueError, match="no field.*async_flush"):
+        logger.async_flush = lambda: None
+
+    assert asyncio.run(logger.async_flush()) == []
+
+
+@pytest.mark.parametrize("flush_outcome", ["success", "failure", "cancelled"])
+def test_real_galileo_2_4_one_shot_flush_closes_only_owned_ingest_client(
+    monkeypatch, flush_outcome
+):
+    traces_module = pytest.importorskip("galileo.traces")
+    IngestTraces = traces_module.IngestTraces
+    Traces = traces_module.Traces
+
+    async def sdk_flush(_logger):
+        if flush_outcome == "failure":
+            raise RuntimeError("ingest failed")
+        if flush_outcome == "cancelled":
+            raise asyncio.CancelledError
+        return []
+
+    _base, _callback, logger = _build_real_sdk_callback(
+        monkeypatch,
+        async_flush=sdk_flush,
+    )
+
+    class FakeAsyncClient:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+
+    owned_client = FakeAsyncClient()
+    owned_traces = IngestTraces(
+        project_id=_EVALUATION_PROJECT_ID,
+        base_url="https://api.galileo.ai",
+        api_key="test-only",
+        log_stream_id=_EVALUATION_LOG_STREAM_ID,
+    )
+    owned_traces._thread_local.client = owned_client
+    logger._traces_client = owned_traces
+    logger.traces.append({"raw": "private-trajectory"})
+
+    if flush_outcome == "failure":
+        with pytest.raises(RuntimeError, match="ingest failed"):
+            asyncio.run(logger.async_flush())
+    elif flush_outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(logger.async_flush())
+    else:
+        assert asyncio.run(logger.async_flush()) == []
+
+    assert owned_client.close_calls == 1
+    assert not hasattr(owned_traces._thread_local, "client")
+    assert logger.traces == []
+
+    # The standard Traces client delegates to Galileo's shared API client. It
+    # may look structurally similar but must never be closed by logger cleanup.
+    shared_client = FakeAsyncClient()
+    shared_traces = object.__new__(Traces)
+    shared_traces._thread_local = SimpleNamespace(client=shared_client)
+    logger._traces_client = shared_traces
+    if flush_outcome == "failure":
+        with pytest.raises(RuntimeError):
+            asyncio.run(logger.async_flush())
+    elif flush_outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(logger.async_flush())
+    else:
+        asyncio.run(logger.async_flush())
+    assert shared_client.close_calls == 0
+
+
 def test_approved_callback_accepts_explicit_hosted_cloud_egress(monkeypatch):
     captured = {}
 
@@ -2117,6 +2229,69 @@ def test_approved_callback_accepts_explicit_hosted_cloud_egress(monkeypatch):
     assert captured["start_new_trace"] is True
     assert captured["flush_on_chain_end"] is True
     assert captured["ingestion_hook"] is None
+
+
+def test_approved_callback_disables_sdk_lifecycle_and_discards_failed_flush(
+    monkeypatch,
+):
+    captured: dict[str, Any] = {}
+    unregistered: list[Any] = []
+
+    class FakeGalileoLogger:
+        def __init__(self, *, project_id, log_stream_id, mode):
+            self.project_id = project_id
+            self.log_stream_id = log_stream_id
+            self.mode = mode
+            self.traces = [{"raw": "private-trajectory"}]
+            self.agent_control_disabled = 0
+
+        def terminate(self):
+            raise AssertionError("one-shot callbacks must never terminate-flush")
+
+        def disable_agent_control(self):
+            self.agent_control_disabled += 1
+
+        async def async_flush(self):
+            # Galileo 2.4 returns [] after swallowing an ingestion error and
+            # leaves traces resident. The integration must make that attempt
+            # final rather than allowing an atexit retry.
+            return []
+
+    class FakeGalileoAsyncCallback:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake_callback_module = SimpleNamespace(
+        GalileoAsyncCallback=FakeGalileoAsyncCallback
+    )
+    fake_galileo_module = SimpleNamespace(GalileoLogger=FakeGalileoLogger)
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "galileo":
+            return fake_galileo_module
+        if name == "galileo.handlers.langchain":
+            return fake_callback_module
+        if name == "galileo.config":
+            return SimpleNamespace(GalileoPythonConfig=SimpleNamespace(_instance=None))
+        return real_import(name, *args, **kwargs)
+
+    _approve_full_trajectory_evaluation(monkeypatch)
+    monkeypatch.setenv("GALILEO_CONSOLE_URL", "https://app.galileo.ai")
+    monkeypatch.setenv(ALLOW_PUBLIC_CLOUD_ENV_VAR, "true")
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(
+        "aibom.agentic_telemetry.atexit.unregister", unregistered.append
+    )
+
+    create_galileo_async_callback(approved_fixture=True)
+    logger = captured["galileo_logger"]
+
+    assert logger.agent_control_disabled == 1
+    assert unregistered and unregistered[0] == logger.terminate
+    asyncio.run(logger.async_flush())
+    assert logger.traces == []
+    assert logger.agent_control_disabled >= 2
 
 
 def _install_fake_galileo_for_session(monkeypatch, *, sessions_created):
@@ -2182,6 +2357,7 @@ def test_full_trajectory_factory_groups_callbacks_in_one_session(monkeypatch):
         session_name="aibom-agentic-scan-2026-07-17T03:34:24Z",
         session_external_id="7d335cf2-c011-4a7b-99b7-c65e833b58e5",
     )
+    assert getattr(factory, "_aibom_strict_tool_roots") is True
 
     # Three separate live invocations, as a multi-batch scan would produce.
     factory()
@@ -2196,6 +2372,81 @@ def test_full_trajectory_factory_groups_callbacks_in_one_session(monkeypatch):
     session_ids = {logger.session_id for logger in built_loggers}
     assert len(session_ids) == 1
     assert None not in session_ids
+
+
+def test_full_trajectory_factory_closes_session_setup_ingest_client(monkeypatch):
+    IngestTraces = pytest.importorskip("galileo.traces").IngestTraces
+
+    class FakeAsyncClient:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+
+    clients: list[FakeAsyncClient] = []
+    built_loggers: list[Any] = []
+
+    class FakeGalileoLogger:
+        def __init__(self, **kwargs):
+            self.project_id = kwargs["project_id"]
+            self.log_stream_id = kwargs["log_stream_id"]
+            self.session_id = None
+            client = FakeAsyncClient()
+            clients.append(client)
+            self._traces_client = IngestTraces(
+                project_id=self.project_id,
+                base_url="https://api.galileo.ai",
+                api_key="test-only",
+                log_stream_id=self.log_stream_id,
+            )
+            # Callback construction and session setup share this daemon worker,
+            # so Galileo's thread-local client is closable in the same context.
+            self._traces_client._thread_local.client = client
+
+        async def _start_or_get_session_async(self, **_kwargs):
+            self.session_id = "66666666-6666-4666-8666-666666666666"
+            return self.session_id
+
+        def set_session(self, session_id):
+            self.session_id = session_id
+
+        async def async_flush(self):
+            return []
+
+    class FakeGalileoAsyncCallback:
+        def __init__(self, galileo_logger=None, **_kwargs):
+            self.galileo_logger = galileo_logger
+            built_loggers.append(galileo_logger)
+
+    fake_galileo_module = SimpleNamespace(GalileoLogger=FakeGalileoLogger)
+    fake_callback_module = SimpleNamespace(
+        GalileoAsyncCallback=FakeGalileoAsyncCallback
+    )
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "galileo":
+            return fake_galileo_module
+        if name == "galileo.handlers.langchain":
+            return fake_callback_module
+        if name == "galileo.config":
+            return SimpleNamespace(GalileoPythonConfig=SimpleNamespace(_instance=None))
+        return real_import(name, *args, **kwargs)
+
+    _approve_full_trajectory_evaluation(monkeypatch)
+    monkeypatch.setenv("GALILEO_CONSOLE_URL", "https://app.galileo.ai")
+    monkeypatch.setenv(ALLOW_PUBLIC_CLOUD_ENV_VAR, "true")
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    callback = create_full_trajectory_callback_factory(
+        session_name="aibom-agentic-scan-session-client",
+    )()
+
+    assert isinstance(callback, FakeGalileoAsyncCallback)
+    assert len(built_loggers) == 1
+    assert clients[0].close_calls == 1
+    assert not hasattr(built_loggers[0]._traces_client._thread_local, "client")
 
 
 def test_full_trajectory_factory_is_concurrency_safe(monkeypatch):
@@ -2235,42 +2486,46 @@ def test_full_trajectory_factory_is_concurrency_safe(monkeypatch):
     assert len({logger.session_id for logger in built_loggers}) == 1
 
 
-def test_full_trajectory_factory_recovers_from_bounded_session_timeout(monkeypatch):
-    # A create that exceeds the bounded setup budget must not pin later loggers
-    # to an unusable session: the session stays unset and the next invocation
-    # retries the create.
-    import time
+def test_full_trajectory_factory_bounds_logger_initialization_and_discards_late(
+    monkeypatch,
+):
+    import threading
 
-    sessions_created: list[dict[str, Any]] = []
+    constructor_started = threading.Event()
+    release_constructor = threading.Event()
+    late_traces_discarded = threading.Event()
+    session_calls: list[str] = []
+    callbacks: list[Any] = []
 
-    class SlowThenFastLogger:
-        calls = {"n": 0}
+    class ObservableTraces(list):
+        def clear(self):
+            super().clear()
+            late_traces_discarded.set()
 
+    class SlowInitLogger:
         def __init__(self, **kwargs):
+            constructor_started.set()
+            release_constructor.wait(1.0)
             self.project_id = kwargs["project_id"]
             self.log_stream_id = kwargs["log_stream_id"]
             self.session_id = None
+            self.traces = ObservableTraces([{"raw": "private-trajectory"}])
 
-        def start_session(self, *, name, external_id=None, metadata=None):
-            SlowThenFastLogger.calls["n"] += 1
-            if SlowThenFastLogger.calls["n"] == 1:
-                # First create blows the (test-shrunk) budget → treated as timeout.
-                time.sleep(0.3)
-            session_id = "44444444-4444-4444-8444-444444444444"
-            sessions_created.append({"external_id": external_id})
-            self.session_id = session_id
-            return session_id
+        def disable_agent_control(self):
+            return None
+
+        def start_session(self, **_kwargs):
+            session_calls.append("started")
+            return "55555555-5555-4555-8555-555555555555"
 
         def set_session(self, session_id):
             self.session_id = session_id
 
-    built = []
-
     class FakeGalileoAsyncCallback:
-        def __init__(self, galileo_logger=None, **kwargs):
-            built.append(galileo_logger)
+        def __init__(self, **kwargs):
+            callbacks.append(kwargs)
 
-    fake_galileo_module = SimpleNamespace(GalileoLogger=SlowThenFastLogger)
+    fake_galileo_module = SimpleNamespace(GalileoLogger=SlowInitLogger)
     fake_callback_module = SimpleNamespace(
         GalileoAsyncCallback=FakeGalileoAsyncCallback
     )
@@ -2288,8 +2543,76 @@ def test_full_trajectory_factory_recovers_from_bounded_session_timeout(monkeypat
     _approve_full_trajectory_evaluation(monkeypatch)
     monkeypatch.setenv("GALILEO_CONSOLE_URL", "https://app.galileo.ai")
     monkeypatch.setenv(ALLOW_PUBLIC_CLOUD_ENV_VAR, "true")
-    # Shrink the bounded-setup budget so the 0.3s first create is a timeout.
-    monkeypatch.setenv("AIBOM_GALILEO_SETUP_BUDGET_S", "0.1")
+    monkeypatch.setenv("AIBOM_GALILEO_SETUP_BUDGET_S", "0.02")
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    factory = create_full_trajectory_callback_factory(
+        session_name="aibom-agentic-scan-slow-init",
+    )
+    with pytest.raises(GalileoIntegrationUnavailable, match="setup budget"):
+        factory()
+    assert constructor_started.wait(0.1)
+
+    release_constructor.set()
+    assert late_traces_discarded.wait(0.2)
+    # Once the constructor returns after the caller's deadline, the hardened
+    # logger is discarded before it can create a remote session or callback.
+    assert session_calls == []
+    assert callbacks == []
+
+
+def test_full_trajectory_factory_does_not_duplicate_timed_out_session(monkeypatch):
+    import threading
+
+    release = threading.Event()
+    started = threading.Event()
+    sessions_created: list[dict[str, Any]] = []
+
+    class SlowLogger:
+        calls = {"n": 0}
+
+        def __init__(self, **kwargs):
+            self.project_id = kwargs["project_id"]
+            self.log_stream_id = kwargs["log_stream_id"]
+            self.session_id = None
+
+        def start_session(self, *, name, external_id=None, metadata=None):
+            SlowLogger.calls["n"] += 1
+            started.set()
+            release.wait(1.0)
+            session_id = "44444444-4444-4444-8444-444444444444"
+            sessions_created.append({"external_id": external_id})
+            self.session_id = session_id
+            return session_id
+
+        def set_session(self, session_id):
+            self.session_id = session_id
+
+    built = []
+
+    class FakeGalileoAsyncCallback:
+        def __init__(self, galileo_logger=None, **kwargs):
+            built.append(galileo_logger)
+
+    fake_galileo_module = SimpleNamespace(GalileoLogger=SlowLogger)
+    fake_callback_module = SimpleNamespace(
+        GalileoAsyncCallback=FakeGalileoAsyncCallback
+    )
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "galileo":
+            return fake_galileo_module
+        if name == "galileo.handlers.langchain":
+            return fake_callback_module
+        if name == "galileo.config":
+            return SimpleNamespace(GalileoPythonConfig=SimpleNamespace(_instance=None))
+        return real_import(name, *args, **kwargs)
+
+    _approve_full_trajectory_evaluation(monkeypatch)
+    monkeypatch.setenv("GALILEO_CONSOLE_URL", "https://app.galileo.ai")
+    monkeypatch.setenv(ALLOW_PUBLIC_CLOUD_ENV_VAR, "true")
+    monkeypatch.setenv("AIBOM_GALILEO_SETUP_BUDGET_S", "0.02")
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
     factory = create_full_trajectory_callback_factory(
@@ -2297,13 +2620,23 @@ def test_full_trajectory_factory_recovers_from_bounded_session_timeout(monkeypat
         session_external_id="7d335cf2-c011-4a7b-99b7-c65e833b58e5",
     )
 
-    factory()  # first create times out → session left unset
-    factory()  # retries the create → succeeds and binds
+    with pytest.raises(GalileoIntegrationUnavailable, match="setup budget"):
+        factory()
+    assert started.wait(0.1)
 
-    # Two create attempts were made (the first timed out, the second bound).
-    assert SlowThenFastLogger.calls["n"] == 2
-    # The second logger converged on a real session id.
-    assert built[1].session_id == "44444444-4444-4444-8444-444444444444"
+    # A second invocation shares the still-running attempt and also fails open;
+    # it must not launch a non-atomic duplicate create.
+    with pytest.raises(GalileoIntegrationUnavailable, match="setup budget"):
+        factory()
+    assert SlowLogger.calls["n"] == 1
+
+    release.set()
+    callback = factory()
+
+    assert isinstance(callback, FakeGalileoAsyncCallback)
+    assert SlowLogger.calls["n"] == 1
+    assert len(sessions_created) == 1
+    assert built[0].session_id == "44444444-4444-4444-8444-444444444444"
 
 
 def test_full_trajectory_factory_enforces_gates(monkeypatch):
@@ -2313,6 +2646,7 @@ def test_full_trajectory_factory_enforces_gates(monkeypatch):
         session_name="aibom-agentic-scan-denied",
         session_external_id="7d335cf2-c011-4a7b-99b7-c65e833b58e5",
     )
+    assert getattr(factory, "_aibom_strict_tool_roots") is False
     with pytest.raises(FullContentLoggingDenied):
         factory()
 

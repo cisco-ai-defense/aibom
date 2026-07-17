@@ -246,6 +246,21 @@ class TestAgenticEnrichmentViaCLI:
 
         assert option.default is False
 
+    def test_galileo_full_trajectory_requires_galileo(self, sample_dir):
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--llm-model",
+                "test-model",
+                "--galileo-full-trajectory",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--galileo-full-trajectory requires --galileo" in result.output
+
     def test_galileo_sample_rate_is_bounded(self, sample_dir):
         result = runner.invoke(
             app,

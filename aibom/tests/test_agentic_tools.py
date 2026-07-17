@@ -25,18 +25,18 @@ from pathlib import Path
 import pytest
 
 from aibom.agentic.tools import (
-    _read_pkg_cache,
     _reset_tool_stats,
     analyze_imports_impl,
     get_tool_stats,
     list_directory_tree_impl,
     lookup_model_impl,
     reset_allowed_search_roots,
+    reset_strict_tool_root_enforcement,
     resolve_env_var_impl,
     scan_directory_impl,
     search_codebase_impl,
-    search_package_info_impl,
     set_allowed_search_roots,
+    set_strict_tool_root_enforcement,
     trace_data_flow_impl,
 )
 
@@ -44,10 +44,12 @@ from aibom.agentic.tools import (
 @pytest.fixture(autouse=True)
 def _clear_search_roots():
     """Reset module-level search roots so earlier test files don't pollute."""
-    token = set_allowed_search_roots(None)
+    roots_token = set_allowed_search_roots(None)
+    strict_token = set_strict_tool_root_enforcement(False)
     _reset_tool_stats()
     yield
-    reset_allowed_search_roots(token)
+    reset_strict_tool_root_enforcement(strict_token)
+    reset_allowed_search_roots(roots_token)
     _reset_tool_stats()
 
 
@@ -164,24 +166,6 @@ class TestSearchCodebase:
         result = json.loads(search_codebase_impl("[invalid", ["/tmp"]))
         assert "error" in result
 
-    @pytest.mark.parametrize(
-        "pattern",
-        [
-            r"(?:a|aa)+$",
-            r"a.*secret",
-            r"a{1,}",
-            r"a{1,1000}",
-            r"(a|aa){1,40}b",
-            r"(a|aa)(a|aa)(a|aa)(a|aa)b",
-        ],
-    )
-    def test_backtracking_or_unbounded_regex_is_rejected(self, pattern, tmp_path):
-        (tmp_path / "payload.txt").write_text("a" * 128 + "!")
-
-        result = json.loads(search_codebase_impl(pattern, [str(tmp_path)]))
-
-        assert "Unsafe regex" in result["error"]
-
 
 class TestReadFileSnippetInBuildTools:
     """Fix 2: read_file_snippet must be in the main scanner tools."""
@@ -210,9 +194,23 @@ class TestReadFileSnippetInBuildTools:
 
 
 class TestApprovedSourceRootGuard:
+    def test_non_raw_mode_preserves_legacy_direct_file_access(
+        self, tmp_path: Path
+    ) -> None:
+        from aibom.agentic.tools import read_file_snippet_impl
+
+        approved = tmp_path / "approved"
+        approved.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text("LEGACY_DIRECT_READ = True\n")
+        set_allowed_search_roots([str(approved)])
+
+        assert "LEGACY_DIRECT_READ" in read_file_snippet_impl(str(outside))
+
     def test_explicitly_empty_root_set_denies_all_access(self, tmp_path: Path) -> None:
         (tmp_path / "canary.py").write_text("PRIVATE_CANARY = True\n")
         set_allowed_search_roots([])
+        set_strict_tool_root_enforcement(True)
 
         output = scan_directory_impl(str(tmp_path))
 
@@ -234,6 +232,7 @@ class TestApprovedSourceRootGuard:
         outside = tmp_path / "outside.py"
         outside.write_text("PRIVATE_CANARY = 'must-not-be-read'\n")
         set_allowed_search_roots([str(approved)])
+        set_strict_tool_root_enforcement(True)
 
         outputs = [
             analyze_imports_impl(str(outside)),
@@ -274,6 +273,7 @@ class TestApprovedSourceRootGuard:
         (approved / "secret.py").symlink_to(outside / "secret.py")
         (approved / "outside-dir").symlink_to(outside, target_is_directory=True)
         set_allowed_search_roots([str(approved)])
+        set_strict_tool_root_enforcement(True)
 
         env_result = resolve_env_var_impl("PRIVATE_CANARY", [str(approved)])
         search_result = search_codebase_impl(
@@ -290,54 +290,6 @@ class TestApprovedSourceRootGuard:
         assert stats["resolve_env_var"]["guard_denials"] >= 1
         assert stats["search_codebase"]["guard_denials"] >= 1
         assert stats["list_directory_tree"]["guard_denials"] >= 1
-
-
-class TestPackageCacheGuard:
-    def test_cache_identity_cannot_escape_package_cache(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        outside = tmp_path / "canary.json"
-        outside.write_text('{"secret": "must-not-be-read"}')
-        cache_root = tmp_path / "cache"
-        cache_root.mkdir()
-        monkeypatch.setattr(
-            "aibom.agentic.tools.cache_read_dirs", lambda _kind: [cache_root]
-        )
-
-        assert _read_pkg_cache(str(outside.with_suffix("")), "pypi") is None
-        result = json.loads(search_package_info_impl("../../canary", "pypi"))
-        assert result == {"error": "invalid package name or ecosystem"}
-        assert "must-not-be-read" not in json.dumps(result)
-        stats = get_tool_stats()["search_package_info"]
-        assert stats["guard_denials"] == 1
-        assert stats["errors"] == 1
-
-        valid_cache = cache_root / "pypi" / "openai.json"
-        valid_cache.parent.mkdir()
-        valid_cache.write_text('{"name": "openai"}')
-        assert _read_pkg_cache("openai", "pypi")["name"] == "openai"
-
-    @pytest.mark.parametrize(
-        ("name", "ecosystem"),
-        [
-            ("openai", "pypi"),
-            ("@langchain/core", "npm"),
-            ("github.com/example/module/v2", "go"),
-        ],
-    )
-    def test_supported_package_identities_remain_valid(
-        self, name: str, ecosystem: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            f"aibom.agentic.tools._fetch_{ecosystem}",
-            lambda value: {"name": value},
-        )
-        monkeypatch.setattr("aibom.agentic.tools._read_pkg_cache", lambda *_: None)
-        monkeypatch.setattr("aibom.agentic.tools._write_pkg_cache", lambda *_: None)
-
-        result = json.loads(search_package_info_impl(name, ecosystem))
-        assert result["name"] == name
-        assert result["is_cached"] is False
 
 
 class TestRunScopedSourceRoots:

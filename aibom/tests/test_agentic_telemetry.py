@@ -946,6 +946,39 @@ def test_slow_flush_runs_off_the_scan_path_and_drain_is_finite() -> None:
     assert any(name == "flush" for name, _ in logger.calls)
 
 
+def test_drain_timeout_drops_queue_and_rejects_new_flushes() -> None:
+    release = threading.Event()
+    flush_started = threading.Event()
+
+    class SlowFlushLogger(FakeLogger):
+        def flush(self, **kwargs: Any) -> list[object]:
+            self._record("flush", **kwargs)
+            flush_started.set()
+            release.wait(1.0)
+            return []
+
+    first = SlowFlushLogger()
+    queued = FakeLogger()
+    after_close = FakeLogger()
+    loggers = iter((first, queued, after_close))
+    client = create_agentic_telemetry(
+        _config(), logger_factory=lambda _project, _stream: next(loggers)
+    )
+
+    client.start_batch(batch_id="first").finish(status="success")
+    assert flush_started.wait(0.2)
+    client.start_batch(batch_id="queued").finish(status="success")
+
+    assert not client.drain(0.01)
+    client.start_batch(batch_id="after-close").finish(status="success")
+    release.set()
+    assert client.drain(1.0)
+
+    assert any(name == "flush" for name, _ in first.calls)
+    assert not any(name == "flush" for name, _ in queued.calls)
+    assert not any(name == "flush" for name, _ in after_close.calls)
+
+
 def test_flush_drain_uses_one_global_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

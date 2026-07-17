@@ -42,6 +42,7 @@ approval and destination checks.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -52,8 +53,9 @@ import ssl
 import threading
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from functools import wraps
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from functools import lru_cache, wraps
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -227,6 +229,104 @@ class GalileoIntegrationUnavailable(RuntimeError):
 
 class HostedGalileoDestinationRequired(RuntimeError):
     """Raised before evaluation data could be sent to hosted Galileo safely."""
+
+
+@dataclass(slots=True)
+class _SessionSetupAttempt:
+    done: threading.Event = field(default_factory=threading.Event)
+    session_id: str | None = None
+    error: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _FullTrajectorySessionState:
+    session_id: str | None = None
+    in_flight: _SessionSetupAttempt | None = None
+
+
+@dataclass(slots=True)
+class _CallbackSetupAttempt:
+    """One bounded callback construction owned by a factory invocation."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    callback: Any | None = None
+    logger: Any | None = None
+    error: BaseException | None = None
+    abandoned: bool = False
+
+
+async def _close_owned_ingest_client(logger: Any) -> None:
+    """Close this thread's logger-owned Galileo ingest client, when present.
+
+    Galileo 2.4's ``IngestTraces`` creates one ``httpx.AsyncClient`` lazily per
+    logger and thread but does not expose a lifecycle method for it.  Closing
+    that exact client after a one-shot flush prevents socket/file-descriptor
+    leaks.  The fallback ``Traces`` client delegates to the process-wide
+    ``GalileoPythonConfig.api_client`` and must never be closed here.
+    """
+    traces_client = getattr(logger, "_traces_client", None)
+    try:
+        from galileo.traces import IngestTraces
+    except (ImportError, ModuleNotFoundError):
+        return
+    if not isinstance(traces_client, IngestTraces):
+        return
+
+    thread_local = getattr(traces_client, "_thread_local", None)
+    if thread_local is None:
+        return
+    client = getattr(thread_local, "client", None)
+    if client is None:
+        return
+    try:
+        await client.aclose()
+    except BaseException:  # noqa: BLE001 - cleanup must preserve flush outcome
+        pass
+    finally:
+        # Do not retain a closed client if an SDK path happens to inspect this
+        # logger after its deliberately terminal flush.
+        try:
+            del thread_local.client
+        except (AttributeError, TypeError):
+            pass
+
+
+def _discard_raw_logger(logger: Any) -> None:
+    """Disable SDK-global lifecycle hooks and erase retained raw traces."""
+    from .agentic_telemetry import _discard_logger
+
+    _discard_logger(logger)
+
+
+class _OneShotGalileoLoggerMixin:
+    """Class-level one-shot flush override accepted by Pydantic loggers.
+
+    This mixin deliberately does not capture a logger in a closure.  Galileo's
+    logger is a Pydantic model that rejects assigning ``async_flush`` on an
+    instance, while a normal class-level override remains supported.
+    """
+
+    async def async_flush(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            parent_flush = getattr(super(), "async_flush")
+            return await parent_flush(*args, **kwargs)
+        finally:
+            await _close_owned_ingest_client(self)
+            # Galileo 2.4 swallows ordinary async ingestion failures and can
+            # leave traces resident.  Clearing here makes this callback's one
+            # attempt final and prevents delayed shutdown egress.
+            _discard_raw_logger(self)
+
+
+@lru_cache(maxsize=8)
+def _one_shot_logger_class(galileo_logger_class: type[Any]) -> type[Any]:
+    """Return a reusable SDK subclass without importing Galileo eagerly."""
+    return type(
+        "_AIBOMOneShotGalileoLogger",
+        (_OneShotGalileoLoggerMixin, galileo_logger_class),
+        {"__module__": __name__},
+    )
 
 
 # Backward-compatible import alias for the pre-hosted-only integration name.
@@ -423,6 +523,22 @@ def _require_full_trajectory_approval(*, approved_fixture: bool) -> None:
             "metadata, and exception details; additionally set "
             f"{FULL_TRAJECTORY_ENV_VAR}=true"
         )
+
+
+def _raw_tool_root_guards_approved() -> bool:
+    """Return whether raw-mode file guards have every static approval gate."""
+    try:
+        _require_full_trajectory_approval(approved_fixture=True)
+        _require_hosted_galileo_destination()
+        _required_resource_id(EVALUATION_PROJECT_ID_ENV_VAR)
+        _required_resource_id(EVALUATION_LOG_STREAM_ID_ENV_VAR)
+    except (
+        ExactIdentityLoggingDenied,
+        FullContentLoggingDenied,
+        HostedGalileoDestinationRequired,
+    ):
+        return False
+    return True
 
 
 def _required_resource_id(environment_name: str) -> str:
@@ -2027,7 +2143,7 @@ def _object_mapping(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
         return value
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="python")
+        return cast(Mapping[str, Any], value.model_dump(mode="python"))
     return None
 
 
@@ -2992,8 +3108,10 @@ def create_galileo_async_callback(
     5. immutable evaluation project and log-stream UUIDs are configured.
 
     The approval checks happen before the optional Galileo/LangChain import.
-    This function does not invoke a chain or explicitly flush/send any data, but
-    constructing the callback may initialize the SDK's logger configuration.
+    This function does not invoke a chain or explicitly flush/send any data.
+    Logger initialization and optional session binding run in a daemon worker
+    and are bounded by ``AIBOM_GALILEO_SETUP_BUDGET_S`` (2 seconds by default).
+    A logger that completes after that deadline is hardened and discarded.
 
     ``session_binder``, when supplied, receives the freshly built logger and may
     attach it to a shared session so that every callback built for one scan
@@ -3029,29 +3147,119 @@ def create_galileo_async_callback(
         ) from exc
 
     _verify_loaded_galileo_destination(hosted_url)
-    logger = GalileoLogger(
-        project_id=project_id,
-        log_stream_id=log_stream_id,
-        mode="batch",
+    from .agentic_telemetry import (
+        _disable_agent_control,
+        _disable_logger_atexit_flush,
+        _resolve_setup_budget_s,
     )
-    if (
-        str(getattr(logger, "project_id", "")) != project_id
-        or str(getattr(logger, "log_stream_id", "")) != log_stream_id
-    ):
-        raise HostedGalileoDestinationRequired(
-            "The Galileo callback logger did not retain the approved project and "
-            "log-stream IDs"
+
+    setup = _CallbackSetupAttempt()
+
+    def _build_callback() -> None:
+        logger: Any | None = None
+        callback: Any | None = None
+        error: BaseException | None = None
+        try:
+            one_shot_logger_class = _one_shot_logger_class(GalileoLogger)
+            logger = one_shot_logger_class(
+                project_id=project_id,
+                log_stream_id=log_stream_id,
+                mode="batch",
+            )
+
+            # Remove autonomous SDK lifecycle behavior before any raw span can
+            # be created. A logger that completed after the caller's deadline
+            # is still hardened before it can start a remote session.
+            _disable_logger_atexit_flush(logger)
+            if not _disable_agent_control(logger):
+                raise HostedGalileoDestinationRequired(
+                    "Galileo Agent Control could not be disabled for the approved "
+                    "full-trajectory callback"
+                )
+            if not callable(getattr(logger, "async_flush", None)):
+                raise HostedGalileoDestinationRequired(
+                    "The Galileo callback logger does not expose async one-shot "
+                    "ingestion"
+                )
+            if (
+                str(getattr(logger, "project_id", "")) != project_id
+                or str(getattr(logger, "log_stream_id", "")) != log_stream_id
+            ):
+                raise HostedGalileoDestinationRequired(
+                    "The Galileo callback logger did not retain the approved "
+                    "project and log-stream IDs"
+                )
+
+            with setup.lock:
+                abandoned = setup.abandoned
+            if abandoned:
+                raise GalileoIntegrationUnavailable(
+                    "Galileo callback setup exceeded its setup budget"
+                )
+            if session_binder is not None:
+                session_binder(logger)
+            callback = GalileoAsyncCallback(
+                galileo_logger=logger,
+                start_new_trace=True,
+                flush_on_chain_end=True,
+                ingestion_hook=None,
+            )
+        except BaseException as exc:  # noqa: BLE001 - relayed to caller
+            error = exc
+            if logger is not None:
+                _discard_raw_logger(logger)
+
+        late_logger: Any | None = None
+        with setup.lock:
+            if setup.abandoned:
+                late_logger = logger
+            else:
+                setup.callback = callback
+                setup.logger = logger
+                setup.error = error
+            setup.done.set()
+        if late_logger is not None:
+            _discard_raw_logger(late_logger)
+
+    threading.Thread(
+        target=_build_callback,
+        name="aibom-galileo-callback-setup",
+        daemon=True,
+    ).start()
+
+    if not setup.done.wait(_resolve_setup_budget_s()):
+        completed_logger: Any | None = None
+        with setup.lock:
+            setup.abandoned = True
+            # Resolve the boundary race where the worker published its callback
+            # just as Event.wait reached the deadline.
+            completed_logger = setup.logger
+            setup.callback = None
+            setup.logger = None
+        if completed_logger is not None:
+            _discard_raw_logger(completed_logger)
+        raise GalileoIntegrationUnavailable(
+            "Galileo callback setup exceeded its setup budget; raw trajectory "
+            "disabled for this invocation"
         )
 
-    if session_binder is not None:
-        session_binder(logger)
-
-    return GalileoAsyncCallback(
-        galileo_logger=logger,
-        start_new_trace=True,
-        flush_on_chain_end=True,
-        ingestion_hook=None,
-    )
+    with setup.lock:
+        callback = setup.callback
+        error = setup.error
+        setup.callback = None
+        setup.logger = None
+        setup.error = None
+    if error is not None:
+        if isinstance(error, Exception):
+            raise error
+        raise GalileoIntegrationUnavailable(
+            "Galileo callback setup failed with a fatal worker error"
+        ) from error
+    if callback is None:
+        raise GalileoIntegrationUnavailable(
+            "Galileo callback setup returned no callback"
+        )
+    return callback
 
 
 def create_full_trajectory_callback_factory(
@@ -3070,48 +3278,115 @@ def create_full_trajectory_callback_factory(
 
     This factory keeps that per-invocation isolation — every call still builds a
     fresh logger and callback — while sharing only the immutable resolved
-    session id. The first logger creates the session under a lock and caches the
-    returned UUID; every later logger attaches to it via ``set_session``. The
-    lock is required because the SDK's ``external_id`` de-duplication is a
-    non-atomic search-then-create, so concurrent first calls would otherwise each
-    create a separate session. Session creation is bounded by the sanitized
-    path's setup budget (``AIBOM_GALILEO_SETUP_BUDGET_S``, 2s default): a
-    timed-out create leaves the session unset so the next invocation retries,
-    and never adds its latency to the scan.
+    session id. The first logger creates the session and every later logger
+    attaches to it via ``set_session``. The SDK's ``external_id`` de-duplication
+    is a non-atomic search-then-create, so only one remote creation may remain in
+    flight. Session creation is bounded by the sanitized path's setup budget
+    (``AIBOM_GALILEO_SETUP_BUDGET_S``, 2s default). A caller that reaches that
+    budget receives no raw callback; later callers wait for the same in-flight
+    operation instead of creating a duplicate session.
 
     The returned callable takes no arguments and satisfies the CLI's
     ``invoke_callback_factory`` contract; it raises exactly like
     :func:`create_galileo_async_callback` when a gate is not satisfied.
     """
-    # Reuse the sanitized path's bounded-setup helper so a hung Galileo API
-    # cannot inherit its HTTP timeout as scanner latency. Session creation runs
-    # in a daemon thread with the same AIBOM_GALILEO_SETUP_BUDGET_S allowance
-    # (2s default). Imported lazily to keep this module import free of the
-    # telemetry runtime.
-    from .agentic_telemetry import _bounded_call
+    from .agentic_telemetry import _resolve_setup_budget_s
 
     lock = threading.Lock()
-    state: dict[str, str | None] = {"session_id": None}
+    state = _FullTrajectorySessionState()
 
-    def _bind_session(logger: Any) -> None:
-        with lock:
-            existing = state["session_id"]
-            if existing is not None:
-                logger.set_session(existing)
-                return
-            completed, session_id = _bounded_call(
-                lambda: logger.start_session(
+    def _start_session(logger: Any) -> Any:
+        """Use Galileo 2.4's coroutine on this worker so its client is closable."""
+        async_start = getattr(logger, "_start_or_get_session_async", None)
+        if not callable(async_start):
+            # Test doubles and older compatible SDKs may expose only the public
+            # method. They do not have Galileo 2.4's per-thread IngestTraces
+            # client, so there is no private client to close here.
+            return logger.start_session(
+                name=session_name,
+                external_id=session_external_id,
+                metadata={"component": "agentic-classifier-full-trajectory"},
+            )
+
+        async def _run() -> Any:
+            try:
+                return await async_start(
                     name=session_name,
                     external_id=session_external_id,
                     metadata={"component": "agentic-classifier-full-trajectory"},
                 )
+            finally:
+                await _close_owned_ingest_client(logger)
+
+        return asyncio.run(_run())
+
+    def _attach_session(logger: Any, session_id: str) -> None:
+        logger.set_session(session_id)
+        if str(getattr(logger, "session_id", "")) != session_id:
+            raise GalileoIntegrationUnavailable(
+                "Galileo did not retain the approved full-trajectory session ID"
             )
-            # Cache only a real session id. A create that timed out (completed is
-            # False) or failed under the SDK's exception guard (returns None)
-            # must not pin every later logger to an unusable session; the next
-            # invocation simply retries the bounded create.
-            if completed and isinstance(session_id, str) and session_id:
-                state["session_id"] = session_id
+
+    def _bind_session(logger: Any) -> None:
+        owns_attempt = False
+        with lock:
+            if state.session_id is not None:
+                resolved_session_id = state.session_id
+                attempt = None
+            else:
+                resolved_session_id = None
+                attempt = state.in_flight
+            if resolved_session_id is not None:
+                pass
+            elif attempt is None:
+                attempt = _SessionSetupAttempt()
+                state.in_flight = attempt
+                owns_attempt = True
+
+        if resolved_session_id is not None:
+            _attach_session(logger, resolved_session_id)
+            return
+
+        assert attempt is not None
+        if owns_attempt:
+            try:
+                created = _start_session(logger)
+                if isinstance(created, str) and created:
+                    attempt.session_id = created
+                else:
+                    attempt.error = GalileoIntegrationUnavailable(
+                        "Galileo session creation returned no session ID"
+                    )
+            except BaseException as exc:  # noqa: BLE001 - relayed to callers
+                attempt.error = exc
+            finally:
+                with lock:
+                    if attempt.session_id is not None:
+                        state.session_id = attempt.session_id
+                    if state.in_flight is attempt:
+                        state.in_flight = None
+                attempt.done.set()
+        else:
+            # This wait happens only in the daemon setup worker. The outer
+            # callback deadline can abandon this logger without starting a
+            # duplicate non-atomic session create.
+            if not attempt.done.wait(_resolve_setup_budget_s()):
+                raise GalileoIntegrationUnavailable(
+                    "Galileo session creation remained in flight beyond the setup "
+                    "budget; raw trajectory disabled for this invocation"
+                )
+
+        if attempt.error is not None:
+            raise GalileoIntegrationUnavailable(
+                "Galileo session creation failed; raw trajectory disabled for "
+                "this invocation"
+            ) from attempt.error
+        if attempt.session_id is None:
+            raise GalileoIntegrationUnavailable(
+                "Galileo session creation returned no session ID; raw trajectory "
+                "disabled for this invocation"
+            )
+        _attach_session(logger, attempt.session_id)
 
     def _factory() -> Any:
         return create_galileo_async_callback(
@@ -3119,6 +3394,10 @@ def create_full_trajectory_callback_factory(
             session_binder=_bind_session,
         )
 
+    # The agent wrapper uses this private marker to enable direct-file guards
+    # only for a statically approved raw Galileo mode. A missing approval must
+    # remain fail-open and behavior-identical to an ordinary scan.
+    setattr(_factory, "_aibom_strict_tool_roots", _raw_tool_root_guards_approved())
     return _factory
 
 

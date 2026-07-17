@@ -1255,6 +1255,7 @@ class ScanPipeline:
         self.telemetry_source_id = telemetry_source_id
         self.telemetry_source_kind = telemetry_source_kind
         self._agentic_degraded_count = 0
+        self._agentic_telemetry_degraded_count: int | None = None
         self._agentic_token_usage: Any | None = None
         self._agentic_input_count = 0
         self._agentic_input_snapshot: list[AIComponent] = []
@@ -1290,6 +1291,7 @@ class ScanPipeline:
     def run(self) -> PipelineResult:
         clear_cache()
         self._agentic_degraded_count = 0
+        self._agentic_telemetry_degraded_count = None
         self._agentic_token_usage = None
         self._agentic_input_count = 0
         self._agentic_input_snapshot = []
@@ -1387,7 +1389,8 @@ class ScanPipeline:
                 component.model_copy(deep=True) for component in components
             ]
         elapsed = time.monotonic() - t0
-        skipped = not self.llm_config or self._agentic_input_count == 0
+        skipped = not self.llm_config
+        telemetry_skipped = skipped or self._agentic_input_count == 0
         timings.append(
             StageTiming(
                 "agentic",
@@ -1433,7 +1436,11 @@ class ScanPipeline:
 
         tu = getattr(self, "_agentic_token_usage", None)
         if telemetry_enabled and self.agentic_telemetry is not None:
-            degraded_count = getattr(self, "_agentic_degraded_count", 0)
+            degraded_count = (
+                self._agentic_telemetry_degraded_count
+                if self._agentic_telemetry_degraded_count is not None
+                else getattr(self, "_agentic_degraded_count", 0)
+            )
             before_by_id = {
                 component.instance_id: component
                 for component in self._agentic_input_snapshot
@@ -1502,7 +1509,7 @@ class ScanPipeline:
                 "risk_findings": self._agentic_raw_risk_count,
                 "degraded": degraded_count,
             }
-            if skipped:
+            if telemetry_skipped:
                 agentic_summary_decisions = {
                     key: 0 for key in agentic_summary_decisions
                 }
@@ -1512,7 +1519,7 @@ class ScanPipeline:
                 source_kind=self.telemetry_source_kind,
                 status=(
                     "skipped"
-                    if skipped
+                    if telemetry_skipped
                     else ("degraded" if degraded_count else "success")
                 ),
                 candidate_count=len(self._agentic_input_snapshot),
@@ -1739,7 +1746,9 @@ class ScanPipeline:
                     cache_dir=self.agentic_cache_dir,
                     include_code_snippets=self.include_code_snippets,
                     agent_signature_catalog=agent_catalog,
-                    telemetry=self.agentic_telemetry,
+                    telemetry=(
+                        self.agentic_telemetry if self._telemetry_enabled() else None
+                    ),
                     telemetry_source_id=self.telemetry_source_id
                     or (self.scan_paths[0] if self.scan_paths else "unknown"),
                     invoke_callback_factory=self.invoke_callback_factory,
@@ -1805,8 +1814,8 @@ class ScanPipeline:
             raise
         except Exception as exc:  # noqa: BLE001
             exact_candidates = self._agentic_input_count or len(components)
-            self._agentic_degraded_count = exact_candidates
             if self._telemetry_enabled():
+                self._agentic_telemetry_degraded_count = exact_candidates
                 if not self._agentic_input_snapshot:
                     self._agentic_input_snapshot = [
                         component.model_copy(deep=True) for component in components

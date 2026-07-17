@@ -26,6 +26,8 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
 
 import aibom.agentic.agent as agent_module
 import aibom.agentic.sanitized_trace as sanitized_trace_module
@@ -215,6 +217,97 @@ def test_callback_preserves_order_per_call_tokens_timestamps_and_durations(
     assert [call.created_at for call in calls] == sorted(
         call.created_at for call in calls
     )
+
+
+def test_callback_does_not_duplicate_response_level_usage_across_choices() -> None:
+    collector = SanitizedAgentCallback()
+    run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    usage = {
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "total_tokens": 14,
+    }
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(content="first", usage_metadata=usage)
+                ),
+                ChatGeneration(
+                    message=AIMessage(content="second", usage_metadata=usage)
+                ),
+            ]
+        ],
+        llm_output={"token_usage": usage},
+    )
+
+    collector.on_chat_model_start({}, [[]], run_id=run_id)
+    collector.on_llm_end(response, run_id=run_id)
+
+    call = collector.seal()[0]
+    assert (
+        call.prompt_tokens,
+        call.completion_tokens,
+        call.total_tokens,
+    ) == (10, 4, 14)
+
+
+def test_callback_sums_equal_choice_usage_without_response_level_carrier() -> None:
+    collector = SanitizedAgentCallback()
+    run_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    usage = {
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "total_tokens": 14,
+    }
+    response = LLMResult(
+        generations=[
+            [
+                ChatGeneration(
+                    message=AIMessage(content="first", usage_metadata=usage)
+                ),
+                ChatGeneration(
+                    message=AIMessage(content="second", usage_metadata=dict(usage))
+                ),
+            ]
+        ],
+        llm_output={},
+    )
+
+    collector.on_chat_model_start({}, [[]], run_id=run_id)
+    collector.on_llm_end(response, run_id=run_id)
+
+    call = collector.seal()[0]
+    assert (
+        call.prompt_tokens,
+        call.completion_tokens,
+        call.total_tokens,
+    ) == (20, 8, 28)
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "compact_conversation",
+        "edit_file",
+        "execute",
+        "glob",
+        "grep",
+        "ls",
+        "read_file",
+        "task",
+        "write_file",
+        "write_todos",
+    ],
+)
+def test_callback_preserves_allowlisted_deep_agent_tool_names(tool_name: str) -> None:
+    collector = SanitizedAgentCallback()
+    run_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+    collector.on_tool_start({"name": tool_name}, "private", run_id=run_id)
+    collector.on_tool_end("private", run_id=run_id)
+
+    assert collector.seal()[0].tool_name == tool_name
 
 
 def test_timeout_seal_converts_unfinished_calls_and_ignores_late_callbacks(

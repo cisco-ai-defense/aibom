@@ -1816,6 +1816,13 @@ def analyze(
         )
         raise typer.Exit(code=1)
 
+    if galileo_full_trajectory and not galileo:
+        console.print(
+            "[bold red]Error:[/] --galileo-full-trajectory requires --galileo.",
+            highlight=False,
+        )
+        raise typer.Exit(code=1)
+
     parsed_init_kwargs: Optional[Dict[str, Any]] = None
     if llm_init_kwargs is not None:
         try:

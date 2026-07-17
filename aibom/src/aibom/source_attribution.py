@@ -208,22 +208,12 @@ def capture_git_remote(path: str) -> Optional[str]:
     """Return the ``origin`` remote URL for the git working tree at *path*.
 
     Returns ``None`` when the path is not a git tree or has no ``origin``
-    remote. The repository's raw configured URL is returned as-is, without
-    applying user-level ``url.*.insteadOf`` rewrites that may inject mirror
-    hosts or credentials. Canonicalization is the caller's responsibility via
-    :func:`canonicalize_source_ref`.
+    remote. The raw URL is returned as-is; canonicalization is the caller's
+    responsibility via :func:`canonicalize_source_ref`.
     """
     try:
         result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(path),
-                "config",
-                "--local",
-                "--get",
-                "remote.origin.url",
-            ],
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,

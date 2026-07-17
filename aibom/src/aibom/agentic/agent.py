@@ -32,7 +32,7 @@ import os
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
@@ -1021,24 +1021,28 @@ import hashlib as _hashlib
 
 def _component_cache_key(c: AIComponent) -> str:
     """Derive a content-based cache key for a component."""
-    payload: dict[str, Any] = {"component": c.model_dump(mode="json")}
+    parts = [
+        c.file_path or "",
+        str(c.line_number),
+        c.name,
+        c.component_type.value,
+        c.model_name or "",
+    ]
     if c.file_path and c.line_number:
         snippet = _read_code_window(c.file_path, c.line_number)
         if snippet:
-            payload["source_window"] = snippet
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+            parts.append(snippet)
+    raw = "|".join(parts)
+    return _hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
 _TIER_CACHE_VERSION = 1
 _BATCH_CACHE_VERSION = 1
 _CROSS_REPO_CACHE_VERSION = 1
-_AGENTIC_CACHE_NAMESPACE_VERSION = 3
-_MAX_CACHE_EVIDENCE_FILES = 50_000
-_MAX_CACHE_EVIDENCE_BYTES = 128 * 1024 * 1024
+_AGENTIC_TELEMETRY_VERSION = 1
 
 
-def _agentic_cache_namespace(
+def _agentic_telemetry_version(
     *,
     model_string: str,
     fast_model: str | None,
@@ -1050,16 +1054,12 @@ def _agentic_cache_namespace(
     max_retry_seconds: int,
     include_code_snippets: bool,
     agent_signature_catalog: AgentSignatureCatalog | None,
-    decision_context_digest: str = "",
 ) -> str:
-    """Return a non-sensitive digest of every input that can alter a verdict.
+    """Return a non-sensitive version for Galileo trace comparisons.
 
-    Agentic cache entries used to be keyed only by component/source content.
-    That allowed a new model, prompt, schema, tool implementation, reasoning
-    setting, or custom signature catalog to replay an old verdict.  The
-    namespace is deliberately a digest: provider endpoints and arbitrary
-    ``init_kwargs`` can affect behavior but must never appear in cache file
-    names or logs.
+    This value is telemetry metadata only. It deliberately does not participate
+    in cache identity, so enabling Galileo remains observe-only and cannot
+    change cache hits or normal agentic scan behavior.
     """
 
     cfg = llm_config or {}
@@ -1090,7 +1090,7 @@ def _agentic_cache_namespace(
         tools_digest = "unavailable"
 
     payload = {
-        "namespace_version": _AGENTIC_CACHE_NAMESPACE_VERSION,
+        "telemetry_version": _AGENTIC_TELEMETRY_VERSION,
         "analyzer_version": resolve_package_version("cisco-aibom"),
         "model": model_string,
         "fast_model": fast_model or model_string,
@@ -1110,136 +1110,9 @@ def _agentic_cache_namespace(
         "response_schema": AgentResponse.model_json_schema(),
         "tools_source": tools_digest,
         "agent_signature_catalog": catalog_payload,
-        "decision_context_digest": decision_context_digest,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return _hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
-
-
-def _agentic_decision_context_digest(
-    components: list[AIComponent],
-    relationships: list[ComponentRelationship],
-    dossier_index: DossierIndex,
-    scan_paths: list[str],
-    excluded_paths: list[Path] | None = None,
-) -> str:
-    """Hash every bounded, prompt/tool-visible input used by a verdict.
-
-    The model sees sibling candidates, deterministic edges, class dossiers,
-    and can inspect arbitrary files below the approved roots. Replaying an
-    unchanged component against changed sibling or source evidence is stale,
-    so all of that context participates in the namespace.
-    """
-
-    dossiers: list[dict[str, Any]] = []
-    for key, dossier in sorted(dossier_index.items()):
-        try:
-            value: Any = asdict(dossier)
-        except (TypeError, ValueError):
-            value = repr(dossier)
-        dossiers.append({"key": list(key), "value": value})
-    payload = {
-        "components": sorted(_component_cache_key(c) for c in components),
-        "relationships": sorted(
-            json.dumps(
-                relationship.model_dump(mode="json"),
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-            for relationship in relationships
-        ),
-        "dossiers": dossiers,
-        "source_evidence": _scan_evidence_digest(
-            scan_paths, excluded_paths=excluded_paths
-        ),
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _scan_evidence_digest(
-    scan_paths: list[str], *, excluded_paths: list[Path] | None = None
-) -> str:
-    """Hash source-root state that an agent tool can inspect.
-
-    Content is streamed into the digest and never persisted. To keep the scan
-    bounded, repositories above the file/byte limits receive a per-run volatile
-    value, intentionally disabling cross-run verdict reuse instead of risking a
-    stale decision from an incomplete fingerprint.
-    """
-    digest = _hashlib.sha256()
-    file_count = 0
-    byte_count = 0
-    entries: list[tuple[int, str, Path, int]] = []
-    excluded = tuple(path.resolve(strict=False) for path in (excluded_paths or []))
-
-    def _is_excluded(path: Path) -> bool:
-        return any(path == item or item in path.parents for item in excluded)
-
-    def _volatile() -> str:
-        return "volatile_" + _hashlib.sha256(os.urandom(32)).hexdigest()
-
-    if not scan_paths:
-        return _volatile()
-
-    def _iter_files(root: Path) -> Iterator[tuple[Path, Path]]:
-        if root.is_file() and not root.is_symlink():
-            yield root.parent, root
-            return
-        if not root.is_dir():
-            return
-        for current, directories, files in os.walk(root, followlinks=False):
-            directories[:] = sorted(
-                directory
-                for directory in directories
-                if directory != ".git"
-                and not (Path(current) / directory).is_symlink()
-                and not _is_excluded(Path(current) / directory)
-            )
-            base = Path(current)
-            for name in sorted(files):
-                yield root, base / name
-
-    for root_index, raw_root in enumerate(sorted(set(scan_paths))):
-        try:
-            root = Path(raw_root).resolve(strict=False)
-        except (OSError, RuntimeError):
-            return _volatile()
-        if not root.exists() or root.is_symlink():
-            return _volatile()
-
-        for relative_root, path in _iter_files(root):
-            if path.is_symlink() or _is_excluded(path):
-                continue
-            file_count += 1
-            if file_count > _MAX_CACHE_EVIDENCE_FILES:
-                return _volatile()
-            try:
-                stat = path.stat()
-                if not path.is_file():
-                    continue
-                byte_count += stat.st_size
-                if byte_count > _MAX_CACHE_EVIDENCE_BYTES:
-                    return _volatile()
-                relative = path.relative_to(relative_root).as_posix()
-                entries.append((root_index, relative, path, stat.st_size))
-            except (OSError, RuntimeError, ValueError):
-                return _volatile()
-
-    # Only read contents after proving the complete evidence set is within the
-    # bounds. Oversized roots therefore disable reuse without first hashing
-    # hundreds of megabytes.
-    for root_index, relative, path, size in entries:
-        try:
-            digest.update(f"{root_index}:{relative}:{size}\0".encode())
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            digest.update(b"\0")
-        except OSError:
-            return _volatile()
-    return digest.hexdigest()
 
 
 @dataclass
@@ -1616,11 +1489,11 @@ def _finish_batch_trace(
     hints = Counter(c.agentic_hint for c in enriched if c.agentic_hint)
     failure_hint = hints.most_common(1)[0][0] if hints else ""
     status = _telemetry_status(failed, failure_hint)
-    if failure_hint in {
-        "model_refused",
-        "no_usable_output",
-        "structured_output_parse_error",
-    }:
+    # A failed batch with no parsed decision carrier produced no schema-valid
+    # response, regardless of whether the root cause was a timeout, provider
+    # outage, rate limit, recursion limit, refusal, or parse failure. Preserve
+    # schema validity only when a real structured carrier reached middleware.
+    if failed and raw_data is None:
         schema_valid = False
     usage = _token_usage_for_result(result)
     final_raw = _raw_decision_counts(raw_data)
@@ -1835,7 +1708,7 @@ def _record_no_llm_trace(
         decisions=decisions,
         degraded_candidates=len(inputs),
         failure_hint=failure_hint,
-        schema_valid=True,
+        schema_valid=False,
     )
 
 
@@ -1955,32 +1828,10 @@ def _normalized_cross_repo_results(
 def _cross_repo_cache_key(
     model_string: str,
     per_repo_results: dict[str, dict[str, Any]],
-    llm_config: dict[str, Any] | None = None,
 ) -> str:
-    cfg = llm_config or {}
-    try:
-        tool_digest = _hashlib.sha256(
-            Path(__file__).with_name("cross_repo.py").read_bytes()
-        ).hexdigest()
-    except OSError:
-        tool_digest = "unavailable"
     raw = json.dumps(
         {
-            "cache_version": _CROSS_REPO_CACHE_VERSION,
-            "analyzer_version": resolve_package_version("cisco-aibom"),
             "model_string": model_string,
-            "llm_config": {
-                "provider": cfg.get("provider"),
-                "api_base": cfg.get("api_base"),
-                "api_version": cfg.get("api_version"),
-                "reasoning": cfg.get("reasoning", "auto"),
-                "max_tokens": cfg.get("max_tokens"),
-                "init_kwargs": cfg.get("init_kwargs"),
-            },
-            "prompt": _hashlib.sha256(
-                _CROSS_REPO_COORDINATOR_PROMPT.encode("utf-8")
-            ).hexdigest(),
-            "tool_source": tool_digest,
             "per_repo_results": _normalized_cross_repo_results(per_repo_results),
         },
         sort_keys=True,
@@ -2052,12 +1903,10 @@ class _AgenticResultCache:
         self,
         cache_dir: Path | None = None,
         fallback_dirs: list[Path] | None = None,
-        namespace: str = "",
     ) -> None:
         self._mem: dict[str, dict[str, Any]] = {}
         self._disk_dir = cache_dir
         self._fallback_dirs = fallback_dirs or []
-        self._namespace = namespace
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
             self._load_disk()
@@ -2075,23 +1924,19 @@ class _AgenticResultCache:
             except (json.JSONDecodeError, OSError):
                 continue
 
-    def _storage_key(self, key: str) -> str:
-        return f"{self._namespace}_{key}" if self._namespace else key
-
     def get(self, key: str) -> dict[str, Any] | None:
-        return self._mem.get(self._storage_key(key))
+        return self._mem.get(key)
 
     def put(self, key: str, value: dict[str, Any]) -> None:
-        storage_key = self._storage_key(key)
-        self._mem[storage_key] = value
+        self._mem[key] = value
         if self._disk_dir:
             # Write atomically: serialize to a temp file in the same directory,
             # then os.replace() into place. A crash mid-write leaves only the
             # temp file (ignored by the ``*.json`` resume glob), never a
             # half-written ``key.json`` that a resume would read as a corrupt
             # cache hit.
-            dest = self._disk_dir / f"{storage_key}.json"
-            tmp = self._disk_dir / f".{storage_key}.json.{os.getpid()}.tmp"
+            dest = self._disk_dir / f"{key}.json"
+            tmp = self._disk_dir / f".{key}.json.{os.getpid()}.tmp"
             try:
                 tmp.write_text(json.dumps(value, default=str), encoding="utf-8")
                 os.replace(tmp, dest)
@@ -2202,10 +2047,6 @@ class _DecisionMemo:
         """
         k = self._key(c_before)
         if k is None:
-            return
-        if c_after is not None and c_after.agentic_hint:
-            # A degraded/provider-failure snapshot is not a verdict and must
-            # not poison later batches in the same run.
             return
         if c_after is None:
             self._verdicts[k] = {"action": "remove"}
@@ -2368,11 +2209,6 @@ def _count_degraded(components: list[AIComponent]) -> int:
     ``_all_batches_failed``). Successful enrichment clears the hint to ``""``.
     """
     return sum(1 for c in components if c.agentic_hint)
-
-
-def _cacheable_agentic_result(components: list[AIComponent]) -> bool:
-    """Return false for timeout/refusal/parse/circuit-breaker snapshots."""
-    return not any(component.agentic_hint for component in components)
 
 
 def _dominant_degraded_hint(components: list[AIComponent]) -> str | None:
@@ -3097,7 +2933,12 @@ async def _run_batch_async(
     t0 = time.monotonic()
 
     result = None
-    invoke_callbacks = _callbacks_for_invoke(
+    # A diagnostic callback factory may perform bounded SDK setup and wait on
+    # a scan-scoped session operation. Keep that synchronous work off the event
+    # loop so concurrent agent batches share the setup window instead of
+    # serializing one blocking wait per batch.
+    invoke_callbacks = await asyncio.to_thread(
+        _callbacks_for_invoke,
         call_collector,
         invoke_callback_factory,
     )
@@ -3228,14 +3069,24 @@ async def _run_batch_async(
         )
         coercion_attempt = batch_trace.start_attempt(kind="coercion", attempt_number=1)
         coercion_started = time.monotonic()
-        data = _resolve_batch_data(
-            agent,
-            result,
-            telemetry_context=telemetry_context,
-            telemetry_attempt=coercion_attempt,
-            defer_coercion_finish=True,
-            invoke_callback_factory=invoke_callback_factory,
-        )
+        resolve_kwargs: dict[str, Any] = {
+            "telemetry_context": telemetry_context,
+            "telemetry_attempt": coercion_attempt,
+            "defer_coercion_finish": True,
+            "invoke_callback_factory": invoke_callback_factory,
+        }
+        if invoke_callback_factory is not None:
+            # Raw callback construction is synchronous and bounded. Keep both
+            # that setup and the synchronous Phase-2 coercion call off the
+            # shared async batch loop.
+            data = await asyncio.to_thread(
+                _resolve_batch_data,
+                agent,
+                result,
+                **resolve_kwargs,
+            )
+        else:
+            data = _resolve_batch_data(agent, result, **resolve_kwargs)
         coercion_duration_s = time.monotonic() - coercion_started
     else:
         data = direct_data
@@ -3909,10 +3760,6 @@ def _run_tier(
         for c_before in all_batch_components:
             key = _component_cache_key(c_before)
             c_after = enriched_by_id.get(c_before.instance_id)
-            if c_after is not None and c_after.agentic_hint:
-                # Failure snapshots are operational state, not reusable model
-                # verdicts. A later healthy run must invoke the provider again.
-                continue
             if c_after is None:
                 entry: dict[str, Any] = {
                     "enriched_components": [],
@@ -3951,11 +3798,7 @@ def _run_tier(
     tier_rels.extend(rels)
     tier_flags.extend(flags)
     _record_memo_verdicts(memo, components, tier_enriched)
-    if (
-        cache
-        and tier_cache_key is not None
-        and _cacheable_agentic_result(tier_enriched)
-    ):
+    if cache and tier_cache_key is not None:
         cache.put(
             tier_cache_key,
             _build_tier_cache_payload(tier_enriched, tier_new, tier_rels, tier_flags),
@@ -3990,17 +3833,29 @@ def _with_scoped_tool_roots(fn: Any) -> Any:
 
     @wraps(fn)
     def _wrapped(*args: Any, **kwargs: Any) -> Any:
-        from .tools import reset_allowed_search_roots, set_allowed_search_roots
+        from .tools import (
+            reset_allowed_search_roots,
+            reset_strict_tool_root_enforcement,
+            set_allowed_search_roots,
+            set_strict_tool_root_enforcement,
+        )
 
         scan_paths = kwargs.get("scan_paths")
         if scan_paths is None and len(args) >= 4:
             scan_paths = args[3]
+        callback_factory = kwargs.get("invoke_callback_factory")
+        if callback_factory is None and len(args) >= 17:
+            callback_factory = args[16]
         roots = [str(Path(path).resolve()) for path in (scan_paths or [])]
-        token = set_allowed_search_roots(roots)
+        roots_token = set_allowed_search_roots(roots)
+        strict_token = set_strict_tool_root_enforcement(
+            bool(getattr(callback_factory, "_aibom_strict_tool_roots", False))
+        )
         try:
             return fn(*args, **kwargs)
         finally:
-            reset_allowed_search_roots(token)
+            reset_strict_tool_root_enforcement(strict_token)
+            reset_allowed_search_roots(roots_token)
 
     return _wrapped
 
@@ -4071,6 +3926,10 @@ def run_agentic_enrichment(
     Tuple of (enriched_components, new_relationships, risk_flags, token_usage).
     """
     _reset_token_usage()
+    if telemetry is not None and not telemetry.enabled:
+        # Preserve the disabled integration's no-op contract for direct API
+        # callers as well as ScanPipeline: no version hashing or trace setup.
+        telemetry = None
 
     # Shared retry deadline for the whole run: bounds total retry wall-clock
     # across every tier / sub-agent / strategy-fallback pass.
@@ -4105,33 +3964,9 @@ def run_agentic_enrichment(
         fallback_dirs = [
             p for p in cache_read_dirs("agentic") if p != resolved_cache_dir
         ]
-    cache_namespace = _agentic_cache_namespace(
-        model_string=model_string,
-        fast_model=fast_model,
-        llm_config=llm_config,
-        batch_size=batch_size,
-        max_concurrent=max_concurrent,
-        timeout_s=timeout_s,
-        max_consecutive_failures=max_consecutive_failures,
-        max_retry_seconds=max_retry_seconds,
-        include_code_snippets=include_code_snippets,
-        agent_signature_catalog=agent_signature_catalog,
-        decision_context_digest=_agentic_decision_context_digest(
-            deterministic_components,
-            deterministic_relationships,
-            dossier_index,
-            scan_paths,
-            excluded_paths=[
-                path
-                for path in [resolved_cache_dir, *fallback_dirs]
-                if path is not None
-            ],
-        ),
-    )
     cache = _AgenticResultCache(
         resolved_cache_dir,
         fallback_dirs=fallback_dirs,
-        namespace=cache_namespace,
     )
     middleware = AIBOMScannerMiddleware(
         include_code_snippets=include_code_snippets,
@@ -4146,27 +3981,48 @@ def run_agentic_enrichment(
 
     tier_model_name = fast_model or model_string
     simple_batch_size = batch_size
-    provider = str(
-        resolve_provider(model_string, (llm_config or {}).get("provider")) or "unknown"
-    ).lower()
+    provider = "unknown"
     simple_provider = provider
-    if fast_model:
-        simple_provider = str(resolve_provider(fast_model, None) or provider).lower()
-    analyzer_version = resolve_package_version("cisco-aibom")
-    schema_version = _hashlib.sha256(
-        json.dumps(
-            AgentResponse.model_json_schema(),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()[:20]
+    analyzer_version = ""
+    schema_version = ""
+    telemetry_version = ""
+    if telemetry is not None:
+        provider = str(
+            resolve_provider(model_string, (llm_config or {}).get("provider"))
+            or "unknown"
+        ).lower()
+        simple_provider = provider
+        if fast_model:
+            simple_provider = str(
+                resolve_provider(fast_model, None) or provider
+            ).lower()
+        analyzer_version = resolve_package_version("cisco-aibom")
+        schema_version = _hashlib.sha256(
+            json.dumps(
+                AgentResponse.model_json_schema(),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        telemetry_version = _agentic_telemetry_version(
+            model_string=model_string,
+            fast_model=fast_model,
+            llm_config=llm_config,
+            batch_size=batch_size,
+            max_concurrent=max_concurrent,
+            timeout_s=timeout_s,
+            max_consecutive_failures=max_consecutive_failures,
+            max_retry_seconds=max_retry_seconds,
+            include_code_snippets=include_code_snippets,
+            agent_signature_catalog=agent_signature_catalog,
+        )
     simple_telemetry = (
         _BatchTelemetryContext(
             telemetry=telemetry,
             tier="simple",
             provider=simple_provider,
             model=tier_model_name,
-            prompt_version=cache_namespace,
+            prompt_version=telemetry_version,
             schema_version=schema_version,
             analyzer_version=analyzer_version,
             source_id=telemetry_source_id or "",
@@ -4180,7 +4036,7 @@ def run_agentic_enrichment(
             tier="complex",
             provider=provider,
             model=model_string,
-            prompt_version=cache_namespace,
+            prompt_version=telemetry_version,
             schema_version=schema_version,
             analyzer_version=analyzer_version,
             source_id=telemetry_source_id or "",
@@ -4838,7 +4694,7 @@ def run_cross_repo_coordination(
     cache = _AgenticResultCache(
         cache_dir if cache_dir is not None else _default_agentic_cache_dir()
     )
-    cache_key = _cross_repo_cache_key(model_string, per_repo_results, llm_config)
+    cache_key = _cross_repo_cache_key(model_string, per_repo_results)
     cached = _load_cross_repo_cache_payload(cache.get(cache_key))
     if cached is not None:
         _LOGGER.info(

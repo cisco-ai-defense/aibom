@@ -1,13 +1,13 @@
 # Galileo observability for agentic scans
 
-This guide describes the optional Galileo integration implemented by AI BOM. It
-is an **observe-only, fail-open** integration for the agentic classifier. It
-does not change findings, block a scan, or configure Galileo resources.
-Sanitized production telemetry never sends repository content. A separate live
-diagnostic callback can send full raw trajectories, and the evaluation path is
-pseudonymous by default. Exact evaluation rows or full trajectories are
-available only through separate identity, full-content, trajectory,
-immutable-destination, and public-cloud egress approval gates.
+This guide describes the optional Galileo integration implemented by AI BOM.
+The sanitized production path is **observe-only and fail-open**: it does not
+change findings, block a scan, or configure Galileo resources, and it never
+sends repository content. A separate live diagnostic callback can send full
+raw trajectories, and the evaluation path is pseudonymous by default. Exact
+evaluation rows or full trajectories are available only through separate
+identity, full-content, trajectory, immutable-destination, and public-cloud
+egress approval gates.
 
 The implementation is in
 [`agentic_telemetry.py`](../src/aibom/agentic_telemetry.py). Entity-level
@@ -87,12 +87,15 @@ and `galileo-core==4.4.0`. The pre-ingestion validator checks the exact Galileo
 2.4 and galileo-core 4.4.0 node/metrics envelope; a new SDK or core release must
 pass the real-SDK hierarchy/privacy tests before either range is widened.
 
-Hosted first-use authentication and resource lookup receive a bounded two-second
-setup budget by default. `AIBOM_GALILEO_SETUP_BUDGET_S` may override that value
-from greater than zero through 10 seconds. A timeout disables telemetry for the
-run and never fails the scan. During shutdown, all queued flushes share one
-bounded two-second drain deadline. Any remaining traces are dropped after that
-global budget so telemetry cannot materially delay CLI shutdown.
+Sanitized hosted logger/resource setup and initial session attachment are each
+bounded to a two-second operation budget by default.
+`AIBOM_GALILEO_SETUP_BUDGET_S` may override that value from greater than zero
+through 10 seconds. A timeout disables sanitized telemetry for the run and never
+fails the scan. During shutdown, all queued flushes share one bounded two-second
+drain deadline. Starting the drain closes the dispatcher to new traces; queued
+flushes that have not started are dropped at the deadline. An SDK request
+already in progress cannot be cancelled safely, so it may finish on the daemon
+worker, but it cannot delay CLI shutdown or cause another queued trace to start.
 
 ### HMAC key requirements
 
@@ -126,15 +129,16 @@ It does **not** send:
 
 For every emitted content field, `input == redacted_input` and, where an output
 exists, `output == redacted_output`. Unknown enum-like values are collapsed to
-`other`; unknown tools are combined into one `aibom.tool.other` span. At most
-128 pseudonymous component identifiers are included in a batch trace.
+`other`; each callback-observed unknown tool invocation is labeled
+`aibom.tool.other`, while aggregate fallback counters combine unknown tools. At
+most 128 pseudonymous component identifiers are included in a batch trace.
 
 The following data is observable:
 
 | Record | Sanitized fields |
 |---|---|
 | Batch trace input | HMAC source ID; source-scoped pseudonymous batch/component IDs; stable per-component decision-chain IDs; attempt kind; batch number and size; component-type counts; language counts; tier; cache-hit flag |
-| Batch metadata | HMAC source ID, attempt kind, analyzer version, provider, pseudonymous model ID, tier, batch size, cache-hit flag, cache namespace in `prompt_version`, response-schema digest in `schema_version` |
+| Batch metadata | HMAC source ID, attempt kind, analyzer version, provider, pseudonymous model ID, tier, batch size, cache-hit flag, telemetry-configuration digest in `prompt_version`, response-schema digest in `schema_version` |
 | Batch output | Allowlisted decision totals; keep/enrich/remove/reclassify/discover counts sliced by original component type, language, and bounded heuristic-confidence bucket (`low` < 0.5, `medium` < 0.8, `high` ≥ 0.8, or `unknown`; discoveries use emitted dimensions); degraded-candidate count; failure category; schema-valid flag; middleware-guard flag; status |
 | Attempt workflow | Attempt number/kind; raw model-requested mutation counts; post-middleware final action counts; blocked-action deltas; aggregate allowlisted tool calls/errors/root denials/duration; recovered flag; status; duration |
 | LLM span | One span per callback-observed model invocation, in start order, with HMAC call ID, provider, pseudonymous model ID, call start/duration, per-call tokens when supplied, status, and schema/decision-carrier flags. Only the terminal decision-bearing call carries raw mutation counts. A single `mode=aggregate` fallback is used only when callbacks are unavailable. |
@@ -152,7 +156,7 @@ organization's telemetry policy.
 
 The production payload therefore contains no raw confidential repository
 content, but it remains **internal operational telemetry**. Provider family,
-analyzer/cache/schema versions, type/language distributions, action/risk
+analyzer/telemetry/schema versions, type/language distributions, action/risk
 counts, reliability outcomes, latency, token use, tool-use shape, and
 correlatable pseudonyms can reveal system behavior. Keep the hosted project
 access-restricted and do not use customer, repository, incident, username, or
@@ -170,14 +174,35 @@ credential text in project/log-stream configuration labels.
 The live diagnostic path is separate from the sanitized logger. It is selected
 only when both `--galileo` and the explicit `--galileo-full-trajectory` option
 are active. The trajectory option defaults to disabled, so `--galileo` alone
-cannot activate the raw callback. The explicit CLI option supplies the
+cannot activate the raw callback, and the CLI rejects the trajectory option
+when `--galileo` is absent. The explicit CLI option supplies the
 call-site approval only after all environment and immutable-destination gates
 pass. The raw callback is not governed by `--galileo-sample-rate`: each actual
-initial, retry, or fallback agent invocation receives a fresh callback and
-logger and flushes one raw trace when that chain completes or reports an error.
-Cache hits and circuit-breaker skips do not create raw callbacks. No callback is
-stored in module-global state, so later disabled scans and concurrent batches
-cannot inherit or share it.
+initial, retry, fallback, or structured-coercion agent invocation receives a
+fresh callback and logger and flushes one raw trace when that chain completes or
+reports an error. Cache hits and circuit-breaker skips do not create raw
+callbacks. No callback is stored in module-global state, so later disabled
+scans and concurrent batches cannot inherit or share it.
+
+Raw logger construction and scan-session binding share the configured setup
+budget for each invocation. Synchronous setup runs outside the asynchronous
+batch event loop. A timeout is fail-open: the invocation continues without a
+raw callback, and any callback produced after its deadline is hardened and
+discarded instead of being attached late. Scan-session creation permits only
+one remote request in flight; later invocations wait for that request and never
+launch an overlapping create.
+
+Raw callback loggers have SDK shutdown flushing and Agent Control disabled.
+After the callback's one-shot asynchronous flush attempt, any trace still
+retained by the SDK is cleared instead of being retried during interpreter
+shutdown. The per-logger ingest client owned by the raw callback is then
+closed; the shared Galileo API client, which the callback does not own, is not.
+When raw mode is requested and all static approval, destination, and immutable
+resource gates pass, direct file-tool access is restricted to the invocation's
+scan roots so a captured trajectory cannot include files outside the approved
+source set. An out-of-root tool request is denied and counted; this safety
+boundary means raw diagnostic runs are not guaranteed to be behavior-identical
+to ordinary or sanitized-only scans.
 
 The hosted custom-function runner remains pseudonymous by default: exact inputs
 stay out of Galileo's dataset, the application receives a deep copy from an
@@ -192,14 +217,17 @@ Set `exact_identities=True` only for a reviewed exact-row run. That path require
 the literal `approved_fixture=True` plus
 `AIBOM_GALILEO_ALLOW_EXACT_IDENTITIES=true`. If the rows contain approved
 evidence, `AIBOM_GALILEO_ALLOW_FULL_CONTENT=true` is independently required.
-The full LangChain callback captures prompts, responses, tool I/O, callback
-metadata, and exception details. Both the live diagnostic and evaluation paths
-require `AIBOM_GALILEO_ALLOW_EXACT_IDENTITIES=true`,
+The optional full LangChain callback captures prompts, responses, tool I/O,
+callback metadata, and exception details. The live diagnostic and any
+evaluation that explicitly uses this callback require
+`AIBOM_GALILEO_ALLOW_EXACT_IDENTITIES=true`,
 `AIBOM_GALILEO_ALLOW_FULL_CONTENT=true`, and
 `AIBOM_GALILEO_ALLOW_FULL_TRAJECTORY=true`. They also require immutable UUIDs in
 `AIBOM_GALILEO_EVALUATION_PROJECT_ID` and
 `AIBOM_GALILEO_EVALUATION_LOG_STREAM_ID`, construct the logger internally, and
-force one new trace plus one flush per chain.
+force one new trace plus one flush per chain. The default pseudonymous
+custom-function experiment and exact custom-function rows do not use this
+callback; their narrower identity/evidence gates are described above.
 
 Every networked evaluation or live raw diagnostic requires the exact hosted
 console/API origins, verified TLS, and
@@ -233,12 +261,20 @@ aibom-agentic-scan                         session
 ```
 
 Attempt kinds are allowlisted as `initial`, `retry`, `fallback`, `coercion`,
-`middleware_validation`, `unknown`, or `other`. Cache hits emit a batch trace
+`middleware_validation`, `unknown`, or `other`. Sampled cache hits, plus cache
+replays retained for degraded or quality-exception signals, emit a batch trace
 with `cache_hit=true` but do not fabricate LLM or tool spans. Successful,
 cached, and skipped records use status code 200; other batch/LLM records use
 500. Per-call tool spans use 500 on callback error; aggregate fallback tool
 spans use 500 when their error or approved-root-denial count is non-zero.
 Structured coercion emits its own workflow and LLM span.
+
+Tool names come from one shared allowlist. It includes the AIBOM tools
+`analyze_imports`, `list_directory_tree`, `lookup_model`, `read_file_snippet`,
+`resolve_env_var`, `search_codebase`, `search_package_info`, and
+`trace_data_flow`, plus the Deep Agents built-ins `compact_conversation`,
+`edit_file`, `execute`, `glob`, `grep`, `ls`, `read_file`, `task`, `write_file`,
+and `write_todos`. Every other name is emitted as `other`.
 
 Callback events are sealed at the batch deadline, so a late completion from an
 abandoned synchronous daemon invocation cannot mutate or cross-contaminate an
@@ -246,6 +282,9 @@ already concluded trace. Concurrent batches each own an independent callback,
 trace handle, workflow, and logger. Actual `created_at`, monotonic duration,
 sequence, and per-call token carriers are retained; unknown usage becomes null
 native token metrics plus `token_usage_missing=true`, not fabricated zeros.
+Response-level provider usage takes precedence over per-generation metadata;
+when no response-level carrier exists, each generation's usage is counted
+independently even when two choices report equal numeric values.
 
 The decision-bearing LLM span contains raw model-requested mutation counts
 (`enrich`, `remove`, `reclassify`, `discover`, relationships, and risks). The
@@ -253,6 +292,9 @@ workflow's `final_actions` and the batch output are computed from the
 post-middleware product result. `blocked_actions` is the non-negative delta, so
 a guard rejection is not mistaken for a model decision. Keep counts exist only
 at the final boundary because the response schema has no explicit raw keep list.
+`schema_valid` is false whenever a failed batch has no parsed decision carrier,
+including timeouts, recursion limits, rate limits, provider outages, refusals,
+parse failures, and no-LLM circuit-breaker or retry-budget skips.
 
 Retries and fallbacks are tagged in both batch metadata and their attempt span.
 When the retry orchestrator regroups failed candidates, that retry group receives
@@ -277,40 +319,26 @@ buffering is bounded at 16 LLM and 32 tool spans per attempt. If an unusually
 long loop exceeds the LLM cap, the terminal schema/decision-bearing call
 replaces the oldest LLM entry and sequence gaps make truncation visible.
 
-## Cache and version dimensions
+## Telemetry version dimensions and cache state
 
-Agentic verdict caches are namespaced by a non-sensitive 20-character digest.
-The digest currently covers:
+The batch trace's `prompt_version` is a non-sensitive 20-character digest used
+only to compare Galileo traces produced by materially different agent
+configurations. It currently covers the telemetry-version marker and installed
+analyzer version; primary and fast models; selected provider initialization
+settings; batching, concurrency, timeout, retry, and code-snippet settings;
+hashes of the system and coercion prompts; the response schema; the agent-tool
+implementation; and the custom agent-signature catalog.
 
-- namespace version and installed analyzer version;
-- primary and fast model;
-- provider, API endpoint/version, reasoning mode, token limit, and provider
-  initialization settings;
-- batch size, concurrency, timeout, circuit-breaker threshold, retry budget,
-  and code-snippet setting;
-- hashes of the system and coercion prompts;
-- response JSON schema;
-- agent-tool implementation source;
-- custom agent-signature catalog;
-- every sibling deterministic component, relationship, and class dossier; and
-- a content digest of every file visible to the approved-root agent tools.
+This digest is observational metadata. It does not participate in agentic
+verdict-cache identity, so enabling Galileo does not change normal cache keys
+or cache-hit behavior. The independent `cache_hit` field reports whether the
+existing agentic verdict cache supplied the result.
 
-The source digest is complete only for roots containing at most 50,000 files
-and 128 MiB. Missing, unreadable, symlinked, or larger roots receive a volatile
-per-run namespace, which deliberately disables cross-run verdict reuse rather
-than risking a stale cache hit. `.git` and AIBOM cache directories are excluded.
-
-A change to any of these inputs creates a new namespace instead of replaying a
-verdict produced under an incompatible configuration. The current internal
-agentic namespace version is 3; tier, batch, and cross-repository payload
-versions are 1; the deterministic scan-cache payload version is 3. These are
-implementation details and may advance between releases.
-
-The batch trace's `prompt_version` is this complete cache-namespace digest,
-not merely a prompt hash. `schema_version` is the first 20 hex characters of
-the `AgentResponse` JSON-schema SHA-256 digest. Always group or filter quality
-trends by `analyzer_version`, `prompt_version`, `schema_version`, `model`, and
-`cache_hit` before comparing releases.
+`schema_version` is the first 20 hex characters of the `AgentResponse`
+JSON-schema SHA-256 digest. Internal tier, batch, and cross-repository payload
+versions are implementation details and may advance between releases. Always
+group or filter quality trends by `analyzer_version`, `prompt_version`,
+`schema_version`, `model`, and `cache_hit` before comparing releases.
 
 ## Exact evaluation metrics
 
@@ -583,11 +611,13 @@ export AIBOM_GALILEO_EVALUATION_LOG_STREAM_ID="<log-stream-uuid>"
 
 # Be explicit when running a reviewed live raw trajectory:
 cisco-aibom analyze /approved/repository --llm-model gpt-5.4 \
-  --galileo --galileo-full-trajectory
+  --galileo --galileo-full-trajectory \
+  -o json -O approved-trajectory-report.json
 
 # Optional explicit assertion of the default sanitized-only behavior:
 cisco-aibom analyze /path/to/repository --llm-model gpt-5.4 \
-  --galileo --no-galileo-full-trajectory
+  --galileo --no-galileo-full-trajectory \
+  -o json -O sanitized-report.json
 ```
 
 ## Operator setup: project, dashboard, and alerts
@@ -607,7 +637,7 @@ Recommended project layout:
 - an immutable project UUID for pseudonymous experiments, plus a separately
   pinned log-stream UUID and stricter access boundary for exact/full-content
   trajectories;
-- dashboard filters for trace name, analyzer/cache/schema version, provider,
+- dashboard filters for trace name, analyzer/telemetry/schema version, provider,
   model, tier, cache hit, source kind, and status.
 
 Recommended dashboard sections:
@@ -623,7 +653,8 @@ Recommended dashboard sections:
    codes. Group retry and fallback outcomes by `source_id` plus
    `decision_chain_id`, not by batch ordinal, because retries may be regrouped.
    Show cost only when an operator-approved external calculation is configured.
-4. Release comparison: analyzer, cache namespace, schema, model, and provider.
+4. Release comparison: analyzer, telemetry configuration, schema, model, and
+   provider, with cache-hit status as a separate slice.
 
 Starting alert rules should notify, not block:
 
@@ -669,6 +700,7 @@ thresholds on staging data before production.
   bounded `approved_evidence` array. Its separate exact/content/trajectory gates
   are necessary but do not replace fixture-root isolation, tool allowlisting,
   secret/PII review, RBAC, or retention controls.
+
 ## Retention and RBAC assumptions
 
 The runtime assumes only that the configured API key can write to the named
@@ -704,15 +736,16 @@ period permitted for the approved use case.
 3. **Production canary:** use a low, approved AIBOM sampling rate. Keep alerts
    notification-only and compare scan outputs with telemetry disabled/enabled.
 4. **Broader observation:** raise sampling only after privacy and cost review.
-   Establish baselines by cache namespace and analyzer release.
+   Establish baselines by telemetry configuration and analyzer release, with
+   cache-hit status as a separate slice.
 5. **Evaluation loop:** run golden-dataset experiments through the default
    pseudonymous hosted path and verify metric parity locally. Enable exact rows
    or raw trajectories only for separately approved review cases; use
    entity-level metrics to gate releases outside production telemetry.
 
-The Galileo SDK's Agent Control bridge is explicitly disabled for every logger;
-there is no automated remediation path. An alert must lead to manual
-investigation. Disable emission immediately with
+The Galileo SDK's Agent Control bridge is explicitly disabled for every
+AIBOM-constructed sanitized or raw logger; there is no automated remediation
+path. An alert must lead to manual investigation. Disable emission immediately with
 `--no-galileo` or `AIBOM_GALILEO_ENABLED=false`; scanning remains functional
 when Galileo is unavailable.
 

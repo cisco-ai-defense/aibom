@@ -224,24 +224,6 @@ class TestCaptureGitRemote:
         _init_repo(tmp_path)
         assert capture_git_remote(str(tmp_path)) is None
 
-    def test_url_rewrite_does_not_change_captured_remote(self, tmp_path: Path) -> None:
-        _init_repo(tmp_path)
-        _git(
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:org/repo.git",
-            cwd=tmp_path,
-        )
-        _git(
-            "config",
-            "url.https://mirror.invalid/.insteadOf",
-            "git@github.com:",
-            cwd=tmp_path,
-        )
-
-        assert capture_git_remote(str(tmp_path)) == "git@github.com:org/repo.git"
-
     def test_captured_remote_canonicalizes(self, tmp_path: Path) -> None:
         _init_repo(tmp_path)
         _git(

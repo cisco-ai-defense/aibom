@@ -275,7 +275,9 @@ def test_circuit_breaker_trace_has_no_fake_llm_span(tmp_path: Path) -> None:
     names = [name for name, _ in loggers[0].calls]
     assert names == ["start_trace", "conclude", "flush"]
     conclusion = next(values for name, values in loggers[0].calls if name == "conclude")
-    assert json.loads(conclusion["output"])["status"] == "circuit_breaker"
+    output = json.loads(conclusion["output"])
+    assert output["status"] == "circuit_breaker"
+    assert output["schema_valid"] is False
 
 
 def test_structured_coercion_has_its_own_workflow_and_llm_span(
