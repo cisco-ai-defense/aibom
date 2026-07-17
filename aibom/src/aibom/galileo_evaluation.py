@@ -3093,6 +3093,7 @@ def create_galileo_async_callback(
     flush_on_chain_end: bool = True,
     ingestion_hook: Callable[[Any], None] | None = None,
     session_binder: Callable[[Any], None] | None = None,
+    setup_budget_s: float | None = None,
 ) -> Any:
     """Construct Galileo 2.4's LangChain async callback after explicit approval.
 
@@ -3110,8 +3111,12 @@ def create_galileo_async_callback(
     The approval checks happen before the optional Galileo/LangChain import.
     This function does not invoke a chain or explicitly flush/send any data.
     Logger initialization and optional session binding run in a daemon worker
-    and are bounded by ``AIBOM_GALILEO_SETUP_BUDGET_S`` (2 seconds by default).
-    A logger that completes after that deadline is hardened and discarded.
+    and are bounded by ``AIBOM_GALILEO_SETUP_BUDGET_S`` (2 seconds by default),
+    or by ``setup_budget_s`` when a caller passes an explicit override. A logger
+    that completes after that deadline is hardened and discarded. The override
+    lets a one-time session warm-up spend a larger budget on the cold networked
+    auth/session-create so that every later per-invocation callback only has to
+    do the cheap local ``set_session`` attach.
 
     ``session_binder``, when supplied, receives the freshly built logger and may
     attach it to a shared session so that every callback built for one scan
@@ -3151,6 +3156,10 @@ def create_galileo_async_callback(
         _disable_agent_control,
         _disable_logger_atexit_flush,
         _resolve_setup_budget_s,
+    )
+
+    effective_budget_s = (
+        setup_budget_s if setup_budget_s is not None else _resolve_setup_budget_s()
     )
 
     setup = _CallbackSetupAttempt()
@@ -3227,7 +3236,7 @@ def create_galileo_async_callback(
         daemon=True,
     ).start()
 
-    if not setup.done.wait(_resolve_setup_budget_s()):
+    if not setup.done.wait(effective_budget_s):
         completed_logger: Any | None = None
         with setup.lock:
             setup.abandoned = True
@@ -3394,10 +3403,52 @@ def create_full_trajectory_callback_factory(
             session_binder=_bind_session,
         )
 
+    def _warm_up_session(budget_s: float | None = None) -> bool:
+        """Pre-create the shared session once, before the concurrent fan-out.
+
+        The per-invocation callback build is bounded by a small setup budget
+        (``AIBOM_GALILEO_SETUP_BUDGET_S``, 2s default). On a cold start the very
+        first callbacks must do a networked auth + session-create inside that
+        budget; under ``--agentic-concurrency > 1`` the first N invocations race
+        that one create and time out, silently dropping their raw trajectories.
+
+        Running this once up front — with a generous one-time budget, before any
+        concurrency — resolves ``state.session_id`` so every later callback takes
+        the cheap local ``set_session`` attach path and never races the create.
+        The create path self-closes its own ingest client, so the throwaway
+        callback holds no open resources once this returns.
+
+        Fail-open: any error leaves ``state.session_id`` unset and the scan
+        proceeds exactly as before (each callback attempts its own create).
+        Returns True when the shared session is resolved.
+        """
+        import logging
+
+        from .agentic_telemetry import _MAX_SETUP_BUDGET_S
+
+        if state.session_id is not None:
+            return True
+        try:
+            create_galileo_async_callback(
+                approved_fixture=True,
+                session_binder=_bind_session,
+                setup_budget_s=(
+                    budget_s if budget_s is not None else _MAX_SETUP_BUDGET_S
+                ),
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Galileo full-trajectory session warm-up unavailable",
+                exc_info=True,
+            )
+        return state.session_id is not None
+
     # The agent wrapper uses this private marker to enable direct-file guards
     # only for a statically approved raw Galileo mode. A missing approval must
     # remain fail-open and behavior-identical to an ordinary scan.
     setattr(_factory, "_aibom_strict_tool_roots", _raw_tool_root_guards_approved())
+    # One-time cold-start session warm-up, invoked by the CLI before fan-out.
+    setattr(_factory, "warm_up_session", _warm_up_session)
     return _factory
 
 

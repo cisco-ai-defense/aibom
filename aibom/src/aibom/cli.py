@@ -1967,6 +1967,18 @@ def analyze(
             "send raw prompts, responses, tool I/O, and exact identities after "
             "all approval gates pass."
         )
+        # Cold-start warm-up: create the shared session once, before the
+        # concurrent batch fan-out, so no per-invocation callback races the
+        # networked session-create inside its small setup budget and drops its
+        # raw trajectory. Fail-open — a failed warm-up leaves the scan behaving
+        # exactly as before.
+        warm_up = getattr(invoke_callback_factory, "warm_up_session", None)
+        if callable(warm_up) and not warm_up():
+            logging.warning(
+                "Galileo full-trajectory session warm-up did not resolve a "
+                "shared session; per-invocation callbacks will each attempt "
+                "their own session setup."
+            )
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
         explicit_config = load_custom_catalog(Path(custom_catalog))

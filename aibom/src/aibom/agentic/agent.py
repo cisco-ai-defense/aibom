@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import math
@@ -811,6 +812,59 @@ def _build_fallback_agent(model_string: str, model_obj: Any) -> Any | None:
 
 
 _DEFAULT_BATCH_SIZE = 15
+
+# LangChain config-metadata key that pairs a batch's Phase-1 (deep-agent loop,
+# trace name "aibom-scanner") with its Phase-2 structured-output coercion (trace
+# name "RunnableSequence"). Both phases are separate top-level Galileo traces
+# grouped by session; this shared value lets a consumer match the pair. The
+# ``phase`` label distinguishes the two within a pair.
+_GALILEO_CORR_ID_KEY = "aibom_batch_corr_id"
+_GALILEO_PHASE_KEY = "aibom_phase"
+
+
+def _batch_corr_metadata(corr_id: str | None, phase: str) -> dict[str, str] | None:
+    """Build the LangChain config metadata that pairs Phase 1 and Phase 2.
+
+    Returns ``None`` when no correlation id is supplied so callers add nothing to
+    the invoke config and behavior is unchanged.
+    """
+    if not corr_id:
+        return None
+    return {_GALILEO_CORR_ID_KEY: corr_id, _GALILEO_PHASE_KEY: phase}
+
+
+def _batch_corr_id(
+    batch: list[AIComponent],
+    attempt_kind: str,
+    attempt_number: int,
+    *,
+    correlate: bool,
+) -> str | None:
+    """Deterministic per-batch correlation id shared by Phase 1 and Phase 2.
+
+    Returns ``None`` when no trace consumer is active (``correlate`` is False),
+    so no correlation metadata is attached and behavior is unchanged.
+
+    The id is derived from the batch's component ``instance_id`` set (each is a
+    unique ``name_filepath_line`` string) plus the attempt, so it is:
+
+    * **collision-free across tiers** — two batches with the same ordinal (e.g.
+      tier-1 ``b1`` and tier-2 ``b1``) hold different components and get
+      different ids. This matters because the full-trajectory path runs without
+      a sanitized ``telemetry_context``, so ordinal/tier labels are unavailable
+      anyway;
+    * **shared by Phase 1 and Phase 2** of one attempt — both see the same batch;
+    * **distinct per retry/fallback** — the attempt is folded in.
+
+    ``correlate`` must be True whenever traces are being captured — the
+    full-trajectory callback factory (which drives the raw traces regardless of
+    whether the sanitized telemetry is enabled) or the sanitized telemetry.
+    """
+    if not correlate:
+        return None
+    fingerprint = "\0".join(sorted(c.instance_id for c in batch))
+    digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:12]
+    return f"{digest}:{attempt_kind}{attempt_number}"
 
 
 def _callbacks_for_invoke(
@@ -2228,6 +2282,7 @@ def _coerce_structured(
     telemetry_context: _BatchTelemetryContext | None = None,
     defer_successful_workflow: bool = False,
     invoke_callback_factory: Callable[[], Any] | None = None,
+    corr_metadata: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Phase 2 of the two-phase decouple.
 
@@ -2316,12 +2371,14 @@ def _coerce_structured(
     started_at = datetime.now(timezone.utc)
     started = time.monotonic()
     call_id = f"coercion:{time.monotonic_ns()}"
+    invoke_config: dict[str, Any] = {}
+    if invoke_callbacks:
+        invoke_config["callbacks"] = invoke_callbacks
+    if corr_metadata:
+        invoke_config["metadata"] = dict(corr_metadata)
     try:
-        if invoke_callbacks:
-            out = structured.invoke(
-                prompt,
-                config={"callbacks": invoke_callbacks},
-            )
+        if invoke_config:
+            out = structured.invoke(prompt, config=invoke_config)
         else:
             out = structured.invoke(prompt)
     except Exception as exc:
@@ -2404,6 +2461,7 @@ def _resolve_batch_data(
     telemetry_attempt: AttemptTrace | None = None,
     defer_coercion_finish: bool = False,
     invoke_callback_factory: Callable[[], Any] | None = None,
+    corr_metadata: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Get the structured ``AgentResponse`` dict from a finished batch.
 
@@ -2435,6 +2493,7 @@ def _resolve_batch_data(
             telemetry_context=telemetry_context,
             defer_successful_workflow=defer_coercion_finish,
             invoke_callback_factory=invoke_callback_factory,
+            corr_metadata=corr_metadata,
         )
     return None
 
@@ -2464,6 +2523,7 @@ def _invoke_agent_bounded(
     *,
     recursion_limit: int | None = None,
     callbacks: list[Any] | None = None,
+    corr_metadata: dict[str, str] | None = None,
 ) -> Any:
     """Run ``agent.invoke`` in a daemon thread with a hard wall-clock deadline.
 
@@ -2493,6 +2553,8 @@ def _invoke_agent_bounded(
         config["recursion_limit"] = recursion_limit
     if callbacks:
         config["callbacks"] = list(callbacks)
+    if corr_metadata:
+        config["metadata"] = dict(corr_metadata)
 
     def _worker() -> None:
         try:
@@ -2529,6 +2591,7 @@ def _invoke_with_deadline(
     timeout_s: int,
     *,
     callbacks: list[Any] | None = None,
+    corr_metadata: dict[str, str] | None = None,
 ) -> Any:
     """Bounded batch invocation — thin wrapper over :func:`_invoke_agent_bounded`.
 
@@ -2543,6 +2606,7 @@ def _invoke_with_deadline(
             timeout_s,
             recursion_limit=_RECURSION_LIMIT,
             callbacks=callbacks,
+            corr_metadata=corr_metadata,
         )
     except _InvokeTimeout as exc:
         raise _BatchTimeout() from exc
@@ -2672,6 +2736,12 @@ def _run_batch(
     )
     t0 = time.monotonic()
 
+    corr_id = _batch_corr_id(
+        batch,
+        attempt_kind,
+        attempt_number,
+        correlate=invoke_callback_factory is not None,
+    )
     result = None
     invoke_callbacks = _callbacks_for_invoke(
         call_collector,
@@ -2684,6 +2754,7 @@ def _run_batch(
             summary,
             timeout_s,
             callbacks=invoke_callbacks or None,
+            corr_metadata=_batch_corr_metadata(corr_id, "agent"),
         )
     except _BatchTimeout:
         elapsed = time.monotonic() - t0
@@ -2805,6 +2876,7 @@ def _run_batch(
             telemetry_attempt=coercion_attempt,
             defer_coercion_finish=True,
             invoke_callback_factory=invoke_callback_factory,
+            corr_metadata=_batch_corr_metadata(corr_id, "coercion"),
         )
         coercion_duration_s = time.monotonic() - coercion_started
     else:
@@ -2932,6 +3004,12 @@ async def _run_batch_async(
     )
     t0 = time.monotonic()
 
+    corr_id = _batch_corr_id(
+        batch,
+        attempt_kind,
+        attempt_number,
+        correlate=invoke_callback_factory is not None,
+    )
     result = None
     # A diagnostic callback factory may perform bounded SDK setup and wait on
     # a scan-scoped session operation. Keep that synchronous work off the event
@@ -2942,6 +3020,7 @@ async def _run_batch_async(
         call_collector,
         invoke_callback_factory,
     )
+    phase1_corr = _batch_corr_metadata(corr_id, "agent")
     try:
         # asyncio.timeout() (3.11+) is the recommended primitive over
         # wait_for: it cancels the awaited ainvoke at the coroutine level and
@@ -2954,6 +3033,7 @@ async def _run_batch_async(
                 config={
                     "recursion_limit": _RECURSION_LIMIT,
                     **({"callbacks": invoke_callbacks} if invoke_callbacks else {}),
+                    **({"metadata": phase1_corr} if phase1_corr else {}),
                 },
             )
     except asyncio.TimeoutError:
@@ -3074,6 +3154,7 @@ async def _run_batch_async(
             "telemetry_attempt": coercion_attempt,
             "defer_coercion_finish": True,
             "invoke_callback_factory": invoke_callback_factory,
+            "corr_metadata": _batch_corr_metadata(corr_id, "coercion"),
         }
         if invoke_callback_factory is not None:
             # Raw callback construction is synchronous and bounded. Keep both
