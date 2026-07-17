@@ -24,12 +24,18 @@ when the user passes ``--agent-model`` to the CLI.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
+import math
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from collections.abc import Callable, Iterator
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -37,7 +43,9 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic_core import PydanticUndefined
 
 from ..agent_signatures import AgentSignatureCatalog
+from ..agentic_telemetry import AgenticTelemetry, AttemptTrace, BatchTrace
 from ..cache_paths import cache_read_dirs, ensure_cache_dir
+from ..llm_factory import resolve_provider
 from ..models import (
     AIComponent,
     AIComponentType,
@@ -48,9 +56,11 @@ from ..models import (
     ScanResult,
     SourceResult,
 )
+from ..utils.version import resolve_package_version
 from .evidence_injection import DossierIndex, build_dossier_index
 from .middleware import AIBOMScannerMiddleware
 from .prompts import AGENTIC_COERCION_PROMPT, AIBOM_AGENT_SYSTEM_PROMPT
+from .sanitized_trace import SanitizedAgentCallback
 
 _IID_DESC = (
     "The EXACT instance_id string as provided in the input — "
@@ -78,16 +88,21 @@ class TokenUsage:
         self.cached_tokens += other.cached_tokens
 
 
-_token_accumulator = TokenUsage()
+_token_accumulator: contextvars.ContextVar[TokenUsage | None] = contextvars.ContextVar(
+    "_token_accumulator", default=None
+)
 
 
 def _reset_token_usage() -> None:
-    global _token_accumulator
-    _token_accumulator = TokenUsage()
+    _token_accumulator.set(TokenUsage())
 
 
 def get_token_usage() -> TokenUsage:
-    return _token_accumulator
+    usage = _token_accumulator.get()
+    if usage is None:
+        usage = TokenUsage()
+        _token_accumulator.set(usage)
+    return usage
 
 
 def _as_int(value: Any) -> int:
@@ -104,7 +119,7 @@ def _nested_int(d: Any, *path: str) -> int:
     return _as_int(d)
 
 
-def _resolve_message_usage(msg: Any) -> tuple[int, int, int]:
+def _resolve_message_usage(msg: Any) -> tuple[int, int, int, int]:
     """Resolve ``(prompt, completion, total)`` tokens for one AI message.
 
     LangChain's standardized ``usage_metadata`` is preferred, but several
@@ -170,6 +185,13 @@ def _accumulate_token_usage(result: Any) -> None:
     ``response_metadata`` carriers for providers that omit it (see
     :func:`_resolve_message_usage`).
     """
+    get_token_usage().add(_token_usage_for_result(result))
+
+
+def _token_usage_for_result(result: Any) -> TokenUsage:
+    """Return token usage for one result without mutating run-level totals."""
+
+    usage = TokenUsage()
     messages = result.get("messages", []) if isinstance(result, dict) else []
     for msg in messages:
         prompt, completion, total, cached = _resolve_message_usage(msg)
@@ -185,10 +207,11 @@ def _accumulate_token_usage(result: Any) -> None:
                     sorted(rm) if isinstance(rm, dict) else None,
                 )
             continue
-        _token_accumulator.prompt_tokens += prompt
-        _token_accumulator.completion_tokens += completion
-        _token_accumulator.total_tokens += total
-        _token_accumulator.cached_tokens += cached
+        usage.prompt_tokens += prompt
+        usage.completion_tokens += completion
+        usage.total_tokens += total
+        usage.cached_tokens += cached
+    return usage
 
 
 class _NullTolerantModel(BaseModel):
@@ -789,6 +812,36 @@ def _build_fallback_agent(model_string: str, model_obj: Any) -> Any | None:
 
 _DEFAULT_BATCH_SIZE = 15
 
+
+def _callbacks_for_invoke(
+    local_callback: Any | None,
+    invoke_callback_factory: Callable[[], Any] | None,
+) -> list[Any]:
+    """Build callbacks owned by one agent invocation.
+
+    The optional factory is scan-scoped and must return a fresh callback. This
+    prevents callback/logger state from crossing sequential scans or concurrent
+    batches while preserving one independently flushed raw trace per live
+    invocation. Callback construction remains fail-open so sanitized telemetry
+    and the scan continue if the diagnostic integration is unavailable.
+    """
+
+    callbacks = [local_callback] if local_callback is not None else []
+    if invoke_callback_factory is None:
+        return callbacks
+    try:
+        callback = invoke_callback_factory()
+    except Exception as exc:
+        _LOGGER.warning(
+            "Agent invocation callback unavailable (%s); continuing without it",
+            type(exc).__name__,
+        )
+        return callbacks
+    if callback is not None:
+        callbacks.append(callback)
+    return callbacks
+
+
 # LangGraph default since v1.0.6 and also the Deep Agents default.
 # Set explicitly so the intent is clear: this is a safety net against
 # infinite loops, NOT a workload budget.
@@ -968,24 +1021,225 @@ import hashlib as _hashlib
 
 def _component_cache_key(c: AIComponent) -> str:
     """Derive a content-based cache key for a component."""
-    parts = [
-        c.file_path or "",
-        str(c.line_number),
-        c.name,
-        c.component_type.value,
-        c.model_name or "",
-    ]
+    payload: dict[str, Any] = {"component": c.model_dump(mode="json")}
     if c.file_path and c.line_number:
         snippet = _read_code_window(c.file_path, c.line_number)
         if snippet:
-            parts.append(snippet)
-    raw = "|".join(parts)
-    return _hashlib.sha256(raw.encode()).hexdigest()[:24]
+            payload["source_window"] = snippet
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 _TIER_CACHE_VERSION = 1
 _BATCH_CACHE_VERSION = 1
 _CROSS_REPO_CACHE_VERSION = 1
+_AGENTIC_CACHE_NAMESPACE_VERSION = 3
+_MAX_CACHE_EVIDENCE_FILES = 50_000
+_MAX_CACHE_EVIDENCE_BYTES = 128 * 1024 * 1024
+
+
+def _agentic_cache_namespace(
+    *,
+    model_string: str,
+    fast_model: str | None,
+    llm_config: dict[str, Any] | None,
+    batch_size: int,
+    max_concurrent: int,
+    timeout_s: int,
+    max_consecutive_failures: int,
+    max_retry_seconds: int,
+    include_code_snippets: bool,
+    agent_signature_catalog: AgentSignatureCatalog | None,
+    decision_context_digest: str = "",
+) -> str:
+    """Return a non-sensitive digest of every input that can alter a verdict.
+
+    Agentic cache entries used to be keyed only by component/source content.
+    That allowed a new model, prompt, schema, tool implementation, reasoning
+    setting, or custom signature catalog to replay an old verdict.  The
+    namespace is deliberately a digest: provider endpoints and arbitrary
+    ``init_kwargs`` can affect behavior but must never appear in cache file
+    names or logs.
+    """
+
+    cfg = llm_config or {}
+    relevant_config = {
+        "provider": cfg.get("provider"),
+        "api_base": cfg.get("api_base"),
+        "api_version": cfg.get("api_version"),
+        "reasoning": cfg.get("reasoning", "auto"),
+        "max_tokens": cfg.get("max_tokens"),
+        "init_kwargs": cfg.get("init_kwargs"),
+    }
+    try:
+        catalog_payload: Any = (
+            asdict(agent_signature_catalog)
+            if agent_signature_catalog is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        # A user-provided catalog should be a dataclass, but keep cache
+        # versioning fail-open if a compatible catalog implementation is used.
+        catalog_payload = repr(agent_signature_catalog)
+
+    try:
+        tools_digest = _hashlib.sha256(
+            Path(__file__).with_name("tools.py").read_bytes()
+        ).hexdigest()
+    except OSError:
+        tools_digest = "unavailable"
+
+    payload = {
+        "namespace_version": _AGENTIC_CACHE_NAMESPACE_VERSION,
+        "analyzer_version": resolve_package_version("cisco-aibom"),
+        "model": model_string,
+        "fast_model": fast_model or model_string,
+        "llm_config": relevant_config,
+        "batch_size": batch_size,
+        "max_concurrent": max_concurrent,
+        "timeout_s": timeout_s,
+        "max_consecutive_failures": max_consecutive_failures,
+        "max_retry_seconds": max_retry_seconds,
+        "include_code_snippets": include_code_snippets,
+        "system_prompt": _hashlib.sha256(
+            AIBOM_AGENT_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "coercion_prompt": _hashlib.sha256(
+            AGENTIC_COERCION_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "response_schema": AgentResponse.model_json_schema(),
+        "tools_source": tools_digest,
+        "agent_signature_catalog": catalog_payload,
+        "decision_context_digest": decision_context_digest,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _agentic_decision_context_digest(
+    components: list[AIComponent],
+    relationships: list[ComponentRelationship],
+    dossier_index: DossierIndex,
+    scan_paths: list[str],
+    excluded_paths: list[Path] | None = None,
+) -> str:
+    """Hash every bounded, prompt/tool-visible input used by a verdict.
+
+    The model sees sibling candidates, deterministic edges, class dossiers,
+    and can inspect arbitrary files below the approved roots. Replaying an
+    unchanged component against changed sibling or source evidence is stale,
+    so all of that context participates in the namespace.
+    """
+
+    dossiers: list[dict[str, Any]] = []
+    for key, dossier in sorted(dossier_index.items()):
+        try:
+            value: Any = asdict(dossier)
+        except (TypeError, ValueError):
+            value = repr(dossier)
+        dossiers.append({"key": list(key), "value": value})
+    payload = {
+        "components": sorted(_component_cache_key(c) for c in components),
+        "relationships": sorted(
+            json.dumps(
+                relationship.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            for relationship in relationships
+        ),
+        "dossiers": dossiers,
+        "source_evidence": _scan_evidence_digest(
+            scan_paths, excluded_paths=excluded_paths
+        ),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _scan_evidence_digest(
+    scan_paths: list[str], *, excluded_paths: list[Path] | None = None
+) -> str:
+    """Hash source-root state that an agent tool can inspect.
+
+    Content is streamed into the digest and never persisted. To keep the scan
+    bounded, repositories above the file/byte limits receive a per-run volatile
+    value, intentionally disabling cross-run verdict reuse instead of risking a
+    stale decision from an incomplete fingerprint.
+    """
+    digest = _hashlib.sha256()
+    file_count = 0
+    byte_count = 0
+    entries: list[tuple[int, str, Path, int]] = []
+    excluded = tuple(path.resolve(strict=False) for path in (excluded_paths or []))
+
+    def _is_excluded(path: Path) -> bool:
+        return any(path == item or item in path.parents for item in excluded)
+
+    def _volatile() -> str:
+        return "volatile_" + _hashlib.sha256(os.urandom(32)).hexdigest()
+
+    if not scan_paths:
+        return _volatile()
+
+    def _iter_files(root: Path) -> Iterator[tuple[Path, Path]]:
+        if root.is_file() and not root.is_symlink():
+            yield root.parent, root
+            return
+        if not root.is_dir():
+            return
+        for current, directories, files in os.walk(root, followlinks=False):
+            directories[:] = sorted(
+                directory
+                for directory in directories
+                if directory != ".git"
+                and not (Path(current) / directory).is_symlink()
+                and not _is_excluded(Path(current) / directory)
+            )
+            base = Path(current)
+            for name in sorted(files):
+                yield root, base / name
+
+    for root_index, raw_root in enumerate(sorted(set(scan_paths))):
+        try:
+            root = Path(raw_root).resolve(strict=False)
+        except (OSError, RuntimeError):
+            return _volatile()
+        if not root.exists() or root.is_symlink():
+            return _volatile()
+
+        for relative_root, path in _iter_files(root):
+            if path.is_symlink() or _is_excluded(path):
+                continue
+            file_count += 1
+            if file_count > _MAX_CACHE_EVIDENCE_FILES:
+                return _volatile()
+            try:
+                stat = path.stat()
+                if not path.is_file():
+                    continue
+                byte_count += stat.st_size
+                if byte_count > _MAX_CACHE_EVIDENCE_BYTES:
+                    return _volatile()
+                relative = path.relative_to(relative_root).as_posix()
+                entries.append((root_index, relative, path, stat.st_size))
+            except (OSError, RuntimeError, ValueError):
+                return _volatile()
+
+    # Only read contents after proving the complete evidence set is within the
+    # bounds. Oversized roots therefore disable reuse without first hashing
+    # hundreds of megabytes.
+    for root_index, relative, path, size in entries:
+        try:
+            digest.update(f"{root_index}:{relative}:{size}\0".encode())
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+        except OSError:
+            return _volatile()
+    return digest.hexdigest()
 
 
 @dataclass
@@ -994,6 +1248,595 @@ class _BatchArtifact:
     new: list[AIComponent]
     rels: list[ComponentRelationship]
     flags: list[RiskFlag]
+
+
+@dataclass(frozen=True)
+class _BatchTelemetryContext:
+    telemetry: AgenticTelemetry
+    tier: str
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    analyzer_version: str
+    source_id: str = ""
+
+
+_LANGUAGE_SUFFIXES = {
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cs": "csharp",
+    ".go": "go",
+    ".java": "java",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".kt": "kotlin",
+    ".php": "php",
+    ".py": "python",
+    ".r": "r",
+    ".rb": "ruby",
+    ".rs": "rust",
+    ".scala": "scala",
+    ".sh": "shell",
+    ".sql": "sql",
+    ".swift": "swift",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+}
+
+_ENRICHMENT_FIELDS = (
+    "model_name",
+    "embedding_model",
+    "description",
+    "text",
+    "framework",
+    "detection_source",
+    "heuristic_confidence",
+    "transport",
+    "config_source",
+    "storage_uri",
+    "dataset_source",
+    "skill_format",
+    "hyperparameters",
+    "training_info",
+    "metrics",
+    "kb_concept",
+    "kb_label",
+    "sdk_version",
+    "metadata",
+)
+
+
+def _component_language(component: AIComponent) -> str:
+    return _LANGUAGE_SUFFIXES.get(Path(component.file_path).suffix.lower(), "unknown")
+
+
+def _start_batch_trace(
+    context: _BatchTelemetryContext | None,
+    batch: list[AIComponent],
+    batch_num: int,
+    total_batches: int,
+    *,
+    cache_hit: bool = False,
+    trace_variant: str = "initial",
+    attempt_kind: str | None = None,
+) -> BatchTrace:
+    if context is None:
+        return BatchTrace.noop()
+    component_type_counts = Counter(c.component_type.value for c in batch)
+    language_counts = Counter(_component_language(c) for c in batch)
+    raw_batch_id = "|".join(
+        [
+            context.tier,
+            trace_variant,
+            str(batch_num),
+            *(c.instance_id for c in batch),
+        ]
+    )
+    return context.telemetry.start_batch(
+        batch_id=raw_batch_id,
+        sample_key=context.source_id,
+        source_id=context.source_id,
+        attempt_kind=attempt_kind or trace_variant,
+        tier=context.tier,
+        batch_num=batch_num,
+        total_batches=total_batches,
+        component_ids=[c.instance_id for c in batch],
+        component_type_counts=component_type_counts,
+        language_counts=language_counts,
+        provider=context.provider,
+        model=context.model,
+        analyzer_version=context.analyzer_version,
+        prompt_version=context.prompt_version,
+        schema_version=context.schema_version,
+        cache_hit=cache_hit,
+    )
+
+
+def _batch_decision_counts(
+    batch: list[AIComponent],
+    enriched: list[AIComponent],
+    new: list[AIComponent],
+    rels: list[ComponentRelationship],
+    flags: list[RiskFlag],
+) -> dict[str, int]:
+    before = {c.instance_id: c for c in batch}
+    after = {c.instance_id: c for c in enriched}
+    common = before.keys() & after.keys()
+    degraded_ids = {
+        instance_id for instance_id in common if bool(after[instance_id].agentic_hint)
+    }
+    decided_common = common - degraded_ids
+    reclassified = sum(
+        1
+        for instance_id in decided_common
+        if before[instance_id].component_type != after[instance_id].component_type
+    )
+    enriched_count = sum(
+        1
+        for instance_id in decided_common
+        if before[instance_id].component_type == after[instance_id].component_type
+        and any(
+            getattr(before[instance_id], field_name)
+            != getattr(after[instance_id], field_name)
+            for field_name in _ENRICHMENT_FIELDS
+        )
+    )
+    return {
+        # A passthrough carrying an agentic failure hint is an abstention, not
+        # evidence that the model decided to keep the candidate.
+        "kept": max(0, len(decided_common) - reclassified - enriched_count),
+        "enriched": enriched_count,
+        "removed": len(before.keys() - after.keys()),
+        "reclassified": reclassified,
+        "discovered": sum(1 for component in new if not component.agentic_hint),
+        "relationships": len(rels),
+        "risk_findings": len(flags),
+        "degraded": sum(1 for c in enriched if c.agentic_hint),
+    }
+
+
+def _batch_decision_breakdowns(
+    batch: list[AIComponent],
+    enriched: list[AIComponent],
+    new: list[AIComponent],
+) -> tuple[
+    dict[str, dict[str, int]],
+    dict[str, dict[str, int]],
+    dict[str, dict[str, int]],
+]:
+    """Attribute final component actions to safe type and language slices.
+
+    Existing-candidate actions use the deterministic type/language so an
+    over-pruning or reclassification spike remains attributable to the class
+    of candidate that entered the model. Discoveries use their emitted type
+    and language.
+    """
+
+    actions = ("kept", "enriched", "removed", "reclassified", "discovered")
+    by_type: dict[str, Counter[str]] = {action: Counter() for action in actions}
+    by_language: dict[str, Counter[str]] = {action: Counter() for action in actions}
+    by_confidence: dict[str, Counter[str]] = {action: Counter() for action in actions}
+    after = {component.instance_id: component for component in enriched}
+
+    def _record(action: str, component: AIComponent) -> None:
+        by_type[action][component.component_type.value] += 1
+        by_language[action][_component_language(component)] += 1
+        try:
+            confidence = float(component.heuristic_confidence)
+        except (TypeError, ValueError, OverflowError):
+            confidence = math.nan
+        if not math.isfinite(confidence):
+            bucket = "unknown"
+        elif confidence >= 0.8:
+            bucket = "high"
+        elif confidence >= 0.5:
+            bucket = "medium"
+        else:
+            bucket = "low"
+        by_confidence[action][bucket] += 1
+
+    for before in batch:
+        final = after.get(before.instance_id)
+        if final is None:
+            action = "removed"
+        elif final.agentic_hint:
+            # Degraded passthroughs are counted by the dedicated degraded
+            # counter and intentionally omitted from action distributions.
+            continue
+        elif final.component_type != before.component_type:
+            action = "reclassified"
+        elif any(
+            getattr(before, field_name) != getattr(final, field_name)
+            for field_name in _ENRICHMENT_FIELDS
+        ):
+            action = "enriched"
+        else:
+            action = "kept"
+        _record(action, before)
+    for component in new:
+        if not component.agentic_hint:
+            _record("discovered", component)
+
+    return (
+        {action: dict(sorted(counts.items())) for action, counts in by_type.items()},
+        {
+            action: dict(sorted(counts.items()))
+            for action, counts in by_language.items()
+        },
+        {
+            action: dict(sorted(counts.items()))
+            for action, counts in by_confidence.items()
+        },
+    )
+
+
+def _raw_decision_counts(data: dict[str, Any] | None) -> dict[str, int]:
+    data = data or {}
+    substantive_enrichments = 0
+    for item in data.get("enriched_components") or []:
+        if not isinstance(item, dict):
+            continue
+        updates = item.get("updates")
+        if isinstance(updates, dict) and any(
+            field_name in updates for field_name in _ENRICHMENT_FIELDS
+        ):
+            substantive_enrichments += 1
+    return {
+        # Decision annotations and confidence bookkeeping are intentionally not
+        # product enrichments. Excluding them also avoids reporting a normal
+        # annotation-only response as a middleware rejection.
+        "enriched": substantive_enrichments,
+        "removed": len(data.get("remove_components") or []),
+        "reclassified": len(data.get("reclassify_components") or []),
+        "discovered": len(data.get("new_components") or []),
+        "relationships": len(data.get("new_relationships") or []),
+        "risk_findings": len(data.get("risk_findings") or []),
+    }
+
+
+def _blocked_decision_counts(
+    raw: dict[str, int], final: dict[str, int]
+) -> dict[str, int]:
+    """Return safe counts of model-requested actions not present after guards."""
+
+    return {key: max(0, raw.get(key, 0) - final.get(key, 0)) for key in raw}
+
+
+def _telemetry_status(failed: bool, failure_hint: str) -> str:
+    if not failed:
+        return "success"
+    return {
+        "batch_timeout": "timeout",
+        "rate_limited": "rate_limited",
+        "provider_outage": "provider_outage",
+        "model_refused": "refused",
+        "structured_output_parse_error": "parse_error",
+        "circuit_breaker_tripped": "circuit_breaker",
+    }.get(failure_hint, "degraded")
+
+
+def _record_detailed_calls(
+    attempt: AttemptTrace,
+    collector: SanitizedAgentCallback | None,
+    *,
+    context: _BatchTelemetryContext | None,
+    status: str,
+    schema_valid: bool,
+    raw_data: dict[str, Any] | None,
+) -> tuple[bool, bool]:
+    """Emit ordered, content-free call spans and return LLM/tool presence.
+
+    The terminal LLM call alone carries raw model action counts. Intermediate
+    calls commonly request tools and must not be credited with the final
+    decision. The collector is sealed before emission so a timed-out daemon
+    invocation cannot mutate a trace after it has been queued for ingestion.
+    """
+
+    if collector is None:
+        return False, False
+    unfinished_status: Literal["failed", "timeout"] = (
+        "timeout" if status == "timeout" else "failed"
+    )
+    calls = collector.seal(unfinished_status=unfinished_status)
+    llm_sequences = [call.sequence for call in calls if call.kind == "llm"]
+    terminal_llm = max(llm_sequences) if llm_sequences else None
+    raw_decisions = _raw_decision_counts(raw_data)
+    has_llm = has_tool = False
+    for call in calls:
+        if call.kind == "llm":
+            has_llm = True
+            decision_carrier = raw_data is not None and call.sequence == terminal_llm
+            attempt.record_llm(
+                provider=context.provider if context else "unknown",
+                model=context.model if context else "unknown",
+                status=call.status,
+                duration_s=call.duration_s,
+                prompt_tokens=call.prompt_tokens,
+                completion_tokens=call.completion_tokens,
+                total_tokens=call.total_tokens,
+                cached_tokens=call.cached_tokens,
+                schema_valid=(schema_valid if call.sequence == terminal_llm else True),
+                decisions=raw_decisions if decision_carrier else {},
+                call_id=call.call_id,
+                sequence=call.sequence,
+                created_at=call.created_at,
+                mode="per_call",
+                decision_carrier=decision_carrier,
+                schema_expected=call.sequence == terminal_llm,
+            )
+        else:
+            has_tool = True
+            attempt.record_tool_call(
+                name=call.tool_name,
+                call_id=call.call_id,
+                sequence=call.sequence,
+                created_at=call.created_at,
+                duration_s=call.duration_s,
+                status=call.status,
+            )
+    return has_llm, has_tool
+
+
+def _finish_batch_trace(
+    trace: BatchTrace,
+    attempt: AttemptTrace,
+    *,
+    context: _BatchTelemetryContext | None,
+    batch: list[AIComponent],
+    output: tuple[
+        list[AIComponent],
+        list[AIComponent],
+        list[ComponentRelationship],
+        list[RiskFlag],
+        bool,
+    ],
+    result: Any,
+    duration_s: float,
+    tool_stats: dict[str, dict[str, Any]],
+    raw_data: dict[str, Any] | None = None,
+    schema_valid: bool = True,
+    llm_schema_valid: bool | None = None,
+    recovered: bool = False,
+    batch_duration_s: float | None = None,
+    attempt_already_finished: bool = False,
+    call_collector: SanitizedAgentCallback | None = None,
+    coercion_attempt: AttemptTrace | None = None,
+    coercion_duration_s: float | None = None,
+) -> tuple[
+    list[AIComponent],
+    list[AIComponent],
+    list[ComponentRelationship],
+    list[RiskFlag],
+    bool,
+]:
+    enriched, new, rels, flags, failed = output
+    decisions = _batch_decision_counts(batch, enriched, new, rels, flags)
+    hints = Counter(c.agentic_hint for c in enriched if c.agentic_hint)
+    failure_hint = hints.most_common(1)[0][0] if hints else ""
+    status = _telemetry_status(failed, failure_hint)
+    if failure_hint in {
+        "model_refused",
+        "no_usable_output",
+        "structured_output_parse_error",
+    }:
+        schema_valid = False
+    usage = _token_usage_for_result(result)
+    final_raw = _raw_decision_counts(raw_data)
+    (
+        decisions_by_component_type,
+        decisions_by_language,
+        decisions_by_confidence,
+    ) = _batch_decision_breakdowns(batch, enriched, new)
+    middleware_guard_triggered = any(
+        final_raw[key] != decisions[key] for key in final_raw if key in decisions
+    )
+    blocked_decisions = _blocked_decision_counts(final_raw, decisions)
+    if (
+        coercion_attempt is not None
+        and getattr(coercion_attempt, "active", False) is True
+    ):
+        # Successful Phase-2 coercion produces the raw decision carrier, but
+        # only middleware can establish which mutations reached the product
+        # result. Keep the workflow open until this boundary so blocked actions
+        # are never reported as accepted final actions.
+        coercion_status = (
+            "degraded"
+            if status == "success" and any(blocked_decisions.values())
+            else status
+        )
+        coercion_attempt.finish(
+            status=coercion_status,
+            duration_s=coercion_duration_s,
+            recovered=raw_data is not None and schema_valid,
+            raw_decisions=final_raw,
+            final_decisions=decisions,
+            blocked_decisions=blocked_decisions,
+        )
+    if not attempt_already_finished:
+        llm_recorded, tools_recorded = _record_detailed_calls(
+            attempt,
+            call_collector,
+            context=context,
+            status=status,
+            schema_valid=(
+                schema_valid if llm_schema_valid is None else llm_schema_valid
+            ),
+            raw_data=raw_data,
+        )
+        if not llm_recorded:
+            attempt.record_llm(
+                provider=context.provider if context else "unknown",
+                model=context.model if context else "unknown",
+                status=status,
+                duration_s=duration_s,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                cached_tokens=usage.cached_tokens,
+                schema_valid=(
+                    schema_valid if llm_schema_valid is None else llm_schema_valid
+                ),
+                decisions=final_raw,
+                decision_carrier=raw_data is not None,
+            )
+        if not tools_recorded:
+            attempt.record_tools(tool_stats)
+        attempt.finish(
+            status=status,
+            duration_s=duration_s,
+            recovered=recovered,
+            raw_decisions=final_raw,
+            final_decisions=decisions,
+            blocked_decisions=blocked_decisions,
+            tool_stats=tool_stats,
+        )
+    if middleware_guard_triggered:
+        middleware_attempt = trace.start_attempt(
+            kind="middleware_validation", attempt_number=1
+        )
+        middleware_attempt.finish(
+            status="degraded",
+            duration_s=0.0,
+            recovered=True,
+            raw_decisions=final_raw,
+            final_decisions=decisions,
+            blocked_decisions=blocked_decisions,
+        )
+    trace.finish(
+        status=status,
+        duration_s=batch_duration_s if batch_duration_s is not None else duration_s,
+        decisions=decisions,
+        decisions_by_component_type=decisions_by_component_type,
+        decisions_by_language=decisions_by_language,
+        decisions_by_confidence=decisions_by_confidence,
+        degraded_candidates=decisions["degraded"],
+        failure_hint=failure_hint,
+        schema_valid=schema_valid,
+        middleware_guard_triggered=middleware_guard_triggered,
+    )
+    return output
+
+
+def _finish_initial_attempt_before_coercion(
+    attempt: AttemptTrace,
+    *,
+    context: _BatchTelemetryContext | None,
+    result: Any,
+    duration_s: float,
+    tool_stats: dict[str, dict[str, Any]],
+    call_collector: SanitizedAgentCallback | None = None,
+) -> None:
+    """Close the initial workflow before creating its coercion sibling."""
+    usage = _token_usage_for_result(result)
+    llm_recorded, tools_recorded = _record_detailed_calls(
+        attempt,
+        call_collector,
+        context=context,
+        status="parse_error",
+        schema_valid=False,
+        raw_data=None,
+    )
+    if not llm_recorded:
+        attempt.record_llm(
+            provider=context.provider if context else "unknown",
+            model=context.model if context else "unknown",
+            status="parse_error",
+            duration_s=duration_s,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            cached_tokens=usage.cached_tokens,
+            schema_valid=False,
+            decisions={},
+            decision_carrier=False,
+        )
+    if not tools_recorded:
+        attempt.record_tools(tool_stats)
+    attempt.finish(status="parse_error", duration_s=duration_s, tool_stats=tool_stats)
+
+
+def _record_cache_hit_trace(
+    context: _BatchTelemetryContext | None,
+    inputs: list[AIComponent],
+    enriched: list[AIComponent],
+    new: list[AIComponent],
+    rels: list[ComponentRelationship],
+    flags: list[RiskFlag],
+) -> None:
+    """Record a cached verdict without fabricating LLM or tool spans."""
+
+    trace = _start_batch_trace(
+        context,
+        inputs,
+        1,
+        1,
+        cache_hit=True,
+        trace_variant="cache_hit",
+        attempt_kind="initial",
+    )
+    if not trace.active:
+        return
+    decisions = _batch_decision_counts(inputs, enriched, new, rels, flags)
+    (
+        decisions_by_component_type,
+        decisions_by_language,
+        decisions_by_confidence,
+    ) = _batch_decision_breakdowns(inputs, enriched, new)
+    hints = Counter(c.agentic_hint for c in enriched if c.agentic_hint)
+    failure_hint = hints.most_common(1)[0][0] if hints else ""
+    degraded_replay = decisions["degraded"] > 0
+    trace.finish(
+        status="degraded" if degraded_replay else "cache_hit",
+        decisions=decisions,
+        decisions_by_component_type=decisions_by_component_type,
+        decisions_by_language=decisions_by_language,
+        decisions_by_confidence=decisions_by_confidence,
+        degraded_candidates=decisions["degraded"],
+        failure_hint=failure_hint,
+        schema_valid=not degraded_replay,
+    )
+
+
+def _record_no_llm_trace(
+    context: _BatchTelemetryContext | None,
+    inputs: list[AIComponent],
+    batch_num: int,
+    total_batches: int,
+    *,
+    status: str,
+    failure_hint: str,
+    attempt_kind: str = "initial",
+) -> None:
+    """Record a skipped/degraded batch without fabricating an LLM span."""
+
+    trace = _start_batch_trace(
+        context,
+        inputs,
+        batch_num,
+        total_batches,
+        trace_variant=f"no_llm_{attempt_kind}_{status}",
+        attempt_kind=attempt_kind,
+    )
+    if not trace.active:
+        return
+    decisions = {
+        "kept": 0,
+        "removed": 0,
+        "reclassified": 0,
+        "discovered": 0,
+        "relationships": 0,
+        "risk_findings": 0,
+        "degraded": len(inputs),
+    }
+    trace.finish(
+        status=status,
+        decisions=decisions,
+        degraded_candidates=len(inputs),
+        failure_hint=failure_hint,
+        schema_valid=True,
+    )
 
 
 def _tier_cache_key(components: list[AIComponent]) -> str:
@@ -1112,10 +1955,32 @@ def _normalized_cross_repo_results(
 def _cross_repo_cache_key(
     model_string: str,
     per_repo_results: dict[str, dict[str, Any]],
+    llm_config: dict[str, Any] | None = None,
 ) -> str:
+    cfg = llm_config or {}
+    try:
+        tool_digest = _hashlib.sha256(
+            Path(__file__).with_name("cross_repo.py").read_bytes()
+        ).hexdigest()
+    except OSError:
+        tool_digest = "unavailable"
     raw = json.dumps(
         {
+            "cache_version": _CROSS_REPO_CACHE_VERSION,
+            "analyzer_version": resolve_package_version("cisco-aibom"),
             "model_string": model_string,
+            "llm_config": {
+                "provider": cfg.get("provider"),
+                "api_base": cfg.get("api_base"),
+                "api_version": cfg.get("api_version"),
+                "reasoning": cfg.get("reasoning", "auto"),
+                "max_tokens": cfg.get("max_tokens"),
+                "init_kwargs": cfg.get("init_kwargs"),
+            },
+            "prompt": _hashlib.sha256(
+                _CROSS_REPO_COORDINATOR_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "tool_source": tool_digest,
             "per_repo_results": _normalized_cross_repo_results(per_repo_results),
         },
         sort_keys=True,
@@ -1187,10 +2052,12 @@ class _AgenticResultCache:
         self,
         cache_dir: Path | None = None,
         fallback_dirs: list[Path] | None = None,
+        namespace: str = "",
     ) -> None:
         self._mem: dict[str, dict[str, Any]] = {}
         self._disk_dir = cache_dir
         self._fallback_dirs = fallback_dirs or []
+        self._namespace = namespace
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
             self._load_disk()
@@ -1208,19 +2075,23 @@ class _AgenticResultCache:
             except (json.JSONDecodeError, OSError):
                 continue
 
+    def _storage_key(self, key: str) -> str:
+        return f"{self._namespace}_{key}" if self._namespace else key
+
     def get(self, key: str) -> dict[str, Any] | None:
-        return self._mem.get(key)
+        return self._mem.get(self._storage_key(key))
 
     def put(self, key: str, value: dict[str, Any]) -> None:
-        self._mem[key] = value
+        storage_key = self._storage_key(key)
+        self._mem[storage_key] = value
         if self._disk_dir:
             # Write atomically: serialize to a temp file in the same directory,
             # then os.replace() into place. A crash mid-write leaves only the
             # temp file (ignored by the ``*.json`` resume glob), never a
             # half-written ``key.json`` that a resume would read as a corrupt
             # cache hit.
-            dest = self._disk_dir / f"{key}.json"
-            tmp = self._disk_dir / f".{key}.json.{os.getpid()}.tmp"
+            dest = self._disk_dir / f"{storage_key}.json"
+            tmp = self._disk_dir / f".{storage_key}.json.{os.getpid()}.tmp"
             try:
                 tmp.write_text(json.dumps(value, default=str), encoding="utf-8")
                 os.replace(tmp, dest)
@@ -1331,6 +2202,10 @@ class _DecisionMemo:
         """
         k = self._key(c_before)
         if k is None:
+            return
+        if c_after is not None and c_after.agentic_hint:
+            # A degraded/provider-failure snapshot is not a verdict and must
+            # not poison later batches in the same run.
             return
         if c_after is None:
             self._verdicts[k] = {"action": "remove"}
@@ -1495,6 +2370,11 @@ def _count_degraded(components: list[AIComponent]) -> int:
     return sum(1 for c in components if c.agentic_hint)
 
 
+def _cacheable_agentic_result(components: list[AIComponent]) -> bool:
+    """Return false for timeout/refusal/parse/circuit-breaker snapshots."""
+    return not any(component.agentic_hint for component in components)
+
+
 def _dominant_degraded_hint(components: list[AIComponent]) -> str | None:
     """Most common degraded ``agentic_hint`` among *components*, or ``None`` when
     none are degraded. Used to pick the remediation message."""
@@ -1504,7 +2384,15 @@ def _dominant_degraded_hint(components: list[AIComponent]) -> str | None:
     return hints.most_common(1)[0][0] if hints else None
 
 
-def _coerce_structured(model: Any, messages: list[Any]) -> dict[str, Any] | None:
+def _coerce_structured(
+    model: Any,
+    messages: list[Any],
+    *,
+    telemetry_attempt: AttemptTrace | None = None,
+    telemetry_context: _BatchTelemetryContext | None = None,
+    defer_successful_workflow: bool = False,
+    invoke_callback_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any] | None:
     """Phase 2 of the two-phase decouple.
 
     Turn the unforced agent's finished transcript into a schema-valid
@@ -1518,7 +2406,58 @@ def _coerce_structured(model: Any, messages: list[Any]) -> dict[str, Any] | None
     still accounted and a parse error can be recovered from the message carriers.
     Returns the response dict, or ``None`` if coercion is unavailable/failed.
     """
+
+    def _finish_telemetry(
+        *,
+        result: Any = None,
+        status: str,
+        duration_s: float | None = None,
+        schema_valid: bool,
+        recovered: bool = False,
+        llm_invoked: bool = False,
+        raw_data: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
+        call_id: str = "coercion",
+    ) -> None:
+        if telemetry_attempt is None:
+            return
+        if llm_invoked:
+            usage = _token_usage_for_result(result)
+            raw_decisions = _raw_decision_counts(raw_data)
+            telemetry_attempt.record_llm(
+                provider=(
+                    telemetry_context.provider if telemetry_context else "unknown"
+                ),
+                model=telemetry_context.model if telemetry_context else "unknown",
+                status=status,
+                duration_s=duration_s,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                cached_tokens=usage.cached_tokens,
+                schema_valid=schema_valid,
+                decisions=raw_decisions,
+                call_id=call_id,
+                sequence=1,
+                created_at=created_at,
+                mode="per_call",
+                decision_carrier=raw_data is not None,
+                schema_expected=True,
+            )
+        if not (defer_successful_workflow and status == "success" and bool(raw_data)):
+            raw_decisions = _raw_decision_counts(raw_data)
+            telemetry_attempt.finish(
+                status=status,
+                duration_s=duration_s,
+                # A successful coercion recovered an initially unstructured
+                # response even when the provider-native parser itself was clean.
+                recovered=recovered or status == "success",
+                raw_decisions=raw_decisions,
+                final_decisions=raw_decisions,
+            )
+
     if model is None:
+        _finish_telemetry(status="skipped", schema_valid=False)
         return None
     from langchain_core.messages import HumanMessage
 
@@ -1533,43 +2472,103 @@ def _coerce_structured(model: Any, messages: list[Any]) -> dict[str, Any] | None
                 "with_structured_output unavailable for Phase-2 coercion",
                 exc_info=True,
             )
+            _finish_telemetry(status="skipped", schema_valid=False)
             return None
 
     prompt = list(messages) + [HumanMessage(content=AGENTIC_COERCION_PROMPT)]
+    invoke_callbacks = _callbacks_for_invoke(None, invoke_callback_factory)
+    started_at = datetime.now(timezone.utc)
+    started = time.monotonic()
+    call_id = f"coercion:{time.monotonic_ns()}"
     try:
-        out = structured.invoke(prompt)
+        if invoke_callbacks:
+            out = structured.invoke(
+                prompt,
+                config={"callbacks": invoke_callbacks},
+            )
+        else:
+            out = structured.invoke(prompt)
     except Exception as exc:
+        duration_s = time.monotonic() - started
         # StructuredOutputValidationError and friends carry the offending message.
         ai_message = getattr(exc, "ai_message", None)
         if ai_message is not None:
-            _accumulate_token_usage({"messages": [ai_message]})
-            return _extract_structured_response({"messages": [ai_message]})
+            recovered_result = {"messages": [ai_message]}
+            _accumulate_token_usage(recovered_result)
+            recovered_data = _extract_structured_response(recovered_result)
+            _finish_telemetry(
+                result=recovered_result,
+                status="success" if recovered_data else "parse_error",
+                duration_s=duration_s,
+                schema_valid=recovered_data is not None,
+                recovered=recovered_data is not None,
+                llm_invoked=True,
+                raw_data=recovered_data,
+                created_at=started_at,
+                call_id=call_id,
+            )
+            return recovered_data
         _LOGGER.warning("Phase-2 structured coercion failed: %s", exc)
+        _finish_telemetry(
+            status="parse_error",
+            duration_s=duration_s,
+            schema_valid=False,
+            llm_invoked=True,
+            created_at=started_at,
+            call_id=call_id,
+        )
         return None
+
+    duration_s = time.monotonic() - started
+    telemetry_result: Any = None
+    data: dict[str, Any] | None = None
+    recovered = False
 
     # include_raw shape: {"raw": AIMessage, "parsed": <model|None>, "parsing_error"}
     if isinstance(out, dict) and ("raw" in out or "parsed" in out):
         raw = out.get("raw")
         if raw is not None:
-            _accumulate_token_usage({"messages": [raw]})
+            telemetry_result = {"messages": [raw]}
+            _accumulate_token_usage(telemetry_result)
         parsed = out.get("parsed")
         if isinstance(parsed, BaseModel):
-            return parsed.model_dump()
-        if isinstance(parsed, dict):
-            return parsed
-        if raw is not None:
-            return _extract_structured_response({"messages": [raw]})
-        return None
+            data = parsed.model_dump()
+        elif isinstance(parsed, dict):
+            data = parsed
+        elif raw is not None:
+            data = _extract_structured_response(telemetry_result)
+            recovered = data is not None
+        recovered = recovered or bool(out.get("parsing_error") and data is not None)
+    elif isinstance(out, BaseModel):
+        # No include_raw: a direct model / dict. Token usage is unavailable.
+        data = out.model_dump()
+    elif isinstance(out, dict):
+        data = out
 
-    # No include_raw: a direct model / dict.
-    if isinstance(out, BaseModel):
-        return out.model_dump()
-    if isinstance(out, dict):
-        return out
-    return None
+    _finish_telemetry(
+        result=telemetry_result,
+        status="success" if data else "parse_error",
+        duration_s=duration_s,
+        schema_valid=data is not None,
+        recovered=recovered,
+        llm_invoked=True,
+        raw_data=data,
+        created_at=started_at,
+        call_id=call_id,
+    )
+    return data
 
 
-def _resolve_batch_data(agent: Any, result: Any) -> dict[str, Any] | None:
+def _resolve_batch_data(
+    agent: Any,
+    result: Any,
+    *,
+    batch_trace: BatchTrace | None = None,
+    telemetry_context: _BatchTelemetryContext | None = None,
+    telemetry_attempt: AttemptTrace | None = None,
+    defer_coercion_finish: bool = False,
+    invoke_callback_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any] | None:
     """Get the structured ``AgentResponse`` dict from a finished batch.
 
     Prefers the cheap multi-carrier extractor (``structured_response`` / tool
@@ -1588,7 +2587,19 @@ def _resolve_batch_data(agent: Any, result: Any) -> dict[str, Any] | None:
     if getattr(agent, "needs_coercion", False) is True:
         model = getattr(agent, "aibom_chat_model", None)
         messages = result.get("messages", []) if isinstance(result, dict) else []
-        return _coerce_structured(model, messages)
+        coercion_attempt = telemetry_attempt
+        if coercion_attempt is None and batch_trace is not None:
+            coercion_attempt = batch_trace.start_attempt(
+                kind="coercion", attempt_number=1
+            )
+        return _coerce_structured(
+            model,
+            messages,
+            telemetry_attempt=coercion_attempt,
+            telemetry_context=telemetry_context,
+            defer_successful_workflow=defer_coercion_finish,
+            invoke_callback_factory=invoke_callback_factory,
+        )
     return None
 
 
@@ -1616,6 +2627,7 @@ def _invoke_agent_bounded(
     timeout_s: int,
     *,
     recursion_limit: int | None = None,
+    callbacks: list[Any] | None = None,
 ) -> Any:
     """Run ``agent.invoke`` in a daemon thread with a hard wall-clock deadline.
 
@@ -1637,14 +2649,19 @@ def _invoke_agent_bounded(
     its own default (some sites intentionally do not cap recursion).
     """
     box: dict[str, Any] = {}
-    config: dict[str, Any] | None = (
-        {"recursion_limit": recursion_limit} if recursion_limit is not None else None
-    )
+    import contextvars
+
+    invoke_context = contextvars.copy_context()
+    config: dict[str, Any] = {}
+    if recursion_limit is not None:
+        config["recursion_limit"] = recursion_limit
+    if callbacks:
+        config["callbacks"] = list(callbacks)
 
     def _worker() -> None:
         try:
             message = {"messages": [{"role": "user", "content": content}]}
-            if config is not None:
+            if config:
                 box["result"] = agent.invoke(message, config=config)
             else:
                 box["result"] = agent.invoke(message)
@@ -1652,7 +2669,7 @@ def _invoke_agent_bounded(
             box["error"] = exc
 
     worker = threading.Thread(
-        target=_worker,
+        target=lambda: invoke_context.run(_worker),
         name="aibom-agentic-invoke",
         daemon=True,
     )
@@ -1670,7 +2687,13 @@ def _invoke_agent_bounded(
     return box.get("result")
 
 
-def _invoke_with_deadline(agent: Any, summary: str, timeout_s: int) -> Any:
+def _invoke_with_deadline(
+    agent: Any,
+    summary: str,
+    timeout_s: int,
+    *,
+    callbacks: list[Any] | None = None,
+) -> Any:
     """Bounded batch invocation — thin wrapper over :func:`_invoke_agent_bounded`.
 
     Preserves the batch path's ``_BatchTimeout`` contract (so ``_run_batch``'s
@@ -1679,7 +2702,11 @@ def _invoke_with_deadline(agent: Any, summary: str, timeout_s: int) -> Any:
     """
     try:
         return _invoke_agent_bounded(
-            agent, summary, timeout_s, recursion_limit=_RECURSION_LIMIT
+            agent,
+            summary,
+            timeout_s,
+            recursion_limit=_RECURSION_LIMIT,
+            callbacks=callbacks,
         )
     except _InvokeTimeout as exc:
         raise _BatchTimeout() from exc
@@ -1716,6 +2743,9 @@ def _run_async_bounded(coro: Any) -> Any:
     import concurrent.futures
 
     box: dict[str, Any] = {}
+    import contextvars
+
+    runner_context = contextvars.copy_context()
 
     def _runner() -> None:
         loop = asyncio.new_event_loop()
@@ -1740,7 +2770,11 @@ def _run_async_bounded(coro: Any) -> Any:
             asyncio.set_event_loop(None)
             loop.close()
 
-    thread = threading.Thread(target=_runner, name="aibom-agentic-loop", daemon=True)
+    thread = threading.Thread(
+        target=lambda: runner_context.run(_runner),
+        name="aibom-agentic-loop",
+        daemon=True,
+    )
     thread.start()
     thread.join()
     if "error" in box:
@@ -1760,6 +2794,10 @@ def _run_batch(
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     dossier_index: DossierIndex | None = None,
+    telemetry_context: _BatchTelemetryContext | None = None,
+    invoke_callback_factory: Callable[[], Any] | None = None,
+    attempt_kind: str = "initial",
+    attempt_number: int = 1,
 ) -> tuple[
     list[AIComponent],
     list[AIComponent],
@@ -1771,6 +2809,17 @@ def _run_batch(
     from .tools import _reset_tool_stats, get_tool_stats
 
     _reset_tool_stats()
+    batch_trace = _start_batch_trace(
+        telemetry_context,
+        batch,
+        batch_num,
+        total_batches,
+        trace_variant=attempt_kind,
+    )
+    attempt_trace = batch_trace.start_attempt(
+        kind=attempt_kind, attempt_number=attempt_number
+    )
+    call_collector = SanitizedAgentCallback() if attempt_trace.active else None
     _LOGGER.info(
         "Agentic batch %d/%d — %d components [%s]",
         batch_num,
@@ -1788,9 +2837,18 @@ def _run_batch(
     t0 = time.monotonic()
 
     result = None
+    invoke_callbacks = _callbacks_for_invoke(
+        call_collector,
+        invoke_callback_factory,
+    )
 
     try:
-        result = _invoke_with_deadline(agent, summary, timeout_s)
+        result = _invoke_with_deadline(
+            agent,
+            summary,
+            timeout_s,
+            callbacks=invoke_callbacks or None,
+        )
     except _BatchTimeout:
         elapsed = time.monotonic() - t0
         stats = get_tool_stats()
@@ -1801,7 +2859,17 @@ def _run_batch(
             json.dumps(stats),
         )
         enriched = _degraded_batch_components(batch, hint="batch_timeout")
-        return enriched, [], [], [], True
+        return _finish_batch_trace(
+            batch_trace,
+            attempt_trace,
+            context=telemetry_context,
+            batch=batch,
+            output=(enriched, [], [], [], True),
+            result=result,
+            duration_s=elapsed,
+            tool_stats=stats,
+            call_collector=call_collector,
+        )
     except Exception as exc:
         elapsed = time.monotonic() - t0
         stats = get_tool_stats()
@@ -1813,6 +2881,7 @@ def _run_batch(
             json.dumps(stats),
         )
         data = None
+        telemetry_result = result
         if result is not None:
             _accumulate_token_usage(result)
             data = _extract_structured_response(result)
@@ -1825,14 +2894,39 @@ def _run_batch(
                 recovered = {"messages": [ai_message]}
                 _accumulate_token_usage(recovered)
                 data = _extract_structured_response(recovered)
+                telemetry_result = recovered
         if data:
             _LOGGER.info(
                 "Batch %d: recovering partial results from failed run", batch_num
             )
-            return _apply_batch_findings(middleware, batch, data, batch_num)
+            output = _apply_batch_findings(middleware, batch, data, batch_num)
+            return _finish_batch_trace(
+                batch_trace,
+                attempt_trace,
+                context=telemetry_context,
+                batch=batch,
+                output=output,
+                result=telemetry_result,
+                duration_s=elapsed,
+                tool_stats=stats,
+                raw_data=data,
+                schema_valid=False,
+                recovered=True,
+                call_collector=call_collector,
+            )
         hint = _classify_failure_hint(exc)
         enriched = _degraded_batch_components(batch, hint=hint)
-        return enriched, [], [], [], True
+        return _finish_batch_trace(
+            batch_trace,
+            attempt_trace,
+            context=telemetry_context,
+            batch=batch,
+            output=(enriched, [], [], [], True),
+            result=telemetry_result,
+            duration_s=elapsed,
+            tool_stats=stats,
+            call_collector=call_collector,
+        )
 
     _accumulate_token_usage(result)
     elapsed = time.monotonic() - t0
@@ -1849,27 +2943,103 @@ def _run_batch(
         json.dumps(stats),
     )
 
-    data = _resolve_batch_data(agent, result)
+    direct_data = _extract_structured_response(result)
+    coercion_attempted = (
+        direct_data is None
+        and getattr(agent, "needs_coercion", False) is True
+        and not _refusal_present(result)
+    )
+    coercion_attempt: AttemptTrace | None = None
+    coercion_duration_s: float | None = None
+    if coercion_attempted:
+        _finish_initial_attempt_before_coercion(
+            attempt_trace,
+            context=telemetry_context,
+            result=result,
+            duration_s=elapsed,
+            tool_stats=stats,
+            call_collector=call_collector,
+        )
+        coercion_attempt = batch_trace.start_attempt(kind="coercion", attempt_number=1)
+        coercion_started = time.monotonic()
+        data = _resolve_batch_data(
+            agent,
+            result,
+            telemetry_context=telemetry_context,
+            telemetry_attempt=coercion_attempt,
+            defer_coercion_finish=True,
+            invoke_callback_factory=invoke_callback_factory,
+        )
+        coercion_duration_s = time.monotonic() - coercion_started
+    else:
+        data = direct_data
+    coercion_recovered = coercion_attempted and data is not None
     if not data:
         if _refusal_present(result):
             _LOGGER.warning("Batch %d: model refused", batch_num)
-            return (
-                _degraded_batch_components(batch, hint="model_refused"),
+            return _finish_batch_trace(
+                batch_trace,
+                attempt_trace,
+                context=telemetry_context,
+                batch=batch,
+                output=(
+                    _degraded_batch_components(batch, hint="model_refused"),
+                    [],
+                    [],
+                    [],
+                    True,
+                ),
+                result=result,
+                duration_s=elapsed,
+                batch_duration_s=time.monotonic() - t0,
+                tool_stats=stats,
+                attempt_already_finished=coercion_attempted,
+                call_collector=call_collector,
+                coercion_attempt=coercion_attempt,
+                coercion_duration_s=coercion_duration_s,
+            )
+        _LOGGER.warning("Batch %d returned no usable output", batch_num)
+        return _finish_batch_trace(
+            batch_trace,
+            attempt_trace,
+            context=telemetry_context,
+            batch=batch,
+            output=(
+                _degraded_batch_components(batch, hint="no_usable_output"),
                 [],
                 [],
                 [],
                 True,
-            )
-        _LOGGER.warning("Batch %d returned no usable output", batch_num)
-        return (
-            _degraded_batch_components(batch, hint="no_usable_output"),
-            [],
-            [],
-            [],
-            True,
+            ),
+            result=result,
+            duration_s=elapsed,
+            batch_duration_s=time.monotonic() - t0,
+            tool_stats=stats,
+            attempt_already_finished=coercion_attempted,
+            call_collector=call_collector,
+            coercion_attempt=coercion_attempt,
+            coercion_duration_s=coercion_duration_s,
         )
 
-    return _apply_batch_findings(middleware, batch, data, batch_num)
+    output = _apply_batch_findings(middleware, batch, data, batch_num)
+    return _finish_batch_trace(
+        batch_trace,
+        attempt_trace,
+        context=telemetry_context,
+        batch=batch,
+        output=output,
+        result=result,
+        duration_s=elapsed,
+        tool_stats=stats,
+        raw_data=data,
+        llm_schema_valid=not coercion_recovered,
+        recovered=coercion_recovered,
+        batch_duration_s=time.monotonic() - t0,
+        attempt_already_finished=coercion_attempted,
+        call_collector=call_collector,
+        coercion_attempt=coercion_attempt,
+        coercion_duration_s=coercion_duration_s,
+    )
 
 
 async def _run_batch_async(
@@ -1884,6 +3054,10 @@ async def _run_batch_async(
     *,
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     dossier_index: DossierIndex | None = None,
+    telemetry_context: _BatchTelemetryContext | None = None,
+    invoke_callback_factory: Callable[[], Any] | None = None,
+    attempt_kind: str = "initial",
+    attempt_number: int = 1,
 ) -> tuple[
     list[AIComponent],
     list[AIComponent],
@@ -1895,6 +3069,17 @@ async def _run_batch_async(
     from .tools import _reset_tool_stats, get_tool_stats
 
     _reset_tool_stats()
+    batch_trace = _start_batch_trace(
+        telemetry_context,
+        batch,
+        batch_num,
+        total_batches,
+        trace_variant=attempt_kind,
+    )
+    attempt_trace = batch_trace.start_attempt(
+        kind=attempt_kind, attempt_number=attempt_number
+    )
+    call_collector = SanitizedAgentCallback() if attempt_trace.active else None
     _LOGGER.info(
         "Agentic batch %d/%d — %d components [%s]",
         batch_num,
@@ -1912,6 +3097,10 @@ async def _run_batch_async(
     t0 = time.monotonic()
 
     result = None
+    invoke_callbacks = _callbacks_for_invoke(
+        call_collector,
+        invoke_callback_factory,
+    )
     try:
         # asyncio.timeout() (3.11+) is the recommended primitive over
         # wait_for: it cancels the awaited ainvoke at the coroutine level and
@@ -1921,7 +3110,10 @@ async def _run_batch_async(
         async with asyncio.timeout(timeout_s):
             result = await agent.ainvoke(
                 {"messages": [{"role": "user", "content": summary}]},
-                config={"recursion_limit": _RECURSION_LIMIT},
+                config={
+                    "recursion_limit": _RECURSION_LIMIT,
+                    **({"callbacks": invoke_callbacks} if invoke_callbacks else {}),
+                },
             )
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
@@ -1933,7 +3125,17 @@ async def _run_batch_async(
             json.dumps(stats),
         )
         enriched = _degraded_batch_components(batch, hint="batch_timeout")
-        return enriched, [], [], [], True
+        return _finish_batch_trace(
+            batch_trace,
+            attempt_trace,
+            context=telemetry_context,
+            batch=batch,
+            output=(enriched, [], [], [], True),
+            result=result,
+            duration_s=elapsed,
+            tool_stats=stats,
+            call_collector=call_collector,
+        )
     except Exception as exc:
         elapsed = time.monotonic() - t0
         stats = get_tool_stats()
@@ -1945,6 +3147,7 @@ async def _run_batch_async(
             json.dumps(stats),
         )
         data = None
+        telemetry_result = result
         if result is not None:
             _accumulate_token_usage(result)
             data = _extract_structured_response(result)
@@ -1957,14 +3160,39 @@ async def _run_batch_async(
                 recovered = {"messages": [ai_message]}
                 _accumulate_token_usage(recovered)
                 data = _extract_structured_response(recovered)
+                telemetry_result = recovered
         if data:
             _LOGGER.info(
                 "Batch %d: recovering partial results from failed run", batch_num
             )
-            return _apply_batch_findings(middleware, batch, data, batch_num)
+            output = _apply_batch_findings(middleware, batch, data, batch_num)
+            return _finish_batch_trace(
+                batch_trace,
+                attempt_trace,
+                context=telemetry_context,
+                batch=batch,
+                output=output,
+                result=telemetry_result,
+                duration_s=elapsed,
+                tool_stats=stats,
+                raw_data=data,
+                schema_valid=False,
+                recovered=True,
+                call_collector=call_collector,
+            )
         hint = _classify_failure_hint(exc)
         enriched = _degraded_batch_components(batch, hint=hint)
-        return enriched, [], [], [], True
+        return _finish_batch_trace(
+            batch_trace,
+            attempt_trace,
+            context=telemetry_context,
+            batch=batch,
+            output=(enriched, [], [], [], True),
+            result=telemetry_result,
+            duration_s=elapsed,
+            tool_stats=stats,
+            call_collector=call_collector,
+        )
 
     _accumulate_token_usage(result)
     elapsed = time.monotonic() - t0
@@ -1981,27 +3209,103 @@ async def _run_batch_async(
         json.dumps(stats),
     )
 
-    data = _resolve_batch_data(agent, result)
+    direct_data = _extract_structured_response(result)
+    coercion_attempted = (
+        direct_data is None
+        and getattr(agent, "needs_coercion", False) is True
+        and not _refusal_present(result)
+    )
+    coercion_attempt: AttemptTrace | None = None
+    coercion_duration_s: float | None = None
+    if coercion_attempted:
+        _finish_initial_attempt_before_coercion(
+            attempt_trace,
+            context=telemetry_context,
+            result=result,
+            duration_s=elapsed,
+            tool_stats=stats,
+            call_collector=call_collector,
+        )
+        coercion_attempt = batch_trace.start_attempt(kind="coercion", attempt_number=1)
+        coercion_started = time.monotonic()
+        data = _resolve_batch_data(
+            agent,
+            result,
+            telemetry_context=telemetry_context,
+            telemetry_attempt=coercion_attempt,
+            defer_coercion_finish=True,
+            invoke_callback_factory=invoke_callback_factory,
+        )
+        coercion_duration_s = time.monotonic() - coercion_started
+    else:
+        data = direct_data
+    coercion_recovered = coercion_attempted and data is not None
     if not data:
         if _refusal_present(result):
             _LOGGER.warning("Batch %d: model refused", batch_num)
-            return (
-                _degraded_batch_components(batch, hint="model_refused"),
+            return _finish_batch_trace(
+                batch_trace,
+                attempt_trace,
+                context=telemetry_context,
+                batch=batch,
+                output=(
+                    _degraded_batch_components(batch, hint="model_refused"),
+                    [],
+                    [],
+                    [],
+                    True,
+                ),
+                result=result,
+                duration_s=elapsed,
+                batch_duration_s=time.monotonic() - t0,
+                tool_stats=stats,
+                attempt_already_finished=coercion_attempted,
+                call_collector=call_collector,
+                coercion_attempt=coercion_attempt,
+                coercion_duration_s=coercion_duration_s,
+            )
+        _LOGGER.warning("Batch %d returned no usable output", batch_num)
+        return _finish_batch_trace(
+            batch_trace,
+            attempt_trace,
+            context=telemetry_context,
+            batch=batch,
+            output=(
+                _degraded_batch_components(batch, hint="no_usable_output"),
                 [],
                 [],
                 [],
                 True,
-            )
-        _LOGGER.warning("Batch %d returned no usable output", batch_num)
-        return (
-            _degraded_batch_components(batch, hint="no_usable_output"),
-            [],
-            [],
-            [],
-            True,
+            ),
+            result=result,
+            duration_s=elapsed,
+            batch_duration_s=time.monotonic() - t0,
+            tool_stats=stats,
+            attempt_already_finished=coercion_attempted,
+            call_collector=call_collector,
+            coercion_attempt=coercion_attempt,
+            coercion_duration_s=coercion_duration_s,
         )
 
-    return _apply_batch_findings(middleware, batch, data, batch_num)
+    output = _apply_batch_findings(middleware, batch, data, batch_num)
+    return _finish_batch_trace(
+        batch_trace,
+        attempt_trace,
+        context=telemetry_context,
+        batch=batch,
+        output=output,
+        result=result,
+        duration_s=elapsed,
+        tool_stats=stats,
+        raw_data=data,
+        llm_schema_valid=not coercion_recovered,
+        recovered=coercion_recovered,
+        batch_duration_s=time.monotonic() - t0,
+        attempt_already_finished=coercion_attempted,
+        call_collector=call_collector,
+        coercion_attempt=coercion_attempt,
+        coercion_duration_s=coercion_duration_s,
+    )
 
 
 async def _run_batches_parallel(
@@ -2016,6 +3320,8 @@ async def _run_batches_parallel(
     timeout_s: int = _DEFAULT_AGENTIC_TIMEOUT_S,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
     dossier_index: DossierIndex | None = None,
+    telemetry_context: _BatchTelemetryContext | None = None,
+    invoke_callback_factory: Callable[[], Any] | None = None,
 ) -> tuple[
     list[AIComponent],
     list[AIComponent],
@@ -2046,9 +3352,25 @@ async def _run_batches_parallel(
 
     async def _guarded(idx: int, batch: list[AIComponent]) -> _BatchResult:
         if tripped.is_set():
+            _record_no_llm_trace(
+                telemetry_context,
+                batch,
+                idx,
+                total,
+                status="circuit_breaker",
+                failure_hint="circuit_breaker_tripped",
+            )
             return idx, batch, _circuit_breaker_skipped_batch(batch), [], [], [], True
         async with sem:
             if tripped.is_set():
+                _record_no_llm_trace(
+                    telemetry_context,
+                    batch,
+                    idx,
+                    total,
+                    status="circuit_breaker",
+                    failure_hint="circuit_breaker_tripped",
+                )
                 return (
                     idx,
                     batch,
@@ -2070,10 +3392,20 @@ async def _run_batches_parallel(
                     all_components=all_components,
                     timeout_s=timeout_s,
                     dossier_index=dossier_index,
+                    telemetry_context=telemetry_context,
+                    invoke_callback_factory=invoke_callback_factory,
                 )
                 return idx, batch, enriched, new, rels, flags, failed
             except Exception as exc:
                 _LOGGER.warning("Parallel batch %d raised: %s", idx, exc)
+                _record_no_llm_trace(
+                    telemetry_context,
+                    batch,
+                    idx,
+                    total,
+                    status="degraded",
+                    failure_hint="unknown",
+                )
                 return idx, batch, list(batch), [], [], [], True
 
     tasks = [
@@ -2136,6 +3468,8 @@ def _strategy_fallback_pass(
     timeout_s: int,
     max_consecutive_failures: int,
     dossier_index: DossierIndex | None = None,
+    telemetry_context: _BatchTelemetryContext | None = None,
+    invoke_callback_factory: Callable[[], Any] | None = None,
 ) -> tuple[
     list[AIComponent],
     list[AIComponent],
@@ -2179,6 +3513,16 @@ def _strategy_fallback_pass(
                 idx,
                 len(fb_batches),
             )
+            for skipped_idx, skipped in enumerate(fb_batches[idx - 1 :], idx):
+                _record_no_llm_trace(
+                    telemetry_context,
+                    skipped,
+                    skipped_idx,
+                    len(fb_batches),
+                    status="circuit_breaker",
+                    failure_hint="circuit_breaker_tripped",
+                    attempt_kind="fallback",
+                )
             break
         e, n, r, f, batch_failed = _run_batch(
             fallback_agent,
@@ -2191,6 +3535,10 @@ def _strategy_fallback_pass(
             all_components=all_components,
             timeout_s=timeout_s,
             dossier_index=dossier_index,
+            telemetry_context=telemetry_context,
+            invoke_callback_factory=invoke_callback_factory,
+            attempt_kind="fallback",
+            attempt_number=3,
         )
         for c in e:
             recovered[c.instance_id] = c
@@ -2245,6 +3593,8 @@ def _run_tier(
     retry_deadline: float | None = None,
     dossier_index: DossierIndex | None = None,
     fallback_agent_factory: Any | None = None,
+    telemetry_context: _BatchTelemetryContext | None = None,
+    invoke_callback_factory: Callable[[], Any] | None = None,
 ) -> tuple[
     list[AIComponent], list[AIComponent], list[ComponentRelationship], list[RiskFlag]
 ]:
@@ -2259,6 +3609,7 @@ def _run_tier(
         cached_tier = _load_tier_cache_payload(cache.get(tier_cache_key))
         if cached_tier is not None:
             _record_memo_verdicts(memo, components, cached_tier[0])
+            _record_cache_hit_trace(telemetry_context, components, *cached_tier)
             _LOGGER.info(
                 "Tier cache hit for %d components — skipping LLM",
                 len(components),
@@ -2275,6 +3626,7 @@ def _run_tier(
                 len(components),
             )
             e, n, r, f = cache.apply_cached(cached_comps, middleware)
+            _record_cache_hit_trace(telemetry_context, cached_comps, e, n, r, f)
             tier_enriched.extend(e)
             tier_new.extend(n)
             tier_rels.extend(r)
@@ -2289,6 +3641,14 @@ def _run_tier(
                 len(memo_hits) + len(to_send),
             )
             memo_results = memo.apply(memo_hits)
+            _record_cache_hit_trace(
+                telemetry_context,
+                memo_hits,
+                memo_results,
+                [],
+                [],
+                [],
+            )
             tier_enriched.extend(memo_results)
 
     if not to_send:
@@ -2310,6 +3670,11 @@ def _run_tier(
         max_concurrent,
     )
 
+    enriched: list[AIComponent]
+    new: list[AIComponent]
+    rels: list[ComponentRelationship]
+    flags: list[RiskFlag]
+    batch_artifacts: list[_BatchArtifact]
     if max_concurrent > 1 and len(batches) > 1:
         enriched, new, rels, flags, batch_artifacts = _run_async_bounded(
             _run_batches_parallel(
@@ -2323,14 +3688,16 @@ def _run_tier(
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
                 dossier_index=dossier_index,
+                telemetry_context=telemetry_context,
+                invoke_callback_factory=invoke_callback_factory,
             )
         )
     else:
-        enriched: list[AIComponent] = []
-        new: list[AIComponent] = []
-        rels: list[ComponentRelationship] = []
-        flags: list[RiskFlag] = []
-        batch_artifacts: list[_BatchArtifact] = []
+        enriched = []
+        new = []
+        rels = []
+        flags = []
+        batch_artifacts = []
         consecutive_failures = 0
         for idx, batch in enumerate(batches, 1):
             if consecutive_failures >= max_consecutive_failures:
@@ -2341,8 +3708,16 @@ def _run_tier(
                     len(batches),
                     max_consecutive_failures,
                 )
-                for b in batches[idx - 1 :]:
+                for skipped_idx, b in enumerate(batches[idx - 1 :], idx):
                     enriched.extend(_circuit_breaker_skipped_batch(b))
+                    _record_no_llm_trace(
+                        telemetry_context,
+                        b,
+                        skipped_idx,
+                        len(batches),
+                        status="circuit_breaker",
+                        failure_hint="circuit_breaker_tripped",
+                    )
                 break
             e, n, r, f, batch_failed = _run_batch(
                 agent,
@@ -2355,6 +3730,8 @@ def _run_tier(
                 all_components=all_components,
                 timeout_s=timeout_s,
                 dossier_index=dossier_index,
+                telemetry_context=telemetry_context,
+                invoke_callback_factory=invoke_callback_factory,
             )
             enriched.extend(e)
             new.extend(n)
@@ -2404,9 +3781,18 @@ def _run_tier(
                     "%d component(s) left degraded",
                     remaining,
                 )
-                for b in retry_batches[idx - 1 :]:
+                for skipped_idx, b in enumerate(retry_batches[idx - 1 :], idx):
                     retry_enriched.extend(
                         _degraded_batch_components(b, hint="retry_budget_exhausted")
+                    )
+                    _record_no_llm_trace(
+                        telemetry_context,
+                        b,
+                        skipped_idx,
+                        len(retry_batches),
+                        status="degraded",
+                        failure_hint="retry_budget_exhausted",
+                        attempt_kind="retry",
                     )
                 break
             if retry_consecutive >= max_consecutive_failures:
@@ -2415,9 +3801,18 @@ def _run_tier(
                     idx,
                     len(retry_batches),
                 )
-                for b in retry_batches[idx - 1 :]:
+                for skipped_idx, b in enumerate(retry_batches[idx - 1 :], idx):
                     retry_enriched.extend(
                         _degraded_batch_components(b, hint="retry_failed")
+                    )
+                    _record_no_llm_trace(
+                        telemetry_context,
+                        b,
+                        skipped_idx,
+                        len(retry_batches),
+                        status="circuit_breaker",
+                        failure_hint="retry_failed",
+                        attempt_kind="retry",
                     )
                 break
             e, n, r, f, batch_failed = _run_batch(
@@ -2431,6 +3826,10 @@ def _run_tier(
                 all_components=all_components,
                 timeout_s=timeout_s,
                 dossier_index=dossier_index,
+                telemetry_context=telemetry_context,
+                invoke_callback_factory=invoke_callback_factory,
+                attempt_kind="retry",
+                attempt_number=2,
             )
             retry_enriched.extend(e)
             retry_new.extend(n)
@@ -2484,6 +3883,8 @@ def _run_tier(
                 timeout_s=timeout_s,
                 max_consecutive_failures=max_consecutive_failures,
                 dossier_index=dossier_index,
+                telemetry_context=telemetry_context,
+                invoke_callback_factory=invoke_callback_factory,
             )
             new.extend(fb_new)
             rels.extend(fb_rels)
@@ -2508,6 +3909,10 @@ def _run_tier(
         for c_before in all_batch_components:
             key = _component_cache_key(c_before)
             c_after = enriched_by_id.get(c_before.instance_id)
+            if c_after is not None and c_after.agentic_hint:
+                # Failure snapshots are operational state, not reusable model
+                # verdicts. A later healthy run must invoke the provider again.
+                continue
             if c_after is None:
                 entry: dict[str, Any] = {
                     "enriched_components": [],
@@ -2546,7 +3951,11 @@ def _run_tier(
     tier_rels.extend(rels)
     tier_flags.extend(flags)
     _record_memo_verdicts(memo, components, tier_enriched)
-    if cache and tier_cache_key is not None:
+    if (
+        cache
+        and tier_cache_key is not None
+        and _cacheable_agentic_result(tier_enriched)
+    ):
         cache.put(
             tier_cache_key,
             _build_tier_cache_payload(tier_enriched, tier_new, tier_rels, tier_flags),
@@ -2576,6 +3985,27 @@ def _group_by_top_dir(
     return dict(groups)
 
 
+def _with_scoped_tool_roots(fn: Any) -> Any:
+    """Bind approved source roots to this invocation and its worker contexts."""
+
+    @wraps(fn)
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        from .tools import reset_allowed_search_roots, set_allowed_search_roots
+
+        scan_paths = kwargs.get("scan_paths")
+        if scan_paths is None and len(args) >= 4:
+            scan_paths = args[3]
+        roots = [str(Path(path).resolve()) for path in (scan_paths or [])]
+        token = set_allowed_search_roots(roots)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            reset_allowed_search_roots(token)
+
+    return _wrapped
+
+
+@_with_scoped_tool_roots
 def run_agentic_enrichment(
     model_string: str,
     deterministic_components: list[AIComponent],
@@ -2591,6 +4021,9 @@ def run_agentic_enrichment(
     cache_dir: Path | None = None,
     include_code_snippets: bool = False,
     agent_signature_catalog: AgentSignatureCatalog | None = None,
+    telemetry: AgenticTelemetry | None = None,
+    telemetry_source_id: str | None = None,
+    invoke_callback_factory: Callable[[], Any] | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag], TokenUsage]:
     """Run the full agentic enrichment pipeline.
 
@@ -2629,14 +4062,14 @@ def run_agentic_enrichment(
         Optional merged agent-signature catalog (built-ins + user
         overrides). When omitted, :func:`aibom.agent_signatures.resolve_catalog`
         is used to pick up built-in defaults.
+    invoke_callback_factory:
+        Optional scan-scoped factory returning a fresh callback for each live
+        agent invocation. Cache hits and circuit-breaker skips do not create one.
 
     Returns
     -------
     Tuple of (enriched_components, new_relationships, risk_flags, token_usage).
     """
-    from .tools import set_allowed_search_roots
-
-    set_allowed_search_roots([str(Path(p).resolve()) for p in scan_paths])
     _reset_token_usage()
 
     # Shared retry deadline for the whole run: bounds total retry wall-clock
@@ -2672,7 +4105,34 @@ def run_agentic_enrichment(
         fallback_dirs = [
             p for p in cache_read_dirs("agentic") if p != resolved_cache_dir
         ]
-    cache = _AgenticResultCache(resolved_cache_dir, fallback_dirs=fallback_dirs)
+    cache_namespace = _agentic_cache_namespace(
+        model_string=model_string,
+        fast_model=fast_model,
+        llm_config=llm_config,
+        batch_size=batch_size,
+        max_concurrent=max_concurrent,
+        timeout_s=timeout_s,
+        max_consecutive_failures=max_consecutive_failures,
+        max_retry_seconds=max_retry_seconds,
+        include_code_snippets=include_code_snippets,
+        agent_signature_catalog=agent_signature_catalog,
+        decision_context_digest=_agentic_decision_context_digest(
+            deterministic_components,
+            deterministic_relationships,
+            dossier_index,
+            scan_paths,
+            excluded_paths=[
+                path
+                for path in [resolved_cache_dir, *fallback_dirs]
+                if path is not None
+            ],
+        ),
+    )
+    cache = _AgenticResultCache(
+        resolved_cache_dir,
+        fallback_dirs=fallback_dirs,
+        namespace=cache_namespace,
+    )
     middleware = AIBOMScannerMiddleware(
         include_code_snippets=include_code_snippets,
         allowed_roots=scan_paths,
@@ -2686,6 +4146,48 @@ def run_agentic_enrichment(
 
     tier_model_name = fast_model or model_string
     simple_batch_size = batch_size
+    provider = str(
+        resolve_provider(model_string, (llm_config or {}).get("provider")) or "unknown"
+    ).lower()
+    simple_provider = provider
+    if fast_model:
+        simple_provider = str(resolve_provider(fast_model, None) or provider).lower()
+    analyzer_version = resolve_package_version("cisco-aibom")
+    schema_version = _hashlib.sha256(
+        json.dumps(
+            AgentResponse.model_json_schema(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    simple_telemetry = (
+        _BatchTelemetryContext(
+            telemetry=telemetry,
+            tier="simple",
+            provider=simple_provider,
+            model=tier_model_name,
+            prompt_version=cache_namespace,
+            schema_version=schema_version,
+            analyzer_version=analyzer_version,
+            source_id=telemetry_source_id or "",
+        )
+        if telemetry is not None
+        else None
+    )
+    complex_telemetry = (
+        _BatchTelemetryContext(
+            telemetry=telemetry,
+            tier="complex",
+            provider=provider,
+            model=model_string,
+            prompt_version=cache_namespace,
+            schema_version=schema_version,
+            analyzer_version=analyzer_version,
+            source_id=telemetry_source_id or "",
+        )
+        if telemetry is not None
+        else None
+    )
 
     tier_model_obj = _build_model(tier_model_name, llm_config)
     if model_string == tier_model_name:
@@ -2730,6 +4232,8 @@ def run_agentic_enrichment(
                 retry_deadline=retry_deadline,
                 dossier_index=dossier_index,
                 fallback_agent_factory=_simple_fb_factory,
+                telemetry_context=simple_telemetry,
+                invoke_callback_factory=invoke_callback_factory,
             )
             all_enriched.extend(e)
             all_new.extend(n)
@@ -2781,6 +4285,8 @@ def run_agentic_enrichment(
                         retry_deadline=retry_deadline,
                         dossier_index=dossier_index,
                         fallback_agent_factory=_complex_fb_factory,
+                        telemetry_context=complex_telemetry,
+                        invoke_callback_factory=invoke_callback_factory,
                     )
                     all_enriched.extend(e)
                     all_new.extend(n)
@@ -2813,6 +4319,8 @@ def run_agentic_enrichment(
                     retry_deadline=retry_deadline,
                     dossier_index=dossier_index,
                     fallback_agent_factory=_complex_fb_factory,
+                    telemetry_context=complex_telemetry,
+                    invoke_callback_factory=invoke_callback_factory,
                 )
                 all_enriched.extend(e)
                 all_new.extend(n)
@@ -3330,7 +4838,7 @@ def run_cross_repo_coordination(
     cache = _AgenticResultCache(
         cache_dir if cache_dir is not None else _default_agentic_cache_dir()
     )
-    cache_key = _cross_repo_cache_key(model_string, per_repo_results)
+    cache_key = _cross_repo_cache_key(model_string, per_repo_results, llm_config)
     cached = _load_cross_repo_cache_payload(cache.get(cache_key))
     if cached is not None:
         _LOGGER.info(

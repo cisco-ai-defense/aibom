@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
@@ -54,7 +54,9 @@ def test_analyze_defaults_cache_root_for_scan_and_agentic(tmp_path):
         with patch("aibom.cli.resolve_cache_root", return_value=shared_root):
             with patch("aibom.scan_cache.load_cached", return_value=None) as mock_load:
                 with patch("aibom.scan_cache.save_cached") as mock_save:
-                    with patch("aibom.scan_pipeline.ScanPipeline.run", fake_pipeline_run):
+                    with patch(
+                        "aibom.scan_pipeline.ScanPipeline.run", fake_pipeline_run
+                    ):
                         result = runner.invoke(
                             app,
                             [
@@ -203,7 +205,9 @@ def test_analyze_without_component_summary_flag_omits_key(tmp_path):
 @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
 @patch("aibom.multi_repo.is_git_url", return_value=True)
 @patch("aibom.multi_repo.ClonedRepo")
-def test_analyze_records_clone_failures_in_json_output(mock_cloned_repo, _mock_is_git_url, _mock_preflight, tmp_path):
+def test_analyze_records_clone_failures_in_json_output(
+    mock_cloned_repo, _mock_is_git_url, _mock_preflight, tmp_path
+):
     report = tmp_path / "report.json"
     mock_cloned_repo.return_value.__enter__.side_effect = RuntimeError("network down")
 
@@ -254,29 +258,34 @@ def test_analyze_scan_cache_hit_finalizes_per_source_status(tmp_path):
         "_agentic_risk_flags": [],
         "_agentic_candidate_count": 0,
     }
+    telemetry = MagicMock(enabled=True)
 
     def _explode(self):
         raise AssertionError(
             "scan_cache hit must short-circuit ScanPipeline.run; pipeline ran"
         )
 
-    with patch("aibom.cli.ensure_llm_runtime_available"):
-        with patch("aibom.scan_cache.load_cached", return_value=cached_payload):
-            with patch("aibom.scan_cache.save_cached"):
-                with patch("aibom.scan_pipeline.ScanPipeline.run", _explode):
-                    result = runner.invoke(
-                        app,
-                        [
-                            "analyze",
-                            str(source_dir),
-                            "--output-format",
-                            "json",
-                            "--output-file",
-                            str(report),
-                            "--llm-model",
-                            "test-model",
-                        ],
-                    )
+    with patch(
+        "aibom.agentic_telemetry.create_agentic_telemetry",
+        return_value=telemetry,
+    ):
+        with patch("aibom.cli.ensure_llm_runtime_available"):
+            with patch("aibom.scan_cache.load_cached", return_value=cached_payload):
+                with patch("aibom.scan_cache.save_cached"):
+                    with patch("aibom.scan_pipeline.ScanPipeline.run", _explode):
+                        result = runner.invoke(
+                            app,
+                            [
+                                "analyze",
+                                str(source_dir),
+                                "--output-format",
+                                "json",
+                                "--output-file",
+                                str(report),
+                                "--llm-model",
+                                "test-model",
+                            ],
+                        )
 
     assert result.exit_code == 0, result.output
     data = json.loads(report.read_text(encoding="utf-8"))
@@ -289,9 +298,93 @@ def test_analyze_scan_cache_hit_finalizes_per_source_status(tmp_path):
             f"source {src_key!r} status={status!r} is not terminal "
             "after scan_cache hit"
         )
-        assert status == "completed", (
-            f"expected completed after scan_cache hit, got {status!r}"
-        )
-        assert src["summary"]["last_generated_at"], (
-            f"source {src_key!r} missing last_generated_at after cache hit"
-        )
+        assert (
+            status == "completed"
+        ), f"expected completed after scan_cache hit, got {status!r}"
+        assert src["summary"][
+            "last_generated_at"
+        ], f"source {src_key!r} missing last_generated_at after cache hit"
+    summary = telemetry.record_summary.call_args.kwargs
+    assert summary["status"] == "cache_hit"
+    assert summary["candidate_count"] == 0
+    assert summary["candidate_count_available"] is False
+    assert summary["final_component_count"] == 0
+
+
+def test_analyze_pipeline_exception_emits_failed_source_summary(tmp_path):
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    report = tmp_path / "report.json"
+    telemetry = MagicMock(enabled=True)
+
+    with patch(
+        "aibom.agentic_telemetry.create_agentic_telemetry",
+        return_value=telemetry,
+    ):
+        with patch("aibom.cli.ensure_llm_runtime_available"):
+            with patch("aibom.scan_cache.load_cached", return_value=None):
+                with patch("aibom.scan_cache.save_cached"):
+                    with patch(
+                        "aibom.scan_pipeline.ScanPipeline.run",
+                        side_effect=RuntimeError("scanner failed"),
+                    ):
+                        result = runner.invoke(
+                            app,
+                            [
+                                "analyze",
+                                str(source_dir),
+                                "--output-format",
+                                "json",
+                                "--output-file",
+                                str(report),
+                                "--llm-model",
+                                "test-model",
+                            ],
+                        )
+
+    assert result.exit_code != 0
+    telemetry.record_summary.assert_called_once_with(
+        source_id=str(source_dir),
+        source_kind="directory",
+        status="failed",
+    )
+    telemetry.drain.assert_called_once_with(timeout_s=2.0)
+
+
+def test_analyze_unexpected_source_discovery_failure_emits_one_summary(tmp_path):
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    report = tmp_path / "report.json"
+    telemetry = MagicMock(enabled=True)
+
+    with patch(
+        "aibom.agentic_telemetry.create_agentic_telemetry",
+        return_value=telemetry,
+    ):
+        with patch("aibom.cli.ensure_llm_runtime_available"):
+            with patch(
+                "aibom.multi_repo.is_git_url",
+                side_effect=OSError("source discovery failed"),
+            ):
+                result = runner.invoke(
+                    app,
+                    [
+                        "analyze",
+                        str(source_dir),
+                        "--output-format",
+                        "json",
+                        "--output-file",
+                        str(report),
+                        "--llm-model",
+                        "test-model",
+                    ],
+                )
+
+    assert result.exit_code != 0
+    telemetry.record_summary.assert_called_once_with(
+        source_id=str(source_dir),
+        source_kind="unknown",
+        status="failed",
+    )
+    telemetry.drain.assert_called_once_with(timeout_s=2.0)

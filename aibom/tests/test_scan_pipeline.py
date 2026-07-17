@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aibom.agentic.agent import TokenUsage
+from aibom.cross_ref import CrossRefIndex
 from aibom.models import AIComponent, AIComponentType
 from aibom.scan_pipeline import ScanPipeline, StageTiming
 
@@ -88,6 +89,44 @@ ai-common = {git = "https://github.com/org/ai-common.git", branch = "main"}
         result = pipeline.run()
         assert result.components == [] or isinstance(result.components, list)
         assert result.agentic_candidate_count >= 0
+
+    def test_sanitized_source_summary_is_emitted_at_pipeline_boundary(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        telemetry = MagicMock()
+
+        result = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            agentic_telemetry=telemetry,
+            telemetry_source_id="private-repository-name",
+            telemetry_source_kind="directory",
+        ).run()
+
+        assert result.components
+        telemetry.record_summary.assert_called_once()
+        summary = telemetry.record_summary.call_args.kwargs
+        assert summary["source_id"] == "private-repository-name"
+        assert summary["source_kind"] == "directory"
+        assert summary["candidate_count"] >= 1
+        assert summary["candidate_count_available"] is True
+        assert summary["agentic_component_count"] == summary["candidate_count"]
+        assert summary["final_component_count"] == len(result.components)
+        assert summary["created_at"].tzinfo is not None
+        assert summary["status"] == "skipped"
+        assert all(value == 0 for value in summary["decisions"].values())
+        assert set(summary["decisions"]) == {
+            "kept",
+            "enriched",
+            "removed",
+            "reclassified",
+            "discovered",
+            "relationships",
+            "risk_findings",
+            "degraded",
+        }
 
 
 class TestPipelineTiming:
@@ -181,6 +220,258 @@ class TestAgenticScope:
         assert len(to_agentic) == 2
         assert held == []
 
+    def test_source_summary_uses_post_partition_agentic_population(
+        self, tmp_path: Path
+    ) -> None:
+        model = AIComponent(
+            name="gpt-4o",
+            model_name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="app.py",
+            line_number=1,
+        )
+        secret = AIComponent(
+            name="secret-canary",
+            component_type=AIComponentType.SECRET,
+            file_path="app.py",
+            line_number=2,
+        )
+        telemetry = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+            agentic_telemetry=telemetry,
+        )
+
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([model, secret], [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=([model, secret], CrossRefIndex(), CrossRefIndex(), []),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch("aibom.agentic.agent.run_agentic_enrichment") as enrich,
+        ):
+            enrich.return_value = ([model], [], [], _stub_token_usage())
+            result = pipeline.run()
+
+        assert len(enrich.call_args.kwargs["deterministic_components"]) == 1
+        summary = telemetry.record_summary.call_args.kwargs
+        assert summary["candidate_count"] == 1
+        assert summary["candidate_count_available"] is True
+        assert summary["agentic_component_count"] == 1
+        assert summary["created_at"].tzinfo is not None
+        assert summary["decisions"]["kept"] == 1
+        assert summary["decisions"]["removed"] == 0
+        assert summary["final_component_count"] == len(result.components) == 1
+
+    def test_source_summary_counts_deduped_total_degradation_once(
+        self, tmp_path: Path
+    ) -> None:
+        duplicates = [
+            AIComponent(
+                name="gpt-4o",
+                model_name="gpt-4o",
+                component_type=AIComponentType.MODEL,
+                file_path=f"{folder}/app.py",
+                line_number=1,
+            )
+            for folder in ("first", "second")
+        ]
+        telemetry = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+            agentic_telemetry=telemetry,
+        )
+
+        def degraded_once(**kwargs: object) -> tuple[object, ...]:
+            candidates = kwargs["deterministic_components"]
+            assert isinstance(candidates, list) and len(candidates) == 1
+            degraded = candidates[0].model_copy(
+                update={"agentic_hint": "batch_timeout"}
+            )
+            return ([degraded], [], [], _stub_token_usage())
+
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=(duplicates, [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(duplicates, CrossRefIndex(), CrossRefIndex(), []),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                side_effect=degraded_once,
+            ),
+        ):
+            pipeline.run()
+
+        summary = telemetry.record_summary.call_args.kwargs
+        assert summary["candidate_count"] == 1
+        assert summary["degraded_candidate_count"] == 1
+        assert summary["decisions"]["degraded"] == 1
+        assert summary["decisions"]["kept"] == 0
+        assert summary["decisions"]["discovered"] == 0
+        assert summary["status"] == "degraded"
+
+    def test_source_summary_reflects_post_guard_dependency_reinstatement(
+        self, tmp_path: Path
+    ) -> None:
+        dependency = AIComponent(
+            name="cisco-aidefense-sdk",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="requirements.txt",
+            line_number=1,
+            metadata={"ecosystem": "pypi", "known_ai_package": True},
+        )
+        telemetry = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+            agentic_telemetry=telemetry,
+        )
+
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([dependency], [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
+                    [dependency],
+                    CrossRefIndex(),
+                    CrossRefIndex(),
+                    [],
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                return_value=([], [], [], _stub_token_usage()),
+            ),
+        ):
+            result = pipeline.run()
+
+        assert [component.name for component in result.components] == [
+            "cisco-aidefense-sdk"
+        ]
+        summary = telemetry.record_summary.call_args.kwargs
+        assert summary["candidate_count"] == 1
+        assert summary["agentic_component_count"] == 1
+        assert summary["decisions"]["kept"] == 1
+        assert summary["decisions"]["removed"] == 0
+        assert summary["decisions"]["discovered"] == 0
+
+    def test_source_summary_excludes_discovery_removed_by_post_agent_gate(
+        self, tmp_path: Path
+    ) -> None:
+        dependency = AIComponent(
+            name="openai",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="requirements.txt",
+            line_number=1,
+            metadata={"ecosystem": "pypi", "known_ai_package": True},
+        )
+        unresolved_endpoint = AIComponent(
+            name="env:MODEL_ENDPOINT_URL",
+            component_type=AIComponentType.MODEL_ENDPOINT,
+            file_path="app.py",
+            line_number=4,
+        )
+        telemetry = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+            agentic_telemetry=telemetry,
+        )
+
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([dependency], [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
+                    [dependency],
+                    CrossRefIndex(),
+                    CrossRefIndex(),
+                    [],
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                return_value=(
+                    [dependency, unresolved_endpoint],
+                    [],
+                    [],
+                    _stub_token_usage(),
+                ),
+            ),
+        ):
+            result = pipeline.run()
+
+        assert [component.name for component in result.components] == ["openai"]
+        summary = telemetry.record_summary.call_args.kwargs
+        assert summary["candidate_count"] == 1
+        assert summary["agentic_component_count"] == 1
+        assert summary["decisions"]["kept"] == 1
+        assert summary["decisions"]["removed"] == 0
+        assert summary["decisions"]["discovered"] == 0
+
+    def test_source_summary_does_not_count_post_guard_degraded_as_removed(
+        self, tmp_path: Path
+    ) -> None:
+        unresolved_endpoint = AIComponent(
+            name="env:MODEL_ENDPOINT_URL",
+            component_type=AIComponentType.MODEL_ENDPOINT,
+            file_path="app.py",
+            line_number=4,
+        )
+        degraded_endpoint = unresolved_endpoint.model_copy(
+            update={"agentic_hint": "batch_timeout"}
+        )
+        telemetry = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+            agentic_telemetry=telemetry,
+        )
+
+        with (
+            patch.object(
+                pipeline,
+                "_stage_scan",
+                return_value=([unresolved_endpoint], []),
+            ),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
+                    [unresolved_endpoint],
+                    CrossRefIndex(),
+                    CrossRefIndex(),
+                    [],
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                return_value=([degraded_endpoint], [], [], _stub_token_usage()),
+            ),
+        ):
+            result = pipeline.run()
+
+        assert result.components == []
+        summary = telemetry.record_summary.call_args.kwargs
+        assert summary["candidate_count"] == 1
+        assert summary["agentic_component_count"] == 0
+        assert summary["decisions"]["kept"] == 0
+        assert summary["decisions"]["removed"] == 0
+        assert summary["decisions"]["degraded"] == 1
+        assert summary["status"] == "degraded"
+
     def test_all_components_sent_to_agent(self, tmp_path: Path) -> None:
         """All components are sent to the agent for classification."""
         (tmp_path / "app.py").write_text(
@@ -196,6 +487,47 @@ class TestAgenticScope:
                 mock_enrich.return_value = ([], [], [], _stub_token_usage())
                 result = pipeline.run()
         mock_enrich.assert_called_once()
+
+    def test_agentic_telemetry_is_forwarded(self, tmp_path: Path) -> None:
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake"}
+        telemetry = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config=llm_cfg,
+            agentic_telemetry=telemetry,
+        )
+
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([], [], [], _stub_token_usage())
+                pipeline.run()
+
+        assert mock_enrich.call_args.kwargs["telemetry"] is telemetry
+
+    def test_agentic_callback_factory_is_forwarded(self, tmp_path: Path) -> None:
+        (tmp_path / "app.py").write_text(
+            'from openai import OpenAI\nclient = OpenAI(model="gpt-4o")\n'
+        )
+        llm_cfg = {"model": "test/model", "api_key": "fake"}
+        callback_factory = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config=llm_cfg,
+            invoke_callback_factory=callback_factory,
+        )
+
+        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
+            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
+                mock_enrich.return_value = ([], [], [], _stub_token_usage())
+                pipeline.run()
+
+        assert (
+            mock_enrich.call_args.kwargs["invoke_callback_factory"] is callback_factory
+        )
+        callback_factory.assert_not_called()
 
     def test_agentic_cache_dir_is_forwarded(self, tmp_path: Path) -> None:
         (tmp_path / "app.py").write_text(

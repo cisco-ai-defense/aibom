@@ -60,8 +60,9 @@ The deterministic scan has ALREADY run — do NOT re-scan directories.
   value. Call only when a model name is assigned through multiple variables.
 - **analyze_imports** — Deep import analysis on a Python file. Call only when
   you cannot determine the framework from code_context alone.
-- **search_codebase** — Regex search across directories. Use as a LAST RESORT
-  only. Prefer the other targeted tools.
+- **search_codebase** — Literal or linear-subset regex search across directories;
+  open-ended regex quantifiers are rejected. Use as a LAST RESORT only. Prefer
+  the other targeted tools.
 - **search_package_info** — Query a package registry (PyPI, npm, Go proxy) for
   metadata about a dependency. Returns name, summary, description, keywords,
   and classifiers. Use this to determine if a dependency is genuinely AI/ML

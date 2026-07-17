@@ -11,11 +11,10 @@ repos:
       - id: addlicense
         args: [ "-v", "-s",
                 "-c", "Cisco Systems, Inc. and its affiliates",
-                "-l", "apache",
-                "aiswf_analyzer" ]
+                "-l", "apache" ]
         types: [ python ]
   - repo: https://github.com/psf/black
-    rev: 24.3.0
+    rev: 25.12.0
     hooks:
       - id: black
         language_version: python3

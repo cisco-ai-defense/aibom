@@ -1567,6 +1567,43 @@ def analyze(
             "retrying for hours. 0 disables the retry pass."
         ),
     ),
+    galileo: bool = typer.Option(
+        False,
+        "--galileo/--no-galileo",
+        envvar="AIBOM_GALILEO_ENABLED",
+        help=(
+            "Emit privacy-preserving agentic quality telemetry to Galileo. "
+            "Disabled by default; requires the 'observability' extra and "
+            "GALILEO_API_KEY, GALILEO_CONSOLE_URL=https://app.galileo.ai, "
+            "GALILEO_PROJECT, GALILEO_LOG_STREAM, and "
+            "AIBOM_GALILEO_ALLOW_PUBLIC_CLOUD=true."
+        ),
+    ),
+    galileo_sample_rate: float = typer.Option(
+        1.0,
+        "--galileo-sample-rate",
+        envvar="AIBOM_GALILEO_SAMPLE_RATE",
+        min=0.0,
+        max=1.0,
+        help=(
+            "Deterministic AIBOM-side sampling rate for sanitized Galileo "
+            "batch traces (0.0-1.0, default 1.0 when enabled)."
+        ),
+    ),
+    galileo_full_trajectory: bool = typer.Option(
+        False,
+        "--galileo-full-trajectory/--no-galileo-full-trajectory",
+        help=(
+            "DIAGNOSTIC: emit the FULL raw agent trajectory (real prompts, "
+            "model responses, tool I/O, exact component/repo/path identities) as "
+            "a separate Galileo span tree. Disabled by default and requires "
+            "explicit opt-in with "
+            "--galileo plus AIBOM_GALILEO_ALLOW_FULL_CONTENT / "
+            "ALLOW_FULL_TRAJECTORY / ALLOW_EXACT_IDENTITIES / ALLOW_PUBLIC_CLOUD "
+            "and the evaluation project/log-stream UUIDs. Sends raw content to "
+            "the hosted Galileo console; use only on repos you may expose."
+        ),
+    ),
     include_code_snippets: bool = typer.Option(
         False,
         "--include-code-snippets/--no-code-snippets",
@@ -1883,6 +1920,45 @@ def analyze(
         "completion_tokens": 0,
         "cached_tokens": 0,
     }
+    from .agentic_telemetry import (
+        GalileoTelemetryConfig,
+        create_agentic_telemetry,
+    )
+
+    galileo_config = GalileoTelemetryConfig.from_env(
+        enabled=galileo,
+        sample_rate=galileo_sample_rate,
+    )
+    agentic_telemetry = create_agentic_telemetry(
+        galileo_config,
+        session_external_id=run_metadata["scan_batch_id"],
+    )
+    if galileo and not agentic_telemetry.enabled:
+        logging.warning(
+            "Galileo telemetry requested but its hosted destination/TLS settings, "
+            "egress approval, credentials, project/log stream, or optional SDK "
+            "are unavailable; "
+            "scanning will continue without telemetry."
+        )
+    invoke_callback_factory: Callable[[], Any] | None = None
+    # DIAGNOSTIC full-trajectory: supply a scan-owned factory so every live
+    # invocation gets its own callback and logger. This preserves one flush per
+    # chain without sharing callback state across batches, sources, or commands.
+    # The factory shares only the immutable resolved session id, so every
+    # per-invocation trajectory from this run groups under a single Galileo
+    # session instead of fanning out into one session per batch.
+    if galileo and galileo_full_trajectory:
+        from .galileo_evaluation import create_full_trajectory_callback_factory
+
+        invoke_callback_factory = create_full_trajectory_callback_factory(
+            session_name="aibom-agentic-scan-" + run_metadata["started_at"],
+            session_external_id=run_metadata["scan_batch_id"],
+        )
+        logging.warning(
+            "Galileo FULL-TRAJECTORY requested: each live agent invocation will "
+            "send raw prompts, responses, tool I/O, and exact identities after "
+            "all approval gates pass."
+        )
     explicit_config: Optional[CustomCatalogConfig] = None
     if custom_catalog:
         explicit_config = load_custom_catalog(Path(custom_catalog))
@@ -1923,9 +1999,8 @@ def analyze(
     source_to_scan_path: dict[str, str] = {}
     source_image_meta: dict[str, dict[str, Any]] = {}
     deferred_extraction_dirs: list[str] = []
-    eager_extraction_cleanup = (
-        len(sources_to_process) > 20 and not keep_extractions
-    )
+    telemetry_summarized_sources: set[str] = set()
+    eager_extraction_cleanup = len(sources_to_process) > 20 and not keep_extractions
     if eager_extraction_cleanup:
         console.print(
             "  [yellow]>20 sources: extracted container filesystems are cleaned "
@@ -1942,24 +2017,30 @@ def analyze(
         else:
             deferred_extraction_dirs.append(td)
 
+    def _record_agentic_source_summary(source_name: str, **summary: Any) -> None:
+        """Emit at most one CLI-owned summary for an attempted source."""
+
+        key = str(source_name)
+        if key in telemetry_summarized_sources:
+            return
+        try:
+            agentic_telemetry.record_summary(source_id=key, **summary)
+        except Exception:  # noqa: BLE001 - observability must remain fail-open
+            logging.debug("Unable to record Galileo source summary", exc_info=True)
+        finally:
+            telemetry_summarized_sources.add(key)
+
     try:
         for source in sources_to_process:
             console.print(Panel.fit(f"Analyzing Source: {source}", style="bold cyan"))
             temp_dir = None
             clone_ctx = None
 
-            from .multi_repo import ClonedRepo, is_git_url
-
-            is_git = is_git_url(source)
-            if is_git:
-                is_container = False
-            else:
-                is_container = is_container_image(source)
-
-            source_summary = {
-                "source_kind": (
-                    "git-url" if is_git else "container" if is_container else "local-path"
-                ),
+            # Register the attempt before source-type discovery. The outer
+            # finally block can then emit a single content-free failed summary
+            # for any unexpected acquisition or per-source processing error.
+            source_summary: Dict[str, Any] = {
+                "source_kind": "unknown",
                 "status": "in_progress",
                 "status_detail": None,
                 "assets_discovered": 0,
@@ -1970,6 +2051,17 @@ def analyze(
                 "source_path": str(source),
             }
             source_outcomes[source] = source_summary
+
+            from .multi_repo import ClonedRepo, is_git_url
+
+            is_git = is_git_url(source)
+            if is_git:
+                is_container = False
+            else:
+                is_container = is_container_image(source)
+            source_summary["source_kind"] = (
+                "git-url" if is_git else "container" if is_container else "local-path"
+            )
 
             if is_git:
                 try:
@@ -1986,6 +2078,11 @@ def analyze(
                         source,
                         message,
                         severity="fatal",
+                    )
+                    _record_agentic_source_summary(
+                        str(source),
+                        source_kind="git",
+                        status="failed",
                     )
                     continue
             else:
@@ -2006,6 +2103,11 @@ def analyze(
                         message,
                         severity="fatal",
                     )
+                    _record_agentic_source_summary(
+                        str(source),
+                        source_kind="container",
+                        status="failed",
+                    )
                     continue
                 temp_dir = str(extraction.extracted_dir)
                 path_to_analyze = extraction.extracted_dir
@@ -2024,7 +2126,9 @@ def analyze(
                 )
 
             if not path_to_analyze.exists():
-                message = f"Path or image '{source}' not found or could not be processed."
+                message = (
+                    f"Path or image '{source}' not found or could not be processed."
+                )
                 logging.error(message)
                 _record_analysis_error(
                     run_errors,
@@ -2035,6 +2139,15 @@ def analyze(
                 )
                 if temp_dir:
                     shutil.rmtree(temp_dir)
+                _record_agentic_source_summary(
+                    str(source),
+                    source_kind=(
+                        "container"
+                        if is_container
+                        else "git" if is_git else "directory"
+                    ),
+                    status="failed",
+                )
                 continue
 
             from .scan_pipeline import ScanPipeline
@@ -2106,6 +2219,17 @@ def analyze(
                     source_summary["last_generated_at"] = _utcnow_iso()
                     if source_summary["status"] == "in_progress":
                         source_summary["status"] = "completed"
+                    _record_agentic_source_summary(
+                        str(source),
+                        source_kind="git" if is_git else "directory",
+                        status="cache_hit",
+                        # Whole-scan caches do not retain the pre-agentic
+                        # candidate boundary; do not mislabel final BOM size as
+                        # an observed candidate count.
+                        candidate_count=0,
+                        candidate_count_available=False,
+                        final_component_count=len(cached_v2_output["components"]),
+                    )
                     _dispose_extraction(temp_dir)
                     continue
 
@@ -2123,10 +2247,24 @@ def analyze(
                     _scan_cache_hit = True
                     console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
                     all_analysis_outputs[source] = cached
-                    source_summary["assets_discovered"] = len(cached.get("components", []))
+                    source_summary["assets_discovered"] = len(
+                        cached.get("components", [])
+                    )
                     source_summary["last_generated_at"] = _utcnow_iso()
                     if source_summary["status"] == "in_progress":
                         source_summary["status"] = "completed"
+                    _record_agentic_source_summary(
+                        str(source),
+                        source_kind=(
+                            "container"
+                            if is_container
+                            else "git" if is_git else "directory"
+                        ),
+                        status="cache_hit",
+                        candidate_count=0,
+                        candidate_count_available=False,
+                        final_component_count=len(cached.get("components", [])),
+                    )
                     _dispose_extraction(temp_dir)
                     continue
 
@@ -2150,8 +2288,35 @@ def analyze(
                 agentic_review_secrets=agentic_review_secrets,
                 custom_catalog=explicit_config,
                 atr_enrichment=atr_enrichment,
+                agentic_telemetry=agentic_telemetry,
+                invoke_callback_factory=invoke_callback_factory,
+                telemetry_source_id=str(source),
+                telemetry_source_kind=(
+                    "container" if is_container else "git" if is_git else "directory"
+                ),
             )
-            result = _run_pipeline_with_progress(source, pipeline, progress)
+            try:
+                result = _run_pipeline_with_progress(source, pipeline, progress)
+            except Exception:
+                # ScanPipeline emits its detailed source summary only on normal
+                # return. Preserve the one-summary-per-attempted-source contract
+                # when deterministic scanning, cross-reference, agentic, or
+                # assembly raises before that boundary. Telemetry remains
+                # content-free and the original exception still propagates.
+                source_summary["status"] = "failed"
+                _record_agentic_source_summary(
+                    str(source),
+                    source_kind=(
+                        "container"
+                        if is_container
+                        else "git" if is_git else "directory"
+                    ),
+                    status="failed",
+                )
+                _dispose_extraction(temp_dir)
+                raise
+            # The pipeline owns the normal detailed summary.
+            telemetry_summarized_sources.add(str(source))
 
             if llm_config and result.agentic_risk_flags:
                 console.print(
@@ -2334,7 +2499,10 @@ def analyze(
             run_metadata["cross_source_stats"] = cross_source_stats
             _LOGGER.info(
                 "Cross-source summary: sources=%s, links=%d by_type=%s, dropped=%d",
-                sources_by_kind, len(_cross_repo_links), links_by_type, _links_dropped,
+                sources_by_kind,
+                len(_cross_repo_links),
+                links_by_type,
+                _links_dropped,
             )
             _print_cross_source_panel(console, cross_source_stats)
 
@@ -2562,7 +2730,6 @@ def analyze(
             }
             start_api_server(component_map)
 
-
         total_agentic = sum(
             v.get("_agentic_candidate_count", 0)
             for v in all_analysis_outputs.values()
@@ -2586,6 +2753,33 @@ def analyze(
         if show_summary:
             _display_analysis_summary(all_analysis_outputs)
     finally:
+        # A broad, last-resort source boundary covers failures raised before a
+        # pipeline exists (clone, image extraction, attribution, cache, etc.).
+        # Known branches and successful pipelines register above, preventing a
+        # duplicate summary.
+        for pending_source, pending_summary in source_outcomes.items():
+            pending_key = str(pending_source)
+            if pending_key in telemetry_summarized_sources or pending_summary.get(
+                "status"
+            ) not in {"in_progress", "failed"}:
+                continue
+            pending_summary["status"] = "failed"
+            pending_kind = {
+                "git-url": "git",
+                "container": "container",
+                "local-path": "directory",
+            }.get(str(pending_summary.get("source_kind", "")), "unknown")
+            _record_agentic_source_summary(
+                pending_key,
+                source_kind=pending_kind,
+                status="failed",
+            )
+
+        # Telemetry is fail-open and flushed off the scan's critical path.
+        # Give accepted payloads a short, bounded opportunity to finish before
+        # temporary source material and process state are torn down.
+        agentic_telemetry.drain(timeout_s=2.0)
+
         for cm in clone_managers:
             cm.__exit__(None, None, None)
 
