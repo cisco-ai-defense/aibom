@@ -132,6 +132,10 @@ exists, `output == redacted_output`. Unknown enum-like values are collapsed to
 `other`; each callback-observed unknown tool invocation is labeled
 `aibom.tool.other`, while aggregate fallback counters combine unknown tools. At
 most 128 pseudonymous component identifiers are included in a batch trace.
+Each emitted batch trace contains one sanitized
+`aibom.agentic.classifier` Agent span around its attempt workflows. This
+structural span gives Galileo an agent-typed hierarchy; it does not contain or
+enable the separately gated raw LangChain trajectory.
 
 The following data is observable:
 
@@ -140,6 +144,7 @@ The following data is observable:
 | Batch trace input | HMAC source ID; source-scoped pseudonymous batch/component IDs; stable per-component decision-chain IDs; attempt kind; batch number and size; component-type counts; language counts; tier; cache-hit flag |
 | Batch metadata | HMAC source ID, attempt kind, analyzer version, provider, pseudonymous model ID, tier, batch size, cache-hit flag, telemetry-configuration digest in `prompt_version`, response-schema digest in `schema_version` |
 | Batch output | Allowlisted decision totals; keep/enrich/remove/reclassify/discover counts sliced by original component type, language, and bounded heuristic-confidence bucket (`low` < 0.5, `medium` < 0.8, `high` ≥ 0.8, or `unknown`; discoveries use emitted dimensions); degraded-candidate count; failure category; schema-valid flag; middleware-guard flag; status |
+| Batch agent span | One `aibom.agentic.classifier` parent per emitted batch trace, with `agent_type=classifier`; the same sanitized batch input/output, status, duration, and no additional metadata. It contains no prompt, response, tool I/O, or exact identity content. |
 | Attempt workflow | Attempt number/kind; raw model-requested mutation counts; post-middleware final action counts; blocked-action deltas; aggregate allowlisted tool calls/errors/root denials/duration; recovered flag; status; duration |
 | LLM span | One span per callback-observed model invocation, in start order, with HMAC call ID, provider, pseudonymous model ID, call start/duration, per-call tokens when supplied, status, and schema/decision-carrier flags. Only the terminal decision-bearing call carries raw mutation counts. A single `mode=aggregate` fallback is used only when callbacks are unavailable. |
 | Tool span | One span per callback-observed tool invocation, in start order, with HMAC tool-call ID, allowlisted tool name, call start/duration, and status. An aggregate fallback is used only when callbacks are unavailable; authoritative aggregate guard/error counters remain on the workflow. |
@@ -253,12 +258,20 @@ without affecting the scan.
 ```text
 aibom-agentic-scan                         session
 ├── aibom.agentic.batch                    trace per agentic batch
-│   └── aibom.agentic.<attempt-kind>       workflow span
-│       ├── aibom.agentic.llm              actual call 1 (step 1)
-│       ├── aibom.tool.<allowlisted-name>  actual call 2 (step 2)
-│       └── aibom.agentic.llm              actual call 3 (step 3, decisions)
+│   └── aibom.agentic.classifier           agent span (classifier)
+│       └── aibom.agentic.<attempt-kind>   workflow span
+│           ├── aibom.agentic.llm          actual call 1 (step 1)
+│           ├── aibom.tool.<name>           actual call 2 (step 2)
+│           └── aibom.agentic.llm          actual call 3 (step 3, decisions)
 └── aibom.agentic.source_summary           trace per scanned source
 ```
+
+Galileo's SDK always uses a Trace as the root; it has no separate
+`start_agent_trace` root API. Agent typing is represented by the classifier
+Agent span beneath each batch trace. The Console may therefore still title the
+overall visualization **Trace Graph**, while showing the typed Agent node and
+its nested attempt, LLM, and tool spans. Source-summary records intentionally
+remain plain traces and do not contain an Agent span.
 
 Attempt kinds are allowlisted as `initial`, `retry`, `fallback`, `coercion`,
 `middleware_validation`, `unknown`, or `other`. Sampled cache hits, plus cache
@@ -279,9 +292,10 @@ and `write_todos`. Every other name is emitted as `other`.
 Callback events are sealed at the batch deadline, so a late completion from an
 abandoned synchronous daemon invocation cannot mutate or cross-contaminate an
 already concluded trace. Concurrent batches each own an independent callback,
-trace handle, workflow, and logger. Actual `created_at`, monotonic duration,
-sequence, and per-call token carriers are retained; unknown usage becomes null
-native token metrics plus `token_usage_missing=true`, not fabricated zeros.
+trace handle, Agent span, workflow, and logger. Actual `created_at`, monotonic
+duration, sequence, and per-call token carriers are retained; unknown usage
+becomes null native token metrics plus `token_usage_missing=true`, not
+fabricated zeros.
 Response-level provider usage takes precedence over per-generation metadata;
 when no response-level carrier exists, each generation's usage is counted
 independently even when two choices report equal numeric values.
@@ -305,19 +319,22 @@ The source token namespaces batch, component, and decision-chain identities;
 identical repository-relative component IDs in two sources therefore never
 collide.
 
-There are currently no agent or retriever spans, and no raw LangChain/OpenAI
-auto-instrumentation. Sampling decisions are deterministic across repeated
-scans for the same original source, tier, and batch number. Batch and source
-summary records are still sampled independently. Operationally significant
-terminal batches and summaries are retained even when their ordinary cohort
-was not sampled. Batch retention covers failures, degradation, circuit
-breaking, schema/token-accounting failures, middleware guards, tool errors or
-approved-root denials, discoveries, and risk findings. Unsampled handles buffer
-only the sanitized ordered call shape needed to build that retained trace;
-attempts are replayed as sibling workflows under the batch trace. Deferred
-buffering is bounded at 16 LLM and 32 tool spans per attempt. If an unusually
-long loop exceeds the LLM cap, the terminal schema/decision-bearing call
-replaces the oldest LLM entry and sequence gaps make truncation visible.
+Each sanitized batch trace has one classifier Agent span. There are no retriever
+spans and no raw LangChain/OpenAI auto-instrumentation on this path. The Agent
+span changes the typed hierarchy Galileo receives, but remains subject to the
+same content-free contract and does not make content-based metrics valid.
+Sampling decisions are deterministic across repeated scans for the same
+original source, tier, and batch number. Batch and source summary records are
+still sampled independently. Operationally significant terminal batches and
+summaries are retained even when their ordinary cohort was not sampled. Batch
+retention covers failures, degradation, circuit breaking, schema/token-accounting
+failures, middleware guards, tool errors or approved-root denials, discoveries,
+and risk findings. Unsampled handles buffer only the sanitized ordered call shape
+needed to build that retained trace; attempts are replayed as sibling workflows
+under the batch Agent span. Deferred buffering is bounded at 16 LLM and 32 tool
+spans per attempt. If an unusually long loop exceeds the LLM cap, the terminal
+schema/decision-bearing call replaces the oldest LLM entry and sequence gaps
+make truncation visible.
 
 ## Telemetry version dimensions and cache state
 
@@ -416,6 +433,8 @@ calculation within the access-restricted environment.
 Do not enable Context Adherence, Correctness, Prompt Injection, PII, or other
 content judges on sanitized production traces: they would evaluate aggregate
 JSON rather than the source/model exchange and produce misleading results.
+The sanitized classifier Agent span is structural only; it does not supply the
+prompt, response, tool, or retrieval content those judges require.
 
 In an approved full-content experiment only, useful native metrics include
 Context Adherence, Completeness, Ground Truth Adherence, Instruction

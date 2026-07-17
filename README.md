@@ -142,7 +142,7 @@ The `analyze` command always runs the agentic pipeline, so it requires the `agen
 |-------|----------|---------|
 | `analysis` | `detect-secrets`, `tree-sitter` | Secret detection, multi-language parsing |
 | `security` | `cisco-ai-mcp-scanner`, `cisco-ai-skill-scanner` | Cisco security tool integration |
-| `observability` | `galileo` | Opt-in, sanitized agentic quality telemetry |
+| `observability` | `galileo` | Opt-in, sanitized Agent-span quality telemetry |
 | `cloud` | `boto3`, `google-cloud-aiplatform`, `azure-*` | Cloud resource scanning |
 | `all` | All of the above | Full feature set |
 
@@ -301,9 +301,11 @@ All cache families now default under `~/.aibom/cache`, including deterministic s
 ## Galileo Observability
 
 Agentic scans can optionally emit observe-only quality telemetry to Galileo.
-The sanitized path is disabled by default and fail-open: it sends allowlisted
-decision/guard counters, per-call LLM/tool ordering, status/timing/token data,
-and HMAC pseudonyms, but never source code, paths, prompts, model response text,
+Each emitted sanitized batch includes a classifier Agent span, giving Galileo
+an agent-typed hierarchy while the payload remains content-free. The sanitized
+path is disabled by default and fail-open: it sends allowlisted decision/guard
+counters, per-call LLM/tool ordering, status/timing/token data, and HMAC
+pseudonyms, but never source code, paths, prompts, model response text,
 component names, tool arguments, or tool results. A separate diagnostic
 full-trajectory path can send that raw content when every content, identity,
 trajectory, destination, and hosted-egress approval gate is enabled.
@@ -534,8 +536,8 @@ All CLI options with an `envvar` binding can be set via environment variables or
 | `AIBOM_DB_SHA256` | — | Expected SHA-256 checksum for the catalog. |
 | `AIBOM_MANIFEST_PATH` | — | Override path to `manifest.json`. |
 | `AIBOM_ENV_FILE` | — | Path to a custom `.env` file. |
-| `AIBOM_GALILEO_ENABLED` | `--galileo/--no-galileo` | Enable sanitized Galileo telemetry (default `false`). |
-| `AIBOM_GALILEO_SAMPLE_RATE` | `--galileo-sample-rate` | Deterministic ordinary-trace emission rate from `0.0` to `1.0` (default `1.0`; sanitized operational and quality exceptions are retained). |
+| `AIBOM_GALILEO_ENABLED` | `--galileo/--no-galileo` | Enable sanitized Galileo Agent-span telemetry (default `false`). |
+| `AIBOM_GALILEO_SAMPLE_RATE` | `--galileo-sample-rate` | Deterministic ordinary sanitized batch-agent-trace emission rate from `0.0` to `1.0` (default `1.0`; operational and quality exceptions are retained). |
 | `AIBOM_GALILEO_HMAC_KEY` | — | Dedicated secret for stable pseudonyms and deterministic sampling. |
 | `AIBOM_GALILEO_ALLOW_PUBLIC_CLOUD` | — | Explicitly approve sanitized or raw telemetry egress to the hosted `https://app.galileo.ai` console (default `false`). |
 | `AIBOM_GALILEO_SETUP_BUDGET_S` | — | Bounded Galileo logger/session setup budget in seconds (`>0` through `10`; hosted default `2`). |

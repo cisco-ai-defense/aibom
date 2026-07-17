@@ -46,6 +46,9 @@ class _RecordingLogger:
     def start_trace(self, **kwargs: Any) -> object:
         return self._record("start_trace", **kwargs)
 
+    def add_agent_span(self, **kwargs: Any) -> object:
+        return self._record("add_agent_span", **kwargs)
+
     def add_workflow_span(self, **kwargs: Any) -> object:
         return self._record("add_workflow_span", **kwargs)
 
@@ -235,6 +238,7 @@ def test_parallel_batches_use_independent_non_mixed_loggers(tmp_path: Path) -> N
     for logger in loggers:
         names = [name for name, _ in logger.calls]
         assert names.count("start_trace") == 1
+        assert names.count("add_agent_span") == 1
         assert names.count("add_workflow_span") == 1
         assert names.count("add_llm_span") == 1
         trace = next(values for name, values in logger.calls if name == "start_trace")
@@ -273,7 +277,7 @@ def test_circuit_breaker_trace_has_no_fake_llm_span(tmp_path: Path) -> None:
     assert telemetry.drain(1.0)
 
     names = [name for name, _ in loggers[0].calls]
-    assert names == ["start_trace", "conclude", "flush"]
+    assert names == ["start_trace", "add_agent_span", "conclude", "flush"]
     conclusion = next(values for name, values in loggers[0].calls if name == "conclude")
     output = json.loads(conclusion["output"])
     assert output["status"] == "circuit_breaker"
@@ -362,7 +366,7 @@ def test_structured_coercion_has_its_own_workflow_and_llm_span(
     ]
 
 
-def test_real_galileo_structured_coercion_workflows_are_trace_siblings(
+def test_real_galileo_structured_coercion_workflows_share_agent_parent(
     tmp_path: Path,
 ) -> None:
     galileo = pytest.importorskip("galileo", reason="optional observability extra")
@@ -433,13 +437,17 @@ def test_real_galileo_structured_coercion_workflows_are_trace_siblings(
     assert telemetry.drain(2.0)
     assert len(captured) == 1
     trace = captured[0].model_dump(mode="json", exclude_none=True)["traces"][0]
-    assert [span["name"] for span in trace["spans"]] == [
+    agent_span = trace["spans"][0]
+    assert agent_span["type"] == "agent"
+    assert agent_span["name"] == "aibom.agentic.classifier"
+    assert agent_span["agent_type"] == "classifier"
+    assert [span["name"] for span in agent_span["spans"]] == [
         "aibom.agentic.initial",
         "aibom.agentic.coercion",
     ]
     assert all(
         child["name"] == "aibom.agentic.llm"
-        for workflow in trace["spans"]
+        for workflow in agent_span["spans"]
         for child in workflow["spans"]
     )
 
@@ -618,10 +626,12 @@ def test_real_galileo_manual_logger_flushes_only_aibom_spans(
     assert "private-component" not in serialized_safe
     assert "private-deployment-name" not in serialized_safe
     assert safe_payload["traces"][0]["name"] == "aibom.agentic.batch"
+    safe_agent = safe_payload["traces"][0]["spans"][0]
+    assert safe_agent["type"] == "agent"
+    assert safe_agent["name"] == "aibom.agentic.classifier"
+    assert safe_agent["agent_type"] == "classifier"
     span_names = [
-        span["name"]
-        for workflow in safe_payload["traces"][0]["spans"]
-        for span in workflow["spans"]
+        span["name"] for workflow in safe_agent["spans"] for span in workflow["spans"]
     ]
     assert span_names == ["aibom.agentic.llm", "aibom.tool.search_codebase"]
 
@@ -789,8 +799,26 @@ def test_real_galileo_validator_rejects_mutated_dataset_identity_and_metadata() 
         assert not telemetry_module._logger_contains_only_sanitized_aibom_spans(logger)
         trace.user_metadata = dict(original_metadata)
 
-    workflow = trace.spans[0]
+    agent_span = trace.spans[0]
+    original_agent_type = agent_span.agent_type
+    agent_span.agent_type = "planner"
+    assert not telemetry_module._logger_contains_only_sanitized_aibom_spans(logger)
+    agent_span.agent_type = original_agent_type
+
+    original_agent_input = agent_span.input
+    original_agent_redacted_input = agent_span.redacted_input
+    agent_span.input = "RAW_CUSTOMER_SECRET"
+    agent_span.redacted_input = "RAW_CUSTOMER_SECRET"
+    assert not telemetry_module._logger_contains_only_sanitized_aibom_spans(logger)
+    agent_span.input = original_agent_input
+    agent_span.redacted_input = original_agent_redacted_input
+
+    workflow = agent_span.spans[0]
     llm_span, tool_span = workflow.spans
+
+    agent_span.spans.append(tool_span)
+    assert not telemetry_module._logger_contains_only_sanitized_aibom_spans(logger)
+    agent_span.spans.pop()
 
     original_tokens = llm_span.metrics.num_input_tokens
     llm_span.metrics.num_input_tokens = "RAW_CUSTOMER_SECRET"

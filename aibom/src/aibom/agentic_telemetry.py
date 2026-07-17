@@ -249,6 +249,7 @@ _MAX_BUFFERED_LLM_SPANS = 16
 _MAX_BUFFERED_TOOL_SPANS = 32
 
 _TRACE_NAMES = frozenset({"aibom.agentic.batch", "aibom.agentic.source_summary"})
+_AGENT_NAMES = frozenset({"aibom.agentic.classifier"})
 _WORKFLOW_NAMES = frozenset(f"aibom.agentic.{kind}" for kind in _ATTEMPT_KINDS)
 _LLM_NAMES = frozenset({"aibom.agentic.llm"})
 _TOOL_SPAN_NAMES = frozenset(
@@ -256,6 +257,7 @@ _TOOL_SPAN_NAMES = frozenset(
 )
 _ALLOWED_SPAN_NAMES = {
     "trace": _TRACE_NAMES,
+    "agent": _AGENT_NAMES,
     "workflow": _WORKFLOW_NAMES,
     "llm": _LLM_NAMES,
     "tool": _TOOL_SPAN_NAMES,
@@ -425,7 +427,9 @@ def _valid_input_payload(kind: str, name: str, value: Any) -> bool:
     payload = _json_object(value)
     if payload is None:
         return False
-    if kind == "trace" and name == "aibom.agentic.batch":
+    if (kind == "trace" and name == "aibom.agentic.batch") or (
+        kind == "agent" and name == "aibom.agentic.classifier"
+    ):
         return (
             set(payload)
             == {
@@ -524,7 +528,9 @@ def _valid_output_payload(kind: str, name: str, value: Any) -> bool:
     payload = _json_object(value)
     if payload is None:
         return False
-    if kind == "trace" and name == "aibom.agentic.batch":
+    if (kind == "trace" and name == "aibom.agentic.batch") or (
+        kind == "agent" and name == "aibom.agentic.classifier"
+    ):
         return (
             set(payload)
             == {
@@ -658,6 +664,7 @@ def _valid_metadata(kind: str, metadata: Any) -> bool:
             "status",
             "tier",
         },
+        "agent": set(),
         "workflow": {"attempt_number", "kind"},
         "llm": {
             "call_id",
@@ -805,6 +812,7 @@ _SDK_COMMON_NODE_FIELDS = {
 }
 _SDK_NODE_FIELDS = {
     "trace": _SDK_COMMON_NODE_FIELDS | {"spans"},
+    "agent": _SDK_COMMON_NODE_FIELDS | {"spans", "agent_type"},
     "workflow": _SDK_COMMON_NODE_FIELDS | {"spans"},
     "tool": _SDK_COMMON_NODE_FIELDS | {"spans", "tool_call_id"},
     "llm": _SDK_COMMON_NODE_FIELDS
@@ -974,6 +982,12 @@ def _valid_sdk_envelope(node: Any, kind: str) -> bool:
         tool_call_id = getattr(node, "tool_call_id", None)
         if tool_call_id is not None and not _is_token(tool_call_id, "call"):
             return False
+    if kind == "agent":
+        agent_type = getattr(node, "agent_type", None)
+        if isinstance(agent_type, Enum):
+            agent_type = agent_type.value
+        if agent_type != "classifier":
+            return False
     return True
 
 
@@ -1031,8 +1045,12 @@ def _validate_sdk_node(node: Any, *, root: bool = False) -> bool:
         return False
     child_kinds = {_node_kind(child) for child in children}
     if kind == "trace":
-        if name == "aibom.agentic.source_summary" and children:
+        if name == "aibom.agentic.source_summary":
+            if children:
+                return False
+        elif len(children) != 1 or child_kinds != {"agent"}:
             return False
+    elif kind == "agent":
         if not child_kinds.issubset({"workflow"}):
             return False
     elif kind == "workflow":
@@ -1084,6 +1102,12 @@ def _validate_fake_creation(kind: str, values: Mapping[str, Any]) -> bool:
         or not _valid_tags(values.get("tags"))
     ):
         return False
+    if kind == "agent":
+        agent_type = values.get("agent_type")
+        if isinstance(agent_type, Enum):
+            agent_type = agent_type.value
+        if agent_type != "classifier":
+            return False
     if kind in {"llm", "tool"}:
         raw_output = values.get("output")
         return (
@@ -1102,11 +1126,13 @@ def _validate_fake_logger(logger: Any) -> bool:
         return False
     creation_events = {
         "start_trace": "trace",
+        "add_agent_span": "agent",
         "add_workflow_span": "workflow",
         "add_llm_span": "llm",
         "add_tool_span": "tool",
     }
-    trace_count = 0
+    trace_names: list[str] = []
+    agent_count = 0
     for item in calls:
         if (
             not isinstance(item, tuple)
@@ -1119,7 +1145,9 @@ def _validate_fake_logger(logger: Any) -> bool:
         if event in creation_events:
             kind = creation_events[event]
             if kind == "trace":
-                trace_count += 1
+                trace_names.append(str(values.get("name", "")))
+            elif kind == "agent":
+                agent_count += 1
             if not _validate_fake_creation(kind, values):
                 return False
         elif event == "conclude":
@@ -1139,7 +1167,9 @@ def _validate_fake_logger(logger: Any) -> bool:
             event.startswith("add_") and event.endswith("_span")
         ) or event == "start_trace":
             return False
-    return trace_count == 1
+    return len(trace_names) == 1 and agent_count == (
+        1 if trace_names[0] == "aibom.agentic.batch" else 0
+    )
 
 
 def _logger_contains_only_sanitized_aibom_spans(logger: Any) -> bool:
@@ -2080,11 +2110,21 @@ class AgenticTelemetry:
                 tags=["aibom", "agentic", "sanitized"],
                 external_id=batch_token,
             )
+            if trace is None:
+                _discard_logger(logger)
+                return None
+            agent = logger.add_agent_span(
+                input=encoded,
+                redacted_input=encoded,
+                name="aibom.agentic.classifier",
+                tags=["aibom", "agentic", "sanitized"],
+                agent_type="classifier",
+            )
         except Exception:
             _LOGGER.debug("Unable to start Galileo batch trace")
             _discard_logger(logger)
             return None
-        if trace is None:
+        if agent is None:
             _discard_logger(logger)
             return None
         return logger

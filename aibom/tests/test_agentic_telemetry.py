@@ -58,6 +58,9 @@ class FakeLogger:
     def start_trace(self, **kwargs: Any) -> object:
         return self._record("start_trace", **kwargs)
 
+    def add_agent_span(self, **kwargs: Any) -> object:
+        return self._record("add_agent_span", **kwargs)
+
     def add_workflow_span(self, **kwargs: Any) -> object:
         return self._record("add_workflow_span", **kwargs)
 
@@ -740,6 +743,7 @@ def test_batch_attempt_emits_only_aggregate_manual_spans() -> None:
     names = [name for name, _ in logger.calls]
     assert names == [
         "start_trace",
+        "add_agent_span",
         "add_workflow_span",
         "add_llm_span",
         "add_tool_span",
@@ -787,6 +791,7 @@ def test_batch_attempt_emits_only_aggregate_manual_spans() -> None:
     for name, kwargs in logger.calls:
         if name in {
             "start_trace",
+            "add_agent_span",
             "add_workflow_span",
             "add_llm_span",
             "add_tool_span",
@@ -819,6 +824,42 @@ def test_zero_sample_rate_and_logger_failures_are_noops() -> None:
     )
     assert not broken.start_batch(batch_id="safe").active
     broken.record_summary(source_id="safe")
+
+    class BrokenAgentLogger(FakeLogger):
+        def add_agent_span(self, **kwargs: Any) -> object:
+            raise RuntimeError("agent span unavailable")
+
+    broken_agent_logger = BrokenAgentLogger()
+    broken_agent = create_agentic_telemetry(
+        _config(), logger_factory=lambda _project, _stream: broken_agent_logger
+    )
+    assert not broken_agent.start_batch(batch_id="safe-agent").active
+    assert all(name != "flush" for name, _ in broken_agent_logger.calls)
+
+
+def test_fake_validator_requires_exactly_one_classifier_agent_for_batch() -> None:
+    logger = FakeLogger()
+    client = create_agentic_telemetry(
+        _config(), logger_factory=lambda _project, _stream: logger, hmac_key="key"
+    )
+    client.start_batch(batch_id="private-batch").finish(status="success")
+    assert client.drain(1.0)
+    assert telemetry_module._validate_fake_logger(logger)
+
+    original_calls = list(logger.calls)
+    agent_event = next(item for item in original_calls if item[0] == "add_agent_span")
+    logger.calls.append(agent_event)
+    assert not telemetry_module._validate_fake_logger(logger)
+
+    logger.calls = [item for item in original_calls if item[0] != "add_agent_span"]
+    assert not telemetry_module._validate_fake_logger(logger)
+
+    logger.calls = list(original_calls)
+    agent_values = next(
+        values for event, values in logger.calls if event == "add_agent_span"
+    )
+    agent_values["agent_type"] = "router"
+    assert not telemetry_module._validate_fake_logger(logger)
 
 
 def test_extreme_numeric_telemetry_values_are_clamped_and_fail_open() -> None:
@@ -1099,6 +1140,7 @@ def test_unsampled_terminal_batch_is_retained_without_raw_or_llm_data() -> None:
     names = [name for name, _ in loggers[0].calls]
     assert names == [
         "start_trace",
+        "add_agent_span",
         "add_workflow_span",
         "conclude",
         "conclude",
@@ -1141,6 +1183,7 @@ def test_unsampled_quality_and_guard_signals_are_force_retained(
     assert client.drain(1.0)
     assert [name for name, _ in logger.calls] == [
         "start_trace",
+        "add_agent_span",
         "conclude",
         "flush",
     ]
@@ -1186,6 +1229,7 @@ def test_unsampled_attempt_buffers_only_sanitized_aggregates_and_replays_sibling
     assert client.drain(1.0)
     assert [name for name, _ in logger.calls] == [
         "start_trace",
+        "add_agent_span",
         "add_workflow_span",
         "add_llm_span",
         "conclude",

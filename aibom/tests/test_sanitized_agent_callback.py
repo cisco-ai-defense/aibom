@@ -52,6 +52,9 @@ class _RecordingLogger:
     def start_trace(self, **kwargs: Any) -> object:
         return self._record("start_trace", **kwargs)
 
+    def add_agent_span(self, **kwargs: Any) -> object:
+        return self._record("add_agent_span", **kwargs)
+
     def add_workflow_span(self, **kwargs: Any) -> object:
         return self._record("add_workflow_span", **kwargs)
 
@@ -587,6 +590,7 @@ def test_unsampled_deferred_trace_replays_detailed_children_in_trajectory_order(
     assert client.drain(1.0)
     assert [event for event, _ in logger.calls] == [
         "start_trace",
+        "add_agent_span",
         "add_workflow_span",
         "add_llm_span",
         "add_tool_span",
@@ -690,7 +694,13 @@ def test_detailed_hierarchy_passes_real_galileo_ingestion_validation() -> None:
     root = request["traces"][0]
     assert root["name"] == "aibom.agentic.batch"
     assert len(root["spans"]) == 1
-    workflow = root["spans"][0]
+    agent_span = root["spans"][0]
+    assert agent_span["type"] == "agent"
+    assert agent_span["name"] == "aibom.agentic.classifier"
+    assert agent_span["agent_type"] == "classifier"
+    assert agent_span["input"] == agent_span["redacted_input"] == root["input"]
+    assert agent_span["output"] == agent_span["redacted_output"] == root["output"]
+    workflow = agent_span["spans"][0]
     assert workflow["name"] == "aibom.agentic.initial"
     assert [span["name"] for span in workflow["spans"]] == [
         "aibom.agentic.llm",

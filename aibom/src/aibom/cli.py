@@ -1572,8 +1572,9 @@ def analyze(
         "--galileo/--no-galileo",
         envvar="AIBOM_GALILEO_ENABLED",
         help=(
-            "Emit privacy-preserving agentic quality telemetry to Galileo. "
-            "Disabled by default; requires the 'observability' extra and "
+            "Emit privacy-preserving agentic quality telemetry to Galileo using "
+            "a sanitized Agent-span hierarchy. Disabled by default; requires "
+            "the 'observability' extra and "
             "GALILEO_API_KEY, GALILEO_CONSOLE_URL=https://app.galileo.ai, "
             "GALILEO_PROJECT, GALILEO_LOG_STREAM, and "
             "AIBOM_GALILEO_ALLOW_PUBLIC_CLOUD=true."
@@ -1587,7 +1588,7 @@ def analyze(
         max=1.0,
         help=(
             "Deterministic AIBOM-side sampling rate for sanitized Galileo "
-            "batch traces (0.0-1.0, default 1.0 when enabled)."
+            "batch agent traces (0.0-1.0, default 1.0 when enabled)."
         ),
     ),
     galileo_full_trajectory: bool = typer.Option(
