@@ -262,6 +262,8 @@ class TestAgenticEnrichmentViaCLI:
         assert "--galileo-full-trajectory requires --galileo" in result.output
 
     def test_galileo_sample_rate_is_bounded(self, sample_dir):
+        import re
+
         result = runner.invoke(
             app,
             [
@@ -274,8 +276,9 @@ class TestAgenticEnrichmentViaCLI:
             ],
         )
 
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         assert result.exit_code != 0
-        assert "galileo-sample-rate" in result.output
+        assert "galileo-sample-rate" in clean
 
     @patch("aibom.scan_pipeline.ensure_llm_runtime_available", return_value=None)
     @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)
