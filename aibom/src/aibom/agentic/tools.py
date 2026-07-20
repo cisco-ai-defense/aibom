@@ -541,12 +541,11 @@ def search_codebase_impl(
                 text = fp.read_text(errors="replace")
             except (OSError, UnicodeDecodeError):
                 continue
+            file_lines = text.split("\n")
             for m in regex.finditer(text):
                 line_no = text[: m.start()].count("\n") + 1
                 line_text = (
-                    text.splitlines()[line_no - 1]
-                    if line_no <= len(text.splitlines())
-                    else ""
+                    file_lines[line_no - 1] if line_no <= len(file_lines) else ""
                 )
                 matches.append(
                     {

@@ -3912,12 +3912,11 @@ def _with_scoped_tool_roots(fn: Any) -> Any:
             set_strict_tool_root_enforcement,
         )
 
-        scan_paths = kwargs.get("scan_paths")
-        if scan_paths is None and len(args) >= 4:
-            scan_paths = args[3]
-        callback_factory = kwargs.get("invoke_callback_factory")
-        if callback_factory is None and len(args) >= 17:
-            callback_factory = args[16]
+        import inspect
+
+        bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+        scan_paths = bound.arguments.get("scan_paths")
+        callback_factory = bound.arguments.get("invoke_callback_factory")
         roots = [str(Path(path).resolve()) for path in (scan_paths or [])]
         roots_token = set_allowed_search_roots(roots)
         strict_token = set_strict_tool_root_enforcement(

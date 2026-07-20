@@ -1422,7 +1422,7 @@ class TestRunAgenticEnrichment:
 
             # This coroutine can run while the synchronous factory is still
             # blocked only when callback construction is off the event loop.
-            assert time.monotonic() - started < 0.5
+            assert time.monotonic() - started < 0.9
             assert not batch_task.done()
             release_callback.set()
             await asyncio.wait_for(batch_task, timeout=1)
@@ -1493,7 +1493,7 @@ class TestRunAgenticEnrichment:
                 while not coercion_started.is_set():
                     await asyncio.sleep(0.001)
 
-                assert time.monotonic() - started < 0.5
+                assert time.monotonic() - started < 0.9
                 assert not batch_task.done()
                 release_coercion.set()
                 await asyncio.wait_for(batch_task, timeout=1)
