@@ -25,11 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import hashlib
 import json
 import logging
 import math
 import os
+import secrets
 import threading
 import time
 from collections import Counter
@@ -834,37 +834,30 @@ def _batch_corr_metadata(corr_id: str | None, phase: str) -> dict[str, str] | No
 
 
 def _batch_corr_id(
-    batch: list[AIComponent],
     attempt_kind: str,
     attempt_number: int,
     *,
     correlate: bool,
 ) -> str | None:
-    """Deterministic per-batch correlation id shared by Phase 1 and Phase 2.
+    """Create an invocation-scoped id shared by Phase 1 and Phase 2.
 
     Returns ``None`` when no trace consumer is active (``correlate`` is False),
     so no correlation metadata is attached and behavior is unchanged.
 
-    The id is derived from the batch's component ``instance_id`` set (each is a
-    unique ``name_filepath_line`` string) plus the attempt, so it is:
-
-    * **collision-free across tiers** — two batches with the same ordinal (e.g.
-      tier-1 ``b1`` and tier-2 ``b1``) hold different components and get
-      different ids. This matters because the full-trajectory path runs without
-      a sanitized ``telemetry_context``, so ordinal/tier labels are unavailable
-      anyway;
-    * **shared by Phase 1 and Phase 2** of one attempt — both see the same batch;
-    * **distinct per retry/fallback** — the attempt is folded in.
+    Component instance ids are only unique within one scanned source, while the
+    full-trajectory callback session is shared by every source in a CLI run.
+    Deriving this value from the component ids would therefore let independent
+    batches collide. A fresh 128-bit token scopes the pair to this exact live
+    invocation, including when another source, tier, retry, or fallback contains
+    the same component ids. The attempt suffix is retained for trace readability.
 
     ``correlate`` must be True whenever traces are being captured — the
-    full-trajectory callback factory (which drives the raw traces regardless of
-    whether the sanitized telemetry is enabled) or the sanitized telemetry.
+    full-trajectory callback factory drives the raw traces regardless of whether
+    sanitized telemetry is enabled.
     """
     if not correlate:
         return None
-    fingerprint = "\0".join(sorted(c.instance_id for c in batch))
-    digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:12]
-    return f"{digest}:{attempt_kind}{attempt_number}"
+    return f"{secrets.token_hex(16)}:{attempt_kind}{attempt_number}"
 
 
 def _callbacks_for_invoke(
@@ -2737,7 +2730,6 @@ def _run_batch(
     t0 = time.monotonic()
 
     corr_id = _batch_corr_id(
-        batch,
         attempt_kind,
         attempt_number,
         correlate=invoke_callback_factory is not None,
@@ -3005,7 +2997,6 @@ async def _run_batch_async(
     t0 = time.monotonic()
 
     corr_id = _batch_corr_id(
-        batch,
         attempt_kind,
         attempt_number,
         correlate=invoke_callback_factory is not None,

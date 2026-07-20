@@ -33,6 +33,8 @@ from aibom.agentic.agent import (
     AgentEvidence,
     AgentResponse,
     TokenUsage,
+    _batch_corr_id,
+    _batch_corr_metadata,
     _batch_decision_breakdowns,
     _batch_decision_counts,
     _build_context_message,
@@ -77,6 +79,30 @@ def _isolate_agentic_cache():
     """Prevent on-disk agentic cache from leaking between tests."""
     with patch("aibom.agentic.agent._default_agentic_cache_dir", return_value=None):
         yield
+
+
+def test_batch_correlation_is_invocation_scoped_and_phase_pairable():
+    with patch(
+        "aibom.agentic.agent.secrets.token_hex",
+        side_effect=["a" * 32, "b" * 32],
+    ) as token_hex:
+        first = _batch_corr_id("initial", 1, correlate=True)
+        second = _batch_corr_id("initial", 1, correlate=True)
+        disabled = _batch_corr_id("initial", 1, correlate=False)
+
+    assert first == f"{'a' * 32}:initial1"
+    assert second == f"{'b' * 32}:initial1"
+    assert first != second
+    assert disabled is None
+    assert token_hex.call_count == 2
+    assert _batch_corr_metadata(first, "agent") == {
+        "aibom_batch_corr_id": first,
+        "aibom_phase": "agent",
+    }
+    assert _batch_corr_metadata(first, "coercion") == {
+        "aibom_batch_corr_id": first,
+        "aibom_phase": "coercion",
+    }
 
 
 def test_middleware_guard_emits_a_sibling_validation_workflow():
