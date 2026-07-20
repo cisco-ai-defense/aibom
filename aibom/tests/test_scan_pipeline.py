@@ -317,6 +317,49 @@ class TestAgenticScope:
         assert summary["decisions"]["discovered"] == 0
         assert summary["status"] == "degraded"
 
+    def test_galileo_agentic_failure_is_degraded_in_pipeline_evaluation(
+        self, tmp_path: Path
+    ) -> None:
+        from aibom.galileo_evaluation import adapt_pipeline_result_for_galileo
+
+        model = AIComponent(
+            name="gpt-4o",
+            model_name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="app.py",
+            line_number=1,
+        )
+        telemetry = MagicMock()
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+            agentic_telemetry=telemetry,
+        )
+
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([model], [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=([model], CrossRefIndex(), CrossRefIndex(), []),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                side_effect=RuntimeError("provider unavailable"),
+            ),
+        ):
+            result = pipeline.run()
+
+        summary = telemetry.record_summary.call_args.kwargs
+        assert summary["degraded_candidate_count"] == 1
+        assert summary["status"] == "degraded"
+        assert result.agentic_degraded_count == 1
+        assert adapt_pipeline_result_for_galileo(result)["execution_outcome"] == {
+            "degraded_candidate_count": 1,
+            "status": "degraded",
+        }
+
     def test_source_summary_reflects_post_guard_dependency_reinstatement(
         self, tmp_path: Path
     ) -> None:

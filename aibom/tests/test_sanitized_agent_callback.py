@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
@@ -127,6 +129,7 @@ def _record_llm_tool_llm(
         {"name": "search_codebase", "description": content},
         content,
         run_id=UUID(tool_id),
+        tool_call_id=content,
         inputs={"absolute_path": content},
     )
     collector.on_tool_end(
@@ -255,6 +258,33 @@ def test_callback_does_not_duplicate_response_level_usage_across_choices() -> No
     ) == (10, 4, 14)
 
 
+def test_callback_preserves_openai_response_usage_and_cached_tokens() -> None:
+    collector = SanitizedAgentCallback()
+    run_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    response = SimpleNamespace(
+        generations=[],
+        llm_output={
+            "token_usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+                "prompt_tokens_details": {"cached_tokens": 3},
+            }
+        },
+    )
+
+    collector.on_chat_model_start({}, [[]], run_id=run_id)
+    collector.on_llm_end(response, run_id=run_id)
+
+    call = collector.seal()[0]
+    assert (
+        call.prompt_tokens,
+        call.completion_tokens,
+        call.total_tokens,
+        call.cached_tokens,
+    ) == (10, 4, 14, 3)
+
+
 def test_callback_sums_equal_choice_usage_without_response_level_carrier() -> None:
     collector = SanitizedAgentCallback()
     run_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
@@ -311,6 +341,37 @@ def test_callback_preserves_allowlisted_deep_agent_tool_names(tool_name: str) ->
     collector.on_tool_end("private", run_id=run_id)
 
     assert collector.seal()[0].tool_name == tool_name
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadTimeout("provider timed out"),
+        asyncio.CancelledError(),
+    ],
+)
+def test_callback_classifies_provider_timeouts_and_cancellation_as_timeout(
+    error: BaseException,
+) -> None:
+    collector = SanitizedAgentCallback()
+    run_id = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+
+    collector.on_chat_model_start({}, [[]], run_id=run_id)
+    collector.on_llm_error(error, run_id=run_id)
+
+    assert collector.seal()[0].status == "timeout"
+
+
+def test_callback_classifies_wrapped_tool_timeout_as_timeout() -> None:
+    collector = SanitizedAgentCallback()
+    run_id = UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    wrapped = RuntimeError("provider wrapper")
+    wrapped.__cause__ = httpx.ConnectTimeout("provider timed out")
+
+    collector.on_tool_start({"name": "search_codebase"}, "private", run_id=run_id)
+    collector.on_tool_error(wrapped, run_id=run_id)
+
+    assert collector.seal()[0].status == "timeout"
 
 
 def test_timeout_seal_converts_unfinished_calls_and_ignores_late_callbacks(

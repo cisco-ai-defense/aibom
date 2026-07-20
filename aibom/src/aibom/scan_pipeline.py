@@ -1816,6 +1816,11 @@ class ScanPipeline:
             exact_candidates = self._agentic_input_count or len(components)
             if self._telemetry_enabled():
                 self._agentic_telemetry_degraded_count = exact_candidates
+                # Keep the PipelineResult consumed by Galileo evaluation in
+                # sync with the source summary. This assignment intentionally
+                # remains inside the Galileo-enabled path so observability does
+                # not change non-Galileo scan results.
+                self._agentic_degraded_count = exact_candidates
                 if not self._agentic_input_snapshot:
                     self._agentic_input_snapshot = [
                         component.model_copy(deep=True) for component in components

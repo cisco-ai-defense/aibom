@@ -63,28 +63,62 @@ def _usage_from_mapping(value: Any) -> tuple[int, int, int, int]:
     if not isinstance(value, Mapping):
         return 0, 0, 0, 0
 
-    prompt = _non_negative_int(value.get("input_tokens"))
-    completion = _non_negative_int(value.get("output_tokens"))
     total = _non_negative_int(value.get("total_tokens"))
-    cached = max(
-        _nested_int(value, "input_token_details", "cache_read"),
-        _non_negative_int(value.get("cache_read_input_tokens")),
-    )
-    if prompt or completion or total or cached:
+    if any(
+        key in value
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "input_token_details",
+            "cache_read_input_tokens",
+        )
+    ):
+        prompt = _non_negative_int(value.get("input_tokens"))
+        completion = _non_negative_int(value.get("output_tokens"))
+        cached = max(
+            _nested_int(value, "input_token_details", "cache_read"),
+            _non_negative_int(value.get("cache_read_input_tokens")),
+        )
         return prompt, completion, total or prompt + completion, cached
 
-    prompt = _non_negative_int(value.get("prompt_tokens"))
-    completion = _non_negative_int(value.get("completion_tokens"))
-    total = _non_negative_int(value.get("total_tokens"))
-    cached = _nested_int(value, "prompt_tokens_details", "cached_tokens")
-    if prompt or completion or total or cached:
+    if any(
+        key in value
+        for key in ("prompt_tokens", "completion_tokens", "prompt_tokens_details")
+    ):
+        prompt = _non_negative_int(value.get("prompt_tokens"))
+        completion = _non_negative_int(value.get("completion_tokens"))
+        cached = _nested_int(value, "prompt_tokens_details", "cached_tokens")
         return prompt, completion, total or prompt + completion, cached
 
-    prompt = _non_negative_int(value.get("inputTokenCount"))
-    completion = _non_negative_int(value.get("outputTokenCount"))
-    if prompt or completion:
+    if "inputTokenCount" in value or "outputTokenCount" in value:
+        prompt = _non_negative_int(value.get("inputTokenCount"))
+        completion = _non_negative_int(value.get("outputTokenCount"))
         return prompt, completion, prompt + completion, 0
+    if total:
+        return 0, 0, total, 0
     return 0, 0, 0, 0
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    """Recognize provider timeouts without importing optional provider SDKs."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            return True
+        class_names = {
+            cls.__name__.replace("_", "").casefold() for cls in type(current).__mro__
+        }
+        if any("timeout" in name for name in class_names) or class_names & {
+            "cancelederror",
+            "cancellederror",
+            "deadlineexceeded",
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _usage_from_message(message: Any) -> tuple[int, int, int, int]:
@@ -211,7 +245,6 @@ class SanitizedAgentCallback:
         run_id: Any,
         *,
         tool_name: str = "",
-        call_id: Any = None,
     ) -> None:
         identifier = str(run_id)
         if not identifier:
@@ -225,7 +258,7 @@ class SanitizedAgentCallback:
             self._next_sequence += 1
             self._active[identifier] = _ActiveCall(
                 kind=kind,
-                call_id=str(call_id) if call_id is not None else identifier,
+                call_id=identifier,
                 sequence=sequence,
                 created_at=now,
                 monotonic_started=monotonic_started,
@@ -295,7 +328,7 @@ class SanitizedAgentCallback:
     def on_llm_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
         del kwargs
         status: Literal["failed", "timeout"] = (
-            "timeout" if isinstance(error, TimeoutError) else "failed"
+            "timeout" if _is_timeout_error(error) else "failed"
         )
         self._finish(run_id, status=status)
 
@@ -307,14 +340,13 @@ class SanitizedAgentCallback:
         run_id: Any,
         **kwargs: Any,
     ) -> None:
-        del input_str
+        del input_str, kwargs
         raw_name = serialized.get("name") if isinstance(serialized, Mapping) else None
         name = str(raw_name) if str(raw_name) in _TOOL_NAMES else "other"
         self._start(
             "tool",
             run_id,
             tool_name=name,
-            call_id=kwargs.get("tool_call_id"),
         )
 
     def on_tool_end(self, output: Any, *, run_id: Any, **kwargs: Any) -> None:
@@ -326,7 +358,7 @@ class SanitizedAgentCallback:
     ) -> None:
         del kwargs
         status: Literal["failed", "timeout"] = (
-            "timeout" if isinstance(error, TimeoutError) else "failed"
+            "timeout" if _is_timeout_error(error) else "failed"
         )
         self._finish(run_id, status=status)
 
