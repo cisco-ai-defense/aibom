@@ -204,8 +204,9 @@ class TestAgenticEnrichmentViaCLI:
     def test_llm_reasoning_and_init_kwargs_help_listed(self):
         import re
 
-        result = runner.invoke(app, ["analyze", "--help"])
+        result = runner.invoke(app, ["analyze", "--help"], env={"COLUMNS": "200"})
         clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert result.exit_code == 0
         assert "--llm-reasoning" in clean
         assert "--llm-init-kwargs" in clean
 
@@ -213,12 +214,71 @@ class TestAgenticEnrichmentViaCLI:
         import re
 
         # Wide width so Rich doesn't truncate the long option names.
-        result = runner.invoke(
-            app, ["analyze", "--help"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["analyze", "--help"], env={"COLUMNS": "200"})
         clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         assert "--agentic-max-consecutive-failures" in clean
         assert "--agentic-max-retry-seconds" in clean
+
+    def test_galileo_options_are_documented_and_opt_in(self):
+        import re
+
+        result = runner.invoke(app, ["analyze", "--help"], env={"COLUMNS": "200"})
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+        assert result.exit_code == 0
+        assert "--galileo" in clean
+        assert "--no-galileo" in clean
+        assert "--galileo-sample-rate" in clean
+        assert "--galileo-full-trajectory" in clean
+        assert "--no-galileo-full-trajectory" in clean
+        assert "explicit opt-in" in clean
+        assert "Disabled by default" in clean
+
+    def test_galileo_full_trajectory_defaults_off(self):
+        from typer.main import get_command
+
+        analyze_command = get_command(app).commands["analyze"]
+        option = next(
+            parameter
+            for parameter in analyze_command.params
+            if parameter.name == "galileo_full_trajectory"
+        )
+
+        assert option.default is False
+
+    def test_galileo_full_trajectory_requires_galileo(self, sample_dir):
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--llm-model",
+                "test-model",
+                "--galileo-full-trajectory",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--galileo-full-trajectory requires --galileo" in result.output
+
+    def test_galileo_sample_rate_is_bounded(self, sample_dir):
+        import re
+
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(sample_dir),
+                "--llm-model",
+                "test-model",
+                "--galileo-sample-rate",
+                "1.01",
+            ],
+        )
+
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert result.exit_code != 0
+        assert "galileo-sample-rate" in clean
 
     @patch("aibom.scan_pipeline.ensure_llm_runtime_available", return_value=None)
     @patch("aibom.cli.ensure_llm_runtime_available", return_value=None)

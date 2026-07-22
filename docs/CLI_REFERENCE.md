@@ -75,6 +75,13 @@ cisco-aibom analyze [OPTIONS] [SOURCES]...
 | `--agentic-concurrency` | — | Max parallel agentic LLM batches (default `1`). |
 | `--agentic-fast-model` | — | Cheaper/faster model for simple confirmations (e.g. dependency checks). |
 | `--agentic-timeout` | — | Wall-clock timeout in seconds per agentic batch (default `120`). |
+| `--galileo` / `--no-galileo` | `AIBOM_GALILEO_ENABLED` | Emit sampled, privacy-preserving agentic quality telemetry using a sanitized Agent-span hierarchy (disabled by default). Requires the `observability` extra, Galileo credentials and destination variables, and explicit public-cloud approval. |
+| `--galileo-sample-rate` | `AIBOM_GALILEO_SAMPLE_RATE` | Deterministic sampling rate from `0.0` to `1.0` for sanitized Galileo batch agent traces (default `1.0` when enabled). |
+| `--galileo-full-trajectory` / `--no-galileo-full-trajectory` | — | **Diagnostic only.** Separately emits raw prompts, responses, tool I/O, and exact identities. Disabled by default and activated only with `--galileo` plus every full-content, exact-identity, and public-cloud approval gate. |
+
+See the [Galileo observability guide](../aibom/docs/galileo-observability.md)
+for required environment variables, privacy controls, deployment gates, and
+the distinction between sanitized telemetry and raw full-trajectory diagnostics.
 
 ### Analysis Options
 

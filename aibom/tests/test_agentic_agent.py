@@ -25,7 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -33,6 +33,10 @@ from aibom.agentic.agent import (
     AgentEvidence,
     AgentResponse,
     TokenUsage,
+    _batch_corr_id,
+    _batch_corr_metadata,
+    _batch_decision_breakdowns,
+    _batch_decision_counts,
     _build_context_message,
     _build_rate_limiter,
     _EnrichedComponent,
@@ -75,6 +79,239 @@ def _isolate_agentic_cache():
     """Prevent on-disk agentic cache from leaking between tests."""
     with patch("aibom.agentic.agent._default_agentic_cache_dir", return_value=None):
         yield
+
+
+def test_batch_correlation_is_invocation_scoped_and_phase_pairable():
+    with patch(
+        "aibom.agentic.agent.secrets.token_hex",
+        side_effect=["a" * 32, "b" * 32],
+    ) as token_hex:
+        first = _batch_corr_id("initial", 1, correlate=True)
+        second = _batch_corr_id("initial", 1, correlate=True)
+        disabled = _batch_corr_id("initial", 1, correlate=False)
+
+    assert first == f"{'a' * 32}:initial1"
+    assert second == f"{'b' * 32}:initial1"
+    assert first != second
+    assert disabled is None
+    assert token_hex.call_count == 2
+    assert _batch_corr_metadata(first, "agent") == {
+        "aibom_batch_corr_id": first,
+        "aibom_phase": "agent",
+    }
+    assert _batch_corr_metadata(first, "coercion") == {
+        "aibom_batch_corr_id": first,
+        "aibom_phase": "coercion",
+    }
+
+
+def test_middleware_guard_emits_a_sibling_validation_workflow():
+    from aibom.agentic.agent import _finish_batch_trace
+
+    component = AIComponent(
+        name="router",
+        component_type=AIComponentType.AGENT,
+        file_path="src/router.py",
+        line_number=4,
+    )
+    trace = MagicMock()
+    attempt = MagicMock()
+    middleware_attempt = MagicMock()
+    trace.start_attempt.return_value = middleware_attempt
+
+    output = _finish_batch_trace(
+        trace,
+        attempt,
+        context=None,
+        batch=[component],
+        output=([component], [], [], [], False),
+        result=None,
+        duration_s=0.1,
+        tool_stats={},
+        raw_data={"remove_components": [{"instance_id": component.instance_id}]},
+    )
+
+    assert output[0] == [component]
+    trace.start_attempt.assert_called_once_with(
+        kind="middleware_validation", attempt_number=1
+    )
+    middleware_attempt.finish.assert_called_once_with(
+        status="degraded",
+        duration_s=0.0,
+        recovered=True,
+        raw_decisions={
+            "enriched": 0,
+            "removed": 1,
+            "reclassified": 0,
+            "discovered": 0,
+            "relationships": 0,
+            "risk_findings": 0,
+        },
+        final_decisions={
+            "kept": 1,
+            "enriched": 0,
+            "removed": 0,
+            "reclassified": 0,
+            "discovered": 0,
+            "relationships": 0,
+            "risk_findings": 0,
+            "degraded": 0,
+        },
+        blocked_decisions={
+            "enriched": 0,
+            "removed": 1,
+            "reclassified": 0,
+            "discovered": 0,
+            "relationships": 0,
+            "risk_findings": 0,
+        },
+    )
+    assert trace.finish.call_args.kwargs["middleware_guard_triggered"] is True
+    assert trace.finish.call_args.kwargs["decisions_by_component_type"]["kept"] == {
+        "agent": 1
+    }
+    assert trace.finish.call_args.kwargs["decisions_by_language"]["kept"] == {
+        "python": 1
+    }
+
+
+@pytest.mark.parametrize(
+    "failure_hint",
+    [
+        "batch_timeout",
+        "batch_recursion_limit",
+        "provider_outage",
+        "rate_limited",
+    ],
+)
+def test_failed_batch_without_structured_output_is_schema_invalid(failure_hint):
+    from aibom.agentic.agent import _finish_batch_trace
+
+    component = AIComponent(
+        name="router",
+        component_type=AIComponentType.AGENT,
+        file_path="src/router.py",
+        line_number=4,
+        agentic_hint=failure_hint,
+    )
+    trace = MagicMock()
+    attempt = MagicMock()
+
+    _finish_batch_trace(
+        trace,
+        attempt,
+        context=None,
+        batch=[component],
+        output=([component], [], [], [], True),
+        result=None,
+        duration_s=0.1,
+        tool_stats={},
+    )
+
+    assert attempt.record_llm.call_args.kwargs["schema_valid"] is False
+    assert trace.finish.call_args.kwargs["schema_valid"] is False
+
+
+def test_coercion_workflow_is_finalized_at_the_post_middleware_boundary():
+    from aibom.agentic.agent import _finish_batch_trace
+
+    component = AIComponent(
+        name="router",
+        component_type=AIComponentType.AGENT,
+        file_path="src/router.py",
+        line_number=4,
+    )
+    trace = MagicMock()
+    initial_attempt = MagicMock()
+    coercion_attempt = MagicMock()
+    coercion_attempt.active = True
+
+    _finish_batch_trace(
+        trace,
+        initial_attempt,
+        context=None,
+        batch=[component],
+        output=([component], [], [], [], False),
+        result=None,
+        duration_s=0.1,
+        tool_stats={},
+        raw_data={"remove_components": [{"instance_id": component.instance_id}]},
+        attempt_already_finished=True,
+        coercion_attempt=coercion_attempt,
+        coercion_duration_s=0.04,
+    )
+
+    initial_attempt.finish.assert_not_called()
+    coercion_attempt.finish.assert_called_once()
+    concluded = coercion_attempt.finish.call_args.kwargs
+    assert concluded["status"] == "degraded"
+    assert concluded["duration_s"] == 0.04
+    assert concluded["recovered"] is True
+    assert concluded["raw_decisions"]["removed"] == 1
+    assert concluded["final_decisions"]["removed"] == 0
+    assert concluded["final_decisions"]["kept"] == 1
+    assert concluded["blocked_decisions"]["removed"] == 1
+
+
+def test_batch_decision_breakdowns_attribute_original_and_discovered_slices():
+    router = AIComponent(
+        name="router",
+        component_type=AIComponentType.TOOL,
+        file_path="src/router.py",
+        line_number=4,
+    )
+    removed_model = AIComponent(
+        name="old-model",
+        component_type=AIComponentType.MODEL,
+        file_path="src/client.js",
+        line_number=2,
+    )
+    reclassified_router = router.model_copy(
+        update={"component_type": AIComponentType.AGENT}
+    )
+    discovered_model = AIComponent(
+        name="new-model",
+        component_type=AIComponentType.MODEL,
+        file_path="src/new.ts",
+        line_number=8,
+    )
+
+    by_type, by_language, by_confidence = _batch_decision_breakdowns(
+        [router, removed_model],
+        [reclassified_router],
+        [discovered_model],
+    )
+
+    assert by_type["reclassified"] == {"tool": 1}
+    assert by_type["removed"] == {"model": 1}
+    assert by_type["discovered"] == {"model": 1}
+    assert by_language["reclassified"] == {"python": 1}
+    assert by_language["removed"] == {"javascript": 1}
+    assert by_language["discovered"] == {"typescript": 1}
+    assert by_confidence["reclassified"] == {"high": 1}
+    assert by_confidence["removed"] == {"high": 1}
+    assert by_confidence["discovered"] == {"high": 1}
+
+
+def test_degraded_passthrough_is_an_abstention_not_a_keep() -> None:
+    component = AIComponent(
+        name="router",
+        component_type=AIComponentType.AGENT,
+        file_path="src/router.py",
+        line_number=4,
+    )
+    degraded = component.model_copy(update={"agentic_hint": "batch_timeout"})
+
+    decisions = _batch_decision_counts([component], [degraded], [], [], [])
+    by_type, by_language, by_confidence = _batch_decision_breakdowns(
+        [component], [degraded], []
+    )
+
+    assert decisions["kept"] == 0
+    assert decisions["degraded"] == 1
+    assert all(not counts for counts in by_type.values())
+    assert all(not counts for counts in by_language.values())
+    assert all(not counts for counts in by_confidence.values())
 
 
 class TestBuildContextMessage:
@@ -458,6 +695,46 @@ class TestStrategyFallback:
     output strategy is recovered by re-running via the alternate (fallback)
     agent; a clean batch never triggers the fallback."""
 
+    def test_fallback_callsite_preserves_attempt_kind_and_context(self):
+        from aibom.agentic.agent import _strategy_fallback_pass
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        degraded = AIComponent(
+            name="test-model",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+            needs_agentic=False,
+            agentic_hint="no_usable_output",
+        )
+        recovered = degraded.model_copy(
+            update={"needs_agentic": False, "agentic_hint": ""}
+        )
+        telemetry_context = MagicMock()
+
+        with patch(
+            "aibom.agentic.agent._run_batch",
+            return_value=([recovered], [], [], [], False),
+        ) as run_batch:
+            _strategy_fallback_pass(
+                MagicMock(),
+                AIBOMScannerMiddleware(allowed_roots=["/tmp"]),
+                [degraded],
+                [],
+                ["/tmp"],
+                None,
+                batch_size=5,
+                timeout_s=30,
+                max_consecutive_failures=3,
+                telemetry_context=telemetry_context,
+            )
+
+        call = run_batch.call_args
+        assert call.kwargs["attempt_kind"] == "fallback"
+        assert call.kwargs["attempt_number"] == 3
+        assert call.kwargs["telemetry_context"] is telemetry_context
+
     def test_fallback_recovers_no_usable_output(self):
         from aibom.agentic.agent import _strategy_fallback_pass
         from aibom.agentic.middleware import AIBOMScannerMiddleware
@@ -596,6 +873,70 @@ class TestLazyImport:
 class TestRunAgenticEnrichment:
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    def test_disabled_telemetry_skips_version_work(
+        self, _mock_build, _mock_close, tmp_path
+    ):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        telemetry = MagicMock(enabled=False)
+        with patch("aibom.agentic.agent._agentic_telemetry_version") as version:
+            run_agentic_enrichment(
+                "test-model",
+                [],
+                [],
+                [str(tmp_path)],
+                cache_dir=tmp_path / "cache",
+                telemetry=telemetry,
+            )
+
+        version.assert_not_called()
+
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
+    def test_all_tool_root_guards_activate_only_for_raw_callback_factory(
+        self, _mock_build, _mock_close, tmp_path
+    ):
+        from aibom.agentic.agent import run_agentic_enrichment
+
+        def unmarked_factory():
+            return None
+
+        def raw_factory():
+            return None
+
+        setattr(raw_factory, "_aibom_strict_tool_roots", True)
+        with (
+            patch("aibom.agentic.tools.set_strict_tool_root_enforcement") as set_strict,
+            patch("aibom.agentic.tools.reset_strict_tool_root_enforcement"),
+        ):
+            run_agentic_enrichment(
+                "test-model", [], [], [str(tmp_path)], cache_dir=tmp_path / "cache"
+            )
+            run_agentic_enrichment(
+                "test-model",
+                [],
+                [],
+                [str(tmp_path)],
+                cache_dir=tmp_path / "cache",
+                invoke_callback_factory=unmarked_factory,
+            )
+            run_agentic_enrichment(
+                "test-model",
+                [],
+                [],
+                [str(tmp_path)],
+                cache_dir=tmp_path / "cache",
+                invoke_callback_factory=raw_factory,
+            )
+
+        assert [call.args[0] for call in set_strict.call_args_list] == [
+            False,
+            False,
+            True,
+        ]
+
+    @patch("aibom.agentic.agent._close_model_clients")
+    @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
     @patch("aibom.agentic.agent._AgenticResultCache")
     def test_explicit_cache_dir_overrides_default_agentic_cache(
         self,
@@ -619,7 +960,10 @@ class TestRunAgenticEnrichment:
                 cache_dir=cache_dir,
             )
 
-        mock_cache_cls.assert_called_once_with(cache_dir, fallback_dirs=[])
+        mock_cache_cls.assert_called_once_with(
+            cache_dir,
+            fallback_dirs=[],
+        )
         assert comps == []
         assert rels == []
         assert flags == []
@@ -715,6 +1059,8 @@ class TestRunAgenticEnrichment:
                 line_number=1,
             )
         ]
+        scan_root = tmp_path / "repo"
+        scan_root.mkdir()
 
         with patch(
             "aibom.agentic.agent._default_agentic_cache_dir",
@@ -724,13 +1070,13 @@ class TestRunAgenticEnrichment:
                 model_string="test-model",
                 deterministic_components=det_comps,
                 deterministic_relationships=[],
-                scan_paths=["/tmp"],
+                scan_paths=[str(scan_root)],
             )
             cached, _, _, _ = run_agentic_enrichment(
                 model_string="test-model",
                 deterministic_components=det_comps,
                 deterministic_relationships=[],
-                scan_paths=["/tmp"],
+                scan_paths=[str(scan_root)],
             )
 
         assert {c.name for c in fresh} == {"existing", "agent-found-model"}
@@ -815,20 +1161,22 @@ class TestRunAgenticEnrichment:
                 line_number=1,
             )
         ]
+        scan_root = tmp_path / "repo"
+        scan_root.mkdir()
         cache_dir = tmp_path / "agentic-cache"
 
         fresh_components, fresh_rels, fresh_flags, _ = run_agentic_enrichment(
             model_string="test-model",
             deterministic_components=det_comps_first,
             deterministic_relationships=[],
-            scan_paths=["/tmp"],
+            scan_paths=[str(scan_root)],
             cache_dir=cache_dir,
         )
         cached_components, cached_rels, cached_flags, _ = run_agentic_enrichment(
             model_string="test-model",
             deterministic_components=det_comps_second,
             deterministic_relationships=[],
-            scan_paths=["/tmp"],
+            scan_paths=[str(scan_root)],
             cache_dir=cache_dir,
         )
 
@@ -1018,6 +1366,146 @@ class TestRunAgenticEnrichment:
             max_concurrent=3,
         )
         assert mock_agent.ainvoke.call_count >= 2  # 15 + 15 + 2, parallel
+
+    def test_async_batch_callback_setup_does_not_block_event_loop(self):
+        import asyncio
+        import threading
+        import time
+
+        from aibom.agentic.agent import _run_batch_async
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        callback_started = threading.Event()
+        release_callback = threading.Event()
+
+        def blocking_callback_factory():
+            callback_started.set()
+            release_callback.wait()
+            return None
+
+        class FakeAgent:
+            async def ainvoke(self, _message, config=None):
+                return {
+                    "structured_response": {
+                        "enriched_components": [],
+                        "new_components": [],
+                        "new_relationships": [],
+                        "risk_findings": [],
+                    }
+                }
+
+        component = AIComponent(
+            name="test-model",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+
+        async def exercise():
+            started = time.monotonic()
+            batch_task = asyncio.create_task(
+                _run_batch_async(
+                    FakeAgent(),
+                    AIBOMScannerMiddleware(allowed_roots=["/tmp"]),
+                    [component],
+                    [],
+                    ["/tmp"],
+                    1,
+                    1,
+                    timeout_s=1,
+                    invoke_callback_factory=blocking_callback_factory,
+                )
+            )
+            while not callback_started.is_set():
+                await asyncio.sleep(0.001)
+
+            # This coroutine can run while the synchronous factory is still
+            # blocked only when callback construction is off the event loop.
+            assert time.monotonic() - started < 0.9
+            assert not batch_task.done()
+            release_callback.set()
+            await asyncio.wait_for(batch_task, timeout=1)
+
+        safety_release = threading.Timer(1.0, release_callback.set)
+        safety_release.daemon = True
+        safety_release.start()
+        try:
+            asyncio.run(exercise())
+        finally:
+            release_callback.set()
+            safety_release.cancel()
+
+    def test_async_batch_raw_coercion_setup_does_not_block_event_loop(self):
+        import asyncio
+        import threading
+        import time
+
+        from aibom.agentic.agent import _run_batch_async
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        coercion_started = threading.Event()
+        release_coercion = threading.Event()
+
+        def blocking_resolve(*_args, **_kwargs):
+            coercion_started.set()
+            release_coercion.wait()
+            return {
+                "enriched_components": [],
+                "new_components": [],
+                "new_relationships": [],
+                "risk_findings": [],
+            }
+
+        class FakeAgent:
+            needs_coercion = True
+
+            async def ainvoke(self, _message, config=None):
+                return {"messages": []}
+
+        component = AIComponent(
+            name="test-model",
+            component_type=AIComponentType.MODEL,
+            file_path="x.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+
+        async def exercise():
+            started = time.monotonic()
+            with patch(
+                "aibom.agentic.agent._resolve_batch_data",
+                side_effect=blocking_resolve,
+            ):
+                batch_task = asyncio.create_task(
+                    _run_batch_async(
+                        FakeAgent(),
+                        AIBOMScannerMiddleware(allowed_roots=["/tmp"]),
+                        [component],
+                        [],
+                        ["/tmp"],
+                        1,
+                        1,
+                        timeout_s=1,
+                        invoke_callback_factory=lambda: None,
+                    )
+                )
+                while not coercion_started.is_set():
+                    await asyncio.sleep(0.001)
+
+                assert time.monotonic() - started < 0.9
+                assert not batch_task.done()
+                release_coercion.set()
+                await asyncio.wait_for(batch_task, timeout=1)
+
+        safety_release = threading.Timer(1.0, release_coercion.set)
+        safety_release.daemon = True
+        safety_release.start()
+        try:
+            asyncio.run(exercise())
+        finally:
+            release_coercion.set()
+            safety_release.cancel()
 
     @patch("aibom.agentic.agent._close_model_clients")
     @patch("aibom.agentic.agent._build_model", return_value=MagicMock())
@@ -1390,6 +1878,101 @@ class TestAgenticResultCache:
 
 
 class TestRunTier:
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
+    def test_retry_callsite_preserves_attempt_kind_and_context(self):
+        from aibom.agentic.agent import _run_tier
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        component = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="app.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        degraded = component.model_copy(
+            update={"needs_agentic": False, "agentic_hint": "batch_timeout"}
+        )
+        recovered = component.model_copy(
+            update={"needs_agentic": False, "agentic_hint": ""}
+        )
+        telemetry_context = MagicMock()
+
+        with patch(
+            "aibom.agentic.agent._run_batch",
+            side_effect=[
+                ([degraded], [], [], [], True),
+                ([recovered], [], [], [], False),
+            ],
+        ) as run_batch:
+            enriched, _, _, _ = _run_tier(
+                agent=MagicMock(),
+                middleware=AIBOMScannerMiddleware(),
+                components=[component],
+                relationships=[],
+                scan_paths=["/tmp"],
+                batch_size=4,
+                max_concurrent=1,
+                all_components=[component],
+                cache=None,
+                telemetry_context=telemetry_context,
+            )
+
+        assert enriched == [recovered]
+        assert run_batch.call_count == 2
+        retry_call = run_batch.call_args_list[1]
+        assert retry_call.kwargs["attempt_kind"] == "retry"
+        assert retry_call.kwargs["attempt_number"] == 2
+        assert retry_call.kwargs["telemetry_context"] is telemetry_context
+
+    def test_memo_hit_emits_cache_trace_without_running_the_agent(self):
+        from aibom.agentic.agent import _DecisionMemo, _run_tier
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        component = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="app.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        resolved = component.model_copy(
+            update={"heuristic_confidence": 0.97, "needs_agentic": False}
+        )
+        memo = _DecisionMemo()
+        memo.record(component, resolved)
+        agent = MagicMock()
+        telemetry_context = MagicMock()
+
+        with patch("aibom.agentic.agent._record_cache_hit_trace") as record_trace:
+            enriched, new, rels, flags = _run_tier(
+                agent=agent,
+                middleware=AIBOMScannerMiddleware(),
+                components=[component],
+                relationships=[],
+                scan_paths=["/tmp"],
+                batch_size=4,
+                max_concurrent=1,
+                all_components=[component],
+                cache=None,
+                memo=memo,
+                telemetry_context=telemetry_context,
+            )
+
+        agent.invoke.assert_not_called()
+        assert new == []
+        assert rels == []
+        assert flags == []
+        assert enriched == [resolved]
+        record_trace.assert_called_once_with(
+            telemetry_context,
+            [component],
+            [resolved],
+            [],
+            [],
+            [],
+        )
+
     def test_tier_cache_hit_populates_memo(self, tmp_path):
         from aibom.agentic.agent import (
             _AgenticResultCache,
@@ -2513,8 +3096,14 @@ class TestTwoPhaseStructuredOutput:
             "parsing_error": None,
         }
         model.with_structured_output.return_value = structured
+        raw_callback = object()
+        callback_factory = MagicMock(return_value=raw_callback)
 
-        data = _coerce_structured(model, [self._Msg(content="findings")])
+        data = _coerce_structured(
+            model,
+            [self._Msg(content="findings")],
+            invoke_callback_factory=callback_factory,
+        )
 
         assert isinstance(data, dict)
         assert data["new_components"][0]["name"] == "x"
@@ -2522,6 +3111,48 @@ class TestTwoPhaseStructuredOutput:
         assert agent_mod.get_token_usage().total_tokens == 12
         # with_structured_output must be tool-less (single coercion call).
         model.with_structured_output.assert_called_once()
+        callback_factory.assert_called_once_with()
+        structured.invoke.assert_called_once_with(
+            ANY,
+            config={"callbacks": [raw_callback]},
+        )
+
+    @pytest.mark.skipif(
+        not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
+    )
+    def test_successful_coercion_can_defer_workflow_until_middleware(self):
+        from aibom.agentic.agent import AgentResponse, _coerce_structured
+
+        model = MagicMock()
+        parsed = AgentResponse(
+            remove_components=[{"instance_id": "candidate-1", "reason": "invalid"}]
+        )
+        structured = MagicMock()
+        structured.invoke.return_value = {
+            "raw": self._Msg(
+                usage_metadata={
+                    "input_tokens": 8,
+                    "output_tokens": 2,
+                    "total_tokens": 10,
+                }
+            ),
+            "parsed": parsed,
+            "parsing_error": None,
+        }
+        model.with_structured_output.return_value = structured
+        attempt = MagicMock()
+
+        data = _coerce_structured(
+            model,
+            [self._Msg(content="findings")],
+            telemetry_attempt=attempt,
+            defer_successful_workflow=True,
+        )
+
+        assert data is not None
+        assert data["remove_components"][0]["instance_id"] == "candidate-1"
+        attempt.record_llm.assert_called_once()
+        attempt.finish.assert_not_called()
 
     @pytest.mark.skipif(
         not _HAS_LANGCHAIN, reason="requires langchain_core (agentic extra)"
@@ -2541,12 +3172,20 @@ class TestTwoPhaseStructuredOutput:
         agent = MagicMock()
         agent.needs_coercion = True
         coerced = {"enriched_components": [], "new_components": []}
+        callback_factory = MagicMock()
         with patch(
             "aibom.agentic.agent._coerce_structured", return_value=coerced
         ) as mock_coerce:
-            data = _resolve_batch_data(agent, {"messages": [self._Msg(content="prose")]})
+            data = _resolve_batch_data(
+                agent,
+                {"messages": [self._Msg(content="prose")]},
+                invoke_callback_factory=callback_factory,
+            )
         assert data == coerced
         mock_coerce.assert_called_once()
+        assert (
+            mock_coerce.call_args.kwargs["invoke_callback_factory"] is callback_factory
+        )
 
     def test_resolve_batch_data_skips_coercion_when_structured_present(self):
         from aibom.agentic.agent import _resolve_batch_data
@@ -2594,7 +3233,9 @@ class TestStructuredOutputCapabilityGate:
     def test_agent_response_format_gpt_is_native(self):
         from aibom.agentic.agent import AgentResponse, _agent_response_format
 
-        assert _agent_response_format("gpt-5.5", {"provider": "openai"}) is AgentResponse
+        assert (
+            _agent_response_format("gpt-5.5", {"provider": "openai"}) is AgentResponse
+        )
 
     def test_agent_response_format_bedrock_is_two_phase(self):
         from aibom.agentic.agent import _agent_response_format
@@ -2633,9 +3274,7 @@ class TestRateLimiterConfig:
             captured["rate_limiter"] = kwargs.get("rate_limiter")
             return MagicMock()
 
-        monkeypatch.setattr(
-            "aibom.llm_factory.build_chat_model", fake_build_chat_model
-        )
+        monkeypatch.setattr("aibom.llm_factory.build_chat_model", fake_build_chat_model)
         _build_model("gpt-5.5", {"rate_limit_rps": 5.0})
         assert captured["rate_limiter"].requests_per_second == 5.0
 
@@ -2648,9 +3287,7 @@ class TestRateLimiterConfig:
             captured["rate_limiter"] = kwargs.get("rate_limiter")
             return MagicMock()
 
-        monkeypatch.setattr(
-            "aibom.llm_factory.build_chat_model", fake_build_chat_model
-        )
+        monkeypatch.setattr("aibom.llm_factory.build_chat_model", fake_build_chat_model)
         _build_model("gpt-5.5", {})
         assert captured["rate_limiter"].requests_per_second == 1.0
 
@@ -2701,7 +3338,11 @@ class TestCachedTokenAccounting:
 
     def test_no_cache_fields_yields_zero_cached(self):
         msg = self._msg(
-            usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110,
+            }
         )
         _, _, _, cached = _resolve_message_usage(msg)
         assert cached == 0
@@ -3083,3 +3724,25 @@ class TestPromptCachingMiddleware:
         mock_cda.reset_mock()
         create_aibom_agent("gpt-5.5", llm_config={"provider": "openai"})
         assert mock_cda.call_args.kwargs["middleware"] == []
+
+
+def test_raw_decision_counts_ignore_annotation_only_enrichment() -> None:
+    from aibom.agentic.agent import _raw_decision_counts
+
+    counts = _raw_decision_counts(
+        {
+            "enriched_components": [
+                {
+                    "instance_id": "candidate-1",
+                    "updates": {},
+                    "decision_annotation": {"decision": "keep"},
+                },
+                {
+                    "instance_id": "candidate-2",
+                    "updates": {"framework": "langgraph"},
+                },
+            ]
+        }
+    )
+
+    assert counts["enriched"] == 1

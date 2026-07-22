@@ -14,6 +14,7 @@ Cisco AI BOM scans codebases, container images, and cloud environments to produc
 - [Quick Start](#quick-start)
 - [Commands](#commands)
 - [Agentic Enrichment](#agentic-enrichment)
+- [Galileo Observability](#galileo-observability)
 - [Container Scanning](#container-scanning)
 - [Cross-Repo and Org Scanning](#cross-repo-and-org-scanning)
 - [Output Formats](#output-formats)
@@ -141,6 +142,7 @@ The `analyze` command always runs the agentic pipeline, so it requires the `agen
 |-------|----------|---------|
 | `analysis` | `detect-secrets`, `tree-sitter` | Secret detection, multi-language parsing |
 | `security` | `cisco-ai-mcp-scanner`, `cisco-ai-skill-scanner` | Cisco security tool integration |
+| `observability` | `galileo` | Opt-in, sanitized Agent-span quality telemetry |
 | `cloud` | `boto3`, `google-cloud-aiplatform`, `azure-*` | Cloud resource scanning |
 | `all` | All of the above | Full feature set |
 
@@ -295,6 +297,55 @@ cisco-aibom cache get scan 0123456789ab
 ```
 
 All cache families now default under `~/.aibom/cache`, including deterministic scan cache, agentic cache, org cache, model cache, and package metadata cache.
+
+## Galileo Observability
+
+Agentic scans can optionally emit observe-only quality telemetry to Galileo.
+Each emitted sanitized batch includes a classifier Agent span, giving Galileo
+an agent-typed hierarchy while the payload remains content-free. The sanitized
+path is disabled by default and fail-open: it sends allowlisted decision/guard
+counters, per-call LLM/tool ordering, status/timing/token data, and HMAC
+pseudonyms, but never source code, paths, prompts, model response text,
+component names, tool arguments, or tool results. A separate diagnostic
+full-trajectory path can send that raw content when every content, identity,
+trajectory, destination, and hosted-egress approval gate is enabled.
+
+```bash
+uv tool install --python 3.13 \
+  "cisco-aibom[agentic,observability,llm-openai]"
+
+export GALILEO_API_KEY="<secret-manager-value>"
+export GALILEO_CONSOLE_URL="https://app.galileo.ai"
+export GALILEO_API_URL="https://api.galileo.ai"
+export GALILEO_PROJECT="<project-name>"
+export GALILEO_LOG_STREAM="<log-stream-name>"
+export AIBOM_GALILEO_HMAC_KEY="<independent-high-entropy-secret>"
+export AIBOM_GALILEO_ALLOW_PUBLIC_CLOUD=true
+
+cisco-aibom analyze /path/to/project --llm-model gpt-5.4 \
+  --galileo \
+  --galileo-sample-rate 0.05 -o json -O report.json
+```
+
+Project provisioning, datasets, metrics, dashboards, alerts, RBAC, and
+retention remain operator-managed; the named Galileo project and log stream
+must already exist. This integration is hosted-only: telemetry accepts exactly
+`https://app.galileo.ai` (and the derived `https://api.galileo.ai` API) and
+requires `AIBOM_GALILEO_ALLOW_PUBLIC_CLOUD=true`.
+
+Raw telemetry is disabled by default: `--galileo` alone enables only the
+sanitized path, even when raw-approval environment variables are already
+present. A reviewed run must also pass `--galileo-full-trajectory`; the raw
+callback activates only when the full-content, full-trajectory, exact-identity,
+immutable project/log-stream, TLS, and hosted-egress gates all pass. Each live
+agent invocation receives a fresh callback and logger, which prevents state from
+crossing scans or concurrent batches while retaining one flush per completed or
+failed chain. When active, it captures real prompts, responses, tool I/O,
+callback metadata, exceptions, and exact repository/component/path identities
+and sends them to hosted Galileo. Custom-function experiments remain
+pseudonymous by default. See the
+[Galileo observability guide](https://github.com/cisco-ai-defense/aibom/blob/main/aibom/docs/galileo-observability.md) for the exact
+data contract, trace map, metrics, and rollout procedure.
 
 ## Container Scanning
 
@@ -485,10 +536,26 @@ All CLI options with an `envvar` binding can be set via environment variables or
 | `AIBOM_DB_SHA256` | — | Expected SHA-256 checksum for the catalog. |
 | `AIBOM_MANIFEST_PATH` | — | Override path to `manifest.json`. |
 | `AIBOM_ENV_FILE` | — | Path to a custom `.env` file. |
+| `AIBOM_GALILEO_ENABLED` | `--galileo/--no-galileo` | Enable sanitized Galileo Agent-span telemetry (default `false`). |
+| `AIBOM_GALILEO_SAMPLE_RATE` | `--galileo-sample-rate` | Deterministic ordinary sanitized batch-agent-trace emission rate from `0.0` to `1.0` (default `1.0`; operational and quality exceptions are retained). |
+| `AIBOM_GALILEO_HMAC_KEY` | — | Dedicated secret for stable pseudonyms and deterministic sampling. |
+| `AIBOM_GALILEO_ALLOW_PUBLIC_CLOUD` | — | Explicitly approve sanitized or raw telemetry egress to the hosted `https://app.galileo.ai` console (default `false`). |
+| `AIBOM_GALILEO_SETUP_BUDGET_S` | — | Bounded Galileo logger/session setup budget in seconds (`>0` through `10`; hosted default `2`). |
+| `AIBOM_GALILEO_EVALUATION_PROJECT_ID` | — | Immutable hosted project UUID required by custom-function experiments and full-trajectory callbacks. |
+| `AIBOM_GALILEO_EVALUATION_LOG_STREAM_ID` | — | Immutable hosted log-stream UUID required only by the full-trajectory callback. |
+| `AIBOM_GALILEO_ALLOW_EXACT_IDENTITIES` | — | Additional opt-in required for exact experiment rows or live/evaluation raw trajectories; default experiments remain pseudonymous. |
+| `AIBOM_GALILEO_ALLOW_FULL_CONTENT` | — | Additional opt-in for approved evidence or live/evaluation raw trajectories. |
+| `AIBOM_GALILEO_ALLOW_FULL_TRAJECTORY` | — | Final independent opt-in for live/evaluation raw LangChain prompts, responses, tool I/O, metadata, and exceptions. |
+| `GALILEO_API_KEY` | — | Galileo SDK credential; required when telemetry is enabled. |
+| `GALILEO_CONSOLE_URL` | — | Required hosted console URL; accepts exactly `https://app.galileo.ai` with the public-cloud approval flag. |
+| `GALILEO_API_URL` | — | Optional explicit API URL; when set, accepts exactly `https://api.galileo.ai`. |
+| `GALILEO_SSL_CONTEXT` | — | Optional Galileo SDK TLS setting; omitted or a true value is accepted, while disabling TLS verification rejects telemetry. |
+| `GALILEO_PROJECT` | — | Pre-existing destination Galileo project name. |
+| `GALILEO_LOG_STREAM` | — | Pre-existing destination Galileo log-stream name. |
 
 ## Docker
 
-A single multi-stage Dockerfile is provided. It installs the `all` extra (which expands to `analysis`, `security`, `agentic`, `llm-openai`, `llm-aws`, `llm-anthropic`, `llm-google`, `cloud`) because the `analyze` command requires the agentic pipeline plus at least one LLM provider. Image size is ~800 MB.
+A single multi-stage Dockerfile is provided. It installs the `all` extra (which expands to `analysis`, `security`, `agentic`, `observability`, `llm-openai`, `llm-aws`, `llm-anthropic`, `llm-google`, `cloud`) because the `analyze` command requires the agentic pipeline plus at least one LLM provider. Image size is ~800 MB.
 
 ```bash
 cd aibom
@@ -518,6 +585,7 @@ uv run pytest tests -v
 
 - [CLI Reference](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CLI_REFERENCE.md) — Complete command and option reference.
 - [Agentic Mode Guide](https://github.com/cisco-ai-defense/aibom/blob/main/docs/AGENTIC_MODE.md) — LLM enrichment setup, providers, and tuning.
+- [Galileo Observability](https://github.com/cisco-ai-defense/aibom/blob/main/aibom/docs/galileo-observability.md) — Sanitized production telemetry, evaluation metrics, operator setup, and rollout.
 - [Container Scanning Guide](https://github.com/cisco-ai-defense/aibom/blob/main/docs/CONTAINER_SCANNING.md) — Extraction tiers, Syft, and runtime support.
 - [API Server](https://github.com/cisco-ai-defense/aibom/blob/main/docs/API_SERVER_README.md) — FastAPI endpoint details for `--output-format api`.
 - [Technical Overview](https://github.com/cisco-ai-defense/aibom/blob/main/docs/TECHNICAL_OVERVIEW.md) — Architecture, pipeline stages, and scanner design.

@@ -30,6 +30,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,7 @@ def _strip_env_prefix(name: str) -> str:
 
 
 from .agent_signatures import AgentSignatureCatalog, resolve_catalog
+from .agentic_telemetry import AgenticTelemetry
 from .cross_ref import (
     CrossRefIndex,
     ExternalRepoDep,
@@ -1219,6 +1221,10 @@ class ScanPipeline:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         custom_catalog: CustomCatalogConfig | None = None,
         atr_enrichment: bool = False,
+        agentic_telemetry: AgenticTelemetry | None = None,
+        invoke_callback_factory: Callable[[], Any] | None = None,
+        telemetry_source_id: str | None = None,
+        telemetry_source_kind: str = "unknown",
     ) -> None:
         self.scan_paths = scan_paths
         self.output_format = output_format
@@ -1244,6 +1250,36 @@ class ScanPipeline:
         self.progress_callback = progress_callback
         self.custom_catalog = custom_catalog
         self.atr_enrichment = atr_enrichment
+        self.agentic_telemetry = agentic_telemetry
+        self.invoke_callback_factory = invoke_callback_factory
+        self.telemetry_source_id = telemetry_source_id
+        self.telemetry_source_kind = telemetry_source_kind
+        self._agentic_degraded_count = 0
+        self._agentic_telemetry_degraded_count: int | None = None
+        self._agentic_token_usage: Any | None = None
+        self._agentic_input_count = 0
+        self._agentic_input_snapshot: list[AIComponent] = []
+        self._agentic_output_snapshot: list[AIComponent] = []
+        self._agentic_stage_input_ids: set[str] = set()
+        self._agentic_degraded_ids: set[str] = set()
+        self._agentic_added_relationship_count = 0
+        self._agentic_raw_risk_count = 0
+
+    def _telemetry_enabled(self) -> bool:
+        """Return whether source-boundary telemetry can actually emit.
+
+        Tests may pass a duck-typed recorder without an ``enabled`` property;
+        a real disabled/no-op telemetry object must not add copy/diff work to
+        the normal scan path.
+        """
+
+        telemetry = self.agentic_telemetry
+        if telemetry is None:
+            return False
+        try:
+            return bool(getattr(telemetry, "enabled", True))
+        except Exception:
+            return False
 
     def _emit_progress(self, event: str, **payload: Any) -> None:
         """Send a best-effort progress event to the CLI."""
@@ -1254,6 +1290,17 @@ class ScanPipeline:
 
     def run(self) -> PipelineResult:
         clear_cache()
+        self._agentic_degraded_count = 0
+        self._agentic_telemetry_degraded_count = None
+        self._agentic_token_usage = None
+        self._agentic_input_count = 0
+        self._agentic_input_snapshot = []
+        self._agentic_output_snapshot = []
+        self._agentic_stage_input_ids = set()
+        self._agentic_degraded_ids = set()
+        self._agentic_added_relationship_count = 0
+        self._agentic_raw_risk_count = 0
+        pipeline_started_at = datetime.now(timezone.utc)
         pipeline_start = time.monotonic()
         timings: list[StageTiming] = []
 
@@ -1320,11 +1367,30 @@ class ScanPipeline:
 
         self._emit_progress("stage_started", stage="agentic", total_stages=4)
         t0 = time.monotonic()
+        telemetry_enabled = self._telemetry_enabled()
+        if telemetry_enabled and not self.llm_config:
+            # A skipped summary still reports the deterministic/final boundary,
+            # but never attributes those rows to an LLM decision.
+            self._agentic_input_snapshot = [
+                component.model_copy(deep=True) for component in components
+            ]
+            self._agentic_stage_input_ids = {
+                component.instance_id for component in components
+            }
+            self._agentic_input_count = len(self._agentic_input_snapshot)
         components, relationships, agentic_flags = self._stage_agentic(
             components, relationships
         )
+        if telemetry_enabled and not self.llm_config:
+            # Preserve the actual Stage-3 boundary. Stage 4 can legitimately
+            # canonicalize, filter, or consolidate deterministic findings, but
+            # those changes are not agentic decisions.
+            self._agentic_output_snapshot = [
+                component.model_copy(deep=True) for component in components
+            ]
         elapsed = time.monotonic() - t0
         skipped = not self.llm_config
+        telemetry_skipped = skipped or self._agentic_input_count == 0
         timings.append(
             StageTiming(
                 "agentic",
@@ -1369,6 +1435,108 @@ class ScanPipeline:
         total_elapsed = time.monotonic() - pipeline_start
 
         tu = getattr(self, "_agentic_token_usage", None)
+        if telemetry_enabled and self.agentic_telemetry is not None:
+            degraded_count = (
+                self._agentic_telemetry_degraded_count
+                if self._agentic_telemetry_degraded_count is not None
+                else getattr(self, "_agentic_degraded_count", 0)
+            )
+            before_by_id = {
+                component.instance_id: component
+                for component in self._agentic_input_snapshot
+            }
+            after_by_id = {
+                component.instance_id: component
+                for component in self._agentic_output_snapshot
+            }
+            common_ids = before_by_id.keys() & after_by_id.keys()
+            degraded_ids = common_ids & self._agentic_degraded_ids
+            decided_common_ids = common_ids - degraded_ids
+            removed_ids = (
+                before_by_id.keys() - after_by_id.keys()
+            ) - self._agentic_degraded_ids
+            reclassified = sum(
+                1
+                for component_id in decided_common_ids
+                if before_by_id[component_id].component_type
+                != after_by_id[component_id].component_type
+            )
+            enrichment_fields = (
+                "model_name",
+                "embedding_model",
+                "description",
+                "text",
+                "framework",
+                "detection_source",
+                "heuristic_confidence",
+                "transport",
+                "config_source",
+                "storage_uri",
+                "dataset_source",
+                "skill_format",
+                "hyperparameters",
+                "training_info",
+                "metrics",
+                "kb_concept",
+                "kb_label",
+                "sdk_version",
+                "metadata",
+            )
+            enriched_count = sum(
+                1
+                for component_id in decided_common_ids
+                if before_by_id[component_id].component_type
+                == after_by_id[component_id].component_type
+                and any(
+                    getattr(before_by_id[component_id], field_name)
+                    != getattr(after_by_id[component_id], field_name)
+                    for field_name in enrichment_fields
+                )
+            )
+            agentic_summary_decisions = {
+                "kept": max(0, len(decided_common_ids) - reclassified - enriched_count),
+                "enriched": enriched_count,
+                "removed": len(removed_ids),
+                "reclassified": reclassified,
+                "discovered": len(
+                    (
+                        after_by_id.keys()
+                        - (self._agentic_stage_input_ids or set(before_by_id.keys()))
+                    )
+                    - self._agentic_degraded_ids
+                ),
+                "relationships": self._agentic_added_relationship_count,
+                "risk_findings": self._agentic_raw_risk_count,
+                "degraded": degraded_count,
+            }
+            if telemetry_skipped:
+                agentic_summary_decisions = {
+                    key: 0 for key in agentic_summary_decisions
+                }
+            self.agentic_telemetry.record_summary(
+                source_id=self.telemetry_source_id
+                or (self.scan_paths[0] if self.scan_paths else "unknown"),
+                source_kind=self.telemetry_source_kind,
+                status=(
+                    "skipped"
+                    if telemetry_skipped
+                    else ("degraded" if degraded_count else "success")
+                ),
+                candidate_count=len(self._agentic_input_snapshot),
+                candidate_count_available=True,
+                agentic_component_count=len(self._agentic_output_snapshot),
+                # The action diff uses the raw agentic population above, while
+                # this field deliberately reports the actual post-assemble BOM
+                # count promised by the source-summary contract.
+                final_component_count=len(components),
+                degraded_candidate_count=degraded_count,
+                duration_s=total_elapsed,
+                created_at=pipeline_started_at,
+                prompt_tokens=tu.prompt_tokens if tu else 0,
+                completion_tokens=tu.completion_tokens if tu else 0,
+                cached_tokens=tu.cached_tokens if tu else 0,
+                decisions=agentic_summary_decisions,
+            )
         return PipelineResult(
             components=components,
             relationships=relationships,
@@ -1515,6 +1683,12 @@ class ScanPipeline:
             components, held_secrets = _partition_agentic_secrets(
                 components, review_secrets=self.agentic_review_secrets
             )
+            if self._telemetry_enabled():
+                # Keep the complete post-partition population so fanout of a
+                # deduplicated candidate is not misreported as discovery.
+                self._agentic_stage_input_ids = {
+                    component.instance_id for component in components
+                }
             if held_secrets:
                 # Held-back secrets are intentionally NOT merged back into the
                 # final BOM: the success path below returns the agentic-enriched
@@ -1528,6 +1702,11 @@ class ScanPipeline:
                     len(held_secrets),
                 )
             deduped, fanout = _dedup_for_agentic(components)
+            self._agentic_input_count = len(deduped)
+            if self._telemetry_enabled():
+                self._agentic_input_snapshot = [
+                    component.model_copy(deep=True) for component in deduped
+                ]
             if len(deduped) < len(components):
                 _LOGGER.info(
                     "Pre-agentic dedup: %d → %d components (%d context-free duplicates removed)",
@@ -1567,12 +1746,25 @@ class ScanPipeline:
                     cache_dir=self.agentic_cache_dir,
                     include_code_snippets=self.include_code_snippets,
                     agent_signature_catalog=agent_catalog,
+                    telemetry=(
+                        self.agentic_telemetry if self._telemetry_enabled() else None
+                    ),
+                    telemetry_source_id=self.telemetry_source_id
+                    or (self.scan_paths[0] if self.scan_paths else "unknown"),
+                    invoke_callback_factory=self.invoke_callback_factory,
                 )
             )
+            self._agentic_added_relationship_count = len(agentic_rels)
+            self._agentic_raw_risk_count = len(agentic_flags)
             # Count degraded components from the raw agentic output, before
             # post-filters below may strip components (and their hints) from the
             # BOM.
             self._agentic_degraded_count = _count_degraded(enriched)
+            self._agentic_degraded_ids = {
+                component.instance_id
+                for component in enriched
+                if component.agentic_hint
+            }
             deduped_ids = {c.instance_id for c in deduped}
             enriched_deduped_ids = {
                 c.instance_id for c in enriched if c.instance_id in deduped_ids
@@ -1608,11 +1800,42 @@ class ScanPipeline:
             enriched = _drop_env_placeholder_identifiers(enriched)
             all_rels = _backfill_relationship_instance_ids(all_rels, enriched)
             self._agentic_token_usage = agentic_token_usage
+            if self._telemetry_enabled():
+                # Snapshot the true Stage-3 return boundary. Everything above
+                # can remove, reinstate, or fan out components after the raw
+                # agent response, and source-summary decisions must reflect
+                # that guarded result rather than the unvalidated response.
+                self._agentic_output_snapshot = [
+                    component.model_copy(deep=True) for component in enriched
+                ]
             return enriched, all_rels, agentic_flags
 
         except ImportError:
             raise
         except Exception as exc:  # noqa: BLE001
+            exact_candidates = self._agentic_input_count or len(components)
+            if self._telemetry_enabled():
+                self._agentic_telemetry_degraded_count = exact_candidates
+                # Keep the PipelineResult consumed by Galileo evaluation in
+                # sync with the source summary. This assignment intentionally
+                # remains inside the Galileo-enabled path so observability does
+                # not change non-Galileo scan results.
+                self._agentic_degraded_count = exact_candidates
+                if not self._agentic_input_snapshot:
+                    self._agentic_input_snapshot = [
+                        component.model_copy(deep=True) for component in components
+                    ]
+                    self._agentic_input_count = len(self._agentic_input_snapshot)
+                if not self._agentic_stage_input_ids:
+                    self._agentic_stage_input_ids = {
+                        component.instance_id for component in components
+                    }
+                self._agentic_output_snapshot = [
+                    component.model_copy(deep=True) for component in components
+                ]
+                self._agentic_degraded_ids = {
+                    component.instance_id for component in self._agentic_input_snapshot
+                }
             _LOGGER.warning("Agentic classification failed: %s", exc, exc_info=True)
 
         return components, relationships, []

@@ -43,6 +43,12 @@ dev = [
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.2.1",
     "respx>=0.22.0",
+    # A small set of contract tests exercise the real optional SDK. Keep the
+    # public CI's documented ``uv sync --group dev && uv run pytest`` path
+    # complete instead of requiring an undeclared extra.
+    "galileo==2.4.0",
+    "galileo-core==4.4.0",
+    "langchain-core>=1.2.18",
     "black>=24.0.0",
     "flake8>=7.0.0",
     "isort>=5.13.0",
@@ -56,6 +62,9 @@ test = [
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.2.1",
     "respx>=0.22.0",
+    "galileo==2.4.0",
+    "galileo-core==4.4.0",
+    "langchain-core>=1.2.18",
 ]
 analysis = [
     "detect-secrets>=1.5.0",
@@ -87,6 +96,13 @@ agentic = [
     "langchain>=1.2.11",
     "langchain-core>=1.2.18",
 ]
+observability = [
+    # The production sanitizer validates the exact Galileo 2.4 ingestion
+    # and galileo-core 4.4.0 shapes before every flush. Widen either constraint
+    # only after the new pair passes the hierarchy and privacy-contract tests.
+    "galileo==2.4.0",
+    "galileo-core==4.4.0",
+]
 llm-openai = [
     "langchain-openai>=0.3.0",
 ]
@@ -106,7 +122,7 @@ cloud = [
     "azure-mgmt-cognitiveservices>=13.6.0",
 ]
 all = [
-    "cisco-aibom[analysis,security,agentic,llm-openai,llm-aws,llm-anthropic,llm-google,cloud]",
+    "cisco-aibom[analysis,security,agentic,observability,llm-openai,llm-aws,llm-anthropic,llm-google,cloud]",
 ]
 
 [tool.pytest.ini_options]
@@ -191,6 +207,8 @@ module = [
     "skill_scanner.*",
     "pyatr",
     "pyatr.*",
+    "galileo",
+    "galileo.*",
 ]
 ignore_missing_imports = true
 
