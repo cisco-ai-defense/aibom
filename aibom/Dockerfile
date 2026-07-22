@@ -12,8 +12,8 @@ FROM python:3.13-slim AS builder
 RUN pip install --no-cache-dir uv
 
 WORKDIR /build
-COPY pyproject.toml README.md ./
-COPY src/ ./src/
+COPY aibom/pyproject.toml README.md ./
+COPY aibom/src/ ./src/
 
 RUN uv pip install --system --no-cache ".[all]"
 

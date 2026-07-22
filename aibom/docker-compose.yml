@@ -9,8 +9,8 @@
 services:
   aibom:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: aibom/Dockerfile
     volumes:
       - ${SCAN_DIR:-.}:/workspace:ro
     working_dir: /workspace
