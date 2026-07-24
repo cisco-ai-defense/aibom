@@ -561,7 +561,7 @@ A single multi-stage Dockerfile is provided. It installs the `all` extra (which 
 cd aibom
 
 # Build
-docker build -t cisco-aibom .
+docker build -f Dockerfile -t cisco-aibom ..
 
 # Run
 docker run --rm -v /path/to/project:/workspace cisco-aibom \

@@ -1,0 +1,46 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+**/dist/
+**/build/
+**/.eggs/
+
+# Virtual environments
+**/.venv
+**/venv
+**/.tox
+
+# Test and development files
+aibom/tests/
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+**/.mypy_cache/
+
+# IDE
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.swo
+
+# OS files
+**/.DS_Store
+**/Thumbs.db
+
+# Docker files not needed in the image
+aibom/Dockerfile
+aibom/docker-compose.yml
+
+# Documentation not needed in the image. The root README is required by
+# pyproject.toml while building the package.
+*.md
+!README.md
+docs/
+aibom/docs/
+LICENSE

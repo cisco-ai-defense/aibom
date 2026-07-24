@@ -7,7 +7,7 @@ name = "cisco-aibom"
 version = "1.0.8"
 description = "A tool to generate an AI BOM from source code."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11.4,<3.14"
 classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -21,7 +21,8 @@ dependencies = [
     "duckdb>=1.0.0",
     "typer>=0.9.0",
     "pandas>=2.0.0",
-    "fastapi>=0.104.0",
+    "fastapi>=0.139.2",
+    "starlette>=1.3.1",
     "uvicorn>=0.24.0",
     "pydantic>=2.6.0",
     "httpx>=0.28.1",
@@ -48,8 +49,8 @@ dev = [
     # complete instead of requiring an undeclared extra.
     "galileo==2.4.0",
     "galileo-core==4.4.0",
-    "langchain-core>=1.2.18",
-    "black>=24.0.0",
+    "langchain-core>=1.3.3",
+    "black>=26.3.1",
     "flake8>=7.0.0",
     "isort>=5.13.0",
     "mypy>=1.8.0",
@@ -64,7 +65,7 @@ test = [
     "respx>=0.22.0",
     "galileo==2.4.0",
     "galileo-core==4.4.0",
-    "langchain-core>=1.2.18",
+    "langchain-core>=1.3.3",
 ]
 analysis = [
     "detect-secrets>=1.5.0",
@@ -83,8 +84,8 @@ security = [
     # proxy-side SQL-injection / OIDC auth-bypass criticals. The AI BOM CLI
     # never runs the litellm proxy, but these floors keep dependency audits
     # clean on the ``security``/``all`` installs.
-    "cisco-ai-mcp-scanner>=4.7.3",
-    "cisco-ai-skill-scanner>=2.0.11",
+    "cisco-ai-mcp-scanner>=4.8.1",
+    "cisco-ai-skill-scanner>=2.0.12",
     # Optional engine for the --atr-enrichment pass (off by default). Adds the
     # LLM-I/O / tool-call / agent-config event surface and the per-rule MITRE
     # ATLAS mappings that the bundled skill-scanner rule-pack does not expose
@@ -94,7 +95,7 @@ security = [
 agentic = [
     "deepagents>=0.4.12",
     "langchain>=1.2.11",
-    "langchain-core>=1.2.18",
+    "langchain-core>=1.3.3",
 ]
 observability = [
     # The production sanitizer validates the exact Galileo 2.4 ingestion
