@@ -498,6 +498,8 @@ cisco-aibom kb info
 
 For the schema-v2 concept contract and its compatibility policy, see
 [Schema-v2 concept vocabulary](docs/concept-vocabulary.md).
+Package snapshot and anonymous delta behavior is documented in
+[Package liveness freshness](docs/package-freshness.md).
 
 Manual download from GitHub Releases (replace `<VERSION>` with the desired KB version, e.g. the latest tag from [Releases](https://github.com/cisco-ai-defense/aibom/releases)):
 
@@ -538,6 +540,9 @@ All CLI options with an `envvar` binding can be set via environment variables or
 | `AIBOM_DB_PATH` | — | Override path to the DuckDB catalog file. |
 | `AIBOM_DB_SHA256` | — | Expected SHA-256 checksum for the catalog. |
 | `AIBOM_MANIFEST_PATH` | — | Override path to `manifest.json`. |
+| `AIBOM_NO_NETWORK` | `--no-network` | Disable package-liveness freshness requests while retaining snapshot fields. |
+| `AIBOM_LIVENESS_ONLY_SNAPSHOT` | `--liveness-only-snapshot` | Use only package-liveness fields frozen into the selected knowledge base. |
+| `CISCO_AIBOM_FRESHNESS_URL` | — | Optional package-freshness endpoint override. No default. |
 | `AIBOM_ENV_FILE` | — | Path to a custom `.env` file. |
 | `AIBOM_GALILEO_ENABLED` | `--galileo/--no-galileo` | Enable sanitized Galileo Agent-span telemetry (default `false`). |
 | `AIBOM_GALILEO_SAMPLE_RATE` | `--galileo-sample-rate` | Deterministic ordinary sanitized batch-agent-trace emission rate from `0.0` to `1.0` (default `1.0`; operational and quality exceptions are retained). |

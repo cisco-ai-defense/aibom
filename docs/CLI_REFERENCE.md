@@ -98,6 +98,11 @@ the distinction between sanitized telemetry and raw full-trajectory diagnostics.
 | `--cache-dir` | Shared cache root. Defaults to `~/.aibom/cache` and stores `scan`, `agentic`, `org`, `model`, and `packages` caches beneath it. |
 | `--include-code-snippets` / `--no-code-snippets` | Include raw code snippets in per-finding decision annotations. Off by default. |
 | `--component-summary` / `--no-component-summary` | When `--output-format=json`, include a flat `component_summary` key in the report listing each non-test component as `{component_type, name, file_path, line_number}`, grouped by source and sorted by `(component_type, name)`. Intended for quick human review and demos; the full structured output is unchanged. Off by default. |
+| `--no-network` | Disable anonymous package-liveness freshness requests while retaining local snapshot fields. Also available as `AIBOM_NO_NETWORK`. |
+| `--liveness-only-snapshot` | Use only package-liveness fields frozen into the selected knowledge base. Also available as `AIBOM_LIVENESS_ONLY_SNAPSHOT`. |
+
+See [Package liveness freshness](package-freshness.md) for the snapshot,
+privacy, retry, and output-field contract.
 
 ### Examples
 
@@ -450,6 +455,9 @@ cisco-aibom plugin list
 | `AIBOM_DB_PATH` | Override path to the DuckDB catalog file. |
 | `AIBOM_DB_SHA256` | Expected SHA-256 checksum for the DuckDB catalog. |
 | `AIBOM_MANIFEST_PATH` | Override path to `manifest.json`. |
+| `AIBOM_NO_NETWORK` | Disable package-liveness freshness requests. |
+| `AIBOM_LIVENESS_ONLY_SNAPSHOT` | Use only package-liveness snapshot fields. |
+| `CISCO_AIBOM_FRESHNESS_URL` | Optional package-freshness endpoint override. No default. |
 | `CISCO_AI_DEFENSE_API_KEY` | API key for KB request commands. |
 | `CISCO_AI_DEFENSE_API_BASE` | Regional API base URL for KB request commands. Same regional hosts as `AIBOM_POST_URL` (e.g. `https://api.security.cisco.com`, `https://api.eu.security.cisco.com`). No default. |
 | `CISCO_AIBOM_MANIFEST_URL` | KB manifest URL for `kb download` / `kb check`. No default. |
