@@ -303,6 +303,10 @@ Display information about the locally installed KB.
 cisco-aibom kb info
 ```
 
+For a schema-v2 manifest, this offline command also displays
+`schema_version`, `vocabulary_version`, and the 20-concept vocabulary. See
+[Schema-v2 concept vocabulary](concept-vocabulary.md).
+
 ### `kb verify`
 
 Verify the integrity of the locally installed KB (SHA-256 checksum).

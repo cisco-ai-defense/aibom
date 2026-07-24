@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 
@@ -99,6 +100,47 @@ def test_ensure_local_database_uses_manifest_checksum_when_env_sha_missing(monke
 
         resolved = db_loader.ensure_local_database(console=None)
         assert resolved == db_path
+
+
+def test_schema_v2_manifest_requires_cli_upgrade(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        """{
+  "schema_version": 2,
+  "duckdb_sha256": "unused",
+  "duckdb_file": "candidate.duckdb"
+}""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AIBOM_MANIFEST_PATH", str(manifest_path))
+
+    with pytest.raises(
+        db_loader.UnsupportedDatabaseSchemaError,
+        match=r"requires cisco-aibom 2\.x",
+    ):
+        db_loader.ensure_local_database(console=None)
+
+
+@pytest.mark.parametrize("schema_version", ["1.0.9", 1])
+def test_schema_v1_manifest_remains_supported(
+    monkeypatch,
+    tmp_path,
+    schema_version,
+):
+    db_path = tmp_path / "frozen-v1.duckdb"
+    checksum = _write_dummy_db(db_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        f"""{{
+  "schema_version": {json.dumps(schema_version)},
+  "duckdb_sha256": "{checksum}",
+  "duckdb_file": "{db_path.name}"
+}}""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AIBOM_MANIFEST_PATH", str(manifest_path))
+
+    assert db_loader.ensure_local_database(console=None) == db_path.resolve()
 
 
 def test_default_manifest_path_prefers_packaged_over_cwd(monkeypatch):

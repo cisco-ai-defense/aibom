@@ -16,6 +16,8 @@ from typing import Optional, Tuple
 from importlib import resources as importlib_resources
 from rich.console import Console
 
+from .kb.vocabulary import SCHEMA_VERSION, schema_major
+
 _LOGGER = logging.getLogger(__name__)
 
 BUNDLED_DB_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -23,6 +25,28 @@ BUNDLED_DB_SHA256 = "00000000000000000000000000000000000000000000000000000000000
 
 class DatabaseLoadError(RuntimeError):
     """Raised when the DuckDB knowledge base cannot be loaded or verified."""
+
+
+class UnsupportedDatabaseSchemaError(DatabaseLoadError):
+    """Raised when the configured KB requires a newer CLI generation."""
+
+
+def require_supported_manifest_schema(
+    manifest: Optional[dict] = None,
+) -> None:
+    """Reject a selected manifest that requires the next CLI generation."""
+
+    selected = manifest
+    if selected is None:
+        selected, _ = _load_manifest()
+    manifest_schema = schema_major((selected or {}).get("schema_version"))
+    if manifest_schema is not None and manifest_schema >= SCHEMA_VERSION:
+        raise UnsupportedDatabaseSchemaError(
+            "This knowledge base uses schema version "
+            f"{(selected or {}).get('schema_version')}, which requires "
+            "cisco-aibom 2.x. This 1.x CLI continues to support schema-1 "
+            "knowledge bases; upgrade the CLI before using this knowledge base."
+        )
 
 
 def ensure_local_database(console: Optional[Console] = None) -> Path:
@@ -37,6 +61,7 @@ def ensure_local_database(console: Optional[Console] = None) -> Path:
     del console
 
     manifest, manifest_path = _load_manifest()
+    require_supported_manifest_schema(manifest)
     env_db_path = os.environ.get("AIBOM_DB_PATH")
     has_env_db_path = bool(env_db_path)
     env_db_sha = os.environ.get("AIBOM_DB_SHA256")

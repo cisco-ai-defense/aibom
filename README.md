@@ -496,6 +496,9 @@ cisco-aibom kb verify
 cisco-aibom kb info
 ```
 
+For the schema-v2 concept contract and its compatibility policy, see
+[Schema-v2 concept vocabulary](docs/concept-vocabulary.md).
+
 Manual download from GitHub Releases (replace `<VERSION>` with the desired KB version, e.g. the latest tag from [Releases](https://github.com/cisco-ai-defense/aibom/releases)):
 
 ```bash

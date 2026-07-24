@@ -30,6 +30,41 @@ def test_analyze_rejects_legacy_ui_output_format():
     assert "Invalid output format" in result.output
 
 
+def test_analyze_rejects_schema_v2_manifest_without_traceback(
+    monkeypatch,
+    tmp_path,
+):
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "duckdb_file": "candidate.duckdb",
+                "duckdb_sha256": "unused",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AIBOM_MANIFEST_PATH", str(manifest))
+
+    result = runner.invoke(
+        app,
+        [
+            "analyze",
+            str(source_dir),
+            "--llm-model",
+            "not-used",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Knowledge base upgrade required" in result.output
+    assert "requires cisco-aibom 2.x" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_analyze_defaults_cache_root_for_scan_and_agentic(tmp_path):
     source_dir = tmp_path / "repo"
     source_dir.mkdir()

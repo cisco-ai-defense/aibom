@@ -30,6 +30,7 @@ import platformdirs
 from pydantic import ValidationError
 
 from .manifest import KBManifest, KBManifestIndex
+from .vocabulary import CONCEPTS, SCHEMA_VERSION, VOCABULARY_VERSION, schema_major
 
 LOGGER = logging.getLogger(__name__)
 
@@ -255,7 +256,7 @@ class KBManager:
             raise KBError(f"Failed to query KB database: {e}") from e
 
         last_modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
-        return {
+        info: dict[str, Any] = {
             "version": m.kb_version,
             "path": str(db_path.resolve()),
             "sha256": sha256,
@@ -263,6 +264,18 @@ class KBManager:
             "entity_count": entity_count,
             "last_modified": last_modified,
         }
+        if schema_major(m.schema_version) == SCHEMA_VERSION:
+            info.update(
+                {
+                    "schema_version": m.schema_version,
+                    "vocabulary_version": (
+                        m.vocabulary_version or VOCABULARY_VERSION
+                    ),
+                    "concept_count": len(CONCEPTS),
+                    "concepts": ", ".join(CONCEPTS),
+                }
+            )
+        return info
 
     def verify(self) -> bool:
         mp = self._local_manifest_path()

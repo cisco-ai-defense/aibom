@@ -56,6 +56,10 @@ from .custom_catalog import (
     CustomCatalogConfig,
     load_custom_catalog,
 )
+from .db_loader import (
+    UnsupportedDatabaseSchemaError,
+    require_supported_manifest_schema,
+)
 from .kb.manager import KBError, KBManager
 from .llm_factory import ensure_llm_runtime_available
 from .models.enums import Severity as SeverityEnum
@@ -1765,6 +1769,15 @@ def analyze(
     ),
 ):
     """Analyzes a Python codebase to generate an AI BOM."""
+    try:
+        require_supported_manifest_schema()
+    except UnsupportedDatabaseSchemaError as exc:
+        console.print(
+            f"[bold red]Knowledge base upgrade required:[/] {escape(str(exc))}",
+            highlight=False,
+        )
+        raise typer.Exit(code=1) from None
+
     if output_format not in _VALID_OUTPUT_FORMATS:
         valid = ", ".join(sorted(_VALID_OUTPUT_FORMATS))
         console.print(
