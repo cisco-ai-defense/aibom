@@ -1641,6 +1641,24 @@ def analyze(
             "extra). Surfaced as per-asset findings, not a coverage score."
         ),
     ),
+    no_network: bool = typer.Option(
+        False,
+        "--no-network",
+        envvar="AIBOM_NO_NETWORK",
+        help=(
+            "Disable package-liveness freshness requests. Frozen knowledge-base "
+            "snapshot fields are still included when available."
+        ),
+    ),
+    liveness_only_snapshot: bool = typer.Option(
+        False,
+        "--liveness-only-snapshot",
+        envvar="AIBOM_LIVENESS_ONLY_SNAPSHOT",
+        help=(
+            "Use only package-liveness fields frozen into the knowledge base; "
+            "do not request newer anonymous deltas."
+        ),
+    ),
     container_tier: str = typer.Option(
         "auto",
         "--container-extraction-tier",
@@ -2423,6 +2441,14 @@ def analyze(
                 source_summary["status"] = "completed"
 
             _dispose_extraction(temp_dir)
+
+        from .package_freshness import enrich_analysis_outputs
+
+        enrich_analysis_outputs(
+            all_analysis_outputs,
+            no_network=no_network,
+            liveness_only_snapshot=liveness_only_snapshot,
+        )
 
         run_metadata["completed_at"] = _utcnow_iso()
         run_metadata["error_count"] = len(run_errors)
