@@ -216,6 +216,7 @@ def _apply_live_batch(
     coordinates: list[PackageCoordinate],
     components_by_coordinate: dict[PackageCoordinate, list[Any]],
 ) -> None:
+    requested_coordinates = set(coordinates)
     payload = {
         "snapshot_at": snapshot_at,
         "packages": [
@@ -256,6 +257,8 @@ def _apply_live_batch(
         if not isinstance(ecosystem, str) or not isinstance(name, str):
             continue
         coordinate = package_coordinate(ecosystem, name)
+        if coordinate not in requested_coordinates:
+            continue
         for component in components_by_coordinate.get(coordinate, []):
             metadata = _metadata(component)
             status = signal.get("liveness_status")

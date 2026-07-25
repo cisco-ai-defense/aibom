@@ -199,6 +199,60 @@ def test_fresh_snapshot_does_not_call_network(tmp_path):
 
 
 @respx.mock
+def test_live_delta_only_updates_packages_in_request_batch(tmp_path):
+    path = _catalog(tmp_path)
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            INSERT INTO package_catalog
+            VALUES (?, ?, ?, CAST(? AS TIMESTAMP), CAST(? AS JSON))
+            """,
+            [
+                "fresh-package",
+                "pypi",
+                "maintained",
+                "2026-07-23T00:00:00Z",
+                '{"source_count": 2}',
+            ],
+        )
+    finally:
+        connection.close()
+    stale_component = _dependency()
+    fresh_component = _dependency("fresh-package")
+    respx.post(FRESHNESS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "snapshot_version": "build-2",
+                "as_of": "2026-07-24T00:00:00Z",
+                "signals": [
+                    {
+                        "snapshot_version": "build-2",
+                        "ecosystem": "pypi",
+                        "package_name": "fresh-package",
+                        "liveness_status": "stale",
+                        "observed_at": "2026-07-23T12:00:00Z",
+                        "source": "registry",
+                        "certification": {"source_count": 3},
+                    }
+                ],
+            },
+        )
+    )
+
+    enrich_components(
+        [stale_component, fresh_component],
+        db_path=path,
+        freshness_url=FRESHNESS_URL,
+        now=datetime(2026, 7, 24, tzinfo=timezone.utc),
+    )
+
+    assert fresh_component.metadata["liveness_status"] == "maintained"
+    assert "as_of" not in fresh_component.metadata
+
+
+@respx.mock
 def test_rate_limit_falls_back_to_snapshot(tmp_path, caplog):
     path = _catalog(tmp_path)
     component = _dependency()
