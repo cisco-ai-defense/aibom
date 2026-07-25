@@ -145,27 +145,43 @@ def read_package_snapshots(
             if "liveness_certification" in columns
             else "NULL"
         )
-        query = f"""
-            SELECT package_name, ecosystem, liveness_status,
-                   liveness_snapshot_at, {certification_sql}
-              FROM package_catalog
-             WHERE lower(ecosystem) = ?
-               AND lower(package_name) = ?
-             LIMIT 1
-        """
-        for coordinate in requested:
-            row = connection.execute(
-                query,
-                [coordinate.ecosystem, coordinate.name.lower()],
-            ).fetchone()
-            if row is None:
+        connection.execute(
+            """
+            CREATE TEMP TABLE requested_packages (
+                ecosystem VARCHAR,
+                package_name VARCHAR
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO requested_packages VALUES (?, ?)",
+            [
+                (coordinate.ecosystem, coordinate.name.lower())
+                for coordinate in requested
+            ],
+        )
+        rows = connection.execute(
+            f"""
+            SELECT requested.ecosystem, requested.package_name,
+                   catalog.package_name, catalog.ecosystem,
+                   catalog.liveness_status, catalog.liveness_snapshot_at,
+                   {certification_sql}
+              FROM requested_packages AS requested
+              JOIN package_catalog AS catalog
+                ON lower(catalog.ecosystem) = requested.ecosystem
+               AND lower(catalog.package_name) = requested.package_name
+            """
+        ).fetchall()
+        for row in rows:
+            coordinate = package_coordinate(str(row[0]), str(row[1]))
+            if coordinate in snapshots:
                 continue
-            matched = package_coordinate(str(row[1]), str(row[0]))
+            matched = package_coordinate(str(row[3]), str(row[2]))
             snapshots[coordinate] = PackageSnapshot(
                 coordinate=matched,
-                liveness_status=str(row[2]) if row[2] is not None else None,
-                liveness_snapshot_at=_to_iso8601(row[3]),
-                certification=_json_object(row[4]),
+                liveness_status=str(row[4]) if row[4] is not None else None,
+                liveness_snapshot_at=_to_iso8601(row[5]),
+                certification=_json_object(row[6]),
             )
     except duckdb.Error:
         return {}

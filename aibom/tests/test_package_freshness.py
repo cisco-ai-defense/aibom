@@ -96,6 +96,38 @@ def test_registry_reads_only_requested_package_snapshots(tmp_path):
     assert snapshots[requested].certification == {"source_count": 2}
 
 
+def test_registry_reads_multiple_package_snapshots_in_one_batch(tmp_path):
+    path = _catalog(tmp_path)
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            INSERT INTO package_catalog
+            VALUES (?, ?, ?, CAST(? AS TIMESTAMP), CAST(? AS JSON))
+            """,
+            [
+                "fastapi",
+                "pypi",
+                "maintained",
+                "2026-07-02T00:00:00Z",
+                '{"source_count": 3}',
+            ],
+        )
+    finally:
+        connection.close()
+    requested = {
+        package_coordinate("pypi", "langchain"),
+        package_coordinate("pypi", "fastapi"),
+    }
+
+    snapshots = read_package_snapshots(path, requested)
+
+    assert set(snapshots) == requested
+    assert snapshots[package_coordinate("pypi", "fastapi")].certification == {
+        "source_count": 3
+    }
+
+
 def test_snapshot_only_enrichment_never_calls_network(tmp_path):
     path = _catalog(tmp_path)
     component = _dependency()
