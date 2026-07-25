@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from aibom import db_loader
+from aibom.kb.vocabulary import schema_major
 
 
 def _write_dummy_db(path: Path, content: bytes = b"duckdb") -> str:
@@ -119,6 +120,11 @@ def test_schema_v2_manifest_requires_cli_upgrade(monkeypatch, tmp_path):
         match=r"requires cisco-aibom 2\.x",
     ):
         db_loader.ensure_local_database(console=None)
+
+
+@pytest.mark.parametrize("schema_version", [float("nan"), float("inf")])
+def test_non_finite_schema_versions_are_invalid(schema_version):
+    assert schema_major(schema_version) is None
 
 
 @pytest.mark.parametrize("schema_version", ["1.0.9", 1])

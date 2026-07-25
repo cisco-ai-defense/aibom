@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Final
 
 SCHEMA_VERSION: Final[int] = 2
@@ -55,6 +56,8 @@ def schema_major(value: object) -> int | None:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
         return int(value)
     text = str(value).strip().lower()
     if text.startswith("v"):
