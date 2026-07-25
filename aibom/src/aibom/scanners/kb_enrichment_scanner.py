@@ -34,7 +34,12 @@ from typing import Any, Optional
 
 from ..catalog_db import CatalogDB
 from ..cst_parser import parse_source_code
-from ..db_loader import DatabaseLoadError, ensure_local_database
+from ..db_loader import (
+    DatabaseLoadError,
+    UnsupportedDatabaseSchemaError,
+    ensure_local_database,
+    require_supported_manifest_schema,
+)
 from ..models import (
     AIComponent,
     AIComponentType,
@@ -729,6 +734,12 @@ def _is_known_call(
 
 def _resolve_kb_path(context: ScanContext) -> Optional[Path]:
     """Locate the KB DuckDB file.  Returns ``None`` when unavailable."""
+    try:
+        require_supported_manifest_schema()
+    except UnsupportedDatabaseSchemaError as exc:
+        _LOGGER.warning("%s", exc)
+        return None
+
     if context.kb_path:
         p = Path(context.kb_path)
         if p.is_file():
@@ -736,6 +747,9 @@ def _resolve_kb_path(context: ScanContext) -> Optional[Path]:
 
     try:
         return ensure_local_database()
+    except UnsupportedDatabaseSchemaError as exc:
+        _LOGGER.warning("%s", exc)
+        return None
     except (DatabaseLoadError, Exception):  # noqa: BLE001
         pass
 

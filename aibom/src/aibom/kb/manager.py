@@ -30,6 +30,7 @@ import platformdirs
 from pydantic import ValidationError
 
 from .manifest import KBManifest, KBManifestIndex
+from .vocabulary import CONCEPTS, SCHEMA_VERSION, VOCABULARY_VERSION, schema_major
 
 LOGGER = logging.getLogger(__name__)
 
@@ -231,11 +232,27 @@ class KBManager:
         if not mp.exists():
             raise KBError("No local KB manifest found; run download first")
         try:
-            m = KBManifest.model_validate(json.loads(mp.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, ValidationError) as e:
+            manifest = json.loads(mp.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise KBError("Invalid local manifest: root must be an object")
+        except json.JSONDecodeError as e:
             raise KBError(f"Invalid local manifest: {e}") from e
 
-        db_path = self._kb_duckdb_path(m.kb_version)
+        manifest_schema = schema_major(manifest.get("schema_version"))
+        if manifest_schema == SCHEMA_VERSION:
+            version, db_path = self._schema_v2_info_source(manifest, mp)
+            schema_version = manifest.get("schema_version")
+            vocabulary_version = manifest.get("vocabulary_version")
+        else:
+            try:
+                legacy = KBManifest.model_validate(manifest)
+            except ValidationError as e:
+                raise KBError(f"Invalid local manifest: {e}") from e
+            version = legacy.kb_version
+            db_path = self._kb_duckdb_path(version)
+            schema_version = legacy.schema_version
+            vocabulary_version = legacy.vocabulary_version
+
         if not db_path.exists():
             raise KBError(f"Local KB file missing at {db_path}")
 
@@ -255,14 +272,57 @@ class KBManager:
             raise KBError(f"Failed to query KB database: {e}") from e
 
         last_modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
-        return {
-            "version": m.kb_version,
+        info: dict[str, Any] = {
+            "version": version,
             "path": str(db_path.resolve()),
             "sha256": sha256,
             "size_bytes": stat.st_size,
             "entity_count": entity_count,
             "last_modified": last_modified,
         }
+        if manifest_schema == SCHEMA_VERSION:
+            info.update(
+                {
+                    "schema_version": schema_version,
+                    "vocabulary_version": (
+                        vocabulary_version
+                        if isinstance(vocabulary_version, str)
+                        and vocabulary_version
+                        else VOCABULARY_VERSION
+                    ),
+                    "concept_count": len(CONCEPTS),
+                    "concepts": ", ".join(CONCEPTS),
+                }
+            )
+        return info
+
+    def _schema_v2_info_source(
+        self,
+        manifest: dict[str, Any],
+        manifest_path: Path,
+    ) -> tuple[str, Path]:
+        """Resolve offline display identity and DuckDB path for schema v2."""
+
+        raw_version = manifest.get("kb_version") or manifest.get("build_id")
+        if not isinstance(raw_version, str) or not raw_version.strip():
+            raise KBError(
+                "Invalid local schema-v2 manifest: "
+                "kb_version or build_id is required"
+            )
+        version = raw_version.strip()
+
+        duckdb_entry = manifest.get("duckdb")
+        if not isinstance(duckdb_entry, dict):
+            raise KBError(
+                "Invalid local schema-v2 manifest: duckdb object is required"
+            )
+        filename = duckdb_entry.get("filename")
+        if isinstance(filename, str) and filename.strip():
+            candidate = Path(filename.strip()).expanduser()
+            if candidate.is_absolute():
+                return version, candidate
+            return version, (manifest_path.parent / candidate).resolve()
+        return version, self._kb_duckdb_path(version)
 
     def verify(self) -> bool:
         mp = self._local_manifest_path()

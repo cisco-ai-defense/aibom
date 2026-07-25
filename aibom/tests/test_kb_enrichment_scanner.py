@@ -264,6 +264,27 @@ def _kb_available() -> bool:
     return _resolve_kb_path(ctx) is not None
 
 
+def test_explicit_kb_path_does_not_bypass_schema_guard(
+    monkeypatch,
+    tmp_path: Path,
+):
+    db_path = tmp_path / "candidate.duckdb"
+    db_path.touch()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        """{
+  "schema_version": 2,
+  "duckdb_file": "candidate.duckdb",
+  "duckdb_sha256": "unused"
+}""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AIBOM_MANIFEST_PATH", str(manifest_path))
+    context = ScanContext(paths=[str(tmp_path)], kb_path=str(db_path))
+
+    assert _resolve_kb_path(context) is None
+
+
 class TestExtractLeafClass:
     """Unit tests for _extract_leaf_class KB id parsing."""
 

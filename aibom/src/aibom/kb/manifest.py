@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 
 class KBManifest(BaseModel):
     kb_version: str
+    schema_version: int | str | None = None
+    vocabulary_version: str = ""
     min_cli_version: str = ""
     duckdb_sha256: str
     duckdb_url: str

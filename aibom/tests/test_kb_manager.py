@@ -158,6 +158,47 @@ def test_kb_manager_info_returns_expected_keys(tmp_path):
     assert info["size_bytes"] == db_path.stat().st_size
 
 
+def test_kb_manager_info_surfaces_schema_v2_candidate_offline(tmp_path):
+    root = tmp_path
+    db_path = root / "aibom_catalog.duckdb"
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute("CREATE TABLE component_catalog (id INTEGER)")
+        con.execute("INSERT INTO component_catalog VALUES (1)")
+    finally:
+        con.close()
+
+    manifest = {
+        "artifact_state": "candidate",
+        "authoritative": False,
+        "schema_version": 2,
+        "build_id": "candidate-2026-07-24",
+        "min_cli_version": "2.0.0",
+        "vocabulary_version": "v2.0",
+        "duckdb": {
+            "filename": db_path.name,
+            "size_bytes": db_path.stat().st_size,
+            "sha256": hashlib.sha256(db_path.read_bytes()).hexdigest(),
+        },
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    mgr = KBManager()
+    with patch.object(
+        mgr,
+        "_local_manifest_path",
+        return_value=root / "manifest.json",
+    ):
+        info = mgr.info()
+
+    assert info["version"] == "candidate-2026-07-24"
+    assert info["path"] == str(db_path.resolve())
+    assert info["schema_version"] == 2
+    assert info["vocabulary_version"] == "v2.0"
+    assert info["concept_count"] == 20
+    assert "document_loader" in info["concepts"]
+
+
 @respx.mock
 def test_kb_manager_check_update_available_when_remote_newer(tmp_path):
     root = tmp_path
