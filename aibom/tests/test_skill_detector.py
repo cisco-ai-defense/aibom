@@ -30,6 +30,32 @@ class TestSkillDetector:
         assert len(comps) == 1
         assert comps[0].skill_format == "codex"
 
+        def test_claude_skill_skill_md(self, tmp_path: Path) -> None:
+        md = "# Claude Skill\n\nDesc.\n"
+        comps, _ = run_scanner(
+            SkillDetector, tmp_path, {"proj/.claude/skills/my-skill/SKILL.md": md}
+        )
+        assert len(comps) == 1
+        assert comps[0].skill_format == "claude"
+        assert comps[0].name == "Claude Skill"
+
+    def test_claude_skill_nested_skill_md_not_double_counted(
+        self, tmp_path: Path
+    ) -> None:
+        # Claude skills are single-level (.claude/skills/<name>/SKILL.md). A
+        # nested SKILL.md inside a skill's reference subdir must not register a
+        # second component.
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {
+                "proj/.claude/skills/my-skill/SKILL.md": "# Real Skill\n\nDesc.\n",
+                "proj/.claude/skills/my-skill/references/SKILL.md": "# Nested\n",
+            },
+        )
+        assert len(comps) == 1
+        assert comps[0].name == "Real Skill"
+
     def test_agents_md_format(self, tmp_path: Path) -> None:
         comps, _ = run_scanner(
             SkillDetector, tmp_path, {"AGENTS.md": "# Repo Agents\n\nRules here.\n"}
