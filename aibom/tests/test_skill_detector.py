@@ -30,7 +30,7 @@ class TestSkillDetector:
         assert len(comps) == 1
         assert comps[0].skill_format == "codex"
 
-        def test_claude_skill_skill_md(self, tmp_path: Path) -> None:
+    def test_claude_skill_skill_md(self, tmp_path: Path) -> None:
         md = "# Claude Skill\n\nDesc.\n"
         comps, _ = run_scanner(
             SkillDetector, tmp_path, {"proj/.claude/skills/my-skill/SKILL.md": md}
