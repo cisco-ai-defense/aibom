@@ -2229,6 +2229,14 @@ class TestDecisionMemo:
                 "decision_annotation": DecisionAnnotation(
                     decision="confirmed",
                     justification="The dependency is declared.",
+                    evidence_locations=[
+                        EvidenceLocation(
+                            file_path="req.txt",
+                            start_line=1,
+                            end_line=1,
+                            role="primary",
+                        )
+                    ],
                 ),
             }
         )
@@ -2241,6 +2249,8 @@ class TestDecisionMemo:
         replayed = memo.apply([before])[0]
         assert replayed.decision_annotation is not None
         assert replayed.decision_annotation.decision == "confirmed"
+        assert replayed.decision_annotation.evidence_locations == []
+        assert replayed.decision_annotation.code_snippet is None
 
     def test_record_and_lookup_remove(self):
         from aibom.agentic.agent import _DecisionMemo

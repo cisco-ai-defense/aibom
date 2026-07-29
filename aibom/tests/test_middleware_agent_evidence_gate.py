@@ -296,6 +296,8 @@ class TestGateOnNewComponents:
         stored = components[0].metadata["agent_evidence"]
         assert stored["definition_start_line"] == 4
         assert stored["definition_end_line"] == 4
+        assert stored["definition_file"] == str(agent_py)
+        assert "evidence_snippet" not in stored
 
     @pytest.mark.parametrize("comp_type", ["agent", "agent_proxy"])
     def test_new_agent_without_evidence_is_rejected(
@@ -396,6 +398,9 @@ class TestGateOnReclassify:
         result = mw.apply_enrichments_from_dict([existing], data)
         assert len(result) == 1
         assert result[0].component_type == AIComponentType.AGENT
+        stored = result[0].metadata["agent_evidence"]
+        assert stored["definition_file"] == str(agent_py)
+        assert "evidence_snippet" not in stored
 
     def test_reclassify_to_agent_without_evidence_is_rejected(
         self, agent_py: Path
@@ -494,6 +499,9 @@ class TestGateOnEnrichmentUpdates:
         comp = result[0]
         assert comp.component_type == AIComponentType.AGENT
         assert comp.framework == "langchain"
+        stored = comp.metadata["agent_evidence"]
+        assert stored["definition_file"] == str(agent_py)
+        assert "evidence_snippet" not in stored
 
     def test_enrichment_without_type_change_bypasses_the_gate(
         self, agent_py: Path

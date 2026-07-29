@@ -13,10 +13,18 @@ from aibom.cli import (
     _aggregate_agentic_outcomes,
     _apply_cached_agentic_outcome,
     _build_submission_payload,
+    _org_cache_has_agentic_outcome,
     _serializable_scan_cache_payload,
+    _v2_output_from_org_cache,
     app,
 )
-from aibom.models import AIComponent, AIComponentType, RiskScore, ScanResult, SourceResult
+from aibom.models import (
+    AIComponent,
+    AIComponentType,
+    RiskScore,
+    ScanResult,
+    SourceResult,
+)
 from aibom.reporters.json_reporter import JsonReporter
 
 runner = CliRunner()
@@ -48,6 +56,33 @@ def test_scan_cache_preserves_agentic_outcome() -> None:
             "retry_budget_exhausted": 1,
         },
     }
+
+
+def test_org_cache_preserves_agentic_outcome() -> None:
+    cached_result = ScanResult(
+        metadata={
+            "agentic_status": "degraded",
+            "agentic_degraded_count": 2,
+            "agentic_degradation_reasons": {"batch_timeout": 2},
+        },
+        sources=[
+            SourceResult(
+                path="/repo",
+                components=[],
+                relationships=[],
+            )
+        ],
+    )
+
+    cached = _v2_output_from_org_cache(cached_result)
+
+    assert cached["_agentic_status"] == "degraded"
+    assert cached["_agentic_degraded_count"] == 2
+    assert cached["_agentic_degradation_reasons"] == {"batch_timeout": 2}
+    assert _org_cache_has_agentic_outcome(cached_result) is True
+
+    legacy = cached_result.model_copy(update={"metadata": {}})
+    assert _org_cache_has_agentic_outcome(legacy) is False
 
 
 def test_run_agentic_outcome_aggregates_sources() -> None:

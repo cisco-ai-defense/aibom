@@ -370,21 +370,54 @@ def _require_supported_cache_type(cache_type: str) -> None:
     raise typer.Exit(code=1)
 
 
+def _org_cache_has_agentic_outcome(cached_sr: Any) -> bool:
+    """Return whether an org-cache entry carries the current status contract."""
+
+    metadata = getattr(cached_sr, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get("agentic_status") in {"success", "degraded", "skipped"}
+        and isinstance(metadata.get("agentic_degraded_count"), int)
+        and isinstance(metadata.get("agentic_degradation_reasons"), dict)
+    )
+
+
 def _v2_output_from_org_cache(cached_sr: Any) -> Dict[str, Any]:
     merged_components: list = []
     merged_rels: list = []
     for s in cached_sr.sources:
         merged_components.extend(s.components)
         merged_rels.extend(s.relationships)
+    cached_metadata = (
+        cached_sr.metadata if isinstance(cached_sr.metadata, dict) else {}
+    )
+    cached_status = cached_metadata.get("agentic_status", "skipped")
+    if cached_status not in {"success", "degraded", "skipped"}:
+        cached_status = "skipped"
+    cached_degraded_count = cached_metadata.get(
+        "agentic_degraded_count",
+        0,
+    )
+    cached_reasons = cached_metadata.get(
+        "agentic_degradation_reasons",
+        {},
+    )
     return {
         "_v2": True,
         "components": merged_components,
         "relationships": merged_rels,
         "_agentic_risk_flags": [],
         "_agentic_candidate_count": 0,
-        "_agentic_status": "skipped",
-        "_agentic_degraded_count": 0,
-        "_agentic_degradation_reasons": {},
+        "_agentic_status": cached_status,
+        "_agentic_degraded_count": (
+            cached_degraded_count
+            if isinstance(cached_degraded_count, int)
+            else 0
+        ),
+        "_agentic_degradation_reasons": (
+            dict(cached_reasons) if isinstance(cached_reasons, dict) else {}
+        ),
     }
 
 
@@ -2292,6 +2325,14 @@ def analyze(
 
                 org_cache = OrgCache()
                 cached_sr = org_cache.get_cached(str(path_to_analyze.resolve()))
+                if cached_sr is not None and not _org_cache_has_agentic_outcome(
+                    cached_sr
+                ):
+                    console.print(
+                        f"[yellow]Ignoring legacy org cache entry[/] for "
+                        f"{source}: agentic outcome is unavailable"
+                    )
+                    cached_sr = None
                 if cached_sr is not None:
                     console.print(
                         f"[green]Org cache hit[/] for {source} " f"(~/.aibom/cache/org)"
@@ -2453,7 +2494,16 @@ def analyze(
                 org_cache.store(
                     str(path_to_analyze.resolve()),
                     ScanResult(
-                        metadata=run_metadata,
+                        metadata={
+                            **run_metadata,
+                            "agentic_status": result.agentic_status,
+                            "agentic_degraded_count": (
+                                result.agentic_degraded_count
+                            ),
+                            "agentic_degradation_reasons": dict(
+                                result.agentic_degradation_reasons
+                            ),
+                        },
                         sources=[
                             SourceResult(
                                 path=scan_path,

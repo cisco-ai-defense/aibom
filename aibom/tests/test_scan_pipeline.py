@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 
 from aibom.agentic.agent import TokenUsage
 from aibom.cross_ref import CrossRefIndex
-from aibom.models import AIComponent, AIComponentType, DecisionAnnotation
+from aibom.models import (
+    AIComponent,
+    AIComponentType,
+    DecisionAnnotation,
+    EvidenceLocation,
+)
 from aibom.scan_pipeline import ScanPipeline, StageTiming
 
 
@@ -787,6 +792,51 @@ class TestAgenticScope:
         assert result.components[0].needs_agentic is True
         assert result.components[0].agentic_hint == "agentic_stage_error"
 
+    def test_stage_failure_before_dedup_preserves_accounting(
+        self, tmp_path: Path
+    ) -> None:
+        component = AIComponent(
+            name="router",
+            component_type=AIComponentType.AGENT,
+            file_path="app.py",
+            line_number=1,
+        )
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+        )
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([component], [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
+                    [component],
+                    CrossRefIndex(),
+                    CrossRefIndex(),
+                    [],
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.scan_pipeline._partition_agentic_secrets",
+                side_effect=RuntimeError("partition failed"),
+            ),
+        ):
+            result = pipeline.run()
+
+        assert result.agentic_status == "degraded"
+        assert result.agentic_input_count == 1
+        assert result.agentic_reviewed_count == 0
+        assert result.agentic_removed_count == 0
+        assert result.agentic_degraded_count == 1
+        assert (
+            result.agentic_reviewed_count
+            + result.agentic_removed_count
+            + result.agentic_degraded_count
+            == result.agentic_input_count
+        )
+
     def test_agentic_candidate_accounting_has_one_terminal_outcome(
         self, tmp_path: Path
     ) -> None:
@@ -1123,6 +1173,14 @@ class TestFanoutAgenticResults:
                 "decision_annotation": DecisionAnnotation(
                     decision="confirmed",
                     justification="The dependency declaration is explicit.",
+                    evidence_locations=[
+                        EvidenceLocation(
+                            file_path=deduped[0].file_path,
+                            start_line=1,
+                            end_line=1,
+                            role="primary",
+                        )
+                    ],
                 ),
             }
         )
@@ -1136,6 +1194,8 @@ class TestFanoutAgenticResults:
             assert c.agentic_hint == ""
             assert c.decision_annotation is not None
             assert c.decision_annotation.decision == "confirmed"
+            assert c.decision_annotation.evidence_locations == []
+            assert c.decision_annotation.code_snippet is None
 
         assert result[0].decision_annotation is not result[1].decision_annotation
 

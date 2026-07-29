@@ -174,6 +174,8 @@ Components with an explicit reviewed verdict use `confirmed`, and agentic
 discoveries use `added`. A retained component that did not receive a usable
 verdict uses `decision_annotation.decision = "unreviewed"`, keeps
 `needs_agentic = true`, and preserves its failure reason in `agentic_hint`.
+Whole-scan and organization-cache hits preserve these agentic outcome fields;
+legacy organization-cache entries that lack them are ignored and regenerated.
 
 ### `report show`
 

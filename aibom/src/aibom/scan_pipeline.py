@@ -228,7 +228,13 @@ def _fanout_agentic_results(
             clone.needs_agentic = c.needs_agentic
             clone.agentic_hint = c.agentic_hint
             clone.decision_annotation = (
-                c.decision_annotation.model_copy(deep=True)
+                c.decision_annotation.model_copy(
+                    deep=True,
+                    update={
+                        "evidence_locations": [],
+                        "code_snippet": None,
+                    },
+                )
                 if c.decision_annotation is not None
                 else None
             )
@@ -573,6 +579,7 @@ def _evidence_gate(
 
 
 _REVIEWED_COMPONENT_DECISIONS = frozenset({"confirmed", "added"})
+_MISSING_AGENTIC_VERDICT = "missing_agentic_verdict"
 
 
 def _mark_missing_agentic_verdicts(
@@ -601,7 +608,7 @@ def _mark_missing_agentic_verdicts(
                 update={
                     "needs_agentic": True,
                     "agentic_hint": (
-                        component.agentic_hint or "missing_agentic_verdict"
+                        component.agentic_hint or _MISSING_AGENTIC_VERDICT
                     ),
                 }
             )
@@ -1502,10 +1509,10 @@ class ScanPipeline:
 
         tu = getattr(self, "_agentic_token_usage", None)
         agentic_degraded_count = getattr(self, "_agentic_degraded_count", 0)
-        if not self.llm_config or self._agentic_input_count == 0:
-            agentic_status = "skipped"
-        elif agentic_degraded_count:
+        if agentic_degraded_count:
             agentic_status = "degraded"
+        elif not self.llm_config or self._agentic_input_count == 0:
+            agentic_status = "skipped"
         else:
             agentic_status = "success"
         if telemetry_enabled and self.agentic_telemetry is not None:
@@ -1922,7 +1929,7 @@ class ScanPipeline:
                         for component in retained
                         if component.agentic_hint
                     ),
-                    "missing_agentic_verdict",
+                    _MISSING_AGENTIC_VERDICT,
                 )
                 degradation_reasons[reason] += 1
 
@@ -1950,6 +1957,7 @@ class ScanPipeline:
             raise
         except Exception as exc:  # noqa: BLE001
             exact_candidates = self._agentic_input_count or len(components)
+            self._agentic_input_count = exact_candidates
             failure_hint = "agentic_stage_error"
             components = [
                 component.model_copy(

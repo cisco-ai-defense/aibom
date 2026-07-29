@@ -120,6 +120,10 @@ def _component_annotation(
             )
         elif annotation.decision != decision:
             annotation = annotation.model_copy(update={"decision": decision})
+        if not annotation.evidence_locations and primary_location is not None:
+            annotation = annotation.model_copy(
+                update={"evidence_locations": [primary_location]}
+            )
         return _hydrate_annotation(
             annotation,
             include_code_snippets=include_code_snippets,

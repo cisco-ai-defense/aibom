@@ -2106,7 +2106,15 @@ class _DecisionMemo:
             if c_after.agentic_confidence is not None:
                 verdict["agentic_confidence"] = c_after.agentic_confidence
             if c_after.decision_annotation is not None:
-                verdict["decision_annotation"] = c_after.decision_annotation
+                verdict["decision_annotation"] = (
+                    c_after.decision_annotation.model_copy(
+                        deep=True,
+                        update={
+                            "evidence_locations": [],
+                            "code_snippet": None,
+                        },
+                    )
+                )
             self._verdicts[k] = verdict
         else:
             verdict = {
@@ -2116,7 +2124,15 @@ class _DecisionMemo:
             if c_after.agentic_confidence is not None:
                 verdict["agentic_confidence"] = c_after.agentic_confidence
             if c_after.decision_annotation is not None:
-                verdict["decision_annotation"] = c_after.decision_annotation
+                verdict["decision_annotation"] = (
+                    c_after.decision_annotation.model_copy(
+                        deep=True,
+                        update={
+                            "evidence_locations": [],
+                            "code_snippet": None,
+                        },
+                    )
+                )
             self._verdicts[k] = verdict
 
     def lookup(self, c: AIComponent) -> dict[str, Any] | None:

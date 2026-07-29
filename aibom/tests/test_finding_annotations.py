@@ -99,6 +99,9 @@ def test_annotate_findings_hydrates_snippets_when_enabled(tmp_path) -> None:
     assert components[0].decision_annotation is not None
     assert components[0].decision_annotation.code_snippet is not None
     assert "client = OpenAI()" in components[0].decision_annotation.code_snippet.text
+    assert components[0].decision_annotation.evidence_locations[0].file_path == str(
+        source_file
+    )
     assert components[0].needs_agentic is False
     assert components[0].agentic_hint == ""
 

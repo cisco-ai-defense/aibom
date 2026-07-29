@@ -363,6 +363,21 @@ def _sanitize_metadata(
     return cleaned
 
 
+def _agent_evidence_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+    """Persist verified evidence coordinates without copying raw source text."""
+
+    return {
+        key: raw[key]
+        for key in (
+            "pattern",
+            "definition_file",
+            "definition_start_line",
+            "definition_end_line",
+        )
+        if key in raw
+    }
+
+
 _DOCSTRING_RE = re.compile(r'("""|\'\'\')(.*?)\1', re.DOTALL)
 _BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/', re.DOTALL)
 # Line comments must start at the line (possibly after whitespace). This
@@ -1381,7 +1396,9 @@ class AIBOMScannerMiddleware:
                     merged_meta = dict(comp.metadata)
                     reclass_evidence = reclassify_evidence.get(comp.instance_id)
                     if reclass_evidence is not None:
-                        merged_meta["agent_evidence"] = reclass_evidence
+                        merged_meta["agent_evidence"] = (
+                            _agent_evidence_metadata(reclass_evidence)
+                        )
                     comp = comp.model_copy(update={
                         "component_type": new_type,
                         "needs_agentic": False,
@@ -1413,7 +1430,9 @@ class AIBOMScannerMiddleware:
                         _LOGGER.warning("Invalid component_type '%s' in enrichment for %s", raw_type, comp.instance_id)
                 enrich_evidence = enrichment_evidence.get(comp.instance_id)
                 if enrich_evidence is not None:
-                    merged_meta["agent_evidence"] = enrich_evidence
+                    merged_meta["agent_evidence"] = (
+                        _agent_evidence_metadata(enrich_evidence)
+                    )
                 comp = comp.model_copy(update={
                     **upd,
                     "metadata": merged_meta,
@@ -1519,7 +1538,9 @@ class AIBOMScannerMiddleware:
             if comp_type in _AGENT_CLASSIFICATION_TYPES:
                 agent_evidence = item.get("agent_evidence")
                 if isinstance(agent_evidence, dict):
-                    sanitized_meta["agent_evidence"] = agent_evidence
+                    sanitized_meta["agent_evidence"] = (
+                        _agent_evidence_metadata(agent_evidence)
+                    )
             probe = AIComponent(
                 name=name,
                 component_type=comp_type,
