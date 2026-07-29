@@ -383,6 +383,18 @@ def _org_cache_has_agentic_outcome(cached_sr: Any) -> bool:
     )
 
 
+def _scan_cache_has_agentic_outcome(cached: Any) -> bool:
+    """Return whether a scan-cache entry carries the current status contract."""
+
+    if not isinstance(cached, dict):
+        return False
+    return (
+        cached.get("_agentic_status") in {"success", "degraded", "skipped"}
+        and isinstance(cached.get("_agentic_degraded_count"), int)
+        and isinstance(cached.get("_agentic_degradation_reasons"), dict)
+    )
+
+
 def _v2_output_from_org_cache(cached_sr: Any) -> Dict[str, Any]:
     merged_components: list = []
     merged_rels: list = []
@@ -2380,7 +2392,15 @@ def analyze(
                     _ck,
                     search_dirs=scan_cache_read_dirs,
                 )
-                if cached:
+                if cached is not None and not _scan_cache_has_agentic_outcome(
+                    cached
+                ):
+                    console.print(
+                        f"[yellow]Ignoring legacy scan cache entry[/] for "
+                        f"{source}: agentic outcome is unavailable"
+                    )
+                    cached = None
+                if cached is not None:
                     _scan_cache_hit = True
                     console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
                     all_analysis_outputs[source] = cached

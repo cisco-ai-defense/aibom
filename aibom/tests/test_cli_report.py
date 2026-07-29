@@ -14,6 +14,7 @@ from aibom.cli import (
     _apply_cached_agentic_outcome,
     _build_submission_payload,
     _org_cache_has_agentic_outcome,
+    _scan_cache_has_agentic_outcome,
     _serializable_scan_cache_payload,
     _v2_output_from_org_cache,
     app,
@@ -48,6 +49,11 @@ def test_scan_cache_preserves_agentic_outcome() -> None:
     source_summary: dict = {}
     _apply_cached_agentic_outcome(source_summary, cached)
 
+    assert _scan_cache_has_agentic_outcome(cached) is True
+    legacy = {
+        key: value for key, value in cached.items() if not key.startswith("_agentic_")
+    }
+    assert _scan_cache_has_agentic_outcome(legacy) is False
     assert source_summary == {
         "agentic_status": "degraded",
         "agentic_degraded_count": 2,

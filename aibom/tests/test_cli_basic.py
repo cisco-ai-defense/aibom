@@ -257,6 +257,9 @@ def test_analyze_scan_cache_hit_finalizes_per_source_status(tmp_path):
         "relationships": [],
         "_agentic_risk_flags": [],
         "_agentic_candidate_count": 0,
+        "_agentic_status": "success",
+        "_agentic_degraded_count": 0,
+        "_agentic_degradation_reasons": {},
     }
     telemetry = MagicMock(enabled=True)
 
@@ -309,6 +312,68 @@ def test_analyze_scan_cache_hit_finalizes_per_source_status(tmp_path):
     assert summary["candidate_count"] == 0
     assert summary["candidate_count_available"] is False
     assert summary["final_component_count"] == 0
+
+
+def test_analyze_ignores_legacy_scan_cache_without_agentic_outcome(tmp_path):
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    report = tmp_path / "report.json"
+    legacy_cached_payload = {
+        "_v2": True,
+        "components": [],
+        "relationships": [],
+        "_agentic_risk_flags": [],
+        "_agentic_candidate_count": 0,
+    }
+    fresh_result = PipelineResult(
+        components=[],
+        relationships=[],
+        agentic_risk_flags=[],
+        agentic_candidate_count=2,
+        external_deps=[],
+        timings=[],
+        total_elapsed_s=0.0,
+        agentic_status="degraded",
+        agentic_degraded_count=2,
+        agentic_degradation_reasons={"batch_timeout": 2},
+    )
+
+    with patch("aibom.cli.ensure_llm_runtime_available"):
+        with patch(
+            "aibom.scan_cache.load_cached",
+            return_value=legacy_cached_payload,
+        ):
+            with patch("aibom.scan_cache.save_cached") as mock_save:
+                with patch(
+                    "aibom.scan_pipeline.ScanPipeline.run",
+                    return_value=fresh_result,
+                ) as mock_run:
+                    result = runner.invoke(
+                        app,
+                        [
+                            "analyze",
+                            str(source_dir),
+                            "--output-format",
+                            "json",
+                            "--output-file",
+                            str(report),
+                            "--llm-model",
+                            "test-model",
+                        ],
+                    )
+
+    assert result.exit_code == 0, result.output
+    assert "Ignoring legacy scan cache entry" in result.output
+    mock_run.assert_called_once()
+    mock_save.assert_called_once()
+    data = json.loads(report.read_text(encoding="utf-8"))
+    source = next(iter(data["aibom_analysis"]["sources"].values()))
+    assert source["summary"]["agentic_status"] == "degraded"
+    assert source["summary"]["agentic_degraded_count"] == 2
+    assert source["summary"]["agentic_degradation_reasons"] == {
+        "batch_timeout": 2
+    }
 
 
 def test_analyze_pipeline_exception_emits_failed_source_summary(tmp_path):
