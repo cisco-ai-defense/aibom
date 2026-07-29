@@ -145,6 +145,13 @@ def load_scan_result_json(path: Path | str) -> ScanResult:
             "last_generated_at": summary.get("last_generated_at"),
             "assets_discovered": summary.get("assets_discovered"),
         }
+        for key in (
+            "agentic_status",
+            "agentic_degraded_count",
+            "agentic_degradation_reasons",
+        ):
+            if key in summary:
+                source_details[source_path][key] = summary[key]
         raw_comps = src.get("components", [])
         flat: list[AIComponent] = []
         if isinstance(raw_comps, dict):

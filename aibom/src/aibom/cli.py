@@ -1202,6 +1202,13 @@ def _source_outcomes_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, 
             "last_generated_at": summary.get("last_generated_at"),
             "assets_discovered": summary.get("assets_discovered"),
         }
+        for key in (
+            "agentic_status",
+            "agentic_degraded_count",
+            "agentic_degradation_reasons",
+        ):
+            if key in summary:
+                outcomes[source_path][key] = summary[key]
     return outcomes
 
 

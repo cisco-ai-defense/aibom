@@ -318,6 +318,13 @@ def _write_multi_source_report(
             "source_ref_version": spec["version"],
             "status": "completed",
         }
+        for key in (
+            "agentic_status",
+            "agentic_degraded_count",
+            "agentic_degradation_reasons",
+        ):
+            if key in spec:
+                source_outcomes[spec["path"]][key] = spec[key]
     result = ScanResult(
         metadata={
             "run_id": run_id,
@@ -429,6 +436,67 @@ def test_two_sources_fan_out_to_two_uploads(mock_post, tmp_path: Path):
     # Each upload's report is scoped to exactly one source.
     for p in payloads:
         assert len(p["report"]["aibom_analysis"]["sources"]) == 1
+
+
+@patch("aibom.cli.post_report_with_retries")
+def test_report_upload_preserves_per_source_agentic_outcomes(
+    mock_post, tmp_path: Path
+):
+    report_file = tmp_path / "report.json"
+    _write_multi_source_report(
+        report_file,
+        [
+            {
+                "path": "/repo/degraded",
+                "name": "org/degraded",
+                "kind": "git",
+                "canonical": "github.com/org/degraded",
+                "version": "aaa",
+                "agentic_status": "degraded",
+                "agentic_degraded_count": 2,
+                "agentic_degradation_reasons": {
+                    "retry_failed": 1,
+                    "circuit_breaker_tripped": 1,
+                },
+            },
+            {
+                "path": "/repo/success",
+                "name": "org/success",
+                "kind": "git",
+                "canonical": "github.com/org/success",
+                "version": "bbb",
+                "agentic_status": "success",
+                "agentic_degraded_count": 0,
+                "agentic_degradation_reasons": {},
+            },
+        ],
+    )
+
+    generated = json.loads(report_file.read_text(encoding="utf-8"))
+    generated_summaries = {
+        key: value["summary"]
+        for key, value in generated["aibom_analysis"]["sources"].items()
+    }
+    assert generated_summaries["org/degraded"]["agentic_status"] == "degraded"
+    assert generated_summaries["org/success"]["agentic_status"] == "success"
+
+    result = _invoke_upload(report_file)
+
+    assert result.exit_code == 0, result.output
+    assert mock_post.call_count == 2
+    uploaded_summaries = {}
+    for call in mock_post.call_args_list:
+        uploaded_sources = call.args[1]["report"]["aibom_analysis"]["sources"]
+        assert len(uploaded_sources) == 1
+        source_key, source_entry = next(iter(uploaded_sources.items()))
+        uploaded_summaries[source_key] = source_entry["summary"]
+
+    assert uploaded_summaries["org/degraded"] == generated_summaries[
+        "org/degraded"
+    ]
+    assert uploaded_summaries["org/success"] == generated_summaries[
+        "org/success"
+    ]
 
 
 @patch("aibom.cli.post_report_with_retries")
