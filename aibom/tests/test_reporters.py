@@ -202,6 +202,58 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
         assert "summary" in src_data
 
 
+def test_json_reporter_emits_run_and_source_agentic_outcomes():
+    component = AIComponent(
+        name="router_agent",
+        component_type=AIComponentType.AGENT,
+        file_path="/repo/app.py",
+        line_number=4,
+    )
+    result = ScanResult(
+        metadata={
+            "run_id": "run-agentic-status",
+            "agentic_status": "degraded",
+            "agentic_degraded_count": 1,
+            "agentic_degradation_reasons": {"batch_timeout": 1},
+            "source_outcomes": {
+                "/repo": {
+                    "source_name": "example/repo",
+                    "source_path": "/repo",
+                    "source_kind": "local-path",
+                    "status": "completed",
+                    "agentic_status": "degraded",
+                    "agentic_degraded_count": 1,
+                    "agentic_degradation_reasons": {"batch_timeout": 1},
+                }
+            },
+        },
+        sources=[
+            SourceResult(
+                path="/repo",
+                components=[component],
+                relationships=[],
+            )
+        ],
+    )
+    buf = StringIO()
+
+    JsonReporter().render(result, buf)
+
+    analysis = json.loads(buf.getvalue())["aibom_analysis"]
+    assert analysis["metadata"]["agentic_status"] == "degraded"
+    assert analysis["metadata"]["agentic_degraded_count"] == 1
+    assert analysis["metadata"]["agentic_degradation_reasons"] == {
+        "batch_timeout": 1
+    }
+    source_summary = analysis["sources"]["example/repo"]["summary"]
+    assert source_summary["status"] == "completed"
+    assert source_summary["agentic_status"] == "degraded"
+    assert source_summary["agentic_degraded_count"] == 1
+    assert source_summary["agentic_degradation_reasons"] == {
+        "batch_timeout": 1
+    }
+
+
 def test_json_reporter_preserves_decision_annotations():
     component = AIComponent(
         name="router_agent",

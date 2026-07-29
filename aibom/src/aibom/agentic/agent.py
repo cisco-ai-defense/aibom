@@ -2098,16 +2098,26 @@ class _DecisionMemo:
         if c_after is None:
             self._verdicts[k] = {"action": "remove"}
         elif c_after.component_type != c_before.component_type:
-            self._verdicts[k] = {
+            verdict: dict[str, Any] = {
                 "action": "reclassify",
                 "new_type": c_after.component_type.value,
                 "heuristic_confidence": c_after.heuristic_confidence,
             }
+            if c_after.agentic_confidence is not None:
+                verdict["agentic_confidence"] = c_after.agentic_confidence
+            if c_after.decision_annotation is not None:
+                verdict["decision_annotation"] = c_after.decision_annotation
+            self._verdicts[k] = verdict
         else:
-            self._verdicts[k] = {
+            verdict = {
                 "action": "keep",
                 "heuristic_confidence": c_after.heuristic_confidence,
             }
+            if c_after.agentic_confidence is not None:
+                verdict["agentic_confidence"] = c_after.agentic_confidence
+            if c_after.decision_annotation is not None:
+                verdict["decision_annotation"] = c_after.decision_annotation
+            self._verdicts[k] = verdict
 
     def lookup(self, c: AIComponent) -> dict[str, Any] | None:
         k = self._key(c)
@@ -2151,6 +2161,12 @@ class _DecisionMemo:
                             "heuristic_confidence": verdict.get(
                                 "heuristic_confidence", c.heuristic_confidence
                             ),
+                            "agentic_confidence": verdict.get(
+                                "agentic_confidence", c.agentic_confidence
+                            ),
+                            "decision_annotation": verdict.get(
+                                "decision_annotation"
+                            ),
                             "needs_agentic": False,
                         }
                     )
@@ -2161,6 +2177,12 @@ class _DecisionMemo:
                         update={
                             "heuristic_confidence": verdict.get(
                                 "heuristic_confidence", c.heuristic_confidence
+                            ),
+                            "agentic_confidence": verdict.get(
+                                "agentic_confidence", c.agentic_confidence
+                            ),
+                            "decision_annotation": verdict.get(
+                                "decision_annotation"
                             ),
                             "needs_agentic": False,
                         }
@@ -2178,7 +2200,7 @@ def _degraded_batch_components(
     hint: str,
 ) -> list[AIComponent]:
     return [
-        c.model_copy(update={"needs_agentic": False, "agentic_hint": hint})
+        c.model_copy(update={"needs_agentic": True, "agentic_hint": hint})
         for c in batch
     ]
 
@@ -3676,12 +3698,12 @@ def _run_tier(
         time.sleep(_RETRY_COOLDOWN_S)
 
         retry_batch_size = batch_size
-        has_recursion_failures = any(
-            c_orig.agentic_hint == "batch_recursion_limit"
+        has_batch_size_sensitive_failures = any(
+            c_orig.agentic_hint in {"batch_recursion_limit", "batch_timeout"}
             for c_orig in enriched
             if c_orig.agentic_hint in _RETRYABLE_HINTS
         )
-        if has_recursion_failures:
+        if has_batch_size_sensitive_failures:
             retry_batch_size = max(1, batch_size // 2)
 
         retry_batches = _locality_aware_batches(retry_candidates, retry_batch_size)

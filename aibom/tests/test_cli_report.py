@@ -4,15 +4,125 @@ import json
 import uuid
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from typer.testing import CliRunner
 
-from aibom.cli import app
+from aibom.cli import (
+    _aggregate_agentic_outcomes,
+    _apply_cached_agentic_outcome,
+    _build_submission_payload,
+    _serializable_scan_cache_payload,
+    app,
+)
 from aibom.models import AIComponent, AIComponentType, RiskScore, ScanResult, SourceResult
 from aibom.reporters.json_reporter import JsonReporter
 
 runner = CliRunner()
+
+
+def test_scan_cache_preserves_agentic_outcome() -> None:
+    result = SimpleNamespace(
+        components=[],
+        relationships=[],
+        agentic_risk_flags=[],
+        agentic_candidate_count=3,
+        agentic_status="degraded",
+        agentic_degraded_count=2,
+        agentic_degradation_reasons={
+            "batch_timeout": 1,
+            "retry_budget_exhausted": 1,
+        },
+    )
+
+    cached = _serializable_scan_cache_payload(result)
+    source_summary: dict = {}
+    _apply_cached_agentic_outcome(source_summary, cached)
+
+    assert source_summary == {
+        "agentic_status": "degraded",
+        "agentic_degraded_count": 2,
+        "agentic_degradation_reasons": {
+            "batch_timeout": 1,
+            "retry_budget_exhausted": 1,
+        },
+    }
+
+
+def test_run_agentic_outcome_aggregates_sources() -> None:
+    outcomes = {
+        "first": {
+            "agentic_status": "success",
+            "agentic_degraded_count": 0,
+            "agentic_degradation_reasons": {},
+        },
+        "second": {
+            "agentic_status": "degraded",
+            "agentic_degraded_count": 3,
+            "agentic_degradation_reasons": {
+                "batch_timeout": 2,
+                "retry_failed": 1,
+            },
+        },
+        "third": {
+            "agentic_status": "degraded",
+            "agentic_degraded_count": 1,
+            "agentic_degradation_reasons": {"batch_timeout": 1},
+        },
+    }
+
+    assert _aggregate_agentic_outcomes(outcomes) == (
+        "degraded",
+        4,
+        {"batch_timeout": 3, "retry_failed": 1},
+    )
+
+
+def test_submission_preserves_unreviewed_and_agentic_outcome() -> None:
+    report = {
+        "aibom_analysis": {
+            "metadata": {
+                "run_id": "run-123",
+                "analyzer_version": "1.0.9",
+                "agentic_status": "degraded",
+                "agentic_degraded_count": 1,
+                "agentic_degradation_reasons": {"batch_timeout": 1},
+            },
+            "sources": {
+                "example/repo": {
+                    "components": {
+                        "agent": [
+                            {
+                                "name": "RouterAgent",
+                                "decision_annotation": {
+                                    "decision": "unreviewed"
+                                },
+                                "needs_agentic": True,
+                                "agentic_hint": "batch_timeout",
+                            }
+                        ]
+                    },
+                    "summary": {
+                        "agentic_status": "degraded",
+                        "agentic_degraded_count": 1,
+                        "agentic_degradation_reasons": {
+                            "batch_timeout": 1
+                        },
+                    },
+                }
+            },
+        }
+    }
+
+    payload = _build_submission_payload(report)
+
+    assert payload["report"] == report
+    component = payload["report"]["aibom_analysis"]["sources"][
+        "example/repo"
+    ]["components"]["agent"][0]
+    assert component["decision_annotation"]["decision"] == "unreviewed"
+    assert component["needs_agentic"] is True
 
 
 def _write_report(path: Path, *, include_version: bool = True) -> dict:

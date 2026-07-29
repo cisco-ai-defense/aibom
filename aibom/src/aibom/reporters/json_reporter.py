@@ -210,20 +210,29 @@ def _aibom_payload(
             val = detail.get(mk)
             if val is not None:
                 per_source_meta[mk] = val
+        source_summary: dict[str, Any] = {
+            "status": detail.get("status") or "completed",
+            "source_kind": summary_source_kind,
+            "assets_discovered": detail.get("assets_discovered")
+            or total_components,
+            "last_generated_at": (
+                detail.get("last_generated_at") or raw_metadata.get("completed_at")
+            ),
+        }
+        for key in (
+            "agentic_status",
+            "agentic_degraded_count",
+            "agentic_degradation_reasons",
+        ):
+            if key in detail:
+                source_summary[key] = detail[key]
+
         sources_out[source_key] = {
             "source_name": source_name,
             "source_path": source_path,
             "components": comps,
             "relationships": [r.model_dump(mode="json") for r in src.relationships],
-            "summary": {
-                "status": detail.get("status") or "completed",
-                "source_kind": summary_source_kind,
-                "assets_discovered": detail.get("assets_discovered")
-                or total_components,
-                "last_generated_at": (
-                    detail.get("last_generated_at") or raw_metadata.get("completed_at")
-                ),
-            },
+            "summary": source_summary,
             "metadata": per_source_meta,
         }
         components_by_source[source_key] = list(src.components)

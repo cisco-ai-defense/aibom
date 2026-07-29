@@ -158,11 +158,24 @@ class TestVerifyAgentEvidence:
             (-1, 2),
             (2, 1),
             (1, 9999),
-            ("1", 2),
-            (1, "2"),
         ],
     )
-    def test_invalid_line_range_fails(
+    def test_stale_numeric_line_range_is_repaired(
+        self, agent_py: Path, start, end
+    ) -> None:
+        ev = _valid_evidence(agent_py)
+        ev["definition_start_line"] = start
+        ev["definition_end_line"] = end
+        ok, reason = _verify_agent_evidence(
+            ev, allowed_roots=[str(agent_py.parent)]
+        )
+        assert ok
+        assert reason == ""
+        assert ev["definition_start_line"] == 4
+        assert ev["definition_end_line"] == 4
+
+    @pytest.mark.parametrize("start,end", [("1", 2), (1, "2")])
+    def test_non_integer_line_range_fails(
         self, agent_py: Path, start, end
     ) -> None:
         ev = _valid_evidence(agent_py)
@@ -190,9 +203,9 @@ class TestVerifyAgentEvidence:
             ev, allowed_roots=[str(agent_py.parent)]
         )
         assert not ok
-        assert reason == "snippet not found in cited range"
+        assert reason == "snippet not found in cited file"
 
-    def test_snippet_present_but_outside_cited_range_fails(
+    def test_unique_snippet_outside_cited_range_is_repaired(
         self, agent_py: Path
     ) -> None:
         ev = _valid_evidence(agent_py)
@@ -202,8 +215,33 @@ class TestVerifyAgentEvidence:
         ok, reason = _verify_agent_evidence(
             ev, allowed_roots=[str(agent_py.parent)]
         )
+        assert ok
+        assert reason == ""
+        assert ev["definition_start_line"] == 4
+        assert ev["definition_end_line"] == 4
+
+    def test_ambiguous_snippet_outside_range_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "agents.py"
+        source.write_text(
+            "first = Agent()\nsecond = Agent()\n",
+            encoding="utf-8",
+        )
+        ev = {
+            "pattern": "framework_agent",
+            "definition_file": str(source),
+            "definition_start_line": 99,
+            "definition_end_line": 99,
+            "evidence_snippet": "Agent()",
+        }
+
+        ok, reason = _verify_agent_evidence(
+            ev, allowed_roots=[str(tmp_path)]
+        )
+
         assert not ok
-        assert reason == "snippet not found in cited range"
+        assert reason == "snippet match is ambiguous in cited file"
 
     def test_whitespace_tolerant_match(self, agent_py: Path) -> None:
         ev = _valid_evidence(agent_py)
@@ -238,6 +276,9 @@ class TestVerifyAgentEvidence:
 class TestGateOnNewComponents:
     def test_new_agent_with_valid_evidence_is_kept(self, agent_py: Path) -> None:
         mw = AIBOMScannerMiddleware(allowed_roots=[str(agent_py.parent)])
+        evidence = _valid_evidence(agent_py)
+        evidence["definition_start_line"] = 1
+        evidence["definition_end_line"] = 2
         data = {
             "new_components": [
                 {
@@ -245,13 +286,16 @@ class TestGateOnNewComponents:
                     "component_type": "agent",
                     "file_path": str(agent_py),
                     "line_number": 4,
-                    "agent_evidence": _valid_evidence(agent_py),
+                    "agent_evidence": evidence,
                 }
             ],
         }
         components, _rels, _flags = mw.extract_findings_from_dict(data)
         assert [c.name for c in components] == ["MyAgent"]
         assert components[0].component_type == AIComponentType.AGENT
+        stored = components[0].metadata["agent_evidence"]
+        assert stored["definition_start_line"] == 4
+        assert stored["definition_end_line"] == 4
 
     @pytest.mark.parametrize("comp_type", ["agent", "agent_proxy"])
     def test_new_agent_without_evidence_is_rejected(

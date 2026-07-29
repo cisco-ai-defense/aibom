@@ -25,8 +25,8 @@
 5. **Scan Pipeline Stage 1: Scan** — Run all registered scanners against the source files. Each scanner produces components and relationships. File I/O uses async caching for performance.
 6. **Scan Pipeline Stage 2: Cross-Ref** — Build env-var and package indexes. Resolve env-var references (`os.getenv("MODEL_NAME")`) to concrete values by correlating across files, `.env`, docker-compose, Helm, and Terraform.
 7. **Scan Pipeline Stage 3: Agentic** — Classify all candidates into simple/complex tiers. Run locality-aware batched LLM classification. The agent confirms, rejects, reclassifies, or enriches each candidate using tools (`read_file_snippet`, `search_codebase`, `trace_data_flow`, `search_package_info`, `analyze_imports`, `lookup_model`, `resolve_env_var`). Apply structured output (enrichments, new components, removals, risk findings). Cache results by content hash.
-8. **Scan Pipeline Stage 4: Assemble** — Apply `--strict` filtering (drop `needs_agentic` items), collect counts and timing, build the final `PipelineResult`, and ensure final findings carry decision annotations.
-9. **Reporting** — Route `PipelineResult` to the selected reporter. Convert container temp paths to container-style paths. Build per-source summaries, schema version metadata, and run metadata.
+8. **Scan Pipeline Stage 4: Assemble** — Apply `--strict` filtering (drop `needs_agentic` items), collect counts and timing, build the final `PipelineResult`, and ensure final findings carry honest `confirmed`, `added`, or `unreviewed` component decisions.
+9. **Reporting** — Route `PipelineResult` to the selected reporter. Convert container temp paths to container-style paths. Build per-source summaries, schema version metadata, run metadata, and separate machine-readable agentic completion status/count/reasons.
 10. **Post-Processing** — Optionally POST the JSON report with retries or upload an already-generated JSON report, run policy checks, display compliance advisories, render Rich console summary.
 
 ## 3. Scanner Architecture

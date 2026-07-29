@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from aibom.agentic.agent import TokenUsage
 from aibom.cross_ref import CrossRefIndex
-from aibom.models import AIComponent, AIComponentType
+from aibom.models import AIComponent, AIComponentType, DecisionAnnotation
 from aibom.scan_pipeline import ScanPipeline, StageTiming
 
 
@@ -28,6 +28,7 @@ class TestScanPipeline:
         assert result.components is not None
         assert result.env_index is not None
         assert result.pkg_index is not None
+        assert result.agentic_status == "skipped"
 
     def test_strict_filters_agentic(self, tmp_path: Path) -> None:
         """Strict mode should remove agentic candidates from results."""
@@ -253,7 +254,20 @@ class TestAgenticScope:
             patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
             patch("aibom.agentic.agent.run_agentic_enrichment") as enrich,
         ):
-            enrich.return_value = ([model], [], [], _stub_token_usage())
+            reviewed_model = model.model_copy(
+                update={
+                    "decision_annotation": DecisionAnnotation(
+                        decision="confirmed",
+                        justification="The model call is present.",
+                    )
+                }
+            )
+            enrich.return_value = (
+                [reviewed_model],
+                [],
+                [],
+                _stub_token_usage(),
+            )
             result = pipeline.run()
 
         assert len(enrich.call_args.kwargs["deterministic_components"]) == 1
@@ -403,9 +417,10 @@ class TestAgenticScope:
         summary = telemetry.record_summary.call_args.kwargs
         assert summary["candidate_count"] == 1
         assert summary["agentic_component_count"] == 1
-        assert summary["decisions"]["kept"] == 1
+        assert summary["decisions"]["kept"] == 0
         assert summary["decisions"]["removed"] == 0
         assert summary["decisions"]["discovered"] == 0
+        assert summary["decisions"]["degraded"] == 1
 
     def test_source_summary_excludes_discovery_removed_by_post_agent_gate(
         self, tmp_path: Path
@@ -446,7 +461,19 @@ class TestAgenticScope:
             patch(
                 "aibom.agentic.agent.run_agentic_enrichment",
                 return_value=(
-                    [dependency, unresolved_endpoint],
+                    [
+                        dependency.model_copy(
+                            update={
+                                "decision_annotation": DecisionAnnotation(
+                                    decision="confirmed",
+                                    justification=(
+                                        "The dependency is declared."
+                                    ),
+                                )
+                            }
+                        ),
+                        unresolved_endpoint,
+                    ],
                     [],
                     [],
                     _stub_token_usage(),
@@ -463,7 +490,7 @@ class TestAgenticScope:
         assert summary["decisions"]["removed"] == 0
         assert summary["decisions"]["discovered"] == 0
 
-    def test_source_summary_does_not_count_post_guard_degraded_as_removed(
+    def test_source_summary_retains_degraded_candidate_as_unreviewed(
         self, tmp_path: Path
     ) -> None:
         unresolved_endpoint = AIComponent(
@@ -506,10 +533,12 @@ class TestAgenticScope:
         ):
             result = pipeline.run()
 
-        assert result.components == []
+        assert len(result.components) == 1
+        assert result.components[0].agentic_hint == "batch_timeout"
+        assert result.components[0].needs_agentic is True
         summary = telemetry.record_summary.call_args.kwargs
         assert summary["candidate_count"] == 1
-        assert summary["agentic_component_count"] == 0
+        assert summary["agentic_component_count"] == 1
         assert summary["decisions"]["kept"] == 0
         assert summary["decisions"]["removed"] == 0
         assert summary["decisions"]["degraded"] == 1
@@ -657,16 +686,37 @@ class TestAgenticScope:
             model_name="gpt-4o",
             agentic_hint="batch_timeout",
         )
-        with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
-            with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
-                mock_enrich.return_value = (
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([degraded], [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
                     [degraded],
+                    CrossRefIndex(),
+                    CrossRefIndex(),
                     [],
-                    [],
-                    _stub_token_usage(),
-                )
-                result = pipeline.run()
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                return_value=([degraded], [], [], _stub_token_usage()),
+            ),
+        ):
+            result = pipeline.run()
         assert result.agentic_degraded_count == 1
+        assert result.agentic_status == "degraded"
+        assert result.agentic_degradation_reasons == {"batch_timeout": 1}
+        assert result.agentic_input_count == 1
+        assert result.agentic_reviewed_count == 0
+        assert result.agentic_removed_count == 0
+        assert (
+            result.agentic_reviewed_count
+            + result.agentic_removed_count
+            + result.agentic_degraded_count
+            == result.agentic_input_count
+        )
 
     def test_degraded_count_zero_when_clean(self, tmp_path: Path) -> None:
         (tmp_path / "app.py").write_text(
@@ -681,12 +731,196 @@ class TestAgenticScope:
             line_number=2,
             model_name="gpt-4o",
             agentic_hint="",
+            decision_annotation=DecisionAnnotation(
+                decision="confirmed",
+                justification="The model call is present.",
+            ),
         )
         with patch("aibom.scan_pipeline.ensure_llm_runtime_available"):
             with patch("aibom.agentic.agent.run_agentic_enrichment") as mock_enrich:
                 mock_enrich.return_value = ([clean], [], [], _stub_token_usage())
                 result = pipeline.run()
         assert result.agentic_degraded_count == 0
+        assert result.agentic_status == "success"
+        assert result.agentic_degradation_reasons == {}
+        assert result.agentic_reviewed_count == 1
+
+    def test_stage_failure_is_machine_readable_without_telemetry(
+        self, tmp_path: Path
+    ) -> None:
+        component = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="app.py",
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+        )
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=([component], [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
+                    [component],
+                    CrossRefIndex(),
+                    CrossRefIndex(),
+                    [],
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                side_effect=RuntimeError("provider unavailable"),
+            ),
+        ):
+            result = pipeline.run()
+
+        assert result.agentic_status == "degraded"
+        assert result.agentic_degraded_count == 1
+        assert result.agentic_degradation_reasons == {
+            "agentic_stage_error": 1
+        }
+        assert result.components[0].needs_agentic is True
+        assert result.components[0].agentic_hint == "agentic_stage_error"
+
+    def test_agentic_candidate_accounting_has_one_terminal_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        candidates = [
+            AIComponent(
+                name=f"tool-{index}",
+                component_type=AIComponentType.TOOL,
+                file_path="app.py",
+                line_number=index,
+                instance_id=f"tool-{index}",
+            )
+            for index in range(1, 4)
+        ]
+        confirmed = candidates[0].model_copy(
+            update={
+                "needs_agentic": False,
+                "decision_annotation": DecisionAnnotation(
+                    decision="confirmed",
+                    justification="The tool is invoked by the application.",
+                ),
+            }
+        )
+        unreviewed = candidates[2].model_copy(
+            update={
+                "needs_agentic": True,
+                "agentic_hint": "batch_timeout",
+            }
+        )
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+        )
+        with (
+            patch.object(
+                pipeline,
+                "_stage_scan",
+                return_value=(candidates, []),
+            ),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
+                    candidates,
+                    CrossRefIndex(),
+                    CrossRefIndex(),
+                    [],
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                return_value=(
+                    [confirmed, unreviewed],
+                    [],
+                    [],
+                    _stub_token_usage(),
+                ),
+            ),
+        ):
+            result = pipeline.run()
+
+        assert result.agentic_input_count == 3
+        assert result.agentic_reviewed_count == 1
+        assert result.agentic_removed_count == 1
+        assert result.agentic_degraded_count == 1
+        assert (
+            result.agentic_reviewed_count
+            + result.agentic_removed_count
+            + result.agentic_degraded_count
+            == result.agentic_input_count
+        )
+
+    def test_degraded_candidate_dropped_by_guard_is_counted_as_removed(
+        self, tmp_path: Path
+    ) -> None:
+        removed_agent = AIComponent(
+            name="shared",
+            component_type=AIComponentType.AGENT,
+            file_path="removed.py",
+            line_number=1,
+            instance_id="removed-agent",
+        )
+        degraded_candidate = AIComponent(
+            name="shared",
+            component_type=AIComponentType.AGENT,
+            file_path="degraded.py",
+            line_number=2,
+            instance_id="degraded-agent",
+        )
+        degraded_agent = degraded_candidate.model_copy(
+            update={
+                "needs_agentic": True,
+                "agentic_hint": "batch_timeout",
+            }
+        )
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+        )
+        with (
+            patch.object(
+                pipeline,
+                "_stage_scan",
+                return_value=([removed_agent, degraded_candidate], []),
+            ),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(
+                    [removed_agent, degraded_candidate],
+                    CrossRefIndex(),
+                    CrossRefIndex(),
+                    [],
+                ),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                return_value=(
+                    [degraded_agent],
+                    [],
+                    [],
+                    _stub_token_usage(),
+                ),
+            ),
+        ):
+            result = pipeline.run()
+
+        assert result.components == []
+        assert result.agentic_input_count == 2
+        assert result.agentic_reviewed_count == 0
+        assert result.agentic_removed_count == 2
+        assert result.agentic_degraded_count == 0
+        assert result.agentic_degradation_reasons == {}
 
 
 class TestFileCache:
@@ -881,14 +1115,64 @@ class TestFanoutAgenticResults:
         ]
         deduped, fanout = _dedup_for_agentic(comps)
         rep = deduped[0].model_copy(
-            update={"heuristic_confidence": 0.95, "needs_agentic": False}
+            update={
+                "heuristic_confidence": 0.95,
+                "agentic_confidence": 0.9,
+                "needs_agentic": False,
+                "agentic_hint": "",
+                "decision_annotation": DecisionAnnotation(
+                    decision="confirmed",
+                    justification="The dependency declaration is explicit.",
+                ),
+            }
         )
 
         result = _fanout_agentic_results([rep], fanout)
         assert len(result) == 2
         for c in result:
             assert c.heuristic_confidence == 0.95
+            assert c.agentic_confidence == 0.9
             assert c.needs_agentic is False
+            assert c.agentic_hint == ""
+            assert c.decision_annotation is not None
+            assert c.decision_annotation.decision == "confirmed"
+
+        assert result[0].decision_annotation is not result[1].decision_annotation
+
+    def test_fanout_propagates_degradation_reason(self):
+        from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
+
+        comps = [
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="a/req.txt",
+                line_number=1,
+            ),
+            AIComponent(
+                name="torch",
+                component_type=AIComponentType.DEPENDENCY,
+                file_path="b/req.txt",
+                line_number=1,
+            ),
+        ]
+        deduped, fanout = _dedup_for_agentic(comps)
+        degraded = deduped[0].model_copy(
+            update={
+                "needs_agentic": True,
+                "agentic_hint": "batch_timeout",
+                "decision_annotation": None,
+            }
+        )
+
+        result = _fanout_agentic_results([degraded], fanout)
+
+        assert len(result) == 2
+        assert all(component.needs_agentic for component in result)
+        assert all(
+            component.agentic_hint == "batch_timeout" for component in result
+        )
+        assert all(component.decision_annotation is None for component in result)
 
     def test_fanout_propagates_removal(self):
         from aibom.scan_pipeline import _dedup_for_agentic, _fanout_agentic_results
@@ -958,6 +1242,44 @@ class TestFanoutAgenticResults:
 
 
 class TestPropagateRemovals:
+    def test_kept_components_preserve_agentic_verdicts(self):
+        from aibom.scan_pipeline import _propagate_removals
+
+        removed = AIComponent(
+            name="ordinary-wrapper",
+            component_type=AIComponentType.AGENT,
+            file_path="src/wrapper.py",
+            line_number=1,
+        )
+        original_kept = AIComponent(
+            name="openai",
+            component_type=AIComponentType.DEPENDENCY,
+            file_path="requirements.txt",
+            line_number=1,
+        )
+        enriched_kept = original_kept.model_copy(
+            update={
+                "needs_agentic": False,
+                "agentic_hint": "",
+                "decision_annotation": DecisionAnnotation(
+                    decision="confirmed",
+                    justification="The manifest declares an AI dependency.",
+                ),
+            }
+        )
+
+        result = _propagate_removals(
+            sent=[removed, original_kept],
+            received=[enriched_kept],
+            all_candidates=[removed, original_kept],
+            pre_fanout_removed_ids={removed.instance_id},
+        )
+
+        assert result == [enriched_kept]
+        assert result[0] is enriched_kept
+        assert result[0].decision_annotation is not None
+        assert result[0].decision_annotation.decision == "confirmed"
+
     def test_prefanout_removed_ids_drop_all_matching_siblings(self):
         from aibom.scan_pipeline import _propagate_removals
 
