@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -2645,6 +2646,17 @@ def analyze(
         )
         scan_result.risk.flags = annotated_risk_flags
 
+        from .kb.coverage import build_coverage_gaps
+
+        coverage_gaps = build_coverage_gaps(scan_result)
+        if coverage_gaps:
+            console.print(
+                "[yellow]KB coverage gap:[/] "
+                f"{coverage_gaps['uncatalogued_ai_symbol_count']} "
+                "AI-relevant symbol(s) are not catalogued."
+            )
+            console.print(f"[dim]{coverage_gaps['request_hint']}[/]")
+
         if compliance:
             from .compliance import (
                 ComplianceFramework,
@@ -3324,26 +3336,80 @@ def plugin_list() -> None:
 def kb_download(
     version: Optional[str] = typer.Option(
         None,
+        "--aibom-kb-version",
         "--version",
-        "-v",
         help="Specific KB version to download (latest if omitted).",
     ),
     url: Optional[str] = typer.Option(
         None,
+        "--aibom-manifest-url",
         "--url",
-        help=(
-            "KB manifest URL. Required: pass --url or set CISCO_AIBOM_MANIFEST_URL. "
-            "No default is shipped."
-        ),
+        help=("Direct regional S3 HTTPS manifest URL. Overrides a configured pin."),
+    ),
+    allow_unsigned: bool = typer.Option(
+        False,
+        "--allow-unsigned-rehearsal",
+        help="Allow an explicitly unsigned rehearsal artifact. Never use for releases.",
+        hidden=True,
+    ),
+    prefetched_manifest: Optional[Path] = typer.Option(
+        None,
+        "--prefetched-manifest",
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        help="Install prefetched manifest and sibling objects through normal validation.",
     ),
 ) -> None:
-    """Download the knowledge base from the configured remote."""
+    """Download and cryptographically verify a schema-v2 knowledge base."""
     mgr = KBManager()
     try:
-        path = mgr.download(version=version, url=url)
+        if prefetched_manifest:
+            if version or url:
+                raise KBError(
+                    "--prefetched-manifest cannot be combined with a version or URL"
+                )
+            path = mgr.install_prefetched(
+                prefetched_manifest,
+                allow_unsigned=allow_unsigned,
+            )
+        else:
+            path = mgr.download(
+                version=version,
+                url=url,
+                allow_unsigned=allow_unsigned,
+            )
         console.print(f"[green]KB downloaded to {path}[/]")
     except KBError as exc:
         console.print(f"[bold red]Download failed:[/] {exc}")
+        raise typer.Exit(code=1)
+
+
+@kb_app.command("pin")
+def kb_pin(
+    value: Optional[str] = typer.Argument(
+        None,
+        help="Exact KB version or immutable direct S3 manifest URL.",
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Remove the configured pin."),
+) -> None:
+    """Pin downloads to one immutable KB version or manifest URL."""
+
+    mgr = KBManager()
+    try:
+        if clear and value:
+            raise KBError("Pass either a pin value or --clear, not both")
+        if not clear and not value:
+            current = mgr.configured_pin()
+            console.print(current or "No KB pin configured.")
+            return
+        path = mgr.set_pin(None if clear else value)
+        if clear:
+            console.print(f"[green]KB pin cleared in {path}[/]")
+        else:
+            console.print(f"[green]KB pin set to {value} in {path}[/]")
+    except KBError as exc:
+        console.print(f"[bold red]Pin failed:[/] {exc}")
         raise typer.Exit(code=1)
 
 
@@ -3392,14 +3458,211 @@ def kb_verify() -> None:
         raise typer.Exit(code=1)
 
 
+def _normalize_kb_requests(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        raise KBError("KB request input must be a JSON array")
+    grouped: dict[tuple[str, str], set[str]] = {}
+    allowed = {"cargo", "npm", "nuget", "pypi", "rubygems"}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise KBError("Each KB request must be a JSON object")
+        ecosystem = str(item.get("ecosystem") or "").strip().lower()
+        package_name = str(item.get("package_name") or "").strip()
+        item_symbols = item.get("symbols")
+        if ecosystem not in allowed:
+            raise KBError(f"Unsupported ecosystem: {ecosystem or '(empty)'}")
+        if not package_name or not isinstance(item_symbols, list):
+            raise KBError("Each request requires package_name and a symbols array")
+        cleaned = {str(value).strip() for value in item_symbols if str(value).strip()}
+        if not cleaned:
+            raise KBError(f"Package {package_name} has no symbols")
+        grouped.setdefault((ecosystem, package_name), set()).update(cleaned)
+    requests = [
+        {
+            "ecosystem": ecosystem,
+            "package_name": package_name,
+            "symbols": sorted(values),
+        }
+        for (ecosystem, package_name), values in sorted(grouped.items())
+    ]
+    if not requests:
+        raise KBError("At least one KB request is required")
+    if len(requests) > 20 or sum(len(item["symbols"]) for item in requests) > 200:
+        raise KBError("A request supports at most 20 packages and 200 symbols")
+    return requests
+
+
+def _load_kb_requests(
+    *,
+    ecosystem: Optional[str],
+    package_name: Optional[str],
+    symbols: list[str],
+    from_scan: Optional[Path],
+    symbols_from: Optional[Path],
+) -> list[dict[str, Any]]:
+    selected = sum(
+        bool(value)
+        for value in (
+            from_scan,
+            symbols_from,
+            ecosystem or package_name or symbols,
+        )
+    )
+    if selected != 1:
+        raise KBError(
+            "Provide one source: --from-scan, --symbols-from, or "
+            "--ecosystem/--package/--symbol"
+        )
+    if from_scan:
+        try:
+            payload = json.loads(from_scan.read_text(encoding="utf-8"))
+            gaps = payload["aibom_analysis"]["coverage_gaps"]["packages"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise KBError("Scan report has no valid coverage_gaps block") from exc
+        return _normalize_kb_requests(gaps)
+    if symbols_from:
+        try:
+            text_value = symbols_from.read_text(encoding="utf-8")
+            try:
+                parsed = json.loads(text_value)
+            except json.JSONDecodeError:
+                parsed = []
+                for line_number, line in enumerate(text_value.splitlines(), start=1):
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    parts = [part.strip() for part in line.split(",", 2)]
+                    if len(parts) != 3:
+                        raise KBError(
+                            f"Invalid symbols file line {line_number}; expected "
+                            "ecosystem,package,symbol"
+                        )
+                    parsed.append(
+                        {
+                            "ecosystem": parts[0],
+                            "package_name": parts[1],
+                            "symbols": [parts[2]],
+                        }
+                    )
+        except OSError as exc:
+            raise KBError(f"Could not read symbols file: {exc}") from exc
+        return _normalize_kb_requests(parsed)
+    return _normalize_kb_requests(
+        [
+            {
+                "ecosystem": ecosystem,
+                "package_name": package_name,
+                "symbols": symbols,
+            }
+        ]
+    )
+
+
+def _print_kb_request_result(result: dict[str, Any]) -> None:
+    request = result.get("request")
+    if isinstance(request, dict):
+        console.print(
+            f"[green]Request accepted:[/] {request.get('request_id', 'unknown')}"
+        )
+        console.print(f"State: {request.get('state', 'unknown')}")
+        console.print(f"Disposition: {request.get('disposition', 'unknown')}")
+        if request.get("estimated_build_eta"):
+            console.print(f"Estimated build ETA: {request['estimated_build_eta']}")
+        console.print(f"Coalesced: {bool(result.get('coalesced'))}")
+    else:
+        console.print(
+            "[green]Request IDs:[/] "
+            + (", ".join(result.get("request_ids", [])) or "coalesced")
+        )
+        console.print(f"Duplicates: {len(result.get('duplicates', []))}")
+        console.print(f"Rejected: {len(result.get('rejected', []))}")
+    console.print(f"Quota remaining: {result.get('quota_remaining', 'unknown')}")
+    rate_limit = result.get("rate_limit") or {}
+    if any(rate_limit.values()):
+        console.print(
+            "Rate limit: "
+            f"{rate_limit.get('remaining', '?')}/{rate_limit.get('limit', '?')} "
+            f"(reset {rate_limit.get('reset', '?')})"
+        )
+
+
+def _watch_kb_request(
+    manager: KBManager,
+    request_id: str,
+    *,
+    api_key: Optional[str],
+    api_base: Optional[str],
+    json_output: bool,
+) -> dict[str, Any]:
+    delay = 30
+    deadline = time.monotonic() + 24 * 60 * 60
+    terminal = {"available", "rejected"}
+    while True:
+        result = manager.request_status(
+            request_id,
+            api_key=api_key,
+            api_base=api_base,
+        )
+        if json_output:
+            console.print_json(data=result)
+        else:
+            console.print(
+                f"{request_id}: {result.get('state', 'unknown')}"
+                + (
+                    f" (KB {result['available_kb_version']})"
+                    if result.get("available_kb_version")
+                    else ""
+                )
+            )
+        if result.get("state") in terminal:
+            return result
+        if time.monotonic() + delay > deadline:
+            raise KBError(f"Watch timed out after 24 hours for request {request_id}")
+        time.sleep(delay)
+        delay = min(delay * 2, 5 * 60)
+
+
 @kb_app.command("request")
 def kb_request(
-    sdk: str = typer.Option(..., "--sdk", help="SDK name (e.g., langchain, openai)."),
-    version: str = typer.Option(
-        ..., "--version", "-v", help="SDK version to request KB build for."
+    ecosystem: Optional[str] = typer.Option(
+        None,
+        "--ecosystem",
+        help="Package ecosystem: cargo, npm, nuget, pypi, or rubygems.",
     ),
-    language: str = typer.Option(
-        "python", "--language", "-l", help="Programming language."
+    package_name: Optional[str] = typer.Option(
+        None,
+        "--package",
+        help="Package name containing the uncatalogued symbols.",
+    ),
+    symbols: Optional[List[str]] = typer.Option(
+        None,
+        "--symbol",
+        help="Uncatalogued symbol. Repeat for multiple symbols.",
+    ),
+    from_scan: Optional[Path] = typer.Option(
+        None,
+        "--from-scan",
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        help="Read package groups from a JSON report's coverage_gaps block.",
+    ),
+    symbols_from: Optional[Path] = typer.Option(
+        None,
+        "--symbols-from",
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        help="Read requests from JSON or ecosystem,package,symbol lines.",
+    ),
+    watch: bool = typer.Option(
+        False,
+        "--watch",
+        help="Poll accepted requests with bounded exponential backoff.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the structured API response as JSON.",
     ),
     api_key: Optional[str] = typer.Option(
         None,
@@ -3414,20 +3677,51 @@ def kb_request(
         help="Cisco AI Defense API base URL.",
     ),
 ) -> None:
-    """Request a knowledge base build for a specific SDK version."""
+    """Request coverage for one package or a bounded batch of scan gaps."""
     mgr = KBManager()
     try:
-        result = mgr.request_build(
-            sdk=sdk,
-            version=version,
-            language=language,
-            api_key=api_key,
-            api_base=api_base,
+        requests = _load_kb_requests(
+            ecosystem=ecosystem,
+            package_name=package_name,
+            symbols=symbols or [],
+            from_scan=from_scan,
+            symbols_from=symbols_from,
         )
-        console.print(
-            f"[green]Request submitted:[/] {result.get('request_id', 'unknown')}"
-        )
-        console.print(f"Status: {result.get('status', 'unknown')}")
+        if len(requests) == 1:
+            item = requests[0]
+            result = mgr.request_build(
+                ecosystem=item["ecosystem"],
+                package_name=item["package_name"],
+                symbols=item["symbols"],
+                api_key=api_key,
+                api_base=api_base,
+            )
+            request = result.get("request", {})
+            request_ids = [str(request.get("request_id", ""))]
+        else:
+            result = mgr.request_bulk(
+                requests,
+                api_key=api_key,
+                api_base=api_base,
+            )
+            request_ids = [str(value) for value in result.get("request_ids", [])]
+            request_ids.extend(
+                str(item.get("request_id", "")) for item in result.get("duplicates", [])
+            )
+        request_ids = [value for value in request_ids if value]
+        if json_output:
+            console.print_json(data=result)
+        else:
+            _print_kb_request_result(result)
+        if watch:
+            for request_id in dict.fromkeys(request_ids):
+                _watch_kb_request(
+                    mgr,
+                    request_id,
+                    api_key=api_key,
+                    api_base=api_base,
+                    json_output=json_output,
+                )
     except KBError as exc:
         console.print(f"[bold red]Request failed:[/] {exc}")
         raise typer.Exit(code=1)
@@ -3470,27 +3764,47 @@ def kb_list_requests(
         "--api-base",
         envvar="CISCO_AI_DEFENSE_API_BASE",
     ),
+    limit: int = typer.Option(
+        50,
+        "--limit",
+        min=1,
+        max=100,
+        help="Maximum number of tenant-scoped requests to return.",
+    ),
 ) -> None:
     """List all pending KB build requests."""
     mgr = KBManager()
     try:
-        requests = mgr.list_requests(api_key=api_key, api_base=api_base)
+        requests = mgr.list_requests(
+            api_key=api_key,
+            api_base=api_base,
+            limit=limit,
+        )
         if not requests:
             console.print("No pending requests.")
             return
         table = Table(title="KB Build Requests", box=box.SIMPLE_HEAVY)
         table.add_column("Request ID")
-        table.add_column("SDK")
-        table.add_column("Version")
-        table.add_column("Language")
-        table.add_column("Status")
+        table.add_column("Packages")
+        table.add_column("Symbols")
+        table.add_column("State")
+        table.add_column("Disposition")
         for req in requests:
+            items = req.get("requests") or []
+            packages = ", ".join(
+                f"{item.get('ecosystem', '')}:{item.get('package_name', '')}"
+                for item in items
+                if isinstance(item, dict)
+            )
+            symbol_count = sum(
+                len(item.get("symbols", [])) for item in items if isinstance(item, dict)
+            )
             table.add_row(
                 req.get("request_id", ""),
-                req.get("sdk", ""),
-                req.get("version", ""),
-                req.get("language", ""),
-                req.get("status", ""),
+                packages,
+                str(symbol_count),
+                req.get("state", ""),
+                req.get("disposition", ""),
             )
         console.print(table)
     except KBError as exc:

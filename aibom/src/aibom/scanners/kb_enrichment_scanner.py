@@ -2141,6 +2141,10 @@ def _process_file_with_cache(
             meta_partial: dict[str, Any] = {
                 "partial_kb_id": match.partial_kb_id,
                 "obs_module": match.obs_module,
+                "uncatalogued_ai_symbol": True,
+                "uncatalogued_symbol": obs_data["name"],
+                "ecosystem": "pypi",
+                "package_name": match.obs_module.split(".", 1)[0],
             }
             if obs_data.get("assigned_target"):
                 meta_partial["assigned_target"] = obs_data["assigned_target"]
@@ -2409,6 +2413,10 @@ def _process_file(
                         "partial_kb_id": match.partial_kb_id,
                         "obs_module": match.obs_module,
                         "observation_type": obs_data["type"],
+                        "uncatalogued_ai_symbol": True,
+                        "uncatalogued_symbol": obs_data["name"],
+                        "ecosystem": "pypi",
+                        "package_name": match.obs_module.split(".", 1)[0],
                     },
                 )
             )

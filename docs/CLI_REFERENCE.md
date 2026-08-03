@@ -289,8 +289,29 @@ cisco-aibom kb download [OPTIONS]
 
 | Option | Env Var | Description |
 |--------|---------|-------------|
-| `--version`, `-v` | — | Specific KB version to download (latest if omitted). |
-| `--url` | `CISCO_AIBOM_MANIFEST_URL` | Manifest URL. Required: pass `--url` or set the env var. No default is shipped. |
+| `--aibom-kb-version`, `--version` | — | Exact immutable KB version. Overrides a configured pin. |
+| `--aibom-manifest-url`, `--url` | `CISCO_AIBOM_MANIFEST_URL` | Direct regional S3 HTTPS manifest URL. Overrides a configured pin and the public default. |
+| `--prefetched-manifest` | — | Install a local manifest and its prefetched sibling objects through the same validation and cache-install path used for HTTPS downloads. |
+
+Schema-v2 downloads validate the strict manifest before fetching the database,
+enforce `min_cli_version`, bound redirects and object sizes, verify the compressed
+SHA-256 and detached ECDSA P-256 signature, and only then atomically replace the
+active cache. A failed upgrade leaves the last-known-good KB active. The default
+pointer is
+`https://cisco-ai-defense-public.s3.us-west-2.amazonaws.com/aibom/kb/manifest.json`;
+CLI 1.x release artifacts and their frozen schema-v1 manifest are unaffected.
+
+### `kb pin`
+
+Pin normal downloads to an exact version or immutable direct S3 manifest URL.
+
+```bash
+cisco-aibom kb pin 2.4.0
+cisco-aibom kb pin --clear
+```
+
+Selection precedence is explicit command option, saved pin, then the public
+schema-v2 pointer. An exact pin never falls back to another version.
 
 ### `kb check`
 
@@ -314,7 +335,7 @@ For a schema-v2 manifest, this offline command also displays
 
 ### `kb verify`
 
-Verify the integrity of the locally installed KB (SHA-256 checksum).
+Verify the compressed SHA-256, detached signature, and installed DuckDB.
 
 ```bash
 cisco-aibom kb verify
@@ -322,7 +343,8 @@ cisco-aibom kb verify
 
 ### `kb request`
 
-Request a KB build for a specific SDK version.
+Request coverage for uncatalogued package symbols. One command can submit a
+single package, a scan report's grouped `coverage_gaps`, or a bulk symbols file.
 
 ```bash
 cisco-aibom kb request [OPTIONS]
@@ -330,11 +352,25 @@ cisco-aibom kb request [OPTIONS]
 
 | Option | Env Var | Description |
 |--------|---------|-------------|
-| `--sdk` | — | SDK name, e.g. `langchain`, `openai` (required). |
-| `--version`, `-v` | — | SDK version to request (required). |
-| `--language`, `-l` | — | Programming language (default `python`). |
+| `--ecosystem` | — | Package ecosystem: `cargo`, `npm`, `nuget`, `pypi`, or `rubygems`. |
+| `--package` | — | Package name containing the uncatalogued symbols. |
+| `--symbol` | — | Symbol to request. Repeat for multiple symbols. |
+| `--from-scan` | — | Read grouped requests from a JSON report's `coverage_gaps` block. |
+| `--symbols-from` | — | Read a JSON request array or `ecosystem,package,symbol` lines. |
+| `--watch` | — | Poll accepted requests from 30 seconds up to 5 minutes, capped at 24 hours. |
+| `--json` | — | Print structured responses, including accepted IDs, duplicates, rejections, quota, and rate-limit values. |
 | `--api-key` | `CISCO_AI_DEFENSE_API_KEY` | Cisco AI Defense tenant API key (required). |
 | `--api-base` | `CISCO_AI_DEFENSE_API_BASE` | Regional Cisco AI Defense API host (required). Follows the same pattern as `AIBOM_POST_URL`: `https://api.security.cisco.com` (US), `https://api.eu.security.cisco.com` (EU), `https://api.apj.security.cisco.com` (APJ), `https://api.uae.security.cisco.com` (UAE). No default is shipped. |
+
+Bulk submissions accept at most 20 packages and 200 symbols total. The server
+treats the batch as one quota unit. Coverage gaps are informational and never
+change scan exit status. Without a tenant API key, reports provide a setup hint
+and the CLI makes no request attempt.
+
+JSON, CycloneDX, and SPDX SBOMs stamp `kb_version`, `build_type`,
+`schema_version`, `cli_version`, and `uncatalogued_ai_symbol_count`. Unknown
+symbols also carry package coordinates so policy and enterprise tooling can
+filter or submit the grouped coverage gaps.
 
 ### `kb request-status`
 
@@ -362,6 +398,7 @@ cisco-aibom kb list-requests [OPTIONS]
 |--------|---------|-------------|
 | `--api-key` | `CISCO_AI_DEFENSE_API_KEY` | Cisco AI Defense tenant API key (required). |
 | `--api-base` | `CISCO_AI_DEFENSE_API_BASE` | Regional Cisco AI Defense API host (required). Same regional hosts as `kb request` (e.g. `https://api.security.cisco.com`, `https://api.eu.security.cisco.com`). No default is shipped. |
+| `--limit` | — | Return 1–100 requests (default 50). |
 
 ---
 

@@ -21,6 +21,8 @@ import json
 from datetime import datetime, timezone
 from typing import IO, Any
 
+from ..kb.coverage import build_coverage_gaps
+from ..kb.manager import KBManager
 from ..models import AIComponent, AIComponentType, ScanResult
 from .base import BaseReporter
 
@@ -76,14 +78,21 @@ def _software_primary_purpose(t: AIComponentType) -> str:
 
 
 def _cdx_extension(comp: AIComponent) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "cisco-aibom:componentType": comp.component_type.value,
+        "cisco-aibom:instanceId": comp.instance_id,
+        "cisco-aibom:name": comp.name,
+        "cisco-aibom:detectionSource": comp.detection_source.value,
+    }
+    if comp.metadata.get("uncatalogued_ai_symbol"):
+        properties["cisco-aibom:uncatalogued_ai_symbol"] = True
+        for key in ("ecosystem", "package_name", "uncatalogued_symbol"):
+            value = comp.metadata.get(key)
+            if value:
+                properties[f"cisco-aibom:{key}"] = value
     return {
         "type": "CdxPropertiesExtension",
-        "extensionProperties": {
-            "cisco-aibom:componentType": comp.component_type.value,
-            "cisco-aibom:instanceId": comp.instance_id,
-            "cisco-aibom:name": comp.name,
-            "cisco-aibom:detectionSource": comp.detection_source.value,
-        },
+        "extensionProperties": properties,
     }
 
 
@@ -142,9 +151,13 @@ class SpdxReporter(BaseReporter):
         dt = datetime.now(timezone.utc).replace(microsecond=0)
         created = dt.isoformat().replace("+00:00", "Z")
         components = result.all_components
+        identity = KBManager().output_metadata()
+        coverage_gaps = build_coverage_gaps(result)
+        identity["uncatalogued_ai_symbol_count"] = (
+            coverage_gaps.get("uncatalogued_ai_symbol_count", 0) if coverage_gaps else 0
+        )
         element_ids = [
-            _spdx_id(c.component_type.value, _digest(c.instance_id))
-            for c in components
+            _spdx_id(c.component_type.value, _digest(c.instance_id)) for c in components
         ]
 
         doc: dict[str, Any] = {
@@ -157,6 +170,12 @@ class SpdxReporter(BaseReporter):
                 "creators": ["Tool: cisco-aibom"],
             },
             "element": element_ids,
+            "extension_cisco_aibom": {
+                "type": "CdxPropertiesExtension",
+                "extensionProperties": {
+                    f"cisco-aibom:{key}": value for key, value in identity.items()
+                },
+            },
         }
 
         graph: list[dict[str, Any]] = [doc]
