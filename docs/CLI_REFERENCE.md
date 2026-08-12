@@ -156,7 +156,26 @@ cisco-aibom report show REPORT_FILE [--raw-json]
 cisco-aibom report upload REPORT_FILE --format json --post-url URL [OPTIONS]
 ```
 
-The JSON reporter writes `aibom_analysis.metadata.report_schema_version = "1"`. Unversioned legacy JSON reports are still accepted for `report upload`; the CLI warns and synthesizes the current schema version before submitting.
+The JSON reporter writes
+`aibom_analysis.metadata.report_schema_version = "2"`. Unversioned legacy JSON
+reports are still accepted for `report upload`; the CLI warns and synthesizes
+the current schema version before submitting.
+
+Agentic completeness is reported independently from the normal scan status.
+Run metadata and each per-source `summary` include:
+
+| Field | Description |
+|---|---|
+| `agentic_status` | `success`, `degraded`, or `skipped`. |
+| `agentic_degraded_count` | Input candidates retained by the agentic stage without a usable verdict. |
+| `agentic_degradation_reasons` | Failure-hint counts for those candidates. |
+
+Components with an explicit reviewed verdict use `confirmed`, and agentic
+discoveries use `added`. A retained component that did not receive a usable
+verdict uses `decision_annotation.decision = "unreviewed"`, keeps
+`needs_agentic = true`, and preserves its failure reason in `agentic_hint`.
+Whole-scan and organization-cache hits preserve these agentic outcome fields;
+legacy cache entries that lack them are ignored and regenerated.
 
 ### `report show`
 

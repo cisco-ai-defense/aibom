@@ -1925,6 +1925,67 @@ class TestRunTier:
         assert retry_call.kwargs["attempt_number"] == 2
         assert retry_call.kwargs["telemetry_context"] is telemetry_context
 
+    @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
+    def test_timeout_retry_repartitions_into_smaller_batches(self):
+        from aibom.agentic.agent import _run_tier
+        from aibom.agentic.middleware import AIBOMScannerMiddleware
+
+        components = [
+            AIComponent(
+                name=f"model-{index}",
+                component_type=AIComponentType.MODEL,
+                file_path="app.py",
+                line_number=index,
+                model_name=f"model-{index}",
+            )
+            for index in range(1, 5)
+        ]
+        degraded = [
+            component.model_copy(
+                update={
+                    "needs_agentic": True,
+                    "agentic_hint": "batch_timeout",
+                }
+            )
+            for component in components
+        ]
+
+        def run_batch(*args, **kwargs):
+            batch = args[2]
+            if kwargs.get("attempt_kind") == "retry":
+                recovered = [
+                    component.model_copy(
+                        update={"needs_agentic": False, "agentic_hint": ""}
+                    )
+                    for component in batch
+                ]
+                return recovered, [], [], [], False
+            return degraded, [], [], [], True
+
+        with patch(
+            "aibom.agentic.agent._run_batch",
+            side_effect=run_batch,
+        ) as run_batch_mock:
+            enriched, _, _, _ = _run_tier(
+                agent=MagicMock(),
+                middleware=AIBOMScannerMiddleware(),
+                components=components,
+                relationships=[],
+                scan_paths=["/tmp"],
+                batch_size=4,
+                max_concurrent=1,
+                all_components=components,
+                cache=None,
+            )
+
+        assert len(enriched) == 4
+        retry_calls = [
+            call
+            for call in run_batch_mock.call_args_list
+            if call.kwargs.get("attempt_kind") == "retry"
+        ]
+        assert [len(call.args[2]) for call in retry_calls] == [2, 2]
+
     def test_memo_hit_emits_cache_trace_without_running_the_agent(self):
         from aibom.agentic.agent import _DecisionMemo, _run_tier
         from aibom.agentic.middleware import AIBOMScannerMiddleware
@@ -2162,7 +2223,22 @@ class TestDecisionMemo:
             line_number=1,
         )
         after = before.model_copy(
-            update={"heuristic_confidence": 0.95, "needs_agentic": False}
+            update={
+                "heuristic_confidence": 0.95,
+                "needs_agentic": False,
+                "decision_annotation": DecisionAnnotation(
+                    decision="confirmed",
+                    justification="The dependency is declared.",
+                    evidence_locations=[
+                        EvidenceLocation(
+                            file_path="req.txt",
+                            start_line=1,
+                            end_line=1,
+                            role="primary",
+                        )
+                    ],
+                ),
+            }
         )
 
         memo.record(before, after)
@@ -2170,6 +2246,11 @@ class TestDecisionMemo:
         assert verdict is not None
         assert verdict["action"] == "keep"
         assert verdict["heuristic_confidence"] == 0.95
+        replayed = memo.apply([before])[0]
+        assert replayed.decision_annotation is not None
+        assert replayed.decision_annotation.decision == "confirmed"
+        assert replayed.decision_annotation.evidence_locations == []
+        assert replayed.decision_annotation.code_snippet is None
 
     def test_record_and_lookup_remove(self):
         from aibom.agentic.agent import _DecisionMemo

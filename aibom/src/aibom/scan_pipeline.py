@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -99,7 +100,12 @@ class PipelineResult:
     relationships: list[ComponentRelationship] = field(default_factory=list)
     agentic_risk_flags: list[Any] = field(default_factory=list)
     agentic_candidate_count: int = 0
+    agentic_input_count: int = 0
+    agentic_reviewed_count: int = 0
+    agentic_removed_count: int = 0
+    agentic_status: str = "skipped"
     agentic_degraded_count: int = 0
+    agentic_degradation_reasons: dict[str, int] = field(default_factory=dict)
     env_index: CrossRefIndex | None = None
     pkg_index: CrossRefIndex | None = None
     external_deps: list[ExternalRepoDep] = field(default_factory=list)
@@ -220,6 +226,18 @@ def _fanout_agentic_results(
             clone.heuristic_confidence = c.heuristic_confidence
             clone.agentic_confidence = c.agentic_confidence
             clone.needs_agentic = c.needs_agentic
+            clone.agentic_hint = c.agentic_hint
+            clone.decision_annotation = (
+                c.decision_annotation.model_copy(
+                    deep=True,
+                    update={
+                        "evidence_locations": [],
+                        "code_snippet": None,
+                    },
+                )
+                if c.decision_annotation is not None
+                else None
+            )
             if c.model_name:
                 clone.model_name = c.model_name
             if c.component_type != sib.component_type:
@@ -403,8 +421,13 @@ def _propagate_removals(
             continue
         drop_ids.add(c.instance_id)
 
-    result = [c for c in lookup_pool if c.instance_id not in drop_ids]
-    dropped = len(lookup_pool) - len(result)
+    # ``lookup_pool`` is deliberately wider than ``received`` so removals can
+    # be resolved against siblings that pre-agentic deduplication collapsed.
+    # The result must still be filtered from ``received``: rebuilding it from
+    # the original candidates would discard successful verdicts, repaired
+    # evidence, and degradation reasons attached by the agentic stage.
+    result = [c for c in received if c.instance_id not in drop_ids]
+    dropped = len(received) - len(result)
     if dropped:
         weak_n = sum(1 for v in restrict_import.values() if v)
         test_n = sum(1 for v in restrict_test.values() if v)
@@ -478,6 +501,12 @@ def _evidence_gate(
         if orig is None:
             result.append(c)
             continue
+        if c.agentic_hint:
+            # A failed-open candidate did not receive an agentic verdict.
+            # Preserve it as unreviewed instead of applying evidence rules
+            # intended for affirmative agent decisions.
+            result.append(c)
+            continue
 
         if (
             c.component_type == AIComponentType.MODEL
@@ -545,6 +574,44 @@ def _evidence_gate(
             total_removed,
             gate_removed,
             agent_evidence_removed,
+        )
+    return result
+
+
+_REVIEWED_COMPONENT_DECISIONS = frozenset({"confirmed", "added"})
+_MISSING_AGENTIC_VERDICT = "missing_agentic_verdict"
+
+
+def _mark_missing_agentic_verdicts(
+    components: list["AIComponent"],
+    *,
+    input_ids: set[str],
+) -> list["AIComponent"]:
+    """Mark retained inputs without a usable component verdict as degraded."""
+
+    result: list["AIComponent"] = []
+    for component in components:
+        if component.instance_id not in input_ids:
+            result.append(component)
+            continue
+        annotation = component.decision_annotation
+        decision = annotation.decision.strip().lower() if annotation else ""
+        if decision in _REVIEWED_COMPONENT_DECISIONS:
+            result.append(
+                component.model_copy(
+                    update={"needs_agentic": False, "agentic_hint": ""}
+                )
+            )
+            continue
+        result.append(
+            component.model_copy(
+                update={
+                    "needs_agentic": True,
+                    "agentic_hint": (
+                        component.agentic_hint or _MISSING_AGENTIC_VERDICT
+                    ),
+                }
+            )
         )
     return result
 
@@ -1255,6 +1322,9 @@ class ScanPipeline:
         self.telemetry_source_id = telemetry_source_id
         self.telemetry_source_kind = telemetry_source_kind
         self._agentic_degraded_count = 0
+        self._agentic_degradation_reasons: dict[str, int] = {}
+        self._agentic_reviewed_count = 0
+        self._agentic_removed_count = 0
         self._agentic_telemetry_degraded_count: int | None = None
         self._agentic_token_usage: Any | None = None
         self._agentic_input_count = 0
@@ -1291,6 +1361,9 @@ class ScanPipeline:
     def run(self) -> PipelineResult:
         clear_cache()
         self._agentic_degraded_count = 0
+        self._agentic_degradation_reasons = {}
+        self._agentic_reviewed_count = 0
+        self._agentic_removed_count = 0
         self._agentic_telemetry_degraded_count = None
         self._agentic_token_usage = None
         self._agentic_input_count = 0
@@ -1435,6 +1508,13 @@ class ScanPipeline:
         total_elapsed = time.monotonic() - pipeline_start
 
         tu = getattr(self, "_agentic_token_usage", None)
+        agentic_degraded_count = getattr(self, "_agentic_degraded_count", 0)
+        if agentic_degraded_count:
+            agentic_status = "degraded"
+        elif not self.llm_config or self._agentic_input_count == 0:
+            agentic_status = "skipped"
+        else:
+            agentic_status = "success"
         if telemetry_enabled and self.agentic_telemetry is not None:
             degraded_count = (
                 self._agentic_telemetry_degraded_count
@@ -1542,7 +1622,14 @@ class ScanPipeline:
             relationships=relationships,
             agentic_risk_flags=agentic_flags,
             agentic_candidate_count=agentic_count,
-            agentic_degraded_count=getattr(self, "_agentic_degraded_count", 0),
+            agentic_input_count=self._agentic_input_count,
+            agentic_reviewed_count=self._agentic_reviewed_count,
+            agentic_removed_count=self._agentic_removed_count,
+            agentic_status=agentic_status,
+            agentic_degraded_count=agentic_degraded_count,
+            agentic_degradation_reasons=dict(
+                self._agentic_degradation_reasons
+            ),
             env_index=env_idx,
             pkg_index=pkg_idx,
             external_deps=ext_deps,
@@ -1672,7 +1759,7 @@ class ScanPipeline:
         )
 
         try:
-            from .agentic.agent import _count_degraded, run_agentic_enrichment
+            from .agentic.agent import run_agentic_enrichment
         except ImportError as exc:
             raise ImportError(
                 "Agentic classification requires the agentic runtime. "
@@ -1756,21 +1843,17 @@ class ScanPipeline:
             )
             self._agentic_added_relationship_count = len(agentic_rels)
             self._agentic_raw_risk_count = len(agentic_flags)
-            # Count degraded components from the raw agentic output, before
-            # post-filters below may strip components (and their hints) from the
-            # BOM.
-            self._agentic_degraded_count = _count_degraded(enriched)
-            self._agentic_degraded_ids = {
-                component.instance_id
-                for component in enriched
-                if component.agentic_hint
-            }
             deduped_ids = {c.instance_id for c in deduped}
+            enriched = _mark_missing_agentic_verdicts(
+                enriched,
+                input_ids=deduped_ids,
+            )
             enriched_deduped_ids = {
                 c.instance_id for c in enriched if c.instance_id in deduped_ids
             }
+            removed_ids = deduped_ids - enriched_deduped_ids
             new_components = [c for c in enriched if c.instance_id not in deduped_ids]
-            pre_fanout_removed = deduped_ids - enriched_deduped_ids
+            pre_fanout_removed = removed_ids
             enriched_for_fanout = [c for c in enriched if c.instance_id in deduped_ids]
             enriched = _fanout_agentic_results(enriched_for_fanout, fanout)
             enriched = _propagate_removals(
@@ -1799,6 +1882,66 @@ class ScanPipeline:
             enriched = _remove_unresolved_embedders(enriched, all_rels)
             enriched = _drop_env_placeholder_identifiers(enriched)
             all_rels = _backfill_relationship_instance_ids(all_rels, enriched)
+
+            # Reconcile terminal outcomes at the guarded Stage-3 boundary.
+            # Removal propagation and evidence filters can legitimately drop
+            # a raw degraded result, so reporting from the unguarded LLM
+            # response would overstate how many unresolved findings remain in
+            # the BOM. Fanout siblings are mapped back to their one deduped
+            # input representative to preserve the accounting invariant.
+            candidate_instance_ids = {
+                component.instance_id for component in components
+            }
+            enriched = _mark_missing_agentic_verdicts(
+                enriched,
+                input_ids=candidate_instance_ids,
+            )
+            enriched_by_id = {
+                component.instance_id: component for component in enriched
+            }
+            reviewed_ids: set[str] = set()
+            degraded_ids: set[str] = set()
+            degradation_reasons: Counter[str] = Counter()
+            for representative in deduped:
+                siblings = fanout.get(
+                    representative.instance_id,
+                    [representative],
+                )
+                retained = [
+                    enriched_by_id[sibling.instance_id]
+                    for sibling in siblings
+                    if sibling.instance_id in enriched_by_id
+                ]
+                if not retained:
+                    continue
+                if any(
+                    component.decision_annotation is not None
+                    and component.decision_annotation.decision.strip().lower()
+                    in _REVIEWED_COMPONENT_DECISIONS
+                    for component in retained
+                ):
+                    reviewed_ids.add(representative.instance_id)
+                    continue
+                degraded_ids.add(representative.instance_id)
+                reason = next(
+                    (
+                        component.agentic_hint
+                        for component in retained
+                        if component.agentic_hint
+                    ),
+                    _MISSING_AGENTIC_VERDICT,
+                )
+                degradation_reasons[reason] += 1
+
+            self._agentic_degraded_ids = degraded_ids
+            self._agentic_degraded_count = len(degraded_ids)
+            self._agentic_degradation_reasons = dict(degradation_reasons)
+            self._agentic_reviewed_count = len(reviewed_ids)
+            self._agentic_removed_count = (
+                self._agentic_input_count
+                - self._agentic_reviewed_count
+                - self._agentic_degraded_count
+            )
             self._agentic_token_usage = agentic_token_usage
             if self._telemetry_enabled():
                 # Snapshot the true Stage-3 return boundary. Everything above
@@ -1814,13 +1957,28 @@ class ScanPipeline:
             raise
         except Exception as exc:  # noqa: BLE001
             exact_candidates = self._agentic_input_count or len(components)
+            self._agentic_input_count = exact_candidates
+            failure_hint = "agentic_stage_error"
+            components = [
+                component.model_copy(
+                    update={
+                        "needs_agentic": True,
+                        "agentic_hint": failure_hint,
+                    }
+                )
+                for component in components
+            ]
+            self._agentic_degraded_count = exact_candidates
+            self._agentic_degradation_reasons = {
+                failure_hint: exact_candidates
+            }
+            self._agentic_reviewed_count = 0
+            self._agentic_removed_count = 0
+            self._agentic_degraded_ids = {
+                component.instance_id for component in components
+            }
             if self._telemetry_enabled():
                 self._agentic_telemetry_degraded_count = exact_candidates
-                # Keep the PipelineResult consumed by Galileo evaluation in
-                # sync with the source summary. This assignment intentionally
-                # remains inside the Galileo-enabled path so observability does
-                # not change non-Galileo scan results.
-                self._agentic_degraded_count = exact_candidates
                 if not self._agentic_input_snapshot:
                     self._agentic_input_snapshot = [
                         component.model_copy(deep=True) for component in components
@@ -1833,9 +1991,6 @@ class ScanPipeline:
                 self._agentic_output_snapshot = [
                     component.model_copy(deep=True) for component in components
                 ]
-                self._agentic_degraded_ids = {
-                    component.instance_id for component in self._agentic_input_snapshot
-                }
             _LOGGER.warning("Agentic classification failed: %s", exc, exc_info=True)
 
         return components, relationships, []

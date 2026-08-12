@@ -193,8 +193,13 @@ cisco-aibom analyze ./my-repo \
 1. **Candidate triage** — After deterministic scanning, all candidates are split into "simple" (registry-confirmable, e.g. known model IDs, manifest dependencies) and "complex" (needs deeper reasoning) tiers.
 2. **Locality-aware batching** — Candidates are grouped by directory to provide better code context per batch.
 3. **Agent tools** — The agent has access to tools: `read_file_snippet` (inspect source), `search_codebase` (regex-style search across the scanned tree), `trace_data_flow` (follow a symbol's assignments and call sites), `search_package_info` (queries PyPI/npm/Go registries), `analyze_imports`, `lookup_model`, and `resolve_env_var`. It uses these to confirm or reject each candidate.
-4. **Structured output** — Each batch returns a structured JSON response with confirmed components, removed false positives, reclassifications, relationships, and risk findings. Kept findings carry `decision_annotation` metadata with justification and evidence references. Raw code snippets are only included when `--include-code-snippets` is enabled.
+4. **Structured output** — Each batch returns a structured JSON response with confirmed components, removed false positives, reclassifications, relationships, and risk findings. Reviewed existing components use `decision_annotation.decision: confirmed`; agentic discoveries use `added`. A deterministic candidate retained without a usable verdict uses `unreviewed`, keeps `needs_agentic: true`, and is not presented as confirmed. Raw code snippets are only included when `--include-code-snippets` is enabled.
 5. **Caching** — Results are cached by content hash at `~/.aibom/cache/agentic/`. Unchanged components reuse cached results on subsequent runs.
+
+Agent and agent-proxy evidence is verified against the allowed source file. If
+the cited line range is stale, the verifier repairs it only when the exact
+whitespace-normalized snippet has one unique match in that same file. Missing,
+ambiguous, non-numeric, unreadable, or out-of-scope evidence is rejected.
 
 ## Circuit Breaker
 
@@ -202,7 +207,23 @@ To protect against runaway API costs, a circuit breaker trips after 3 consecutiv
 
 - Remaining batches are skipped.
 - Skipped components are marked with `agentic_hint: circuit_breaker_tripped`.
-- The deterministic detection results are preserved.
+- The deterministic detection results are preserved as `unreviewed` with
+  `needs_agentic: true`.
+
+Timed-out work is retried in smaller batches, within the existing retry budget,
+before it is left unreviewed. The JSON report records agentic completeness
+separately from normal scan completion:
+
+- `aibom_analysis.metadata.agentic_status` is `success`, `degraded`, or
+  `skipped`.
+- `agentic_degraded_count` is the number of input candidates retained by the
+  agentic stage without a usable verdict.
+- `agentic_degradation_reasons` maps stable failure hints to affected-candidate
+  counts.
+
+The same fields appear in each source's `summary`. A degraded agentic pass does
+not turn an otherwise successful scan into a run error: the report can retain
+`status: completed` while separately reporting `agentic_status: degraded`.
 
 ## Cache Management
 

@@ -363,6 +363,21 @@ def _sanitize_metadata(
     return cleaned
 
 
+def _agent_evidence_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+    """Persist verified evidence coordinates without copying raw source text."""
+
+    return {
+        key: raw[key]
+        for key in (
+            "pattern",
+            "definition_file",
+            "definition_start_line",
+            "definition_end_line",
+        )
+        if key in raw
+    }
+
+
 _DOCSTRING_RE = re.compile(r'("""|\'\'\')(.*?)\1', re.DOTALL)
 _BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/', re.DOTALL)
 # Line comments must start at the line (possibly after whitespace). This
@@ -777,6 +792,59 @@ def _normalize_ws(text: str) -> str:
     return " ".join(text.split())
 
 
+def _unique_snippet_line_range(
+    file_text: str,
+    snippet: str,
+) -> tuple[int, int] | None:
+    """Return the unique whitespace-normalized snippet location in a file."""
+
+    normalized_parts: list[str] = []
+    token_spans: list[tuple[int, int, int]] = []
+    normalized_length = 0
+    for line_number, line in enumerate(file_text.splitlines(), 1):
+        for match in re.finditer(r"\S+", line):
+            token = match.group(0)
+            if normalized_parts:
+                normalized_length += 1
+            start = normalized_length
+            normalized_parts.append(token)
+            normalized_length += len(token)
+            token_spans.append((start, normalized_length, line_number))
+
+    normalized_file = " ".join(normalized_parts)
+    normalized_snippet = _normalize_ws(snippet)
+    matches: list[tuple[int, int]] = []
+    offset = 0
+    while normalized_snippet:
+        match_start = normalized_file.find(normalized_snippet, offset)
+        if match_start < 0:
+            break
+        match_end = match_start + len(normalized_snippet) - 1
+        start_line = next(
+            (
+                line_number
+                for start, end, line_number in token_spans
+                if start <= match_start < end
+            ),
+            None,
+        )
+        end_line = next(
+            (
+                line_number
+                for start, end, line_number in token_spans
+                if start <= match_end < end
+            ),
+            None,
+        )
+        if start_line is not None and end_line is not None:
+            matches.append((start_line, end_line))
+        offset = match_start + 1
+
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def _verify_agent_evidence(
     raw: Any,
     *,
@@ -844,24 +912,44 @@ def _verify_agent_evidence(
     except OSError:
         return False, "file not readable"
 
-    lines = file_text.splitlines()
-    total = len(lines)
     start = raw.get("definition_start_line") or 0
     end = raw.get("definition_end_line") or 0
     if not isinstance(start, int) or not isinstance(end, int):
-        return False, "invalid line range"
-    if start < 1 or end < start or end > total:
         return False, "invalid line range"
 
     snippet = raw.get("evidence_snippet") or ""
     if not isinstance(snippet, str) or not snippet.strip():
         return False, "missing evidence_snippet"
 
-    window = "\n".join(lines[start - 1:end])
-    if _normalize_ws(snippet) not in _normalize_ws(window):
-        return False, "snippet not found in cited range"
+    lines = file_text.splitlines()
+    total = len(lines)
+    range_is_valid = start >= 1 and end >= start and end <= total
+    if range_is_valid:
+        window = "\n".join(lines[start - 1:end])
+        if _normalize_ws(snippet) in _normalize_ws(window):
+            return True, ""
 
-    return True, ""
+    repaired = _unique_snippet_line_range(file_text, snippet)
+    if repaired is not None:
+        raw["definition_start_line"], raw["definition_end_line"] = repaired
+        _LOGGER.info(
+            "Repaired agent evidence line range for %s: %s-%s -> %s-%s",
+            definition_file,
+            start,
+            end,
+            repaired[0],
+            repaired[1],
+        )
+        return True, ""
+
+    normalized_file = _normalize_ws(file_text)
+    normalized_snippet = _normalize_ws(snippet)
+    if normalized_file.count(normalized_snippet) > 1:
+        return False, "snippet match is ambiguous in cited file"
+    if not range_is_valid:
+        return False, "invalid line range"
+    return False, "snippet not found in cited file"
+
 
 
 def _normalize_endpoint_model_name(comp: AIComponent) -> AIComponent:
@@ -898,6 +986,9 @@ def _reject_class_name_models(
     """Remove ``model`` components whose name is a class name, not a model ID."""
     result: list[AIComponent] = []
     for comp in components:
+        if comp.agentic_hint:
+            result.append(comp)
+            continue
         if (
             comp.component_type == AIComponentType.MODEL
             and _is_class_name_not_model_id(comp.name)
@@ -954,6 +1045,9 @@ def _drop_env_placeholder_identifiers(
     """
     result: list[AIComponent] = []
     for comp in components:
+        if comp.agentic_hint:
+            result.append(comp)
+            continue
         if comp.component_type not in _ENV_PLACEHOLDER_IDENTIFIER_TYPES:
             result.append(comp)
             continue
@@ -987,6 +1081,9 @@ def _remove_unresolved_embedders(
 
     result: list[AIComponent] = []
     for comp in components:
+        if comp.agentic_hint:
+            result.append(comp)
+            continue
         if comp.component_type == AIComponentType.EMBEDDING:
             has_model = bool(comp.model_name or comp.embedding_model)
             has_rel = comp.name in has_embedding_rel
@@ -1299,7 +1396,9 @@ class AIBOMScannerMiddleware:
                     merged_meta = dict(comp.metadata)
                     reclass_evidence = reclassify_evidence.get(comp.instance_id)
                     if reclass_evidence is not None:
-                        merged_meta["agent_evidence"] = reclass_evidence
+                        merged_meta["agent_evidence"] = (
+                            _agent_evidence_metadata(reclass_evidence)
+                        )
                     comp = comp.model_copy(update={
                         "component_type": new_type,
                         "needs_agentic": False,
@@ -1331,7 +1430,9 @@ class AIBOMScannerMiddleware:
                         _LOGGER.warning("Invalid component_type '%s' in enrichment for %s", raw_type, comp.instance_id)
                 enrich_evidence = enrichment_evidence.get(comp.instance_id)
                 if enrich_evidence is not None:
-                    merged_meta["agent_evidence"] = enrich_evidence
+                    merged_meta["agent_evidence"] = (
+                        _agent_evidence_metadata(enrich_evidence)
+                    )
                 comp = comp.model_copy(update={
                     **upd,
                     "metadata": merged_meta,
@@ -1434,6 +1535,12 @@ class AIBOMScannerMiddleware:
                 component_name=name,
                 component_type=comp_type.value,
             )
+            if comp_type in _AGENT_CLASSIFICATION_TYPES:
+                agent_evidence = item.get("agent_evidence")
+                if isinstance(agent_evidence, dict):
+                    sanitized_meta["agent_evidence"] = (
+                        _agent_evidence_metadata(agent_evidence)
+                    )
             probe = AIComponent(
                 name=name,
                 component_type=comp_type,

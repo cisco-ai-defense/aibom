@@ -4,15 +4,166 @@ import json
 import uuid
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from typer.testing import CliRunner
 
-from aibom.cli import app
-from aibom.models import AIComponent, AIComponentType, RiskScore, ScanResult, SourceResult
+from aibom.cli import (
+    _aggregate_agentic_outcomes,
+    _apply_cached_agentic_outcome,
+    _build_submission_payload,
+    _org_cache_has_agentic_outcome,
+    _scan_cache_has_agentic_outcome,
+    _serializable_scan_cache_payload,
+    _v2_output_from_org_cache,
+    app,
+)
+from aibom.models import (
+    AIComponent,
+    AIComponentType,
+    RiskScore,
+    ScanResult,
+    SourceResult,
+)
 from aibom.reporters.json_reporter import JsonReporter
 
 runner = CliRunner()
+
+
+def test_scan_cache_preserves_agentic_outcome() -> None:
+    result = SimpleNamespace(
+        components=[],
+        relationships=[],
+        agentic_risk_flags=[],
+        agentic_candidate_count=3,
+        agentic_status="degraded",
+        agentic_degraded_count=2,
+        agentic_degradation_reasons={
+            "batch_timeout": 1,
+            "retry_budget_exhausted": 1,
+        },
+    )
+
+    cached = _serializable_scan_cache_payload(result)
+    source_summary: dict = {}
+    _apply_cached_agentic_outcome(source_summary, cached)
+
+    assert _scan_cache_has_agentic_outcome(cached) is True
+    legacy = {
+        key: value for key, value in cached.items() if not key.startswith("_agentic_")
+    }
+    assert _scan_cache_has_agentic_outcome(legacy) is False
+    assert source_summary == {
+        "agentic_status": "degraded",
+        "agentic_degraded_count": 2,
+        "agentic_degradation_reasons": {
+            "batch_timeout": 1,
+            "retry_budget_exhausted": 1,
+        },
+    }
+
+
+def test_org_cache_preserves_agentic_outcome() -> None:
+    cached_result = ScanResult(
+        metadata={
+            "agentic_status": "degraded",
+            "agentic_degraded_count": 2,
+            "agentic_degradation_reasons": {"batch_timeout": 2},
+        },
+        sources=[
+            SourceResult(
+                path="/repo",
+                components=[],
+                relationships=[],
+            )
+        ],
+    )
+
+    cached = _v2_output_from_org_cache(cached_result)
+
+    assert cached["_agentic_status"] == "degraded"
+    assert cached["_agentic_degraded_count"] == 2
+    assert cached["_agentic_degradation_reasons"] == {"batch_timeout": 2}
+    assert _org_cache_has_agentic_outcome(cached_result) is True
+
+    legacy = cached_result.model_copy(update={"metadata": {}})
+    assert _org_cache_has_agentic_outcome(legacy) is False
+
+
+def test_run_agentic_outcome_aggregates_sources() -> None:
+    outcomes = {
+        "first": {
+            "agentic_status": "success",
+            "agentic_degraded_count": 0,
+            "agentic_degradation_reasons": {},
+        },
+        "second": {
+            "agentic_status": "degraded",
+            "agentic_degraded_count": 3,
+            "agentic_degradation_reasons": {
+                "batch_timeout": 2,
+                "retry_failed": 1,
+            },
+        },
+        "third": {
+            "agentic_status": "degraded",
+            "agentic_degraded_count": 1,
+            "agentic_degradation_reasons": {"batch_timeout": 1},
+        },
+    }
+
+    assert _aggregate_agentic_outcomes(outcomes) == (
+        "degraded",
+        4,
+        {"batch_timeout": 3, "retry_failed": 1},
+    )
+
+
+def test_submission_preserves_unreviewed_and_agentic_outcome() -> None:
+    report = {
+        "aibom_analysis": {
+            "metadata": {
+                "run_id": "run-123",
+                "analyzer_version": "1.0.9",
+                "agentic_status": "degraded",
+                "agentic_degraded_count": 1,
+                "agentic_degradation_reasons": {"batch_timeout": 1},
+            },
+            "sources": {
+                "example/repo": {
+                    "components": {
+                        "agent": [
+                            {
+                                "name": "RouterAgent",
+                                "decision_annotation": {
+                                    "decision": "unreviewed"
+                                },
+                                "needs_agentic": True,
+                                "agentic_hint": "batch_timeout",
+                            }
+                        ]
+                    },
+                    "summary": {
+                        "agentic_status": "degraded",
+                        "agentic_degraded_count": 1,
+                        "agentic_degradation_reasons": {
+                            "batch_timeout": 1
+                        },
+                    },
+                }
+            },
+        }
+    }
+
+    payload = _build_submission_payload(report)
+
+    assert payload["report"] == report
+    component = payload["report"]["aibom_analysis"]["sources"][
+        "example/repo"
+    ]["components"]["agent"][0]
+    assert component["decision_annotation"]["decision"] == "unreviewed"
+    assert component["needs_agentic"] is True
 
 
 def _write_report(path: Path, *, include_version: bool = True) -> dict:
@@ -173,6 +324,13 @@ def _write_multi_source_report(
             "source_ref_version": spec["version"],
             "status": "completed",
         }
+        for key in (
+            "agentic_status",
+            "agentic_degraded_count",
+            "agentic_degradation_reasons",
+        ):
+            if key in spec:
+                source_outcomes[spec["path"]][key] = spec[key]
     result = ScanResult(
         metadata={
             "run_id": run_id,
@@ -284,6 +442,67 @@ def test_two_sources_fan_out_to_two_uploads(mock_post, tmp_path: Path):
     # Each upload's report is scoped to exactly one source.
     for p in payloads:
         assert len(p["report"]["aibom_analysis"]["sources"]) == 1
+
+
+@patch("aibom.cli.post_report_with_retries")
+def test_report_upload_preserves_per_source_agentic_outcomes(
+    mock_post, tmp_path: Path
+):
+    report_file = tmp_path / "report.json"
+    _write_multi_source_report(
+        report_file,
+        [
+            {
+                "path": "/repo/degraded",
+                "name": "org/degraded",
+                "kind": "git",
+                "canonical": "github.com/org/degraded",
+                "version": "aaa",
+                "agentic_status": "degraded",
+                "agentic_degraded_count": 2,
+                "agentic_degradation_reasons": {
+                    "retry_failed": 1,
+                    "circuit_breaker_tripped": 1,
+                },
+            },
+            {
+                "path": "/repo/success",
+                "name": "org/success",
+                "kind": "git",
+                "canonical": "github.com/org/success",
+                "version": "bbb",
+                "agentic_status": "success",
+                "agentic_degraded_count": 0,
+                "agentic_degradation_reasons": {},
+            },
+        ],
+    )
+
+    generated = json.loads(report_file.read_text(encoding="utf-8"))
+    generated_summaries = {
+        key: value["summary"]
+        for key, value in generated["aibom_analysis"]["sources"].items()
+    }
+    assert generated_summaries["org/degraded"]["agentic_status"] == "degraded"
+    assert generated_summaries["org/success"]["agentic_status"] == "success"
+
+    result = _invoke_upload(report_file)
+
+    assert result.exit_code == 0, result.output
+    assert mock_post.call_count == 2
+    uploaded_summaries = {}
+    for call in mock_post.call_args_list:
+        uploaded_sources = call.args[1]["report"]["aibom_analysis"]["sources"]
+        assert len(uploaded_sources) == 1
+        source_key, source_entry = next(iter(uploaded_sources.items()))
+        uploaded_summaries[source_key] = source_entry["summary"]
+
+    assert uploaded_summaries["org/degraded"] == generated_summaries[
+        "org/degraded"
+    ]
+    assert uploaded_summaries["org/success"] == generated_summaries[
+        "org/success"
+    ]
 
 
 @patch("aibom.cli.post_report_with_retries")

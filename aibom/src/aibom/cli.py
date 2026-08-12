@@ -370,18 +370,66 @@ def _require_supported_cache_type(cache_type: str) -> None:
     raise typer.Exit(code=1)
 
 
+def _org_cache_has_agentic_outcome(cached_sr: Any) -> bool:
+    """Return whether an org-cache entry carries the current status contract."""
+
+    metadata = getattr(cached_sr, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get("agentic_status") in {"success", "degraded", "skipped"}
+        and isinstance(metadata.get("agentic_degraded_count"), int)
+        and isinstance(metadata.get("agentic_degradation_reasons"), dict)
+    )
+
+
+def _scan_cache_has_agentic_outcome(cached: Any) -> bool:
+    """Return whether a scan-cache entry carries the current status contract."""
+
+    if not isinstance(cached, dict):
+        return False
+    return (
+        cached.get("_agentic_status") in {"success", "degraded", "skipped"}
+        and isinstance(cached.get("_agentic_degraded_count"), int)
+        and isinstance(cached.get("_agentic_degradation_reasons"), dict)
+    )
+
+
 def _v2_output_from_org_cache(cached_sr: Any) -> Dict[str, Any]:
     merged_components: list = []
     merged_rels: list = []
     for s in cached_sr.sources:
         merged_components.extend(s.components)
         merged_rels.extend(s.relationships)
+    cached_metadata = (
+        cached_sr.metadata if isinstance(cached_sr.metadata, dict) else {}
+    )
+    cached_status = cached_metadata.get("agentic_status", "skipped")
+    if cached_status not in {"success", "degraded", "skipped"}:
+        cached_status = "skipped"
+    cached_degraded_count = cached_metadata.get(
+        "agentic_degraded_count",
+        0,
+    )
+    cached_reasons = cached_metadata.get(
+        "agentic_degradation_reasons",
+        {},
+    )
     return {
         "_v2": True,
         "components": merged_components,
         "relationships": merged_rels,
         "_agentic_risk_flags": [],
         "_agentic_candidate_count": 0,
+        "_agentic_status": cached_status,
+        "_agentic_degraded_count": (
+            cached_degraded_count
+            if isinstance(cached_degraded_count, int)
+            else 0
+        ),
+        "_agentic_degradation_reasons": (
+            dict(cached_reasons) if isinstance(cached_reasons, dict) else {}
+        ),
     }
 
 
@@ -392,6 +440,11 @@ def _v2_output_from_pipeline_result(result: Any) -> Dict[str, Any]:
         "relationships": result.relationships,
         "_agentic_risk_flags": result.agentic_risk_flags,
         "_agentic_candidate_count": result.agentic_candidate_count,
+        "_agentic_status": result.agentic_status,
+        "_agentic_degraded_count": result.agentic_degraded_count,
+        "_agentic_degradation_reasons": dict(
+            result.agentic_degradation_reasons
+        ),
     }
 
 
@@ -405,7 +458,61 @@ def _serializable_scan_cache_payload(result: Any) -> Dict[str, Any]:
             for f in result.agentic_risk_flags
         ],
         "_agentic_candidate_count": result.agentic_candidate_count,
+        "_agentic_status": result.agentic_status,
+        "_agentic_degraded_count": result.agentic_degraded_count,
+        "_agentic_degradation_reasons": dict(
+            result.agentic_degradation_reasons
+        ),
     }
+
+
+def _apply_cached_agentic_outcome(
+    source_summary: Dict[str, Any],
+    cached: Dict[str, Any],
+) -> None:
+    """Restore machine-readable agentic state from a whole-scan cache."""
+
+    source_summary["agentic_status"] = cached.get(
+        "_agentic_status", "skipped"
+    )
+    source_summary["agentic_degraded_count"] = cached.get(
+        "_agentic_degraded_count", 0
+    )
+    reasons = cached.get("_agentic_degradation_reasons", {})
+    source_summary["agentic_degradation_reasons"] = (
+        dict(reasons) if isinstance(reasons, dict) else {}
+    )
+
+
+def _aggregate_agentic_outcomes(
+    source_outcomes: Dict[str, Dict[str, Any]],
+) -> tuple[str, int, Dict[str, int]]:
+    """Aggregate per-source agentic outcomes into the run metadata."""
+
+    statuses = {
+        str(outcome.get("agentic_status", "skipped"))
+        for outcome in source_outcomes.values()
+    }
+    if "degraded" in statuses:
+        status = "degraded"
+    elif "success" in statuses:
+        status = "success"
+    else:
+        status = "skipped"
+
+    degraded_count = sum(
+        int(outcome.get("agentic_degraded_count", 0) or 0)
+        for outcome in source_outcomes.values()
+    )
+    reasons: Counter[str] = Counter()
+    for outcome in source_outcomes.values():
+        raw_reasons = outcome.get("agentic_degradation_reasons", {})
+        if not isinstance(raw_reasons, dict):
+            continue
+        for reason, count in raw_reasons.items():
+            if isinstance(reason, str) and isinstance(count, int) and count > 0:
+                reasons[reason] += count
+    return status, degraded_count, dict(sorted(reasons.items()))
 
 
 def _gather_analysis_sources(
@@ -1107,6 +1214,13 @@ def _source_outcomes_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, 
             "last_generated_at": summary.get("last_generated_at"),
             "assets_discovered": summary.get("assets_discovered"),
         }
+        for key in (
+            "agentic_status",
+            "agentic_degraded_count",
+            "agentic_degradation_reasons",
+        ):
+            if key in summary:
+                outcomes[source_path][key] = summary[key]
     return outcomes
 
 
@@ -2069,6 +2183,9 @@ def analyze(
                 "errors": [],
                 "source_name": str(source),
                 "source_path": str(source),
+                "agentic_status": "skipped",
+                "agentic_degraded_count": 0,
+                "agentic_degradation_reasons": {},
             }
             source_outcomes[source] = source_summary
 
@@ -2227,6 +2344,14 @@ def analyze(
 
                 org_cache = OrgCache()
                 cached_sr = org_cache.get_cached(str(path_to_analyze.resolve()))
+                if cached_sr is not None and not _org_cache_has_agentic_outcome(
+                    cached_sr
+                ):
+                    console.print(
+                        f"[yellow]Ignoring legacy org cache entry[/] for "
+                        f"{source}: agentic outcome is unavailable"
+                    )
+                    cached_sr = None
                 if cached_sr is not None:
                     console.print(
                         f"[green]Org cache hit[/] for {source} " f"(~/.aibom/cache/org)"
@@ -2237,6 +2362,10 @@ def analyze(
                         cached_v2_output["components"]
                     )
                     source_summary["last_generated_at"] = _utcnow_iso()
+                    _apply_cached_agentic_outcome(
+                        source_summary,
+                        cached_v2_output,
+                    )
                     if source_summary["status"] == "in_progress":
                         source_summary["status"] = "completed"
                     _record_agentic_source_summary(
@@ -2263,7 +2392,15 @@ def analyze(
                     _ck,
                     search_dirs=scan_cache_read_dirs,
                 )
-                if cached:
+                if cached is not None and not _scan_cache_has_agentic_outcome(
+                    cached
+                ):
+                    console.print(
+                        f"[yellow]Ignoring legacy scan cache entry[/] for "
+                        f"{source}: agentic outcome is unavailable"
+                    )
+                    cached = None
+                if cached is not None:
                     _scan_cache_hit = True
                     console.print(f"[green]Cache hit[/] for {source} ({_ck[:12]}…)")
                     all_analysis_outputs[source] = cached
@@ -2271,6 +2408,7 @@ def analyze(
                         cached.get("components", [])
                     )
                     source_summary["last_generated_at"] = _utcnow_iso()
+                    _apply_cached_agentic_outcome(source_summary, cached)
                     if source_summary["status"] == "in_progress":
                         source_summary["status"] = "completed"
                     _record_agentic_source_summary(
@@ -2383,7 +2521,16 @@ def analyze(
                 org_cache.store(
                     str(path_to_analyze.resolve()),
                     ScanResult(
-                        metadata=run_metadata,
+                        metadata={
+                            **run_metadata,
+                            "agentic_status": result.agentic_status,
+                            "agentic_degraded_count": (
+                                result.agentic_degraded_count
+                            ),
+                            "agentic_degradation_reasons": dict(
+                                result.agentic_degradation_reasons
+                            ),
+                        },
                         sources=[
                             SourceResult(
                                 path=scan_path,
@@ -2402,6 +2549,13 @@ def analyze(
             source_summary["completion_tokens"] = result.completion_tokens
             source_summary["total_tokens"] = result.total_tokens
             source_summary["cached_tokens"] = result.cached_tokens
+            source_summary["agentic_status"] = result.agentic_status
+            source_summary["agentic_degraded_count"] = (
+                result.agentic_degraded_count
+            )
+            source_summary["agentic_degradation_reasons"] = dict(
+                result.agentic_degradation_reasons
+            )
             run_metadata["total_tokens"] += result.total_tokens
             run_metadata["prompt_tokens"] += result.prompt_tokens
             run_metadata["completion_tokens"] += result.completion_tokens
@@ -2426,6 +2580,11 @@ def analyze(
             run_metadata["status"] = "completed_with_errors"
         else:
             run_metadata["status"] = "completed"
+        (
+            run_metadata["agentic_status"],
+            run_metadata["agentic_degraded_count"],
+            run_metadata["agentic_degradation_reasons"],
+        ) = _aggregate_agentic_outcomes(source_outcomes)
 
         v2_outputs = {
             k: v

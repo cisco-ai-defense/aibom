@@ -106,8 +106,26 @@ def _component_annotation(
         role="primary",
     )
     if component.decision_annotation is not None:
+        annotation = component.decision_annotation
+        decision = annotation.decision.strip().lower()
+        if decision not in {"confirmed", "added"}:
+            annotation = annotation.model_copy(
+                update={
+                    "decision": "unreviewed",
+                    "justification": (
+                        annotation.justification
+                        or "No usable component verdict was attached."
+                    ),
+                }
+            )
+        elif annotation.decision != decision:
+            annotation = annotation.model_copy(update={"decision": decision})
+        if not annotation.evidence_locations and primary_location is not None:
+            annotation = annotation.model_copy(
+                update={"evidence_locations": [primary_location]}
+            )
         return _hydrate_annotation(
-            component.decision_annotation,
+            annotation,
             include_code_snippets=include_code_snippets,
             snippet_location=primary_location,
             allowed_roots=allowed_roots,
@@ -124,13 +142,35 @@ def _component_annotation(
             f"Prompt '{component.name}' detected but prompt text was not "
             f"extracted; it may be loaded from a file at runtime."
         )
-        evidence_kinds = ["code_context", "file_loaded_limitation"] if evidence_locations else ["file_loaded_limitation"]
+        evidence_kinds = (
+            ["code_context", "file_loaded_limitation"]
+            if evidence_locations
+            else ["file_loaded_limitation"]
+        )
+        decision = "unreviewed"
     elif component.detection_source == DetectionSource.AGENTIC:
         justification = (
             f"{component.component_type.value.replace('_', ' ').capitalize()} "
             f"'{component.name}' was created by agentic enrichment."
         )
-        evidence_kinds = ["code_context", "agentic_enrichment"] if evidence_locations else ["agentic_enrichment"]
+        evidence_kinds = (
+            ["code_context", "agentic_enrichment"]
+            if evidence_locations
+            else ["agentic_enrichment"]
+        )
+        decision = "added"
+    elif component.agentic_hint:
+        justification = (
+            f"{component.component_type.value.replace('_', ' ').capitalize()} "
+            f"'{component.name}' was retained without an agentic verdict "
+            f"because agentic processing degraded ({component.agentic_hint})."
+        )
+        evidence_kinds = (
+            ["code_context", "agentic_degradation"]
+            if evidence_locations
+            else ["agentic_degradation"]
+        )
+        decision = "unreviewed"
     else:
         detector = (
             component.detection_source.value
@@ -143,9 +183,10 @@ def _component_annotation(
             f"agentic verdict was attached to this finding."
         )
         evidence_kinds = ["code_context"] if evidence_locations else ["scan_result"]
+        decision = "unreviewed"
 
     annotation = DecisionAnnotation(
-        decision="confirmed",
+        decision=decision,
         justification=justification,
         evidence_kinds=evidence_kinds,
         evidence_locations=evidence_locations,
@@ -255,18 +296,20 @@ def annotate_findings(
     allowed_roots: list[str] | None = None,
 ) -> tuple[list[AIComponent], list[ComponentRelationship], list[RiskFlag]]:
     """Ensure every final finding carries a decision annotation."""
-    annotated_components = [
-        component.model_copy(
-            update={
-                "decision_annotation": _component_annotation(
-                    component,
-                    include_code_snippets=include_code_snippets,
-                    allowed_roots=allowed_roots,
-                )
-            }
+    annotated_components: list[AIComponent] = []
+    for component in components:
+        annotation = _component_annotation(
+            component,
+            include_code_snippets=include_code_snippets,
+            allowed_roots=allowed_roots,
         )
-        for component in components
-    ]
+        updates: dict[str, object] = {"decision_annotation": annotation}
+        if annotation.decision == "unreviewed":
+            updates["needs_agentic"] = True
+        elif annotation.decision in {"confirmed", "added"}:
+            updates["needs_agentic"] = False
+            updates["agentic_hint"] = ""
+        annotated_components.append(component.model_copy(update=updates))
     component_by_id = {component.instance_id: component for component in annotated_components}
     annotated_relationships = [
         relationship.model_copy(

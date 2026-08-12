@@ -54,7 +54,7 @@ class TestAgenticTimeout:
             timeout_s=1,
         )
         assert len(comps) == 1
-        assert comps[0].needs_agentic is False
+        assert comps[0].needs_agentic is True
         assert comps[0].agentic_hint == "batch_timeout"
 
     @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
@@ -108,7 +108,7 @@ class TestAgenticTimeout:
             elapsed < 20
         ), f"batch hung for {elapsed:.1f}s on a never-returning invoke"
         assert len(comps) == 1
-        assert comps[0].needs_agentic is False
+        assert comps[0].needs_agentic is True
         assert comps[0].agentic_hint == "batch_timeout"
 
 
@@ -186,7 +186,7 @@ class TestAgenticAsyncTimeout:
             elapsed < 25
         ), f"parallel path hung for {elapsed:.1f}s on a never-returning ainvoke"
         assert len(out) == 2
-        assert all(c.needs_agentic is False for c in out)
+        assert all(c.needs_agentic is True for c in out)
         assert all(c.agentic_hint == "batch_timeout" for c in out)
 
 
@@ -464,7 +464,7 @@ class TestAgenticCircuitBreaker:
         # 3 main-pass invocations (breaker trips, 4th skipped) +
         # 3 retry-pass invocations (retry breaker also trips on 4th)
         assert mock_agent.invoke.call_count == 6
-        assert all(c.needs_agentic is False for c in comps)
+        assert all(c.needs_agentic is True for c in comps)
 
     @patch("aibom.agentic.agent._RETRY_COOLDOWN_S", 0)
     @patch("aibom.agentic.agent._close_model_clients")
