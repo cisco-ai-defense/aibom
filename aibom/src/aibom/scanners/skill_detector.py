@@ -285,6 +285,16 @@ def _collect_from_root(
             components.append(c)
             scan_roots.append(str(skill_md.parent.resolve()))
 
+    for skill_md in root.glob("**/.claude/skills/*/SKILL.md"):
+        if _is_excluded(skill_md, scan_root, spec):
+            continue
+        c = _component_for_skill_md(
+            skill_md, "claude", scan_root, spec, seen
+        )
+        if c:
+            components.append(c)
+            scan_roots.append(str(skill_md.parent.resolve()))
+
     for plugins in root.glob("**/.claude/plugins"):
         if not plugins.is_dir() or _is_excluded(plugins, scan_root, spec):
             continue
