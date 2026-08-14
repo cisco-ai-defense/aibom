@@ -515,7 +515,7 @@ wheels = [
 
 [[package]]
 name = "cisco-aibom"
-version = "1.0.9"
+version = "1.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
