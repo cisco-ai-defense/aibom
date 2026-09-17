@@ -81,6 +81,77 @@ class TestToolSchemaDetection:
         tool_comps = [c for c in comps if c.component_type == AIComponentType.TOOL]
         assert any(c.name == "search_web" for c in tool_comps)
 
+    @staticmethod
+    def _tool_names(tmp_path: Path, source: str) -> list[str]:
+        from aibom.cst_parser import parse_source_code
+        from aibom.scanners.kb_enrichment_scanner import _detect_tool_schemas
+
+        path = tmp_path / "server.py"
+        path.write_text(source)
+        comps = _detect_tool_schemas(parse_source_code(str(path), source))
+        return [c.name for c in comps if c.component_type == AIComponentType.TOOL]
+
+    def test_decorator_on_a_server_instance(self, tmp_path: Path):
+        names = self._tool_names(
+            tmp_path,
+            "from mcp.server.fastmcp import FastMCP\n"
+            "app = FastMCP('demo')\n"
+            "\n"
+            "@app.tool()\n"
+            "def execute_sql(query: str) -> str:\n"
+            "    return query\n",
+        )
+        assert "execute_sql" in names
+
+    def test_bare_decorator_in_a_file_that_builds_a_server(self, tmp_path: Path):
+        # Servers wrap their own decorator to add logging; the wrapper is a
+        # plain local function, so the server is the only evidence left.
+        names = self._tool_names(
+            tmp_path,
+            "from mcp.server.fastmcp import FastMCP\n"
+            "mcp = FastMCP('demo')\n"
+            "\n"
+            "def tool(**kwargs):\n"
+            "    return lambda fn: mcp.add_tool(fn)\n"
+            "\n"
+            "@tool()\n"
+            "def describe_table(name: str) -> str:\n"
+            "    return name\n",
+        )
+        assert "describe_table" in names
+
+    def test_bare_decorator_that_registers_nothing_is_left_alone(
+        self, tmp_path: Path
+    ):
+        # A server in the file is not enough on its own: this ``tool`` is an
+        # unrelated local decorator that never hands the function over.
+        names = self._tool_names(
+            tmp_path,
+            "from mcp.server.fastmcp import FastMCP\n"
+            "mcp = FastMCP('demo')\n"
+            "\n"
+            "def tool(**kwargs):\n"
+            "    return lambda fn: fn\n"
+            "\n"
+            "@tool()\n"
+            "def lathe_rpm(bit: str) -> str:\n"
+            "    return bit\n",
+        )
+        assert "lathe_rpm" not in names
+
+    def test_decorator_without_a_server_is_left_alone(self, tmp_path: Path):
+        # ``tool`` here is an unrelated method on an unrelated object.
+        names = self._tool_names(
+            tmp_path,
+            "from machining import Lathe\n"
+            "lathe = Lathe()\n"
+            "\n"
+            "@lathe.tool()\n"
+            "def mount_bit(bit: str) -> str:\n"
+            "    return bit\n",
+        )
+        assert "mount_bit" not in names
+
     def test_function_to_schema_call(self, tmp_path: Path):
         (tmp_path / "schemas.py").write_text(
             "from langchain_core.utils.function_calling import function_to_schema\n"

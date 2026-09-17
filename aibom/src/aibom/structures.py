@@ -36,6 +36,33 @@ class AssignmentObservation:
 
 
 @dataclass
+class ValueAssignmentObservation:
+    """A binding whose right-hand side is *not* a call.
+
+    ``AssignmentObservation`` only fires when the right-hand side unwraps to
+    a ``Call``, so ``model = "gpt-4"`` and ``model = CONFIG["model"]`` were
+    previously not recorded at all. Anything that wants to answer "what
+    value does this name hold" — resolving a ``VARIABLE:`` reference in a
+    constructor kwarg, or propagating a literal to a model identifier —
+    needs those bindings.
+
+    ``value`` uses the same tagged encoding as call arguments, so a literal
+    arrives as a plain ``str``/``int``, a name reference as
+    ``VARIABLE:other``, and an attribute as ``ATTRIBUTE:cfg.model``.
+    ``value_kind`` records which of those it is without re-inspecting the
+    payload. ``owner_qualified_name`` is the enclosing function, or ``None``
+    for a module-level binding, so a resolver can respect scope instead of
+    matching on bare name across the whole file.
+    """
+
+    target_qualified_name: str
+    value: Any
+    value_kind: str
+    owner_qualified_name: Optional[str] = None
+    line_number: int = 0
+
+
+@dataclass
 class DecoratorObservation:
     """Represents a decorator applied to a function."""
     decorator_qualified_name: str
@@ -168,6 +195,7 @@ class CodeAnalysisResult:
     """Holds all observations from a single source file analysis."""
     file_path: str
     assignments: List[AssignmentObservation] = field(default_factory=list)
+    value_assignments: List[ValueAssignmentObservation] = field(default_factory=list)
     calls: List[CallObservation] = field(default_factory=list)
     decorators: List[DecoratorObservation] = field(default_factory=list)
     type_annotations: List[TypeAnnotationObservation] = field(default_factory=list)

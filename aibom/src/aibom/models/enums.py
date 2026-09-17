@@ -137,6 +137,26 @@ class DetectionSource(str, Enum):
     API = "api"
 
 
+class EvidenceStrength(str, Enum):
+    """How directly a relationship was read out of the source.
+
+    Reading an edge off code structure is not one thing. ``Agent(llm=x)``
+    with ``x`` bound in the same scope is stated outright, while "this
+    function is a graph node and something it calls two hops down builds a
+    model" is a deduction from reachability. Both are better than an LLM
+    guess and both are reproducible, but only the first should be trusted
+    to overwrite a component's reported model name.
+
+    ``AMBIGUOUS`` exists so a reference that matched several candidates can
+    be surfaced for review instead of silently discarded, which is what
+    happens when the only options are "certain" and "gone".
+    """
+
+    STATED = "stated"
+    REACHED = "reached"
+    AMBIGUOUS = "ambiguous"
+
+
 class CrossRepoLinkType(str, Enum):
     """Types of cross-repository links in a multi-repo scan."""
 

@@ -243,4 +243,49 @@ _ALL_ENTRIES: List[Dict[str, Any]] = [
     {"id": "google.generativeai.ChatSession", "label": "ChatSession", "concept": "agent", "framework": "google_genai", "sig_name": None, "type": None, "catalog_label": None},
     {"id": "google.generativeai.configure", "label": "configure", "concept": "other", "framework": "google_genai", "sig_name": None, "type": None, "catalog_label": None},
     {"id": "vertexai.generative_models.GenerativeModel", "label": "GenerativeModel", "concept": "model", "framework": "vertexai", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ========================================================================
+    # Google ADK
+    # ========================================================================
+
+    # ── ADK agents ───────────────────────────────────────────────────────
+    {"id": "google.adk.agents.Agent", "label": "Agent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.BaseAgent", "label": "BaseAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.LlmAgent", "label": "LlmAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.SequentialAgent", "label": "SequentialAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.ParallelAgent", "label": "ParallelAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.LoopAgent", "label": "LoopAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.llm_agent.LlmAgent", "label": "LlmAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.sequential_agent.SequentialAgent", "label": "SequentialAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.parallel_agent.ParallelAgent", "label": "ParallelAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.agents.loop_agent.LoopAgent", "label": "LoopAgent", "concept": "agent", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── ADK tools ────────────────────────────────────────────────────────
+    {"id": "google.adk.tools.FunctionTool", "label": "FunctionTool", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.LongRunningFunctionTool", "label": "LongRunningFunctionTool", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.AgentTool", "label": "AgentTool", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.agent_tool.AgentTool", "label": "AgentTool", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.google_search", "label": "google_search", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.built_in_code_execution", "label": "built_in_code_execution", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.VertexAiSearchTool", "label": "VertexAiSearchTool", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.load_memory", "label": "load_memory", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.preload_memory", "label": "preload_memory", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.ToolContext", "label": "ToolContext", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.tools.mcp_tool.MCPToolset", "label": "MCPToolset", "concept": "tool", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── ADK models ───────────────────────────────────────────────────────
+    {"id": "google.adk.models.Gemini", "label": "Gemini", "concept": "model", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.models.google_llm.Gemini", "label": "Gemini", "concept": "model", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.models.lite_llm.LiteLlm", "label": "LiteLlm", "concept": "model", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+
+    # ── ADK memory / sessions ────────────────────────────────────────────
+    {"id": "google.adk.memory.InMemoryMemoryService", "label": "InMemoryMemoryService", "concept": "memory", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.memory.VertexAiRagMemoryService", "label": "VertexAiRagMemoryService", "concept": "memory", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.sessions.InMemorySessionService", "label": "InMemorySessionService", "concept": "memory", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.sessions.DatabaseSessionService", "label": "DatabaseSessionService", "concept": "memory", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+    {"id": "google.adk.sessions.VertexAiSessionService", "label": "VertexAiSessionService", "concept": "memory", "framework": "google_adk", "sig_name": None, "type": None, "catalog_label": None},
+
+    # Runners and artifact services are deliberately absent: they are runtime
+    # plumbing rather than AI assets, and cataloguing them only adds OTHER
+    # components that no ground truth counts.
 ]

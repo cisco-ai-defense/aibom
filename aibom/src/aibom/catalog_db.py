@@ -226,6 +226,45 @@ class CatalogDB:
         rows = self._connection.execute(query, params).fetchall()
         return [r[0] for r in rows]
 
+    def find_components_by_ids(
+        self,
+        ids: Sequence[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return catalog entries whose IDs match exactly, keyed by ID.
+
+        :meth:`find_components_by_suffixes` also matches on the last path
+        segment, so ``google.adk.tools.google_search`` there additionally
+        pulls in ``genai.types.Tool.google_search``. That is the right
+        behaviour when all that is known is a bare name, and the wrong one
+        when the full path is known: an import statement names the module
+        it imports from, and the whole point of using it is that it picks
+        one entry rather than every symbol sharing a final segment.
+        """
+        if not ids:
+            return {}
+
+        label_filter = self._ignore_stale_parameter_sql()
+        cursor = self._connection.execute(
+            f"SELECT {_CATALOG_COLS} FROM kb.component_catalog "
+            "WHERE id IN (SELECT UNNEST(?)) "
+            f"AND {label_filter}",
+            [list(dict.fromkeys(ids))],
+        )
+        columns = [desc[0] for desc in cursor.description]
+        found = {
+            row_dict["id"]: row_dict
+            for row_dict in (dict(zip(columns, row)) for row in cursor.fetchall())
+        }
+
+        for entry_id in ids:
+            if entry_id not in found and entry_id in self._custom_index:
+                found[entry_id] = self._custom_index[entry_id]
+
+        if self._excludes:
+            found = {k: v for k, v in found.items() if not self._is_excluded(k)}
+
+        return found
+
     def find_components_by_suffixes(
         self,
         suffixes: Sequence[str],

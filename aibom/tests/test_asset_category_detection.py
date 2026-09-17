@@ -452,6 +452,70 @@ class TestTypeInferenceDefaults:
 # ====================================================================
 
 
+class TestRedundantSymbolRows:
+    """Rows that restate a component already reported another way."""
+
+    @staticmethod
+    def _imported(name, ctype=AIComponentType.AGENT):
+        return AIComponent(
+            name=name,
+            component_type=ctype,
+            file_path="/svc/a/app.py",
+            line_number=1,
+            metadata={"import_statement": f"from pkg import {name}"},
+        )
+
+    @staticmethod
+    def _built(name, pattern, ctype=AIComponentType.AGENT):
+        return AIComponent(
+            name=name,
+            component_type=ctype,
+            file_path="/svc/a/app.py",
+            line_number=9,
+            metadata={"call_pattern": pattern},
+        )
+
+    def test_import_row_drops_when_class_is_instantiated(self):
+        from aibom.scan_pipeline import _drop_redundant_symbol_rows
+
+        rows = [
+            self._imported("LlmAgent"),
+            self._built("root_agent", "google.adk.agents.LlmAgent"),
+        ]
+        result = _drop_redundant_symbol_rows(rows)
+        assert [c.name for c in result] == ["root_agent"]
+
+    def test_import_row_survives_when_never_instantiated(self):
+        from aibom.scan_pipeline import _drop_redundant_symbol_rows
+
+        # The import line is the only evidence this symbol is used at all.
+        rows = [self._imported("LlmAgent")]
+        assert _drop_redundant_symbol_rows(rows) == rows
+
+    def test_callsite_rows_naming_one_symbol_two_ways_are_kept(self):
+        from aibom.scan_pipeline import _drop_redundant_symbol_rows
+
+        # Redundant, but collapsing them measured worse: see the docstring.
+        rows = [
+            self._built("InMemorySessionService", "x", ctype=AIComponentType.MEMORY),
+            self._built(
+                "google.adk.sessions.InMemorySessionService",
+                "y",
+                ctype=AIComponentType.MEMORY,
+            ),
+        ]
+        assert len(_drop_redundant_symbol_rows(rows)) == 2
+
+    def test_import_of_a_different_class_is_kept(self):
+        from aibom.scan_pipeline import _drop_redundant_symbol_rows
+
+        rows = [
+            self._imported("CrewAgent"),
+            self._built("root_agent", "google.adk.agents.LlmAgent"),
+        ]
+        assert len(_drop_redundant_symbol_rows(rows)) == 2
+
+
 class TestConsolidation:
     """Verify that per-file-reference duplicates are collapsed into
     per-logical-asset entries in the assemble stage."""
