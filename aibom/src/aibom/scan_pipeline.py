@@ -1586,7 +1586,6 @@ class ScanPipeline:
         self._emit_progress("stage_started", stage="cross_ref", total_stages=4)
         t0 = time.monotonic()
         components, env_idx, pkg_idx, ext_deps = self._stage_cross_ref(components)
-        derived_basis = components
         derived_rels, code_model_names, code_tools = self._analyze_code_graph(
             components
         )
@@ -1596,6 +1595,14 @@ class ScanPipeline:
         # than one that does not.
         components = _apply_literal_model_names(components, code_model_names)
         components = components + code_tools
+        # Snapshot after both, so the basis is the set the edges actually
+        # name. ``_remap_relationship_endpoints`` keys it through
+        # ``_consolidation_key``, which prefers ``model_name``: taken any
+        # earlier, a component that just gained one would key as (name,
+        # type) against a survivor keyed (model_name, type), and its edges
+        # would be dropped whenever it was not the surviving representative.
+        # Function tools have to be in here for the same reason.
+        derived_basis = components
         elapsed = time.monotonic() - t0
         timings.append(
             StageTiming(

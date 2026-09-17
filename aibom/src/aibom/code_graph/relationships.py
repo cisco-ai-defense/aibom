@@ -315,7 +315,7 @@ def _annotation(
     )
 
 
-def _is_agent_as_tool(rule: _Rule, kwarg: str, target: AIComponent) -> bool:
+def _is_agent_as_tool(rule: EdgeRule, kwarg: str, target: AIComponent) -> bool:
     """An agent handed to a tool keyword, i.e. delegation to a sub-agent.
 
     Frameworks expose one agent to another by wrapping it in a tool-shaped
@@ -471,12 +471,22 @@ def discover_function_tools(
     say what a symbol it never parsed actually is.
     """
     index = _ComponentIndex(components)
-    by_name: dict[str, FunctionNode] = {}
+    # Indexed per file first. Tools are commonly defined beside the agent
+    # that registers them, and just as commonly imported from a tools
+    # module, so neither a file-local nor a repo-wide lookup is right on
+    # its own. A name defined in more than one file is not resolved at all:
+    # two repos in the corpus define their own ``search``, and picking
+    # whichever was parsed first would attribute the tool to the wrong file.
+    in_file: dict[tuple[str, str], FunctionNode] = {}
+    anywhere: dict[str, FunctionNode] = {}
+    duplicated: set[str] = set()
     for node in iter_nodes(graph):
         # A bare function is a tool; a method belongs to a class that would
         # have been detected on its own terms if it were a component.
         if node.class_name is None:
-            by_name.setdefault(node.method_name, node)
+            in_file.setdefault((node.file_path, node.method_name), node)
+            if anywhere.setdefault(node.method_name, node) is not node:
+                duplicated.add(node.method_name)
 
     found: dict[str, AIComponent] = {}
     for source in components:
@@ -490,7 +500,9 @@ def discover_function_tools(
                 bare = reference.split(".")[-1]
                 if index.resolve(reference, source.file_path) is not None:
                     continue
-                node = by_name.get(bare)
+                node = in_file.get((source.file_path, bare))
+                if node is None and bare not in duplicated:
+                    node = anywhere.get(bare)
                 if node is None or node.node_id in found:
                     continue
                 found[node.node_id] = AIComponent(

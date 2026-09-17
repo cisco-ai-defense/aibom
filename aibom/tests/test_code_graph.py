@@ -26,6 +26,7 @@ from aibom.code_graph import (
     resolve_literal_model_names,
 )
 from aibom.code_graph.models import CodeGraph, ValueBinding
+from aibom.code_graph.relationships import discover_function_tools
 from aibom.cst_parser import parse_source_code
 from aibom.models.enums import (
     AIComponentType,
@@ -860,6 +861,48 @@ executor = AgentExecutor(llm=my_llm)
         self.assertEqual(len(edges), 1)
         self.assertIs(edges[0].relationship_type, RelationshipType.USES_TOOL)
         self.assertEqual(edges[0].target_name, "estimate_cost")
+
+    AGENT_SOURCE = "agent = LlmAgent(tools=[search])\n"
+
+    def _tools_for(self, defining_files, app_source=AGENT_SOURCE):
+        """Discover tools for ``agent = LlmAgent(tools=[search])`` in app.py."""
+        results = [_parse(name, source) for name, source in defining_files.items()]
+        results.append(_parse("app.py", app_source))
+        component = _component(
+            "agent",
+            AIComponentType.AGENT,
+            1,
+            path="app.py",
+            args={"tools": ["VARIABLE:search"]},
+        )
+        return discover_function_tools([component], build_code_graph(results))
+
+    def test_tool_defined_in_another_file_is_found(self):
+        tools = self._tools_for({"tools.py": "def search(q):\n    return q\n"})
+
+        self.assertEqual(
+            [(t.name, t.file_path) for t in tools], [("search", "tools.py")]
+        )
+
+    def test_a_name_defined_in_two_files_is_not_guessed_at(self):
+        tools = self._tools_for(
+            {
+                "alpha.py": "def search(q):\n    return q\n",
+                "beta.py": "def search(q):\n    return q\n",
+            }
+        )
+
+        # Either file could be meant; attributing the tool to whichever was
+        # parsed first would put it in the wrong one half the time.
+        self.assertEqual(tools, [])
+
+    def test_a_local_definition_wins_over_one_elsewhere(self):
+        tools = self._tools_for(
+            {"other.py": "def search(q):\n    return q\n"},
+            app_source="def search(q):\n    return q\n\n" + self.AGENT_SOURCE,
+        )
+
+        self.assertEqual([t.file_path for t in tools], ["app.py"])
 
     def test_functions_not_registered_as_tools_are_left_alone(self):
         path = os.path.join(self.tmp, "plain.py")

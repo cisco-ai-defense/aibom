@@ -1512,6 +1512,15 @@ _TOOL_REGISTRY_CONSTRUCTORS: frozenset[str] = frozenset(
     }
 )
 
+# How a server's own decorator hands a function to it.
+_TOOL_REGISTRATION_METHODS: frozenset[str] = frozenset(
+    {
+        "tool",
+        "add_tool",
+        "register_tool",
+    }
+)
+
 _TOOL_DECORATOR_FRAMEWORKS: frozenset[str] = frozenset(
     {
         "mcp",
@@ -1576,20 +1585,29 @@ def _decorates_via_tool_registry(dec, result: "CodeAnalysisResult") -> bool:
     so the evidence is the construction itself, not the name of the
     variable, which repos spell ``mcp``, ``server`` and ``app`` alike.
     """
+    servers = {
+        (assignment.target_qualified_name or "").rsplit(".", 1)[-1]
+        for assignment in result.assignments
+        if (assignment.call.qualified_name or "").rsplit(".", 1)[-1]
+        in _TOOL_REGISTRY_CONSTRUCTORS
+    }
+    servers.discard("")
+    if not servers:
+        return False
+
     receiver = dec.instance_variable
-    for assignment in result.assignments:
-        built = (assignment.call.qualified_name or "").rsplit(".", 1)[-1]
-        if built not in _TOOL_REGISTRY_CONSTRUCTORS:
-            continue
-        if not receiver:
-            # A bare ``@tool`` in a file that builds a server. Servers
-            # commonly wrap their own decorator to add logging or error
-            # translation, and the wrapper is a plain local function, so
-            # there is no import or receiver left to recognise it by. The
-            # server in the same file is what remains.
-            return True
-        target = assignment.target_qualified_name or ""
-        if target.rsplit(".", 1)[-1] == receiver:
+    if receiver:
+        return receiver in servers
+
+    # A bare ``@tool`` names no receiver, so the server alone would accept
+    # any decorator that happens to be called ``tool``. Servers wrap their
+    # own decorator to add logging or error translation, and the wrapper
+    # registers what it wraps -- greptimedb's ends in
+    # ``mcp.tool(**kwargs)(wrapper)``. Requiring that call keeps the
+    # wrapper and rejects an unrelated local decorator of the same name.
+    for call in result.calls:
+        owner, _, leaf = (call.qualified_name or "").rpartition(".")
+        if leaf in _TOOL_REGISTRATION_METHODS and owner.rsplit(".", 1)[-1] in servers:
             return True
     return False
 

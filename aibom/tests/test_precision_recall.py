@@ -120,6 +120,25 @@ class TestToolSchemaDetection:
         )
         assert "describe_table" in names
 
+    def test_bare_decorator_that_registers_nothing_is_left_alone(
+        self, tmp_path: Path
+    ):
+        # A server in the file is not enough on its own: this ``tool`` is an
+        # unrelated local decorator that never hands the function over.
+        names = self._tool_names(
+            tmp_path,
+            "from mcp.server.fastmcp import FastMCP\n"
+            "mcp = FastMCP('demo')\n"
+            "\n"
+            "def tool(**kwargs):\n"
+            "    return lambda fn: fn\n"
+            "\n"
+            "@tool()\n"
+            "def lathe_rpm(bit: str) -> str:\n"
+            "    return bit\n",
+        )
+        assert "lathe_rpm" not in names
+
     def test_decorator_without_a_server_is_left_alone(self, tmp_path: Path):
         # ``tool`` here is an unrelated method on an unrelated object.
         names = self._tool_names(
