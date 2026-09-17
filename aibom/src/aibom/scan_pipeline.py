@@ -695,6 +695,47 @@ def _has_instantiation_marker(c: "AIComponent") -> bool:
     )
 
 
+def _drop_redundant_symbol_rows(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Drop import rows for a class that is instantiated in the same scan.
+
+    ``from google.adk.agents import LlmAgent`` yields a row named after the
+    *class*, sitting next to the row for the ``root_agent = LlmAgent(...)``
+    that the import exists to serve. The import row is not a second agent,
+    and it survives ``_consolidate_components`` because that groups on the
+    name as detected and the two names differ.
+
+    The class must be instantiated somewhere for the import row to go. An
+    imported symbol that is never constructed stays, because then the
+    import line is the only evidence there is.
+
+    This is deliberately limited to rows that carry an import statement and
+    no callsite. Rows naming the same symbol two ways, such as
+    ``InMemorySessionService`` beside
+    ``google.adk.sessions.InMemorySessionService``, are also redundant, but
+    collapsing them measured *worse*: the duplicate was being counted as a
+    true positive for a component detection misses entirely, so removing it
+    exposed the real recall gap rather than creating one. That is a
+    detection problem, not a deduplication one, and is left alone here.
+    """
+    instantiated: set[str] = set()
+    for c in components:
+        pattern = (c.metadata or {}).get("call_pattern")
+        if pattern:
+            instantiated.add(str(pattern).split(".")[-1])
+
+    kept: list["AIComponent"] = []
+    for c in components:
+        bare = (c.name or "").split(".")[-1]
+        if _is_import_only_candidate(c) and bare in instantiated:
+            _LOGGER.debug("Dropping import row for instantiated class %s", c.name)
+            continue
+        kept.append(c)
+
+    return kept
+
+
 def _consolidate_components(
     components: list["AIComponent"],
 ) -> list["AIComponent"]:
@@ -2261,6 +2302,16 @@ class ScanPipeline:
                 "Embedding reclassification: %d model(s) relabeled as embedding "
                 "via registry (mode=embedding)",
                 reclassified,
+            )
+
+        before_sym = len(components)
+        components = _drop_redundant_symbol_rows(components)
+        if before_sym != len(components):
+            _LOGGER.info(
+                "Symbol dedup: %d → %d components (-%d restated rows)",
+                before_sym,
+                len(components),
+                before_sym - len(components),
             )
 
         before = len(components)
