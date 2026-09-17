@@ -2013,7 +2013,10 @@ def _process_file_with_cache(
                             line_number=call_obs.line_number,
                             framework=qn.split(".")[0] if "." in qn else "",
                             detection_source=DetectionSource.CODE_ANALYSIS,
-                            metadata={"call_pattern": qn},
+                            metadata={
+                                "call_pattern": qn,
+                                "arguments": call_obs.arguments,
+                            },
                         )
                     )
                     seen.add(key)
@@ -2035,7 +2038,15 @@ def _process_file_with_cache(
                             line_number=assignment.line_number,
                             framework=qn.split(".")[0] if "." in qn else "",
                             detection_source=DetectionSource.CODE_ANALYSIS,
-                            metadata={"call_pattern": qn, "assigned_to": target},
+                            # ``assigned_target``/``arguments`` mirror the keys
+                            # the code graph reads; ``assigned_to`` is kept for
+                            # the consolidation heuristics that already use it.
+                            metadata={
+                                "call_pattern": qn,
+                                "assigned_to": target,
+                                "assigned_target": target,
+                                "arguments": assignment.call.arguments,
+                            },
                         )
                     )
                     seen.add(key)
@@ -2254,7 +2265,10 @@ def _process_file(
                             line_number=call_obs.line_number,
                             framework=qn.split(".")[0] if "." in qn else "",
                             detection_source=DetectionSource.CODE_ANALYSIS,
-                            metadata={"call_pattern": qn},
+                            metadata={
+                                "call_pattern": qn,
+                                "arguments": call_obs.arguments,
+                            },
                         )
                     )
                     seen.add(key)
@@ -2276,7 +2290,15 @@ def _process_file(
                             line_number=assignment.line_number,
                             framework=qn.split(".")[0] if "." in qn else "",
                             detection_source=DetectionSource.CODE_ANALYSIS,
-                            metadata={"call_pattern": qn, "assigned_to": target},
+                            # ``assigned_target``/``arguments`` mirror the keys
+                            # the code graph reads; ``assigned_to`` is kept for
+                            # the consolidation heuristics that already use it.
+                            metadata={
+                                "call_pattern": qn,
+                                "assigned_to": target,
+                                "assigned_target": target,
+                                "arguments": assignment.call.arguments,
+                            },
                         )
                     )
                     seen.add(key)
