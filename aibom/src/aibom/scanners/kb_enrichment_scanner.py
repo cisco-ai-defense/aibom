@@ -1499,8 +1499,23 @@ _TOOL_DECORATOR_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Constructors whose instance registers tools through its own decorator, as
+# in ``mcp = FastMCP(...)`` followed by ``@mcp.tool()``. The receiver being
+# one of these is what makes such a decorator a tool registration rather
+# than an arbitrary method named ``tool``.
+_TOOL_REGISTRY_CONSTRUCTORS: frozenset[str] = frozenset(
+    {
+        "FastMCP",
+        "Server",
+        "MCPServer",
+        "FastAPIMCP",
+    }
+)
+
 _TOOL_DECORATOR_FRAMEWORKS: frozenset[str] = frozenset(
     {
+        "mcp",
+        "fastmcp",
         "langchain",
         "langchain_core",
         "crewai",
@@ -1550,6 +1565,33 @@ _PROMPT_KWARG_NAMES: frozenset[str] = frozenset(
         "examples",
     }
 )
+
+
+def _decorates_via_tool_registry(dec, result: "CodeAnalysisResult") -> bool:
+    """True when the decorator's receiver is a server that registers tools.
+
+    ``@mcp.tool()`` only means anything once ``mcp`` is known to be a
+    ``FastMCP(...)``; the same decorator on an unrelated object is just a
+    method call. The receiver is resolved through this file's assignments
+    so the evidence is the construction itself, not the name of the
+    variable, which repos spell ``mcp``, ``server`` and ``app`` alike.
+    """
+    receiver = dec.instance_variable
+    for assignment in result.assignments:
+        built = (assignment.call.qualified_name or "").rsplit(".", 1)[-1]
+        if built not in _TOOL_REGISTRY_CONSTRUCTORS:
+            continue
+        if not receiver:
+            # A bare ``@tool`` in a file that builds a server. Servers
+            # commonly wrap their own decorator to add logging or error
+            # translation, and the wrapper is a plain local function, so
+            # there is no import or receiver left to recognise it by. The
+            # server in the same file is what remains.
+            return True
+        target = assignment.target_qualified_name or ""
+        if target.rsplit(".", 1)[-1] == receiver:
+            return True
+    return False
 
 
 def _detect_tool_schemas(result: "CodeAnalysisResult") -> list[AIComponent]:
@@ -1640,6 +1682,12 @@ def _detect_tool_schemas(result: "CodeAnalysisResult") -> list[AIComponent]:
         fw_confirmed = False
         prefix = dname.split(".")[0].split("_")[0] if "." in dname else ""
         if prefix in _TOOL_DECORATOR_FRAMEWORKS:
+            fw_confirmed = True
+        elif _decorates_via_tool_registry(dec, result):
+            # ``@mcp.tool()`` where ``mcp = FastMCP(...)``. The receiver is
+            # the server the tool is being registered on, which says more
+            # than the import list does: an MCP server imports its own
+            # class, not a symbol called "tool".
             fw_confirmed = True
         else:
             for imp in imports:
