@@ -26,6 +26,7 @@ Stages:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from collections import Counter
@@ -73,7 +74,7 @@ from .cross_ref import (
 from .custom_catalog import CustomCatalogConfig
 from .llm_factory import ensure_llm_runtime_available
 from .models import ScanContext
-from .models.enums import AIComponentType, RelationshipType
+from .models.enums import AIComponentType, EvidenceStrength, RelationshipType
 from .models.scan import AIComponent, ComponentRelationship
 from .scanners import run_scanners
 from .scanners.dependency_scanner import discover_ai_package_set, is_known_ai_package
@@ -907,6 +908,49 @@ def _filter_ai_only_dependency_components(
     return filtered
 
 
+def _remap_relationship_endpoints(
+    relationships: list["ComponentRelationship"],
+    basis: list["AIComponent"],
+    survivors: list["AIComponent"],
+) -> list["ComponentRelationship"]:
+    """Point edges at the components that survived consolidation.
+
+    Code-derived edges are built before ``_stage_assemble`` because that is
+    the only place per-call-site constructor metadata still exists.
+    Consolidation then merges components by (name, type) and keeps one
+    representative, so without this step the edges name instance ids that
+    are gone and :func:`_filter_relationships_for_components` drops all of
+    them.
+    """
+    survivor_ids = {c.instance_id for c in survivors}
+    survivor_by_key = {_consolidation_key(c): c.instance_id for c in survivors}
+    remap = {
+        c.instance_id: survivor_by_key[key]
+        for c in basis
+        if (key := _consolidation_key(c)) in survivor_by_key
+    }
+
+    remapped: list["ComponentRelationship"] = []
+    for rel in relationships:
+        source = remap.get(rel.source_instance_id, rel.source_instance_id)
+        target = remap.get(rel.target_instance_id, rel.target_instance_id)
+        if source not in survivor_ids or target not in survivor_ids:
+            continue
+        if source == target:
+            # Both call sites consolidated into the same component, so the
+            # edge degenerates to a self-loop and carries no information.
+            continue
+        remapped.append(
+            rel.model_copy(
+                update={
+                    "source_instance_id": source,
+                    "target_instance_id": target,
+                }
+            )
+        )
+    return remapped
+
+
 def _filter_relationships_for_components(
     relationships: list["ComponentRelationship"],
     components: list["AIComponent"],
@@ -1202,6 +1246,47 @@ def _resolve_relationship_types(
     return result
 
 
+def _apply_literal_model_names(
+    components: list[AIComponent],
+    model_names: dict[str, str],
+) -> list[AIComponent]:
+    """Fill ``model_name`` from a literal the source binds to the kwarg.
+
+    Keyed on instance id, so this must run before consolidation reassigns
+    them. Only fills an empty field: anything a scanner already established
+    saw the component directly and is not improved on here.
+    """
+    if not model_names:
+        return components
+    applied = 0
+    result: list[AIComponent] = []
+    for comp in components:
+        name = model_names.get(comp.instance_id)
+        if name and not comp.model_name:
+            applied += 1
+            result.append(comp.model_copy(update={"model_name": name}))
+        else:
+            result.append(comp)
+    if applied:
+        _LOGGER.info("Set model_name on %d component(s) from literal bindings", applied)
+    return result
+
+
+def _evidence_rank(rel: ComponentRelationship) -> int:
+    """How much weight an edge has earned when two disagree.
+
+    Ordered rather than boolean because "read off code" spans a name the
+    source states outright and a component found several call hops from an
+    attached function, and only the former should be able to overwrite a
+    field that gets reported as fact.
+    """
+    if rel.is_stated_in_source:
+        return 2
+    if rel.is_code_derived:
+        return 1
+    return 0
+
+
 def _propagate_model_from_relationships(
     components: list[AIComponent],
     relationships: list[ComponentRelationship],
@@ -1212,16 +1297,49 @@ def _propagate_model_from_relationships(
     to a ``"name:"``-prefixed name for LLM-produced edges with blank
     instance ids) so two identically-named components in different files
     don't all inherit the same ``model_name``.
+
+    This writes an edge's target straight onto a component, so a wrong edge
+    becomes a wrongly reported model. Edges are therefore ranked by how
+    directly they were read out of the source, and a stronger one wins
+    regardless of the order they appear in. An edge found by following call
+    reachability outranks an LLM guess but not a name the source states
+    outright, and an ambiguous edge never writes a name at all. When the
+    best available edges disagree, nothing is written: a field left empty
+    is recoverable, a field filled with the wrong model is not.
     """
-    model_targets: dict[str, str] = {}
+    by_rank: dict[str, dict[int, set[str]]] = {}
     for rel in relationships:
         if rel.relationship_type in (
             RelationshipType.USES_EMBEDDING,
             RelationshipType.USES_MODEL,
         ):
+            if rel.evidence_strength == EvidenceStrength.AMBIGUOUS:
+                # This edge exists to record that the reference could not be
+                # pinned to one component. Writing a candidate here would
+                # assert precisely what it says is unknown.
+                continue
             key = _rel_endpoint_key(rel.source_instance_id, rel.source_name)
-            if key:
-                model_targets[key] = rel.target_name
+            if not key:
+                continue
+            by_rank.setdefault(key, {}).setdefault(_evidence_rank(rel), set()).add(
+                rel.target_name
+            )
+
+    model_targets: dict[str, str] = {}
+    for key, ranked in by_rank.items():
+        names = ranked[max(ranked)]
+        if len(names) == 1:
+            model_targets[key] = next(iter(names))
+        else:
+            # Equally-good edges naming different models, which is what a
+            # provider chosen by configuration looks like from the outside.
+            # Picking one would report a runtime choice as a fact.
+            _LOGGER.debug(
+                "No model_name for %s: %d equally-evidenced candidates (%s)",
+                key,
+                len(names),
+                ", ".join(sorted(names)),
+            )
     result: list[AIComponent] = []
     for comp in components:
         if comp.model_name is None:
@@ -1247,6 +1365,10 @@ def _dedup_relationships(
     The endpoint key prefers ``instance_id`` over ``name`` so two
     identically-named components in different files are treated as
     distinct endpoints. See :func:`_rel_endpoint_key`.
+
+    When the same edge arrives more than once, the best-evidenced copy
+    wins: it carries source locations an auditor can check, and the weaker
+    duplicate adds nothing. See :func:`_evidence_rank`.
     """
     seen: dict[tuple[str, str, str], ComponentRelationship] = {}
     for rel in relationships:
@@ -1255,7 +1377,8 @@ def _dedup_relationships(
             _rel_endpoint_key(rel.target_instance_id, rel.target_name),
             rel.relationship_type.value,
         )
-        if key not in seen:
+        existing = seen.get(key)
+        if existing is None or _evidence_rank(rel) > _evidence_rank(existing):
             seen[key] = rel
     return list(seen.values())
 
@@ -1422,6 +1545,13 @@ class ScanPipeline:
         self._emit_progress("stage_started", stage="cross_ref", total_stages=4)
         t0 = time.monotonic()
         components, env_idx, pkg_idx, ext_deps = self._stage_cross_ref(components)
+        derived_basis = components
+        derived_rels, code_model_names = self._analyze_code_graph(components)
+        # Applied here rather than alongside the relationship pass because
+        # these are keyed on pre-consolidation instance ids, and because a
+        # component that knows its model is worth more to every later stage
+        # than one that does not.
+        components = _apply_literal_model_names(components, code_model_names)
         elapsed = time.monotonic() - t0
         timings.append(
             StageTiming(
@@ -1485,12 +1615,17 @@ class ScanPipeline:
         self._emit_progress("stage_started", stage="assemble", total_stages=4)
         t0 = time.monotonic()
         components, agentic_count = self._stage_assemble(components)
+        derived_rels = _remap_relationship_endpoints(
+            derived_rels, derived_basis, components
+        )
+        relationships = relationships + derived_rels
         elapsed = time.monotonic() - t0
         timings.append(
             StageTiming(
                 "assemble",
                 elapsed,
-                f"{len(components)} final, {agentic_count} agentic",
+                f"{len(components)} final, {agentic_count} agentic, "
+                f"{len(derived_rels)} code-derived relationships",
             )
         )
         self._emit_progress(
@@ -1735,6 +1870,80 @@ class ScanPipeline:
                 )
 
         return resolved, env_idx, pkg_idx, ext_deps
+
+    def _analyze_code_graph(
+        self, components: list[AIComponent]
+    ) -> tuple[list[ComponentRelationship], dict[str, str]]:
+        """Read ``USES_*`` edges and literal model names off code structure.
+
+        Both findings come from one graph because building it means parsing
+        every file that produced a component, which is the expensive part.
+
+        Only files that actually produced a component are parsed, which
+        keeps this proportional to findings rather than to repository size.
+
+        Fails open: a code graph is an enrichment, and losing it should
+        degrade the result rather than the whole scan.
+        """
+        if os.environ.get("AIBOM_CODE_GRAPH", "1") == "0":
+            return [], {}
+        if not components:
+            return [], {}
+
+        from .code_graph import (
+            build_code_graph,
+            derive_relationships,
+            resolve_literal_model_names,
+        )
+        from .cst_parser import parse_source_code
+        from .scanners.file_cache import is_python_source, read_python_source
+
+        # Notebooks count: ``read_python_source`` hands back their
+        # concatenated code cells, which is the same text the scanners
+        # numbered their findings against, so the lines line up.
+        interesting = {
+            c.file_path
+            for c in components
+            if is_python_source(c.file_path) and (c.metadata or {})
+        }
+        if not interesting:
+            return [], {}
+
+        results = []
+        for path in sorted(interesting):
+            try:
+                source = read_python_source(path)
+            except OSError as exc:
+                _LOGGER.debug("Code graph: unreadable %s (%s)", path, exc)
+                continue
+            if not source:
+                continue
+            try:
+                results.append(parse_source_code(path, source))
+            except Exception as exc:  # noqa: BLE001 - parser is third-party
+                _LOGGER.debug("Code graph: unparseable %s (%s)", path, exc)
+
+        if not results:
+            return [], {}
+
+        try:
+            graph = build_code_graph(results)
+            derived = derive_relationships(components, graph)
+            model_names = resolve_literal_model_names(components, graph)
+        except Exception:
+            _LOGGER.exception(
+                "Code graph derivation failed -- continuing without "
+                "code-derived relationships"
+            )
+            return [], {}
+
+        _LOGGER.info(
+            "Code graph: %s, %d code-derived relationship(s), %d model name(s)",
+            graph.stats(),
+            len(derived),
+            len(model_names),
+        )
+        return derived, model_names
 
     # ------------------------------------------------------------------
     # Stage 3: Agentic classification (mandatory)
