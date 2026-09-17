@@ -18,7 +18,11 @@
 
 from .builder import build_code_graph
 from .models import CodeGraph, FunctionNode, MethodCall, ValueBinding, make_node_id
-from .relationships import derive_relationships, resolve_literal_model_names
+from .relationships import (
+    derive_relationships,
+    discover_function_tools,
+    resolve_literal_model_names,
+)
 
 __all__ = [
     "CodeGraph",
@@ -27,6 +31,7 @@ __all__ = [
     "ValueBinding",
     "build_code_graph",
     "derive_relationships",
+    "discover_function_tools",
     "make_node_id",
     "resolve_literal_model_names",
 ]

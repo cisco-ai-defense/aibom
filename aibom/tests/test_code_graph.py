@@ -502,6 +502,35 @@ class TestDerivedRelationships(unittest.TestCase):
         ]
         self.assertEqual(self._edges(comps), [])
 
+    def test_agent_in_tools_keyword_is_delegation(self):
+        # ``tools=[AgentTool(researcher)]`` -- the reference resolves to an
+        # agent, which the tool rule would otherwise reject on type.
+        comps = [
+            _component("researcher", AIComponentType.AGENT, 5, assigned="researcher"),
+            _component(
+                "lead",
+                AIComponentType.AGENT,
+                9,
+                args={
+                    "tools": [{"_call": "AgentTool", "_args": ["VARIABLE:researcher"]}]
+                },
+            ),
+        ]
+        edges = self._edges(comps)
+        self.assertEqual(len(edges), 1)
+        self.assertIs(edges[0].relationship_type, RelationshipType.USES_AGENT)
+        self.assertEqual(edges[0].target_name, "researcher")
+
+    def test_agent_exemption_does_not_apply_to_other_keywords(self):
+        # The type check still guards every keyword that is not a tool slot.
+        comps = [
+            _component("researcher", AIComponentType.AGENT, 5, assigned="researcher"),
+            _component(
+                "lead", AIComponentType.AGENT, 9, args={"llm": "VARIABLE:researcher"}
+            ),
+        ]
+        self.assertEqual(self._edges(comps), [])
+
     def test_ambiguous_name_is_not_guessed(self):
         comps = [
             _component("Dup", AIComponentType.TOOL, 1, path="a.py"),
@@ -795,22 +824,68 @@ executor = AgentExecutor(llm=my_llm)
 
     def test_pipeline_derives_edges_from_real_files(self):
         pipeline = ScanPipeline([self.tmp])
-        edges, _ = pipeline._analyze_code_graph(self.components)
+        edges, _, _ = pipeline._analyze_code_graph(self.components)
         self.assertEqual(len(edges), 1)
         self.assertIs(edges[0].relationship_type, RelationshipType.USES_MODEL)
         self.assertTrue(edges[0].is_code_derived)
 
+    def test_function_passed_as_tool_becomes_a_component(self):
+        path = os.path.join(self.tmp, "tools_app.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "def estimate_cost(x):\n"
+                "    return x\n"
+                "\n"
+                "def unused_helper(x):\n"
+                "    return x\n"
+                "\n"
+                "agent = LlmAgent(tools=[estimate_cost])\n"
+            )
+        components = [
+            _component(
+                "agent",
+                AIComponentType.AGENT,
+                7,
+                path=path,
+                args={"tools": ["VARIABLE:estimate_cost"]},
+            ),
+        ]
+        edges, _, tools = ScanPipeline([self.tmp])._analyze_code_graph(components)
+
+        self.assertEqual([t.name for t in tools], ["estimate_cost"])
+        self.assertIs(tools[0].component_type, AIComponentType.TOOL)
+        self.assertEqual(tools[0].line_number, 1)
+        # The discovered tool is in the index before edges are derived, so
+        # the reference that found it also links to it.
+        self.assertEqual(len(edges), 1)
+        self.assertIs(edges[0].relationship_type, RelationshipType.USES_TOOL)
+        self.assertEqual(edges[0].target_name, "estimate_cost")
+
+    def test_functions_not_registered_as_tools_are_left_alone(self):
+        path = os.path.join(self.tmp, "plain.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("def helper(x):\n    return x\n")
+        components = [
+            _component("agent", AIComponentType.AGENT, 1, path=path, args={}),
+        ]
+        _, _, tools = ScanPipeline([self.tmp])._analyze_code_graph(components)
+        self.assertEqual(tools, [])
+
     def test_env_toggle_disables_derivation(self):
         pipeline = ScanPipeline([self.tmp])
         with mock.patch.dict(os.environ, {"AIBOM_CODE_GRAPH": "0"}):
-            self.assertEqual(pipeline._analyze_code_graph(self.components), ([], {}))
+            self.assertEqual(
+                pipeline._analyze_code_graph(self.components), ([], {}, [])
+            )
 
     def test_derivation_failure_does_not_break_the_scan(self):
         pipeline = ScanPipeline([self.tmp])
         with mock.patch(
             "aibom.code_graph.derive_relationships", side_effect=RuntimeError("boom")
         ):
-            self.assertEqual(pipeline._analyze_code_graph(self.components), ([], {}))
+            self.assertEqual(
+                pipeline._analyze_code_graph(self.components), ([], {}, [])
+            )
 
     def test_unreadable_file_is_skipped_not_fatal(self):
         missing = _component(
@@ -821,7 +896,7 @@ executor = AgentExecutor(llm=my_llm)
             args={"llm": "VARIABLE:nothing"},
         )
         pipeline = ScanPipeline([self.tmp])
-        self.assertEqual(pipeline._analyze_code_graph([missing]), ([], {}))
+        self.assertEqual(pipeline._analyze_code_graph([missing]), ([], {}, []))
 
     def test_derivation_runs_before_consolidation(self):
         """Order is load-bearing, not incidental.

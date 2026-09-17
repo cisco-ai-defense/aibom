@@ -1546,12 +1546,15 @@ class ScanPipeline:
         t0 = time.monotonic()
         components, env_idx, pkg_idx, ext_deps = self._stage_cross_ref(components)
         derived_basis = components
-        derived_rels, code_model_names = self._analyze_code_graph(components)
+        derived_rels, code_model_names, code_tools = self._analyze_code_graph(
+            components
+        )
         # Applied here rather than alongside the relationship pass because
         # these are keyed on pre-consolidation instance ids, and because a
         # component that knows its model is worth more to every later stage
         # than one that does not.
         components = _apply_literal_model_names(components, code_model_names)
+        components = components + code_tools
         elapsed = time.monotonic() - t0
         timings.append(
             StageTiming(
@@ -1873,7 +1876,7 @@ class ScanPipeline:
 
     def _analyze_code_graph(
         self, components: list[AIComponent]
-    ) -> tuple[list[ComponentRelationship], dict[str, str]]:
+    ) -> tuple[list[ComponentRelationship], dict[str, str], list[AIComponent]]:
         """Read ``USES_*`` edges and literal model names off code structure.
 
         Both findings come from one graph because building it means parsing
@@ -1886,13 +1889,14 @@ class ScanPipeline:
         degrade the result rather than the whole scan.
         """
         if os.environ.get("AIBOM_CODE_GRAPH", "1") == "0":
-            return [], {}
+            return [], {}, []
         if not components:
-            return [], {}
+            return [], {}, []
 
         from .code_graph import (
             build_code_graph,
             derive_relationships,
+            discover_function_tools,
             resolve_literal_model_names,
         )
         from .cst_parser import parse_source_code
@@ -1907,7 +1911,7 @@ class ScanPipeline:
             if is_python_source(c.file_path) and (c.metadata or {})
         }
         if not interesting:
-            return [], {}
+            return [], {}, []
 
         results = []
         for path in sorted(interesting):
@@ -1924,26 +1928,32 @@ class ScanPipeline:
                 _LOGGER.debug("Code graph: unparseable %s (%s)", path, exc)
 
         if not results:
-            return [], {}
+            return [], {}, []
 
         try:
             graph = build_code_graph(results)
-            derived = derive_relationships(components, graph)
+            # Discovered before the edge pass so a function registered as a
+            # tool is a component by the time the ``tools=`` reference that
+            # named it is resolved, and the edge lands too.
+            found_tools = discover_function_tools(components, graph)
+            derived = derive_relationships(components + found_tools, graph)
             model_names = resolve_literal_model_names(components, graph)
         except Exception:
             _LOGGER.exception(
                 "Code graph derivation failed -- continuing without "
                 "code-derived relationships"
             )
-            return [], {}
+            return [], {}, []
 
         _LOGGER.info(
-            "Code graph: %s, %d code-derived relationship(s), %d model name(s)",
+            "Code graph: %s, %d code-derived relationship(s), %d model name(s), "
+            "%d function tool(s)",
             graph.stats(),
             len(derived),
             len(model_names),
+            len(found_tools),
         )
-        return derived, model_names
+        return derived, model_names, found_tools
 
     # ------------------------------------------------------------------
     # Stage 3: Agentic classification (mandatory)

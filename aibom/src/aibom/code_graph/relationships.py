@@ -59,7 +59,7 @@ from ..models.scan import (
     DecisionAnnotation,
     EvidenceLocation,
 )
-from .models import CodeGraph, MethodCall
+from .models import CodeGraph, FunctionNode, MethodCall, iter_nodes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +76,10 @@ _WIRING_METHODS = frozenset({"add_node"})
 MAX_WIRING_DEPTH = 2
 
 STATED = EvidenceStrength.STATED
+
+# Keywords whose value registers a tool. Kept beside the rule that consumes
+# them so tool discovery and tool edges cannot drift apart.
+_TOOL_KWARGS = frozenset({"tool", "tools", "toolkit", "toolkits", "abilities"})
 
 # Past a handful of candidates the reference is not "ambiguous between a
 # few things", it is a common word, and listing them all is noise.
@@ -311,6 +315,79 @@ def _annotation(
     )
 
 
+def _is_agent_as_tool(rule: _Rule, kwarg: str, target: AIComponent) -> bool:
+    """An agent handed to a tool keyword, i.e. delegation to a sub-agent.
+
+    Frameworks expose one agent to another by wrapping it in a tool-shaped
+    adapter -- ADK's ``tools=[AgentTool(researcher)]`` is the common form.
+    The reference resolves to the agent, so the tool rule rejects it on type
+    and a real delegation is lost.
+
+    This stays narrow on purpose. The type check is not only about naming
+    the edge correctly: a name that resolves to an unexpected type is also
+    the main signal that the resolution itself was wrong, and dropping the
+    edge is the safe response. Only this pattern is exempted, because only
+    this one is idiomatic enough to be worth the lost sanity check.
+    """
+    return (
+        AIComponentType.TOOL in rule.targets
+        and kwarg.lower() in _TOOL_KWARGS
+        and target.component_type is AIComponentType.AGENT
+    )
+
+
+def _agent_as_tool_annotation(
+    source: AIComponent, target: AIComponent, kwarg: str
+) -> DecisionAnnotation:
+    return DecisionAnnotation(
+        decision="KEEP",
+        justification=(
+            f"'{source.name}' lists '{target.name}' in its '{kwarg}' argument "
+            f"at {source.file_path}:{source.line_number}. The target is an "
+            f"agent exposed through a tool-shaped adapter, so this is "
+            f"recorded as delegation to a sub-agent rather than tool use."
+        ),
+        evidence_kinds=["code_graph", "constructor_argument", "agent_as_tool"],
+        evidence_locations=[
+            EvidenceLocation(
+                file_path=source.file_path,
+                start_line=source.line_number,
+                end_line=source.line_number,
+                role="constructor_call",
+            ),
+            EvidenceLocation(
+                file_path=target.file_path,
+                start_line=target.line_number,
+                end_line=target.line_number,
+                role="referenced_component",
+            ),
+        ],
+    )
+
+
+def _binding_scope(graph: CodeGraph, comp: AIComponent) -> FunctionNode | None:
+    """The function whose body the component's name is bound in.
+
+    Usually the function containing its line. A component that *is* a
+    function definition is the exception: ``enclosing_function`` answers
+    with its own body, but ``def estimate_cost(...)`` binds the name in the
+    scope holding the ``def``, so a module-level tool is visible to an
+    agent built further down the same file.
+    """
+    scope = graph.enclosing_function(comp.file_path, comp.line_number)
+    if scope is None or scope.start_line != comp.line_number:
+        return scope
+    outer: FunctionNode | None = None
+    for node in iter_nodes(graph):
+        if node.file_path != comp.file_path or node.node_id == scope.node_id:
+            continue
+        if not node.contains_line(comp.line_number):
+            continue
+        if outer is None or node.start_line > outer.start_line:
+            outer = node
+    return outer
+
+
 def _in_scope(
     graph: CodeGraph | None, source: AIComponent, target: AIComponent
 ) -> bool:
@@ -323,7 +400,7 @@ def _in_scope(
     """
     if graph is None or source.file_path != target.file_path:
         return True
-    target_scope = graph.enclosing_function(target.file_path, target.line_number)
+    target_scope = _binding_scope(graph, target)
     if target_scope is None:
         # Module-level binding is visible everywhere in the file.
         return True
@@ -374,6 +451,64 @@ def resolve_literal_model_names(
     if found:
         _LOGGER.info("Resolved %d model name(s) from literal bindings", len(found))
     return found
+
+
+def discover_function_tools(
+    components: list[AIComponent],
+    graph: CodeGraph,
+) -> list[AIComponent]:
+    """Components for plain functions handed to a tool keyword.
+
+    ``LlmAgent(tools=[estimate_cost, calculate_timeline])`` is how every
+    current agent framework registers a tool: the callable itself is the
+    tool, with no decorator and no constructor to detect. Nothing upstream
+    looks for that shape, so these are missing from the inventory entirely
+    even though the agent that uses them was found.
+
+    Only names that resolve to a function defined in the scanned source are
+    accepted. A reference to an imported framework helper resolves to no
+    node here and is left alone rather than invented, because this cannot
+    say what a symbol it never parsed actually is.
+    """
+    index = _ComponentIndex(components)
+    by_name: dict[str, FunctionNode] = {}
+    for node in iter_nodes(graph):
+        # A bare function is a tool; a method belongs to a class that would
+        # have been detected on its own terms if it were a component.
+        if node.class_name is None:
+            by_name.setdefault(node.method_name, node)
+
+    found: dict[str, AIComponent] = {}
+    for source in components:
+        arguments = (source.metadata or {}).get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        for kwarg, value in arguments.items():
+            if not isinstance(kwarg, str) or kwarg.lower() not in _TOOL_KWARGS:
+                continue
+            for reference in sorted(_extract_references(value)):
+                bare = reference.split(".")[-1]
+                if index.resolve(reference, source.file_path) is not None:
+                    continue
+                node = by_name.get(bare)
+                if node is None or node.node_id in found:
+                    continue
+                found[node.node_id] = AIComponent(
+                    name=node.method_name,
+                    component_type=AIComponentType.TOOL,
+                    file_path=node.file_path,
+                    line_number=node.start_line,
+                    framework=source.framework,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    metadata={
+                        "call_pattern": node.qualified_name,
+                        "registered_as_tool_by": source.name,
+                        "tool_kwarg": kwarg,
+                    },
+                )
+    if found:
+        _LOGGER.info("Discovered %d function tool(s) from tool keywords", len(found))
+    return list(found.values())
 
 
 def _relationship_for(component_type: AIComponentType) -> RelationshipType | None:
@@ -632,16 +767,22 @@ def derive_relationships(
                         continue
                     if target is source:
                         continue
-                    if target.component_type not in rule.targets:
-                        continue
                     if not _in_scope(graph, source, target):
                         continue
-                    emit(
-                        source,
-                        target,
-                        rule.relationship,
-                        _annotation(source, target, kwarg),
-                    )
+                    if target.component_type in rule.targets:
+                        emit(
+                            source,
+                            target,
+                            rule.relationship,
+                            _annotation(source, target, kwarg),
+                        )
+                    elif _is_agent_as_tool(rule, kwarg, target):
+                        emit(
+                            source,
+                            target,
+                            RelationshipType.USES_AGENT,
+                            _agent_as_tool_annotation(source, target, kwarg),
+                        )
 
     if graph is not None:
         _derive_wiring_edges(graph, index, emit)
