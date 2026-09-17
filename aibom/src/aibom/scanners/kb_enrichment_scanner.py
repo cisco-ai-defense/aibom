@@ -891,6 +891,7 @@ class KBEnrichmentScanner(BaseScanner):
                 components.extend(_detect_tool_schemas(result))
                 components.extend(_detect_prompt_kwargs(result))
                 components.extend(_detect_model_kwargs(result))
+                components.extend(_detect_catalogued_imports(result, db))
                 components.extend(_detect_import_based_assets(result))
                 components.extend(_detect_guardrail_calls(result))
 
@@ -1149,6 +1150,158 @@ def _detect_cache_ai_co_occurrence(
             )
         )
     return candidates
+
+
+# Catalog rows that describe part of a class rather than a symbol that can
+# be imported on its own. A ``from x import y`` can never name one of these.
+_NON_IMPORTABLE_LABELS: frozenset[str] = frozenset({"parameter", "method", "attribute"})
+
+_FROM_IMPORT_RE = re.compile(r"^\s*from\s+([\w.]+)\s+import\s+(.+)$")
+
+
+def _is_importable_asset_name(leaf: str) -> bool:
+    """False for symbols imported to type code rather than to build with.
+
+    The catalog answers "what concept is this symbol", not "is an instance
+    of it an asset". ``ToolContext`` is catalogued under ``tool`` because it
+    belongs to the tool API, but it is the context handed *to* a tool, and
+    ``BaseTool`` is the class a tool inherits from. Both are imported for
+    annotations and base clauses, and neither is a tool.
+
+    Reuses the exclusion lists the class-name detector already applies so
+    the two paths agree on what counts, and adds the two shapes those lists
+    do not cover.
+    """
+    if leaf in _GENERIC_CLASS_NAMES or leaf in _EXCLUDED_CLASS_NAMES:
+        return False
+    if any(leaf.endswith(suffix) for suffix in _DATA_CLASS_SUFFIXES):
+        return False
+    if leaf == "Context" or leaf.endswith("Context"):
+        return False
+    # ``BaseChatModel``/``BaseTool`` but not ``Baseten``: the segment after
+    # "Base" has to start a new word for this to be an abstract base name.
+    if leaf.startswith("Base") and len(leaf) > 4 and leaf[4].isupper():
+        return False
+    return True
+
+
+def _parse_from_import(line: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split ``from mod import a, b as c`` into ``(mod, [(name, local)])``.
+
+    Star imports name nothing, and relative imports have no absolute module
+    path to join onto, so both yield no symbols.
+    """
+    match = _FROM_IMPORT_RE.match(line)
+    if not match:
+        return "", []
+    module, names = match.group(1), match.group(2)
+    if module.startswith("."):
+        return "", []
+    symbols: list[tuple[str, str]] = []
+    for part in names.replace("(", " ").replace(")", " ").split(","):
+        tokens = part.split()
+        if not tokens or tokens[0] == "*":
+            continue
+        imported = tokens[0]
+        local = tokens[2] if len(tokens) >= 3 and tokens[1] == "as" else imported
+        symbols.append((imported, local))
+    return module, symbols
+
+
+def _detect_catalogued_imports(
+    result: "CodeAnalysisResult",
+    db: CatalogDB,
+) -> list[AIComponent]:
+    """Detect components named directly by an import statement.
+
+    Everything else here decides what a symbol is by how it is written:
+    :func:`_extract_leaf_class` requires a CamelCase leaf, so only classes
+    are ever detected. Frameworks routinely export a tool as a lowercase
+    function or a module-level singleton -- ``google.adk.tools.google_search``,
+    ``langchain.tools.tool``, ``agno.tools.tool``, ``strands.tool`` -- and
+    none of those can be seen through that filter.
+
+    An import statement removes the need to guess. ``from google.adk.tools
+    import google_search`` states the module and the symbol, and joining
+    them gives an ID the catalog can be asked about exactly. Capitalization
+    stops mattering, and a symbol the catalog does not know yields nothing
+    rather than a guess, so this cannot invent components for frameworks
+    that have not been catalogued.
+    """
+    from ..structures import CodeAnalysisResult as _CAR  # noqa: F811
+
+    if not isinstance(result, _CAR):
+        return []
+
+    wanted: dict[str, tuple[str, int]] = {}
+    for imp_entry in result.imports:
+        if isinstance(imp_entry, tuple):
+            line_no, imp_line = imp_entry
+        else:
+            line_no, imp_line = 0, imp_entry
+        module, symbols = _parse_from_import(imp_line)
+        if not module:
+            continue
+        for imported, local in symbols:
+            wanted.setdefault(f"{module}.{imported}", (local, line_no))
+
+    if not wanted:
+        return []
+
+    try:
+        entries = db.find_components_by_ids(list(wanted))
+    except Exception:
+        _LOGGER.debug("Catalog import lookup failed", exc_info=True)
+        return []
+
+    components: list[AIComponent] = []
+    for kb_id, entry in entries.items():
+        if str(entry.get("label") or "").lower() in _NON_IMPORTABLE_LABELS:
+            continue
+        concept = entry.get("concept")
+        comp_type = _CONCEPT_TO_TYPE.get(concept)
+        if comp_type is None:
+            continue
+        leaf = kb_id.rsplit(".", 1)[-1]
+        if not _is_importable_asset_name(leaf):
+            continue
+        # Same path overrides the class-name detector gets, so a KB
+        # misclassification is corrected once rather than per detector.
+        refined = _refine_type_from_kb_id(kb_id, comp_type)
+        if refined is None:
+            continue
+        comp_type = refined
+        local, line_no = wanted[kb_id]
+        components.append(
+            AIComponent(
+                name=local,
+                component_type=comp_type,
+                file_path=result.file_path,
+                line_number=line_no,
+                framework=str(entry.get("framework") or ""),
+                detection_source=DetectionSource.CODE_ANALYSIS,
+                # The catalog named this symbol outright, which is stronger
+                # than the name-shape guesses the other import path makes.
+                heuristic_confidence=0.75,
+                needs_agentic=False,
+                kb_concept=concept,
+                kb_label=str(entry.get("label") or ""),
+                metadata={
+                    "import_statement": f"from {kb_id.rsplit('.', 1)[0]} "
+                    f"import {kb_id.rsplit('.', 1)[-1]}",
+                    "kb_id": kb_id,
+                    "catalog_exact_id": kb_id,
+                },
+            )
+        )
+
+    if components:
+        _LOGGER.debug(
+            "Catalogued imports in %s: %d component(s)",
+            result.file_path,
+            len(components),
+        )
+    return components
 
 
 def _detect_import_based_assets(

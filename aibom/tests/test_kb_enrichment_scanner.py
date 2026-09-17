@@ -44,6 +44,8 @@ from aibom.scanners.kb_enrichment_scanner import (
     _emit_suggestive_candidates,
     _extract_class_segment,
     _extract_leaf_class,
+    _is_importable_asset_name,
+    _parse_from_import,
     _frameworks_related,
     _has_suggestive_signal,
     _match_observation_rich,
@@ -262,6 +264,71 @@ class TestMethodLabelFiltering:
 def _kb_available() -> bool:
     ctx = ScanContext(paths=["/tmp"])
     return _resolve_kb_path(ctx) is not None
+
+
+class TestParseFromImport:
+    """Unit tests for _parse_from_import."""
+
+    def test_plain_symbol(self):
+        assert _parse_from_import("from google.adk.tools import google_search") == (
+            "google.adk.tools",
+            [("google_search", "google_search")],
+        )
+
+    def test_alias_keeps_both_names(self):
+        # The catalog is asked about the imported name; the component is
+        # reported under the name the code actually uses.
+        assert _parse_from_import("from agno.tools import tool as agno_tool") == (
+            "agno.tools",
+            [("tool", "agno_tool")],
+        )
+
+    def test_multiple_symbols_and_parens(self):
+        module, symbols = _parse_from_import(
+            "from langchain_core.tools import (BaseTool, tool)"
+        )
+        assert module == "langchain_core.tools"
+        assert symbols == [("BaseTool", "BaseTool"), ("tool", "tool")]
+
+    def test_relative_import_has_no_absolute_path(self):
+        assert _parse_from_import("from .helpers import thing") == ("", [])
+
+    def test_star_import_names_nothing(self):
+        assert _parse_from_import("from langchain.tools import *") == (
+            "langchain.tools",
+            [],
+        )
+
+    def test_plain_import_is_not_a_from_import(self):
+        assert _parse_from_import("import google.adk") == ("", [])
+
+
+class TestImportableAssetName:
+    """Symbols imported to type code are not themselves components."""
+
+    @pytest.mark.parametrize(
+        "leaf", ["google_search", "FastMCP", "ChatGoogleGenerativeAI", "LlmAgent"]
+    )
+    def test_real_assets_are_kept(self, leaf):
+        assert _is_importable_asset_name(leaf) is True
+
+    @pytest.mark.parametrize(
+        "leaf",
+        [
+            "ToolContext",  # handed to a tool, not a tool
+            "Context",
+            "BaseTool",  # inherited from, not instantiated
+            "BaseChatModel",
+            "HumanMessage",  # data carrier
+            "GenerateContentConfig",
+        ],
+    )
+    def test_typing_and_base_symbols_are_rejected(self, leaf):
+        assert _is_importable_asset_name(leaf) is False
+
+    def test_base_prefix_needs_a_word_boundary(self):
+        # "Baseten" is a vendor name, not an abstract base class.
+        assert _is_importable_asset_name("Baseten") is True
 
 
 class TestExtractLeafClass:
