@@ -50,7 +50,7 @@ _RE_FASTMCP_NAME = re.compile(r"""\bFastMCP\s*\(\s*["']([^"']+)["']""")
 _RE_SERVER_CALL = re.compile(r"\bServer\s*\(")
 _RE_SERVER_CALL_NAME = re.compile(r"""\bServer\s*\(\s*["']([^"']+)["']""")
 _RE_MCP_TOOL_DECORATOR = re.compile(
-    r"@\s*\w+\s*\.\s*(tool|resource|prompt)\s*\(", re.MULTILINE
+    r"@\s*(?:\w+\s*\.\s*)?(tool|resource|prompt)\s*\(", re.MULTILINE
 )
 _RE_MCP_CLIENT = re.compile(r"\bMCPClient\s*\(")
 _RE_MULTI_MCP_CLIENT = re.compile(r"\bMultiServerMCPClient\s*\(")
@@ -260,13 +260,16 @@ def _components_from_python(path: Path) -> list[AIComponent]:
             )
         )
 
-    mdec = _RE_MCP_TOOL_DECORATOR.search(text)
     has_mcp = bool(m_imp or m_srv_imp or m_fastmcp_imp or _RE_FASTMCP.search(text))
-    if mdec:
+    _RE_DEF_AFTER_DECORATOR = re.compile(r"(?:async\s+)?def\s+(\w+)")
+    for i, mdec in enumerate(_RE_MCP_TOOL_DECORATOR.finditer(text)):
+        rest = text[mdec.end() : mdec.end() + 200]
+        fn_m = _RE_DEF_AFTER_DECORATOR.search(rest)
+        tool_name = fn_m.group(1) if fn_m else f"{path.stem}_tool_{i}"
         if has_mcp:
             out.append(
                 AIComponent(
-                    name=f"{path.stem}_mcp_tooling",
+                    name=tool_name,
                     component_type=AIComponentType.TOOL,
                     file_path=fp,
                     line_number=_line_for_match(text, mdec.start()),
@@ -278,7 +281,7 @@ def _components_from_python(path: Path) -> list[AIComponent]:
         else:
             out.append(
                 AIComponent(
-                    name=f"{path.stem}_mcp_tooling",
+                    name=tool_name,
                     component_type=AIComponentType.TOOL,
                     file_path=fp,
                     line_number=_line_for_match(text, mdec.start()),
