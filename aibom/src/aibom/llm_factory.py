@@ -58,19 +58,29 @@ _BEDROCK_REGION_PREFIX_RE = re.compile(
     r"^(?:us|eu|apac|global)\.", re.IGNORECASE
 )
 
+# Bedrock vendor segments that precede the leaf model id, e.g.
+# ``us.openai.gpt-5.6-luna`` or ``nvidia.nemotron-nano-9b-v2``. All must be
+# stripped so capability regexes (reasoning / temperature-support) see the bare
+# leaf; otherwise a retained ``openai.`` prefix makes the reasoning regex miss
+# and aibom sends ``temperature`` to a model that rejects it.
+_BEDROCK_VENDOR_PREFIXES = ("anthropic.", "openai.", "nvidia.")
+
 
 def _leaf_model_id(model_id: str) -> str:
     """Normalize *model_id* to a bare leaf for capability regexes.
 
     Drops any ``provider/`` prefix, then any Bedrock regional inference-profile
-    prefix (``us.``/``eu.``/``apac.``/``global.``), then a leading
-    ``anthropic.`` vendor segment, so ``bedrock/us.anthropic.claude-opus-4-8``
-    and ``claude-opus-4-8`` both reduce to ``claude-opus-4-8``.
+    prefix (``us.``/``eu.``/``apac.``/``global.``), then a leading vendor segment
+    (``anthropic.``/``openai.``/``nvidia.``), so
+    ``bedrock/us.anthropic.claude-opus-4-8`` and ``claude-opus-4-8`` both reduce
+    to ``claude-opus-4-8``.
     """
     leaf = model_id.rsplit("/", 1)[-1].strip()
     leaf = _BEDROCK_REGION_PREFIX_RE.sub("", leaf)
-    if leaf.lower().startswith("anthropic."):
-        leaf = leaf[len("anthropic."):]
+    for prefix in _BEDROCK_VENDOR_PREFIXES:
+        if leaf.lower().startswith(prefix):
+            leaf = leaf[len(prefix):]
+            break
     return leaf
 
 
