@@ -221,6 +221,7 @@ class CatalogDB:
             SELECT DISTINCT id FROM component_catalog
             WHERE id LIKE ? AND LOWER(concept) IN ({placeholders})
               AND {label_filter}
+            ORDER BY id
         """
         params: list[str] = [f"%{path_segment}%"] + [c.lower() for c in concepts]
         rows = self._connection.execute(query, params).fetchall()
@@ -281,7 +282,8 @@ class CatalogDB:
             cursor = self._connection.execute(
                 f"SELECT {_CATALOG_COLS} FROM kb.component_catalog "
                 "WHERE id IN (SELECT UNNEST(?)) "
-                f"AND {label_filter}",
+                f"AND {label_filter} "
+                "ORDER BY id",
                 [id_list],
             )
             columns = [desc[0] for desc in cursor.description]
