@@ -239,7 +239,11 @@ def _components_from_python(path: Path) -> list[AIComponent]:
                 constructor_name = m_srv_name.group(1)
         constructor_hits.append(("Server", _line_for_match(text, m_srv_call.start())))
 
-    server_hits = constructor_hits or import_hits
+    # Only emit an mcp_server when there is an actual constructor call in this file
+    # (FastMCP() or Server()). Import-only hits indicate a helper/client module in a
+    # multi-file MCP package, not a server definition — emitting one per import file
+    # causes significant FPs in packages like couchbase or clickhouse.
+    server_hits = constructor_hits
     if server_hits:
         all_kinds = [k for k, _ in import_hits] + [k for k, _ in constructor_hits]
         if constructor_hits:
