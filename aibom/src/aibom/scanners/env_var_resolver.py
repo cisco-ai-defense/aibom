@@ -77,6 +77,32 @@ _RUBY_ENV_FETCH = re.compile(
 )
 _RUBY_ENV_PATTERNS = [_RUBY_ENV_BRACKET, _RUBY_ENV_FETCH]
 
+_RUST_ENV_VAR = re.compile(
+    r'''(?:std::)?env::var(?:_os)?\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']'''
+)
+_RUST_ENV_MACRO = re.compile(
+    r'''(?:option_)?env!\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']'''
+)
+_RUST_ENV_PATTERNS = [_RUST_ENV_VAR, _RUST_ENV_MACRO]
+
+_CS_ENVIRONMENT_GET = re.compile(
+    r'''Environment\.GetEnvironmentVariable\(\s*["']'''
+    r'''([A-Za-z_][A-Za-z0-9_]*)["']'''
+)
+_CS_CONFIGURATION_BRACKET = re.compile(
+    r'''(?:builder\.)?(?:Configuration|_configuration)'''
+    r'''\s*\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]'''
+)
+_CS_CONFIGURATION_GET = re.compile(
+    r'''(?:IConfiguration|Configuration|_configuration)\.GetValue'''
+    r'''(?:<[^>]+>)?\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']'''
+)
+_CS_ENV_PATTERNS = [
+    _CS_ENVIRONMENT_GET,
+    _CS_CONFIGURATION_BRACKET,
+    _CS_CONFIGURATION_GET,
+]
+
 _LANG_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ".py": _PY_ENV_PATTERNS,
     ".ipynb": _PY_ENV_PATTERNS,
@@ -88,6 +114,8 @@ _LANG_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ".go": [_GO_GETENV],
     ".java": [_JAVA_GETENV],
     ".rb": _RUBY_ENV_PATTERNS,
+    ".rs": _RUST_ENV_PATTERNS,
+    ".cs": _CS_ENV_PATTERNS,
 }
 
 # ---------------------------------------------------------------------------
@@ -267,6 +295,8 @@ _COMMENT_PREFIXES = {
     ".mjs": "//",
     ".go": "//",
     ".java": "//",
+    ".rs": "//",
+    ".cs": "//",
 }
 
 

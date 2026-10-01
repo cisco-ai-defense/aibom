@@ -202,6 +202,78 @@ def test_json_reporter_render(sample_scan_result: ScanResult):
         assert "summary" in src_data
 
 
+def test_json_reporter_stamps_kb_identity_and_groups_coverage_gaps(monkeypatch):
+    monkeypatch.setenv("CISCO_AI_DEFENSE_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "aibom.kb.manager.KBManager.output_metadata",
+        lambda _self: {
+            "kb_version": "2.4.0",
+            "build_type": "delta",
+            "schema_version": 2,
+            "cli_version": "2.0.0",
+        },
+    )
+    components = [
+        AIComponent(
+            name="ExampleClient",
+            component_type=AIComponentType.MODEL,
+            metadata={
+                "uncatalogued_ai_symbol": True,
+                "uncatalogued_symbol": "example_sdk.ExampleClient",
+                "ecosystem": "pypi",
+                "package_name": "example-sdk",
+            },
+        ),
+        AIComponent(
+            name="ExampleModel",
+            component_type=AIComponentType.MODEL,
+            metadata={
+                "uncatalogued_ai_symbol": True,
+                "uncatalogued_symbol": "example_sdk.ExampleModel",
+                "ecosystem": "pypi",
+                "package_name": "example-sdk",
+            },
+        ),
+    ]
+    result = ScanResult(
+        metadata={"run_id": "scan-cache-001"},
+        sources=[SourceResult(path="/tmp/example", components=components)],
+    )
+    output = StringIO()
+    JsonReporter().render(result, output)
+    analysis = json.loads(output.getvalue())["aibom_analysis"]
+
+    assert (
+        analysis["metadata"]
+        | {
+            "kb_version": "2.4.0",
+            "build_type": "delta",
+            "schema_version": 2,
+            "cli_version": "2.0.0",
+        }
+        == analysis["metadata"]
+    )
+    assert analysis["coverage_gaps"] == {
+        "informational": True,
+        "uncatalogued_ai_symbol_count": 2,
+        "scan_cache_id": "scan-cache-001",
+        "packages": [
+            {
+                "ecosystem": "pypi",
+                "package_name": "example-sdk",
+                "symbols": [
+                    "example_sdk.ExampleClient",
+                    "example_sdk.ExampleModel",
+                ],
+            }
+        ],
+        "request_hint": (
+            "Run `cisco-aibom kb request --from-scan <report.json>` to request "
+            "coverage for these symbols."
+        ),
+    }
+
+
 def test_json_reporter_preserves_decision_annotations():
     component = AIComponent(
         name="router_agent",
@@ -424,6 +496,14 @@ def test_cyclonedx_reporter_render(sample_scan_result: ScanResult):
     assert doc["specVersion"] == "1.6"
     assert isinstance(doc.get("components"), list)
     assert len(doc["components"]) == 6
+    properties = {item["name"]: item["value"] for item in doc["properties"]}
+    assert set(properties) >= {
+        "cisco-aibom:kb_version",
+        "cisco-aibom:build_type",
+        "cisco-aibom:schema_version",
+        "cisco-aibom:cli_version",
+        "cisco-aibom:uncatalogued_ai_symbol_count",
+    }
 
 
 def test_sarif_reporter_render(sample_scan_result: ScanResult):
@@ -444,6 +524,14 @@ def test_spdx_reporter_render(sample_scan_result: ScanResult):
     doc = json.loads(buf.getvalue())
     assert "@context" in doc
     assert doc["@context"]
+    properties = doc["@graph"][0]["extension_cisco_aibom"]["extensionProperties"]
+    assert set(properties) >= {
+        "cisco-aibom:kb_version",
+        "cisco-aibom:build_type",
+        "cisco-aibom:schema_version",
+        "cisco-aibom:cli_version",
+        "cisco-aibom:uncatalogued_ai_symbol_count",
+    }
 
 
 def test_html_reporter_render(sample_scan_result: ScanResult):

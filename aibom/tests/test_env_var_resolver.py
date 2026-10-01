@@ -245,6 +245,57 @@ class TestRubyEnvVarExtraction:
         assert len(comps) == 1
 
 
+class TestRustEnvVarExtraction:
+    def test_std_env_var_and_var_os(self, tmp_path: Path) -> None:
+        (tmp_path / "main.rs").write_text(
+            'let model = std::env::var("RUST_MODEL").unwrap();\n'
+            'let model_name = std::env::var_os("RUST_MODEL_OS").unwrap();\n'
+        )
+        components, _ = EnvVarResolver().scan(_make_ctx(tmp_path))
+        assert {component.metadata["env"] for component in components} == {
+            "RUST_MODEL",
+            "RUST_MODEL_OS",
+        }
+
+    def test_compile_time_env_macros(self, tmp_path: Path) -> None:
+        (tmp_path / "config.rs").write_text(
+            'let model = env!("BUILD_MODEL");\n'
+            'let model_name = option_env!("OPTIONAL_MODEL");\n'
+        )
+        components, _ = EnvVarResolver().scan(_make_ctx(tmp_path))
+        assert {component.metadata["env"] for component in components} == {
+            "BUILD_MODEL",
+            "OPTIONAL_MODEL",
+        }
+
+
+class TestCSharpEnvVarExtraction:
+    def test_environment_and_configuration_patterns(self, tmp_path: Path) -> None:
+        (tmp_path / "Program.cs").write_text(
+            'var model = Environment.GetEnvironmentVariable("CS_MODEL");\n'
+            'var model_name = Configuration["CS_CONFIG_MODEL"];\n'
+            'var model_id = _configuration.GetValue<string>("CS_TYPED_MODEL");\n'
+            'var deployment_name = builder.Configuration["CS_DEPLOYMENT"];\n'
+        )
+        components, _ = EnvVarResolver().scan(_make_ctx(tmp_path))
+        assert {component.metadata["env"] for component in components} == {
+            "CS_MODEL",
+            "CS_CONFIG_MODEL",
+            "CS_TYPED_MODEL",
+            "CS_DEPLOYMENT",
+        }
+
+    def test_comment_is_ignored(self, tmp_path: Path) -> None:
+        (tmp_path / "Program.cs").write_text(
+            '// var model = Configuration["COMMENTED_MODEL"];\n'
+            'var model = Configuration["ACTIVE_MODEL"];\n'
+        )
+        components, _ = EnvVarResolver().scan(_make_ctx(tmp_path))
+        assert [component.metadata["env"] for component in components] == [
+            "ACTIVE_MODEL"
+        ]
+
+
 class TestCommentSkipping:
     def test_python_comment_skipped(self, tmp_path: Path) -> None:
         (tmp_path / "app.py").write_text(

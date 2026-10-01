@@ -65,6 +65,117 @@ def test_analyze_rejects_schema_v2_manifest_without_traceback(
     assert "Traceback" not in result.output
 
 
+def test_kb_request_submits_one_package_with_schema_v2_contract():
+    response = {
+        "request": {
+            "request_id": "00000000-0000-4000-8000-000000000001",
+            "state": "queued",
+            "disposition": "ready_in_build",
+        },
+        "coalesced": False,
+        "quota_remaining": 9,
+        "rate_limit": {"limit": "10", "remaining": "9", "reset": "1234"},
+    }
+    with patch(
+        "aibom.cli.KBManager.request_build",
+        return_value=response,
+    ) as request_build:
+        result = runner.invoke(
+            app,
+            [
+                "kb",
+                "request",
+                "--ecosystem",
+                "pypi",
+                "--package",
+                "example-sdk",
+                "--symbol",
+                "example_sdk.Client",
+                "--api-key",
+                "test-key",
+                "--api-base",
+                "https://api.example.com",
+            ],
+        )
+
+    assert result.exit_code == 0
+    request_build.assert_called_once_with(
+        ecosystem="pypi",
+        package_name="example-sdk",
+        symbols=["example_sdk.Client"],
+        api_key="test-key",
+        api_base="https://api.example.com",
+    )
+    assert "ready_in_build" in result.output
+    assert "Quota remaining: 9" in result.output
+
+
+def test_kb_request_reads_grouped_coverage_gaps_as_one_bulk_request(tmp_path):
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "aibom_analysis": {
+                    "coverage_gaps": {
+                        "packages": [
+                            {
+                                "ecosystem": "pypi",
+                                "package_name": "example-sdk",
+                                "symbols": ["example_sdk.Client"],
+                            },
+                            {
+                                "ecosystem": "npm",
+                                "package_name": "example-ai",
+                                "symbols": ["ExampleAgent"],
+                            },
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    response = {
+        "request_ids": ["00000000-0000-4000-8000-000000000002"],
+        "duplicates": [],
+        "rejected": [],
+        "quota_remaining": 8,
+        "rate_limit": {},
+    }
+    with patch(
+        "aibom.cli.KBManager.request_bulk",
+        return_value=response,
+    ) as request_bulk:
+        result = runner.invoke(
+            app,
+            [
+                "kb",
+                "request",
+                "--from-scan",
+                str(report),
+                "--api-key",
+                "test-key",
+                "--api-base",
+                "https://api.example.com",
+            ],
+        )
+
+    assert result.exit_code == 0
+    requests = request_bulk.call_args.args[0]
+    assert requests == [
+        {
+            "ecosystem": "npm",
+            "package_name": "example-ai",
+            "symbols": ["ExampleAgent"],
+        },
+        {
+            "ecosystem": "pypi",
+            "package_name": "example-sdk",
+            "symbols": ["example_sdk.Client"],
+        },
+    ]
+
+
 def test_analyze_defaults_cache_root_for_scan_and_agentic(tmp_path):
     source_dir = tmp_path / "repo"
     source_dir.mkdir()

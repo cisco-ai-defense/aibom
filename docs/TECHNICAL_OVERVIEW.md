@@ -220,7 +220,7 @@ AI BOM's analysis depth varies by language. Python gets a full CST pipeline; oth
 | Code-level import detection | all imports | allowlist | allowlist | allowlist | allowlist | allowlist | allowlist |
 | Model literal detection (`model="..."`) | yes | yes | yes | yes | yes | yes | yes |
 | Agent / tool instantiation (`new Agent(...)`, `@tool`) | CST | regex | regex | regex | regex | regex | regex |
-| Env-var resolver (`os.getenv`, `process.env`, …) | yes | yes | yes | yes | no | yes | no |
+| Env-var resolver (`os.getenv`, `process.env`, …) | yes | yes | yes | yes | yes | yes | yes |
 | Class / decorator / annotation observations | yes | no | no | no | no | no | no |
 | Method body shape, control-flow loops (ReAct detection) | yes | no | no | no | no | no | no |
 | KB symbol enrichment (DuckDB catalog) | yes | no | no | no | no | no | no |
@@ -230,6 +230,11 @@ AI BOM's analysis depth varies by language. Python gets a full CST pipeline; oth
 | ML-lifecycle detection (training runs, hyperparameters) | yes | no | no | no | no | no | no |
 | Jupyter notebook (`.ipynb`) | yes | — | — | — | — | — | — |
 | Tier 3 agentic classification | yes | yes | yes | yes | yes | yes | yes |
+
+Rust env-var coverage includes `std::env::var`, `std::env::var_os`, `env!`, and
+`option_env!`. C# coverage includes `Environment.GetEnvironmentVariable`,
+`Configuration["..."]`, `_configuration["..."]`,
+`builder.Configuration["..."]`, and `IConfiguration.GetValue<T>("...")`.
 
 ### Why Python is deeper
 

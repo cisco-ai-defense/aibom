@@ -519,6 +519,7 @@ version = "1.0.9"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
+    { name = "cryptography" },
     { name = "cyclonedx-python-lib" },
     { name = "duckdb" },
     { name = "fastapi" },
@@ -642,6 +643,7 @@ requires-dist = [
     { name = "cisco-ai-mcp-scanner", marker = "extra == 'security'", specifier = ">=4.8.1" },
     { name = "cisco-ai-skill-scanner", marker = "extra == 'security'", specifier = ">=2.0.12" },
     { name = "cisco-aibom", extras = ["analysis", "security", "agentic", "observability", "llm-openai", "llm-aws", "llm-anthropic", "llm-google", "cloud"], marker = "extra == 'all'" },
+    { name = "cryptography", specifier = ">=45.0.0" },
     { name = "cyclonedx-python-lib", specifier = ">=9.0.0" },
     { name = "deepagents", marker = "extra == 'agentic'", specifier = ">=0.4.12" },
     { name = "detect-secrets", marker = "extra == 'analysis'", specifier = ">=1.5.0" },

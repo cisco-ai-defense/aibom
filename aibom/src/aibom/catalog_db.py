@@ -54,6 +54,22 @@ class CatalogDB:
             f"CREATE VIEW component_catalog AS SELECT * FROM kb.component_catalog"
         )
 
+        # ``catalog_label`` is present in the legacy schema but omitted from the
+        # kb-v2 schema. Project the real column when present, otherwise ``NULL``
+        # so suffix lookups work against both schemas.
+        kb_cols = {
+            r[1]
+            for r in self._connection.execute(
+                "PRAGMA table_info('component_catalog')"
+            ).fetchall()
+        }
+        catalog_label_expr = (
+            "catalog_label" if "catalog_label" in kb_cols else "NULL AS catalog_label"
+        )
+        self._catalog_cols = (
+            f"id, label, concept, framework, sig_name, type, {catalog_label_expr}"
+        )
+
         self._custom_index: Dict[str, Dict[str, Any]] = {}
         self._excludes: List[str] = []
         self._token_table: str | None = None
@@ -221,6 +237,7 @@ class CatalogDB:
             SELECT DISTINCT id FROM component_catalog
             WHERE id LIKE ? AND LOWER(concept) IN ({placeholders})
               AND {label_filter}
+            ORDER BY id
         """
         params: list[str] = [f"%{path_segment}%"] + [c.lower() for c in concepts]
         rows = self._connection.execute(query, params).fetchall()
@@ -279,9 +296,10 @@ class CatalogDB:
         if matched_ids:
             id_list = list(matched_ids)
             cursor = self._connection.execute(
-                f"SELECT {_CATALOG_COLS} FROM kb.component_catalog "
+                f"SELECT {self._catalog_cols} FROM kb.component_catalog "
                 "WHERE id IN (SELECT UNNEST(?)) "
-                f"AND {label_filter}",
+                f"AND {label_filter} "
+                "ORDER BY id",
                 [id_list],
             )
             columns = [desc[0] for desc in cursor.description]

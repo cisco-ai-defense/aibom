@@ -28,6 +28,8 @@ from cyclonedx.output.json import JsonV1Dot6
 from cyclonedx.schema import SchemaVersion
 from cyclonedx.validation.json import JsonValidator
 
+from ..kb.coverage import build_coverage_gaps
+from ..kb.manager import KBManager
 from ..models import AIComponent, AIComponentType, ScanResult
 from .base import BaseReporter
 
@@ -77,9 +79,7 @@ def _prop(name: str, value: str) -> Property:
     return Property(name=name, value=value)
 
 
-def _optional_aibom_properties(
-    comp: AIComponent, include_type: bool
-) -> list[Property]:
+def _optional_aibom_properties(comp: AIComponent, include_type: bool) -> list[Property]:
     props: list[Property] = []
     if include_type:
         props.append(_prop("cisco-aibom:type", comp.component_type.value))
@@ -99,6 +99,12 @@ def _optional_aibom_properties(
         props.append(_prop("cisco-aibom:dataset_source", comp.dataset_source))
     if comp.skill_format:
         props.append(_prop("cisco-aibom:skill_format", comp.skill_format))
+    if comp.metadata.get("uncatalogued_ai_symbol"):
+        props.append(_prop("cisco-aibom:uncatalogued_ai_symbol", "true"))
+        for key in ("ecosystem", "package_name", "uncatalogued_symbol"):
+            value = comp.metadata.get(key)
+            if value:
+                props.append(_prop(f"cisco-aibom:{key}", str(value)))
     return props
 
 
@@ -156,12 +162,28 @@ def _build_bom(result: ScanResult) -> Bom:
         version=_tool_version(meta),
     )
     bom_meta = BomMetaData(tools=[tool])
+    identity = KBManager().output_metadata()
+    properties = [
+        _prop(f"cisco-aibom:{key}", str(value)) for key, value in identity.items()
+    ]
+    coverage_gaps = build_coverage_gaps(result)
+    properties.append(
+        _prop(
+            "cisco-aibom:uncatalogued_ai_symbol_count",
+            str(
+                coverage_gaps.get("uncatalogued_ai_symbol_count", 0)
+                if coverage_gaps
+                else 0
+            ),
+        )
+    )
     return Bom(
         serial_number=uuid4(),
         version=1,
         metadata=bom_meta,
         components=components,
         vulnerabilities=vulnerabilities,
+        properties=properties,
     )
 
 

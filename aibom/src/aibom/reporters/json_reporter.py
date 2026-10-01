@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import IO, Any
 
+from ..kb.coverage import build_coverage_gaps
 from ..models import AIComponent, ScanResult
 from .base import BaseReporter
 
@@ -179,6 +180,12 @@ def _aibom_payload(
     source_outcomes = raw_metadata.pop("source_outcomes", {})
     source_details = raw_metadata.pop("_report_source_details", {})
     raw_metadata.setdefault("report_schema_version", REPORT_SCHEMA_VERSION)
+    try:
+        from ..kb.manager import KBManager
+
+        raw_metadata.update(KBManager().output_metadata())
+    except Exception:
+        _LOGGER.debug("Could not resolve installed KB metadata", exc_info=True)
     sources_out: dict[str, dict[str, Any]] = {}
     components_by_source: dict[str, list[AIComponent]] = {}
     seen_source_names: dict[str, int] = {}
@@ -239,6 +246,9 @@ def _aibom_payload(
         analysis["component_summary"] = _component_summary(components_by_source)
     analysis["risk"] = base["risk"]
     analysis["errors"] = base["errors"]
+    coverage_gaps = build_coverage_gaps(result)
+    if coverage_gaps:
+        analysis["coverage_gaps"] = coverage_gaps
     if cross_repo_links_out:
         analysis["cross_repo_links"] = cross_repo_links_out
     return {"aibom_analysis": analysis}
