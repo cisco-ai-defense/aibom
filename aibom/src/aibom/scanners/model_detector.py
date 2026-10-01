@@ -767,6 +767,14 @@ _PY_SUBSCRIPT_MODEL_RE = re.compile(
     r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
 )
 
+# First positional string arg of known model-registry dataclass/spec constructors,
+# e.g. ``ModelSpec("gpt-4o", ...)`` or ``LLMConfig("claude-3-5-sonnet-...", ...)``.
+_PY_POSITIONAL_SPEC_RE = re.compile(
+    r"\b(?:ModelSpec|LLMSpec|LLMConfig|ModelConfig|ModelEntry|ModelDef|ModelRecord)"
+    r"\s*\(\s*(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
+    re.MULTILINE,
+)
+
 _ENV_MODEL_RE = re.compile(
     r"(?m)^\s*(?:MODEL|OPENAI_MODEL|LLM_MODEL|ANTHROPIC_MODEL)\s*=\s*"
     r"(?:[\"']([^\"']+)[\"']|([^\s#]+))",
@@ -1104,6 +1112,7 @@ def _extract_python_models(text: str) -> list[tuple[str, int]]:
         _PY_CTOR_RE,
         _PY_GETENV_WITH_DEFAULT_RE,
         _PY_SUBSCRIPT_MODEL_RE,
+        _PY_POSITIONAL_SPEC_RE,
     ):
         for m in rx.finditer(text):
             raw = m.group("val")
