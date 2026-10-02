@@ -33,6 +33,7 @@ from .structures import (
     MethodBodyShapeObservation,
     StringLiteralObservation,
     TypeAnnotationObservation,
+    ValueAssignmentObservation,
 )
 from .custom_catalog import parse_inline_annotation
 
@@ -155,6 +156,69 @@ def _extract_argument_value(node: cst.BaseExpression) -> Any:
         return {"_call": "unknown", "_args": inner_parts}
 
     return f"COMPLEX_TYPE:{type(node).__name__}"
+
+
+VALUE_KIND_LITERAL = "literal"
+VALUE_KIND_VARIABLE = "variable"
+VALUE_KIND_ATTRIBUTE = "attribute"
+VALUE_KIND_SUBSCRIPT = "subscript"
+
+_LITERAL_NAMES = ("True", "False", "None")
+
+
+def _render_subscript(node: cst.Subscript) -> Optional[str]:
+    """Render ``CONFIG["model"]`` as ``CONFIG[model]``.
+
+    Only a single literal or name index is rendered; slices and computed
+    indices return ``None`` because nothing downstream could resolve them.
+    """
+    base = None
+    if isinstance(node.value, cst.Name):
+        base = node.value.value
+    elif isinstance(node.value, cst.Attribute):
+        base = _format_attribute_name(node.value)
+    if not base or len(node.slice) != 1:
+        return None
+
+    index = node.slice[0].slice
+    if not isinstance(index, cst.Index):
+        return None
+
+    key = index.value
+    if isinstance(key, cst.SimpleString):
+        try:
+            return f"{base}[{ast.literal_eval(key.value)}]"
+        except (ValueError, SyntaxError):
+            return None
+    if isinstance(key, cst.Name):
+        return f"{base}[{key.value}]"
+    if isinstance(key, cst.Integer):
+        return f"{base}[{key.value}]"
+    return None
+
+
+def _classify_value_node(node: cst.BaseExpression) -> Optional[tuple[Any, str]]:
+    """Return ``(value, kind)`` for a non-call assignment right-hand side.
+
+    Returns ``None`` for shapes no resolver can act on today — lambdas,
+    comprehensions, f-strings, boolean operators — so the observation list
+    stays limited to bindings that could actually resolve to a value.
+    """
+    if isinstance(node, cst.Name) and node.value in _LITERAL_NAMES:
+        return ast.literal_eval(node.value), VALUE_KIND_LITERAL
+    if isinstance(node, (cst.SimpleString, cst.Integer, cst.Float)):
+        return _extract_argument_value(node), VALUE_KIND_LITERAL
+    if isinstance(node, (cst.List, cst.Tuple, cst.Set, cst.Dict)):
+        return _extract_argument_value(node), VALUE_KIND_LITERAL
+    if isinstance(node, cst.Name):
+        return f"VARIABLE:{node.value}", VALUE_KIND_VARIABLE
+    if isinstance(node, cst.Attribute):
+        return f"ATTRIBUTE:{_format_attribute_name(node)}", VALUE_KIND_ATTRIBUTE
+    if isinstance(node, cst.Subscript):
+        rendered = _render_subscript(node)
+        if rendered:
+            return f"SUBSCRIPT:{rendered}", VALUE_KIND_SUBSCRIPT
+    return None
 
 
 class SymbolVisitor(cst.CSTVisitor):
@@ -672,10 +736,47 @@ class SymbolVisitor(cst.CSTVisitor):
             )
             self.result.decorators.append(obs)
 
+    def _record_value_assignment(self, node: cst.Assign) -> None:
+        """Record a non-call binding so a resolver can answer "what is in this name".
+
+        Every target of a chained ``a = b = "gpt-4"`` is recorded; keeping
+        only the first would silently lose a binding.
+        """
+        classified = _classify_value_node(node.value)
+        if classified is None:
+            return
+        value, kind = classified
+
+        frame = self._current_function_frame()
+        owner = frame.get("qname") if frame else None
+        try:
+            line = self.get_metadata(cst.metadata.PositionProvider, node).start.line
+        except (KeyError, AttributeError):
+            line = 0
+
+        for target in node.targets:
+            target_name = self._extract_target_name(target.target)
+            if not target_name:
+                continue
+            self.result.value_assignments.append(
+                ValueAssignmentObservation(
+                    target_qualified_name=target_name,
+                    value=value,
+                    value_kind=kind,
+                    owner_qualified_name=owner,
+                    line_number=line,
+                )
+            )
+
     def leave_Assign(self, original_node: cst.Assign) -> None:
-        """Captures assignments where the value is a class instantiation (a Call)."""
+        """Captures assignments where the value is a class instantiation (a Call).
+
+        Non-call right-hand sides are recorded separately as
+        :class:`ValueAssignmentObservation`.
+        """
         call_node = self._unwrap_call_expression(original_node.value)
         if call_node is None:
+            self._record_value_assignment(original_node)
             return
 
         qualified_name = self._get_qualified_name_for_node(call_node.func)
