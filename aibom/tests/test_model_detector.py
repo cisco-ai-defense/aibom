@@ -362,6 +362,36 @@ class TestModelDetector:
         gpt4o = next(c for c in comps if c.model_name == "gpt-4o")
         assert gpt4o.metadata["provider"] == "openai"
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'spec = ModelSpec("gpt-4o", "openai")\n',
+            'MODELS = [\n    LLMConfig("gpt-4o", provider="openai"),\n]\n',
+        ],
+    )
+    def test_py_positional_spec_captures_constructor_arg(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        assert [c.model_name for c in comps] == ["gpt-4o"]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            '# ModelSpec("gpt-4o", "openai")\n',
+            'x = 1  # e.g. LLMConfig("gpt-4o")\n',
+            '"""Usage: ModelSpec("gpt-4o", provider)."""\n',
+            'HELP = \'ModelConfig("gpt-4o")\'\n',
+            'HELP = f\'ModelConfig("gpt-4o") {x}\'\n',
+        ],
+    )
+    def test_py_positional_spec_ignores_comments_and_strings(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """Constructor text inside comments or string literals is not code."""
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        assert comps == [], f"false positive on {source!r}"
+
     def test_py_getenv_default_ignores_non_model_env_vars(
         self, tmp_path: Path
     ) -> None:

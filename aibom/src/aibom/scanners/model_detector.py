@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
+import bisect
+import io
 import json
 import logging
 import re
 import time
+import tokenize
 from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import quote_plus
@@ -1104,8 +1107,49 @@ def _extract_env_models(text: str) -> list[tuple[str, int]]:
     return found
 
 
+_FSTRING_START = getattr(tokenize, "FSTRING_START", None)
+_FSTRING_END = getattr(tokenize, "FSTRING_END", None)
+
+
+def _python_noncode_spans(text: str) -> list[tuple[int, int]]:
+    """Return sorted ``(start, end)`` offsets of comments and string literals.
+
+    Returns an empty list when *text* does not tokenize (e.g. notebook magics),
+    so callers fall back to treating the whole text as code.
+    """
+    line_starts = [0]
+    for line in text.splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(line))
+
+    def _offset(row: int, col: int) -> int:
+        return line_starts[row - 1] + col
+
+    spans: list[tuple[int, int]] = []
+    fstring_starts: list[int] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                spans.append((_offset(*tok.start), _offset(*tok.end)))
+            elif tok.type == _FSTRING_START:
+                fstring_starts.append(_offset(*tok.start))
+            elif tok.type == _FSTRING_END and fstring_starts:
+                start = fstring_starts.pop()
+                if not fstring_starts:
+                    spans.append((start, _offset(*tok.end)))
+    except (tokenize.TokenError, SyntaxError):
+        return []
+    spans.sort()
+    return spans
+
+
+def _in_spans(spans: list[tuple[int, int]], pos: int) -> bool:
+    i = bisect.bisect_right(spans, (pos, float("inf"))) - 1
+    return i >= 0 and spans[i][0] <= pos < spans[i][1]
+
+
 def _extract_python_models(text: str) -> list[tuple[str, int]]:
     found: list[tuple[str, int]] = []
+    noncode: list[tuple[int, int]] | None = None
     for rx in (
         _PY_KWARG_RE,
         _PY_ASSIGN_RE,
@@ -1119,6 +1163,13 @@ def _extract_python_models(text: str) -> list[tuple[str, int]]:
             s = _normalize_candidate(raw)
             if not _is_plausible_model_id(s):
                 continue
+            if rx is _PY_POSITIONAL_SPEC_RE:
+                # The constructor name must sit in executable code, not in a
+                # comment or docstring example such as ``# ModelSpec("gpt-4o")``.
+                if noncode is None:
+                    noncode = _python_noncode_spans(text)
+                if _in_spans(noncode, m.start()):
+                    continue
             found.append((s, _line_number(text, m.start())))
     return found
 
