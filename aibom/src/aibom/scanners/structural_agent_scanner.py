@@ -127,6 +127,7 @@ _BUILTIN_LLM_SDK_IMPORT_HINTS: tuple[str, ...] = (
     "ollama",
     "google.generativeai",
     "google.genai",
+    "google.adk",
     "vertexai",
     "autogen",
     "autogen_core",
