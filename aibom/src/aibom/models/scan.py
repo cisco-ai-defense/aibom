@@ -25,6 +25,7 @@ from .enums import (
     AIComponentType,
     CrossRepoLinkType,
     DetectionSource,
+    EvidenceStrength,
     RelationshipType,
     Severity,
 )
@@ -114,6 +115,29 @@ class ComponentRelationship(BaseModel):
     source_repo: str = ""
     target_repo: str = ""
     decision_annotation: DecisionAnnotation | None = None
+    # ``None`` means unattributed, which is how every edge behaved before
+    # code-derived edges existed. Consumers that need to trust an edge
+    # should check for ``CODE_ANALYSIS`` rather than assume.
+    detection_source: DetectionSource | None = None
+    evidence_strength: EvidenceStrength | None = None
+
+    @property
+    def is_code_derived(self) -> bool:
+        """True when this edge was read off code structure, not inferred."""
+        return self.detection_source == DetectionSource.CODE_ANALYSIS
+
+    @property
+    def is_stated_in_source(self) -> bool:
+        """True when the source names the target outright.
+
+        Narrower than :attr:`is_code_derived`, which also covers edges found
+        by walking call reachability. Anything that writes a component field
+        from an edge should gate on this instead.
+        """
+        return (
+            self.is_code_derived
+            and self.evidence_strength == EvidenceStrength.STATED
+        )
 
     def model_post_init(self, __context: Any) -> None:
         if not self.label:
