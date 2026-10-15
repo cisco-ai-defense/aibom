@@ -711,7 +711,7 @@ def _scope_bindings(node: ast.AST) -> dict[str, list[tuple[int, str]]]:
     """Name -> [(line, kind)] for every binding in *node*'s own scope.
 
     ``kind`` is ``"def"`` for function definitions and ``"other"`` for imports,
-    assignments, class definitions and other name bindings.
+    assignments, parameters, class definitions and other name bindings.
     """
     out: dict[str, list[tuple[int, str]]] = {}
     for child in _scope_statements(node):
@@ -727,6 +727,9 @@ def _scope_bindings(node: ast.AST) -> dict[str, list[tuple[int, str]]]:
             out.setdefault(child.id, []).append((child.lineno, "other"))
         elif isinstance(child, ast.ExceptHandler) and child.name:
             out.setdefault(child.name, []).append((child.lineno, "other"))
+        elif isinstance(child, ast.arg):
+            # parameters are bound before any statement in the body runs
+            out.setdefault(child.arg, []).append((0, "other"))
     return out
 
 

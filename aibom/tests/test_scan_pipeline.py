@@ -3049,6 +3049,16 @@ class TestAlignToolAnchors:
         )
         assert self._align_one(tmp_path, source, "lookup", 2) == 4
 
+    def test_parameter_shadows_module_def(self, tmp_path: Path):
+        source = (
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "def build(lookup):\n"
+            "    return Agent(tools=[lookup])\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 5) == 5
+
     def test_consolidated_evidence_keeps_reported_line(self):
         from aibom.scan_pipeline import _consolidate_components
 
