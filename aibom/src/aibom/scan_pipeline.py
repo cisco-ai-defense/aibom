@@ -25,6 +25,7 @@ Stages:
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 import time
@@ -694,6 +695,143 @@ def _has_instantiation_marker(c: "AIComponent") -> bool:
     )
 
 
+_DEF_LINE_RE = re.compile(r"\s*(async\s+)?def\s")
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _scope_statements(node: ast.AST):
+    """Yield the nodes of *node*'s own scope, not descending into nested scopes."""
+    for child in ast.iter_child_nodes(node):
+        yield child
+        if not isinstance(child, _SCOPE_NODES + (ast.Lambda,)):
+            yield from _scope_statements(child)
+
+
+def _scope_bindings(node: ast.AST) -> dict[str, list[tuple[int, str]]]:
+    """Name -> [(line, kind)] for every binding in *node*'s own scope.
+
+    ``kind`` is ``"def"`` for function definitions and ``"other"`` for imports,
+    assignments, parameters, class definitions and other name bindings.
+    """
+    out: dict[str, list[tuple[int, str]]] = {}
+    for child in _scope_statements(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.setdefault(child.name, []).append((child.lineno, "def"))
+        elif isinstance(child, ast.ClassDef):
+            out.setdefault(child.name, []).append((child.lineno, "other"))
+        elif isinstance(child, (ast.Import, ast.ImportFrom)):
+            for alias in child.names:
+                name = (alias.asname or alias.name).split(".")[0]
+                out.setdefault(name, []).append((child.lineno, "other"))
+        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            out.setdefault(child.id, []).append((child.lineno, "other"))
+        elif isinstance(child, ast.ExceptHandler) and child.name:
+            out.setdefault(child.name, []).append((child.lineno, "other"))
+        elif isinstance(child, ast.arg):
+            # parameters are bound before any statement in the body runs
+            out.setdefault(child.arg, []).append((0, "other"))
+    return out
+
+
+class _FileScopes:
+    """Lexical scopes of one Python file, for resolving which ``def`` a name refers to."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        # (start, end, is_class, bindings); the module scope spans every line
+        self.scopes: list[tuple[int, int, bool, dict[str, list[tuple[int, str]]]]] = [
+            (0, 10**9, False, _scope_bindings(tree))
+        ]
+        for node in ast.walk(tree):
+            if isinstance(node, _SCOPE_NODES):
+                self.scopes.append(
+                    (
+                        node.lineno,
+                        getattr(node, "end_lineno", None) or node.lineno,
+                        isinstance(node, ast.ClassDef),
+                        _scope_bindings(node),
+                    )
+                )
+
+    def def_line_for(self, name: str, line: int) -> int | None:
+        """Line of the ``def`` that *name* refers to at *line*, or None if not a local def."""
+        chain = sorted(
+            (sc for sc in self.scopes if sc[0] <= line <= sc[1]),
+            key=lambda sc: sc[0],
+            reverse=True,
+        )
+        for depth, (_, _, is_class, bindings) in enumerate(chain):
+            if depth and is_class:
+                continue  # class bodies are not visible to nested functions
+            found = bindings.get(name)
+            if not found:
+                continue
+            if depth == 0:
+                # own scope: the binding in effect at the registration line
+                preceding = [b for b in found if b[0] <= line]
+                if not preceding:
+                    return None  # bound only later in this scope
+                bound_line, kind = max(preceding)
+            else:
+                # enclosing scope has finished running when this code executes
+                bound_line, kind = max(found)
+            return bound_line if kind == "def" else None
+        return None
+
+
+def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
+    """Anchor Python tools at their defining ``def`` statement.
+
+    Scanners report tools at the decorator line or at the registration call
+    (``Agent(tools=[fn])``, ``add_tool(fn)``). A decorator-line anchor moves to the
+    function it decorates. A registered tool moves to the same-file ``def`` that the
+    name is bound to at the registration line, following Python scoping; imports,
+    assignments and definitions that only appear later keep the registration line.
+    """
+    cache: dict[str, tuple[_FileScopes | None, list[str]]] = {}
+
+    def file_info(path: str) -> tuple[_FileScopes | None, list[str]]:
+        if path not in cache:
+            scopes: _FileScopes | None = None
+            lines: list[str] = []
+            try:
+                source = Path(path).read_text(encoding="utf-8", errors="ignore")
+                lines = source.splitlines()
+                scopes = _FileScopes(ast.parse(source))
+            except (OSError, SyntaxError, ValueError):
+                pass
+            cache[path] = (scopes, lines)
+        return cache[path]
+
+    moved = 0
+    for comp in components:
+        if (
+            comp.component_type != AIComponentType.TOOL
+            or not comp.line_number
+            or not str(comp.file_path or "").endswith(".py")
+        ):
+            continue
+        scopes, lines = file_info(str(comp.file_path))
+        target: int | None = None
+        idx = comp.line_number - 1
+        if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("@"):
+            j = idx
+            while j < len(lines) and not _DEF_LINE_RE.match(lines[j]):
+                j += 1
+            if j < len(lines):
+                target = j + 1
+        elif scopes is not None:
+            target = scopes.def_line_for(comp.name, comp.line_number)
+        if target and target != comp.line_number:
+            comp.metadata = {**(comp.metadata or {}), "reported_line": comp.line_number}
+            comp.line_number = target
+            moved += 1
+    if moved:
+        _LOGGER.info(
+            "Tool anchor alignment: moved %d tool(s) to their defining line", moved
+        )
+    return components
+
+
 def _consolidate_components(
     components: list["AIComponent"],
 ) -> list["AIComponent"]:
@@ -756,6 +894,11 @@ def _consolidate_components(
                         "line": c.line_number,
                         "service": _service_dir(c.file_path),
                         "test_only": is_test,
+                        **(
+                            {"reported_line": c.metadata["reported_line"]}
+                            if (c.metadata or {}).get("reported_line")
+                            else {}
+                        ),
                     }
                 )
 
@@ -2043,6 +2186,8 @@ class ScanPipeline:
                 "via registry (mode=embedding)",
                 reclassified,
             )
+
+        components = _align_tool_anchors(components)
 
         before = len(components)
         components = _consolidate_components(components)

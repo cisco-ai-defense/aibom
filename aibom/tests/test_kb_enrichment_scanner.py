@@ -988,3 +988,106 @@ class TestGuardrailDetection:
         for mod in ("agentsec", "aidefense", "nemoguardrails", "guardrails"):
             assert mod in _IMPORT_MODULE_TYPE_MAP
             assert _IMPORT_MODULE_TYPE_MAP[mod].primary is AIComponentType.GUARDRAIL
+
+
+class TestArgumentAwareExtraction:
+    """Instance-level assets read from the arguments of catalogued constructors."""
+
+    _KB = {
+        "agno.agent.Agent": {
+            "id": "agno.agent.Agent",
+            "concept": "agent",
+            "framework": "agno",
+            "label": "class",
+        },
+        "agno.models.openai.OpenAIChat": {
+            "id": "agno.models.openai.OpenAIChat",
+            "concept": "model",
+            "framework": "agno",
+            "label": "class",
+        },
+    }
+
+    def _scan(self, tmp_path: Path, source: str):
+        path = tmp_path / "app.py"
+        path.write_text(source)
+        result = parse_source_code(str(path), source)
+        return _process_file_with_cache(result, self._KB)
+
+    def test_agent_name_model_and_tools_from_constructor_args(self, tmp_path: Path):
+        comps = self._scan(
+            tmp_path,
+            "from agno.agent import Agent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            "\n"
+            "def get_weather(city: str) -> str:\n"
+            "    return city\n"
+            "\n"
+            "assistant = Agent(\n"
+            '    name="Weather Bot",\n'
+            '    model=OpenAIChat(id="gpt-4o"),\n'
+            "    tools=[get_weather],\n"
+            ")\n",
+        )
+        by_type = {(c.component_type, c.name) for c in comps}
+        assert (AIComponentType.AGENT, "Weather Bot") in by_type
+        assert (AIComponentType.MODEL, "gpt-4o") in by_type
+        assert (AIComponentType.TOOL, "get_weather") in by_type
+        agent = next(c for c in comps if c.name == "Weather Bot")
+        assert agent.metadata["instance_name_from"] == "name_kwarg"
+
+    def test_one_line_constructor_uses_its_own_name_not_nested_call(
+        self, tmp_path: Path
+    ):
+        comps = self._scan(
+            tmp_path,
+            "from agno.agent import Agent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            'assistant = Agent(name="Weather Bot", model=OpenAIChat(id="gpt-4o"))\n',
+        )
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert [a.name for a in agents] == ["Weather Bot"]
+
+    def test_positional_name_not_taken_from_nested_call(self, tmp_path: Path):
+        path = tmp_path / "app.py"
+        source = (
+            "from autogen import ConversableAgent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            'bot = ConversableAgent(llm=OpenAIChat("gpt-4o"))\n'
+        )
+        path.write_text(source)
+        kb = {
+            **self._KB,
+            "autogen.ConversableAgent": {
+                "id": "autogen.ConversableAgent",
+                "concept": "agent",
+                "framework": "autogen",
+                "label": "class",
+            },
+        }
+        comps = _process_file_with_cache(parse_source_code(str(path), source), kb)
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert agents
+        assert all(a.name != "gpt-4o" for a in agents)
+
+    def test_non_model_literal_is_not_emitted_as_model(self, tmp_path: Path):
+        comps = self._scan(
+            tmp_path,
+            "from agno.models.openai import OpenAIChat\n"
+            "\n"
+            'llm = OpenAIChat(id="my-deployment")\n',
+        )
+        assert not [
+            c
+            for c in comps
+            if c.component_type == AIComponentType.MODEL and c.name == "my-deployment"
+        ]
+
+    def test_agent_without_name_kwarg_keeps_scanner_name(self, tmp_path: Path):
+        comps = self._scan(
+            tmp_path,
+            "from agno.agent import Agent\n" "\n" "assistant = Agent()\n",
+        )
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert agents
+        assert all("instance_name_from" not in (c.metadata or {}) for c in agents)
