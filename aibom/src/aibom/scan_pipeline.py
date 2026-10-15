@@ -702,15 +702,17 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
     """Anchor Python tools at their defining ``def`` statement.
 
     Scanners report tools at the decorator line or at the registration call
-    (``Agent(tools=[fn])``, ``add_tool(fn)``). A tool whose function is defined in
-    the same file is anchored at that ``def``; a decorator-line anchor moves to the
-    ``def`` below it. Tools registered from another file keep the registration line.
+    (``Agent(tools=[fn])``, ``add_tool(fn)``). A decorator-line anchor moves to the
+    function it decorates. A registered tool moves to the same-file ``def`` that the
+    name is bound to at the registration line; a name imported into the file, or
+    defined in another file, keeps the registration line.
     """
-    cache: dict[str, tuple[dict[str, list[int]], list[str]]] = {}
+    cache: dict[str, tuple[dict[str, list[int]], set[str], list[str]]] = {}
 
-    def file_info(path: str) -> tuple[dict[str, list[int]], list[str]]:
+    def file_info(path: str) -> tuple[dict[str, list[int]], set[str], list[str]]:
         if path not in cache:
             defs: dict[str, list[int]] = {}
+            imported: set[str] = set()
             lines: list[str] = []
             try:
                 source = Path(path).read_text(encoding="utf-8", errors="ignore")
@@ -718,9 +720,12 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
                 for node in ast.walk(ast.parse(source)):
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         defs.setdefault(node.name, []).append(node.lineno)
+                    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                        for alias in node.names:
+                            imported.add((alias.asname or alias.name).split(".")[0])
             except (OSError, SyntaxError, ValueError):
                 pass
-            cache[path] = (defs, lines)
+            cache[path] = (defs, imported, lines)
         return cache[path]
 
     moved = 0
@@ -731,19 +736,22 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
             or not str(comp.file_path or "").endswith(".py")
         ):
             continue
-        defs, lines = file_info(str(comp.file_path))
+        defs, imported, lines = file_info(str(comp.file_path))
         target: int | None = None
-        same_file_defs = defs.get(comp.name) or []
-        if same_file_defs:
-            target = min(same_file_defs, key=lambda ln: abs(ln - comp.line_number))
-        else:
-            idx = comp.line_number - 1
-            if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("@"):
-                j = idx
-                while j < len(lines) and not _DEF_LINE_RE.match(lines[j]):
-                    j += 1
-                if j < len(lines):
-                    target = j + 1
+        idx = comp.line_number - 1
+        if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("@"):
+            j = idx
+            while j < len(lines) and not _DEF_LINE_RE.match(lines[j]):
+                j += 1
+            if j < len(lines):
+                target = j + 1
+        elif comp.name not in imported:
+            same_file_defs = defs.get(comp.name) or []
+            preceding = [ln for ln in same_file_defs if ln <= comp.line_number]
+            if preceding:
+                target = max(preceding)
+            elif same_file_defs:
+                target = min(same_file_defs)
         if target and target != comp.line_number:
             comp.metadata = {**(comp.metadata or {}), "reported_line": comp.line_number}
             comp.line_number = target

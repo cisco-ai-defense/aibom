@@ -1975,6 +1975,7 @@ _MODEL_ID_HINT = re.compile(
 
 
 def _arg_literal(value: Any) -> str | None:
+    """Return a string literal argument, or None for variables and complex values."""
     if not isinstance(value, str) or value.startswith(
         ("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")
     ):
@@ -1984,12 +1985,14 @@ def _arg_literal(value: Any) -> str | None:
 
 
 def _arg_variable(value: Any) -> str | None:
+    """Return the variable name of a ``VARIABLE:`` argument, else None."""
     if isinstance(value, str) and value.startswith("VARIABLE:"):
         return value[len("VARIABLE:") :]
     return None
 
 
 def _instance_name(args: dict[str, Any], allow_positional: bool) -> str | None:
+    """Instance name from ``name=`` / ``agent_name=``, or the first positional literal."""
     for key in _INSTANCE_NAME_KWARGS:
         lit = _arg_literal(args.get(key))
         if lit:
@@ -2000,6 +2003,7 @@ def _instance_name(args: dict[str, Any], allow_positional: bool) -> str | None:
 
 
 def _call_sites(result: CodeAnalysisResult) -> list[tuple[CallObservation, int]]:
+    """Every call in the file with its line, including calls on assignment lines."""
     sites = [(c, c.line_number) for c in result.calls]
     sites += [(a.call, a.line_number) for a in result.assignments]
     return sites
@@ -2008,16 +2012,45 @@ def _call_sites(result: CodeAnalysisResult) -> list[tuple[CallObservation, int]]
 def _apply_instance_names(
     components: list[AIComponent], result: CodeAnalysisResult
 ) -> list[AIComponent]:
-    """Rename agent / MCP-server instances to their ``name=`` argument when given."""
-    args_at: dict[int, dict[str, Any]] = {}
-    for call, line in _call_sites(result):
+    """Rename agent / MCP-server instances to their ``name=`` argument when given.
+
+    Nested calls on the same line (``Agent(model=OpenAIChat(id=...))``) are recorded
+    as separate calls, so each component takes the arguments of its own constructor:
+    the call whose class matches the component's constructor, else the assignment's
+    (outermost) call on that line.
+    """
+    # line -> [(constructor class, arguments)], assignment calls first
+    calls_at: dict[int, list[tuple[str, dict[str, Any]]]] = {}
+    sites = [(a.call, a.line_number) for a in result.assignments]
+    sites += [(c, c.line_number) for c in result.calls]
+    for call, line in sites:
         if call.arguments:
-            args_at.setdefault(line, call.arguments)
-            args_at.setdefault(call.line_number, call.arguments)
+            short = (call.qualified_name or "").rsplit(".", 1)[-1]
+            for ln in {line, call.line_number}:
+                calls_at.setdefault(ln, []).append((short, call.arguments))
+    assigned_lines = {a.line_number for a in result.assignments} | {
+        a.call.line_number for a in result.assignments
+    }
+
+    def own_args(comp: AIComponent) -> dict[str, Any]:
+        candidates = calls_at.get(comp.line_number) or []
+        meta = comp.metadata or {}
+        ctor = (
+            meta.get("kb_id")
+            or meta.get("call_pattern")
+            or meta.get("catalog_constructor")
+        )
+        if ctor:
+            ctor_short = str(ctor).rsplit(".", 1)[-1]
+            return next((args for short, args in candidates if short == ctor_short), {})
+        if candidates and comp.line_number in assigned_lines:
+            return candidates[0][1]
+        return {}
+
     out = []
     for comp in components:
         if comp.component_type in (AIComponentType.AGENT, AIComponentType.MCP_SERVER):
-            args = args_at.get(comp.line_number) or {}
+            args = own_args(comp)
             positional = comp.component_type == AIComponentType.MCP_SERVER or (
                 comp.framework or ""
             ).startswith("autogen")
@@ -2051,6 +2084,7 @@ def _nested_model_literals(value: Any, depth: int = 0) -> list[str]:
 
 
 def _looks_like_model_id(value: str) -> bool:
+    """True when a literal is a known model id or names a known model family."""
     from .model_detector import registry_lookup
 
     if len(value) > 120 or value.startswith(("http://", "https://")) or " " in value:

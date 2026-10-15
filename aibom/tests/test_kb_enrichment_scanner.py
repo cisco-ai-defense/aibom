@@ -1036,6 +1036,40 @@ class TestArgumentAwareExtraction:
         agent = next(c for c in comps if c.name == "Weather Bot")
         assert agent.metadata["instance_name_from"] == "name_kwarg"
 
+    def test_one_line_constructor_uses_its_own_name_not_nested_call(
+        self, tmp_path: Path
+    ):
+        comps = self._scan(
+            tmp_path,
+            "from agno.agent import Agent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            'assistant = Agent(name="Weather Bot", model=OpenAIChat(id="gpt-4o"))\n',
+        )
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert [a.name for a in agents] == ["Weather Bot"]
+
+    def test_positional_name_not_taken_from_nested_call(self, tmp_path: Path):
+        path = tmp_path / "app.py"
+        source = (
+            "from autogen import ConversableAgent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            'bot = ConversableAgent(llm=OpenAIChat("gpt-4o"))\n'
+        )
+        path.write_text(source)
+        kb = {
+            **self._KB,
+            "autogen.ConversableAgent": {
+                "id": "autogen.ConversableAgent",
+                "concept": "agent",
+                "framework": "autogen",
+                "label": "class",
+            },
+        }
+        comps = _process_file_with_cache(parse_source_code(str(path), source), kb)
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert agents
+        assert all(a.name != "gpt-4o" for a in agents)
+
     def test_non_model_literal_is_not_emitted_as_model(self, tmp_path: Path):
         comps = self._scan(
             tmp_path,

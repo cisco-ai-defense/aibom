@@ -2920,6 +2920,69 @@ class TestAlignToolAnchors:
         assert aligned.line_number == 3
         assert "reported_line" not in (aligned.metadata or {})
 
+    def test_decorator_anchor_prefers_decorated_function(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "server.py"
+        src.write_text(
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            '@mcp.tool(name="lookup")\n'
+            "def search(q):\n"
+            "    return q\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 5
+
+    def test_imported_tool_not_moved_to_unrelated_local_def(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from tools import lookup\n"
+            "agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=2,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 2
+
+    def test_registered_tool_uses_def_bound_at_registration(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x * 2\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 1
+
     def test_non_tools_are_untouched(self, tmp_path: Path):
         from aibom.scan_pipeline import _align_tool_anchors
 
