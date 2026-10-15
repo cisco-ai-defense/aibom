@@ -25,6 +25,7 @@ Stages:
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 import time
@@ -692,6 +693,66 @@ def _has_instantiation_marker(c: "AIComponent") -> bool:
         meta.get(key)
         for key in ("call_pattern", "assigned_to", "assigned_target", "kb_id")
     )
+
+
+_DEF_LINE_RE = re.compile(r"\s*(async\s+)?def\s")
+
+
+def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
+    """Anchor Python tools at their defining ``def`` statement.
+
+    Scanners report tools at the decorator line or at the registration call
+    (``Agent(tools=[fn])``, ``add_tool(fn)``). A tool whose function is defined in
+    the same file is anchored at that ``def``; a decorator-line anchor moves to the
+    ``def`` below it. Tools registered from another file keep the registration line.
+    """
+    cache: dict[str, tuple[dict[str, list[int]], list[str]]] = {}
+
+    def file_info(path: str) -> tuple[dict[str, list[int]], list[str]]:
+        if path not in cache:
+            defs: dict[str, list[int]] = {}
+            lines: list[str] = []
+            try:
+                source = Path(path).read_text(encoding="utf-8", errors="ignore")
+                lines = source.splitlines()
+                for node in ast.walk(ast.parse(source)):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        defs.setdefault(node.name, []).append(node.lineno)
+            except (OSError, SyntaxError, ValueError):
+                pass
+            cache[path] = (defs, lines)
+        return cache[path]
+
+    moved = 0
+    for comp in components:
+        if (
+            comp.component_type != AIComponentType.TOOL
+            or not comp.line_number
+            or not str(comp.file_path or "").endswith(".py")
+        ):
+            continue
+        defs, lines = file_info(str(comp.file_path))
+        target: int | None = None
+        same_file_defs = defs.get(comp.name) or []
+        if same_file_defs:
+            target = min(same_file_defs, key=lambda ln: abs(ln - comp.line_number))
+        else:
+            idx = comp.line_number - 1
+            if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("@"):
+                j = idx
+                while j < len(lines) and not _DEF_LINE_RE.match(lines[j]):
+                    j += 1
+                if j < len(lines):
+                    target = j + 1
+        if target and target != comp.line_number:
+            comp.metadata = {**(comp.metadata or {}), "reported_line": comp.line_number}
+            comp.line_number = target
+            moved += 1
+    if moved:
+        _LOGGER.info(
+            "Tool anchor alignment: moved %d tool(s) to their defining line", moved
+        )
+    return components
 
 
 def _consolidate_components(
@@ -2043,6 +2104,8 @@ class ScanPipeline:
                 "via registry (mode=embedding)",
                 reclassified,
             )
+
+        components = _align_tool_anchors(components)
 
         before = len(components)
         components = _consolidate_components(components)

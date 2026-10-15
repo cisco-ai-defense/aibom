@@ -2859,3 +2859,77 @@ class TestATREnrichmentFlag:
         assert tagged, "expected ATR enrichment to tag the skill"
         enrichment = tagged[0].metadata["security_enrichment"]
         assert enrichment["atlas_techniques"] == ["AML.T0010"]
+
+
+class TestAlignToolAnchors:
+    def test_decorated_tool_moves_to_def_line(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "server.py"
+        src.write_text(
+            "from mcp.server.fastmcp import FastMCP\n"
+            'mcp = FastMCP("demo")\n'
+            "\n"
+            "@mcp.tool()\n"
+            "async def search(q: str) -> str:\n"
+            "    return q\n"
+        )
+        tool = AIComponent(
+            name="search",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 5
+        assert aligned.metadata["reported_line"] == 4
+
+    def test_registered_tool_moves_to_same_file_def(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "def get_weather(city):\n"
+            "    return city\n"
+            "\n"
+            "agent = Agent(tools=[get_weather])\n"
+        )
+        tool = AIComponent(
+            name="get_weather",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 1
+
+    def test_tool_defined_elsewhere_keeps_registration_line(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from tools import lookup\n" "\n" "agent = Agent(tools=[lookup])\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=3,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 3
+        assert "reported_line" not in (aligned.metadata or {})
+
+    def test_non_tools_are_untouched(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text("@decorator\n" "def build():\n" "    pass\n")
+        agent = AIComponent(
+            name="build",
+            component_type=AIComponentType.AGENT,
+            file_path=str(src),
+            line_number=1,
+        )
+        [aligned] = _align_tool_anchors([agent])
+        assert aligned.line_number == 1
