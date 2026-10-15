@@ -2983,6 +2983,92 @@ class TestAlignToolAnchors:
         [aligned] = _align_tool_anchors([tool])
         assert aligned.line_number == 1
 
+    def _align_one(self, tmp_path: Path, source: str, name: str, line: int) -> int:
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(source)
+        tool = AIComponent(
+            name=name,
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=line,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        return aligned.line_number
+
+    def test_local_def_replacing_import_is_used(self, tmp_path: Path):
+        source = (
+            "from tools import lookup\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "agent = Agent(tools=[lookup])\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 6) == 3
+
+    def test_nested_def_in_other_scope_is_ignored(self, tmp_path: Path):
+        source = (
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "def helper():\n"
+            "    def lookup(y):\n"
+            "        return y\n"
+            "\n"
+            "agent = Agent(tools=[lookup])\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 8) == 1
+
+    def test_later_def_after_assignment_keeps_registration_line(self, tmp_path: Path):
+        source = (
+            "lookup = existing_tool\n"
+            "agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 2) == 2
+
+    def test_later_module_def_keeps_module_level_registration_line(
+        self, tmp_path: Path
+    ):
+        source = (
+            "agent = Agent(tools=[lookup])\n" "\n" "def lookup(x):\n" "    return x\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 1) == 1
+
+    def test_registration_inside_function_uses_module_def(self, tmp_path: Path):
+        source = (
+            "def main():\n"
+            "    agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 2) == 4
+
+    def test_consolidated_evidence_keeps_reported_line(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        first = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/a.py",
+            line_number=1,
+        )
+        moved = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/b.py",
+            line_number=9,
+            metadata={"reported_line": 20},
+        )
+        [merged] = _consolidate_components([first, moved])
+        assert merged.metadata["evidence"][0]["line"] == 9
+        assert merged.metadata["evidence"][0]["reported_line"] == 20
+
     def test_non_tools_are_untouched(self, tmp_path: Path):
         from aibom.scan_pipeline import _align_tool_anchors
 
