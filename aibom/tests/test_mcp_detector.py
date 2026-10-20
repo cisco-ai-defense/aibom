@@ -151,3 +151,24 @@ class TestMcpDetector:
         comps, _ = run_scanner(McpDetector, tmp_path, {"http.py": src})
         clients = [c for c in comps if c.component_type == AIComponentType.MCP_CLIENT]
         assert clients == []
+
+    def test_resource_and_prompt_decorators_are_not_tools(self, tmp_path: Path) -> None:
+        src = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            'mcp = FastMCP("demo")\n'
+            "\n"
+            "@mcp.tool()\n"
+            "def search(q: str) -> str:\n"
+            "    return q\n"
+            "\n"
+            '@mcp.resource("demo://template")\n'
+            "def template() -> str:\n"
+            '    return ""\n'
+            "\n"
+            "@mcp.prompt()\n"
+            "def review(code: str) -> str:\n"
+            "    return code\n"
+        )
+        comps, _ = run_scanner(McpDetector, tmp_path, {"srv.py": src})
+        tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert [t.name for t in tools] == ["search"]

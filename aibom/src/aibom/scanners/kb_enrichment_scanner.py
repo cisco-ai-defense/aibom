@@ -2729,11 +2729,18 @@ def _obs(
 
 
 def _resolve_chain(name: str, variable_map: dict[str, str]) -> str:
-    """Resolve ``var.method`` → ``FullyQualified.method`` via the variable map."""
+    """Resolve ``var.method`` → ``FullyQualified.method`` via the variable map.
+
+    A name already qualified with the variable's value is left alone: in
+    ``mcp = FastMCP(...)`` the variable ``mcp`` shares its name with the ``mcp``
+    package, and re-resolving ``mcp.server.fastmcp.FastMCP.resource`` would
+    otherwise double the prefix and miss the exact catalog entry.
+    """
     if "." in name:
         head, tail = name.split(".", 1)
-        if head in variable_map:
-            return f"{variable_map[head]}.{tail}"
+        target = variable_map.get(head)
+        if target and name != target and not name.startswith(target + "."):
+            return f"{target}.{tail}"
     return name
 
 

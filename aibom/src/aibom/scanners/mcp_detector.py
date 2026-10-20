@@ -267,6 +267,9 @@ def _components_from_python(path: Path) -> list[AIComponent]:
     has_mcp = bool(m_imp or m_srv_imp or m_fastmcp_imp or _RE_FASTMCP.search(text))
     _RE_DEF_AFTER_DECORATOR = re.compile(r"(?:async\s+)?def\s+(\w+)")
     for i, mdec in enumerate(_RE_MCP_TOOL_DECORATOR.finditer(text)):
+        # @x.resource / @x.prompt register MCP resources and prompts, not tools.
+        if mdec.group(1) != "tool":
+            continue
         rest = text[mdec.end() : mdec.end() + 200]
         fn_m = _RE_DEF_AFTER_DECORATOR.search(rest)
         tool_name = fn_m.group(1) if fn_m else f"{path.stem}_tool_{i}"

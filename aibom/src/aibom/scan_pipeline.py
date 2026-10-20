@@ -778,6 +778,75 @@ class _FileScopes:
         return None
 
 
+# Registration calls that take the tool function itself (``mcp.add_tool(fn)``), as
+# recorded by the scanner's argument-aware pass in ``extracted_via``.
+_REGISTRATION_CALL_PREFIXES = ("add_tool(", "register_tool(", "register_function(")
+_MAX_REEXPORT_DEPTH = 3
+
+
+def _is_registration_call_tool(comp: AIComponent) -> bool:
+    via = str((comp.metadata or {}).get("extracted_via") or "")
+    return via.startswith(_REGISTRATION_CALL_PREFIXES)
+
+
+def _import_target_file(importer: Path, module: str, level: int) -> Path | None:
+    """File that ``from <module> import ...`` in *importer* refers to, if local."""
+    parts = module.split(".") if module else []
+    if level:
+        base = importer.parent
+        for _ in range(level - 1):
+            base = base.parent
+        bases = [base]
+    else:
+        bases = list(importer.parents)
+    for base in bases:
+        target = base.joinpath(*parts)
+        candidates = [target / "__init__.py"]
+        if parts:
+            candidates.insert(0, target.with_suffix(".py"))
+        for cand in candidates:
+            if cand.is_file():
+                return cand
+    return None
+
+
+def _imported_def(
+    path: Path, name: str, trees: dict[Path, ast.Module | None], depth: int = 0
+) -> tuple[Path, int] | None:
+    """(file, line) of the ``def`` a module-level ``from ... import name`` binds to.
+
+    Follows re-exports through package ``__init__`` files up to a small depth.
+    """
+    if depth > _MAX_REEXPORT_DEPTH:
+        return None
+    if path not in trees:
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            trees[path] = ast.parse(source)
+        except (OSError, SyntaxError, ValueError):
+            trees[path] = None
+    tree = trees[path]
+    if tree is None:
+        return None
+    binding: ast.stmt | None = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == name:
+                binding = node
+        elif isinstance(node, ast.ImportFrom):
+            if any((a.asname or a.name) == name for a in node.names):
+                binding = node
+    if isinstance(binding, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return (path, binding.lineno) if depth else None
+    if not isinstance(binding, ast.ImportFrom):
+        return None
+    alias = next(a for a in binding.names if (a.asname or a.name) == name)
+    target = _import_target_file(path, binding.module or "", binding.level)
+    if target is None:
+        return None
+    return _imported_def(target, alias.name, trees, depth + 1)
+
+
 def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
     """Anchor Python tools at their defining ``def`` statement.
 
@@ -786,7 +855,12 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
     function it decorates. A registered tool moves to the same-file ``def`` that the
     name is bound to at the registration line, following Python scoping; imports,
     assignments and definitions that only appear later keep the registration line.
+    A tool registered through ``add_tool(fn)`` / ``register_tool(fn)`` /
+    ``register_function(fn)`` whose name is imported follows the import to the
+    ``def`` in the defining module. Tools handed to an agent's ``tools=[...]`` keep
+    the registration line.
     """
+    trees: dict[Path, ast.Module | None] = {}
     cache: dict[str, tuple[_FileScopes | None, list[str]]] = {}
 
     def file_info(path: str) -> tuple[_FileScopes | None, list[str]]:
@@ -821,6 +895,18 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
                 target = j + 1
         elif scopes is not None:
             target = scopes.def_line_for(comp.name, comp.line_number)
+            if target is None and _is_registration_call_tool(comp):
+                found = _imported_def(Path(comp.file_path), comp.name, trees)
+                if found is not None:
+                    comp.metadata = {
+                        **(comp.metadata or {}),
+                        "reported_file": comp.file_path,
+                        "reported_line": comp.line_number,
+                    }
+                    comp.file_path = str(found[0])
+                    comp.line_number = found[1]
+                    moved += 1
+                    continue
         if target and target != comp.line_number:
             comp.metadata = {**(comp.metadata or {}), "reported_line": comp.line_number}
             comp.line_number = target
@@ -897,6 +983,11 @@ def _consolidate_components(
                         **(
                             {"reported_line": c.metadata["reported_line"]}
                             if (c.metadata or {}).get("reported_line")
+                            else {}
+                        ),
+                        **(
+                            {"reported_file": c.metadata["reported_file"]}
+                            if (c.metadata or {}).get("reported_file")
                             else {}
                         ),
                     }

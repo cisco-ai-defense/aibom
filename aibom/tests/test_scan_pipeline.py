@@ -2920,6 +2920,91 @@ class TestAlignToolAnchors:
         assert aligned.line_number == 3
         assert "reported_line" not in (aligned.metadata or {})
 
+    @staticmethod
+    def _registered(name: str, path: Path, line: int) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=AIComponentType.TOOL,
+            file_path=str(path),
+            line_number=line,
+            metadata={"extracted_via": "add_tool(_pos_0)"},
+        )
+
+    def test_add_tool_follows_relative_import_to_def(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "session.py").write_text(
+            "import json\n" "\n" "async def create_session(name):\n" "    return name\n"
+        )
+        server = pkg / "__init__.py"
+        server.write_text(
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from .session import create_session\n"
+            'mcp = FastMCP("demo")\n'
+            "mcp.add_tool(create_session)\n"
+        )
+        [aligned] = _align_tool_anchors([self._registered("create_session", server, 4)])
+        assert aligned.file_path == str(pkg / "session.py")
+        assert aligned.line_number == 3
+        assert aligned.metadata["reported_file"] == str(server)
+        assert aligned.metadata["reported_line"] == 4
+
+    def test_add_tool_follows_absolute_import_and_reexport(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        pkg = tmp_path / "src" / "app"
+        (pkg / "agent").mkdir(parents=True)
+        (pkg / "agent" / "__init__.py").write_text("from .impl import forecast\n")
+        (pkg / "agent" / "impl.py").write_text(
+            "\n" "def forecast(x):\n" "    return x\n"
+        )
+        server = pkg / "server.py"
+        server.write_text(
+            "from app.agent import forecast as run_forecast\n"
+            "\n"
+            "mcp.add_tool(run_forecast)\n"
+        )
+        [aligned] = _align_tool_anchors([self._registered("run_forecast", server, 3)])
+        assert aligned.file_path == str(pkg / "agent" / "impl.py")
+        assert aligned.line_number == 2
+
+    def test_add_tool_with_unresolvable_import_keeps_registration_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        server = tmp_path / "server.py"
+        server.write_text(
+            "from some_installed_pkg.tools import search\n" "mcp.add_tool(search)\n"
+        )
+        [aligned] = _align_tool_anchors([self._registered("search", server, 2)])
+        assert aligned.file_path == str(server)
+        assert aligned.line_number == 2
+        assert "reported_file" not in (aligned.metadata or {})
+
+    def test_agent_tools_kwarg_keeps_import_resolvable_registration_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        (tmp_path / "tools.py").write_text("def lookup(q):\n    return q\n")
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from tools import lookup\n" "\n" "agent = Agent(tools=[lookup])\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=3,
+            metadata={"extracted_via": "agent_tools_kwarg"},
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.file_path == str(src)
+        assert aligned.line_number == 3
+
     def test_decorator_anchor_prefers_decorated_function(self, tmp_path: Path):
         from aibom.scan_pipeline import _align_tool_anchors
 
@@ -3078,6 +3163,25 @@ class TestAlignToolAnchors:
         [merged] = _consolidate_components([first, moved])
         assert merged.metadata["evidence"][0]["line"] == 9
         assert merged.metadata["evidence"][0]["reported_line"] == 20
+
+    def test_consolidated_evidence_keeps_reported_file(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        first = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/a.py",
+            line_number=1,
+        )
+        moved = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/tools.py",
+            line_number=9,
+            metadata={"reported_file": "/r/server.py", "reported_line": 20},
+        )
+        [merged] = _consolidate_components([first, moved])
+        assert merged.metadata["evidence"][0]["reported_file"] == "/r/server.py"
 
     def test_non_tools_are_untouched(self, tmp_path: Path):
         from aibom.scan_pipeline import _align_tool_anchors

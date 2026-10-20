@@ -1091,3 +1091,61 @@ class TestArgumentAwareExtraction:
         agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
         assert agents
         assert all("instance_name_from" not in (c.metadata or {}) for c in agents)
+
+
+class TestVariableNamedLikeItsPackage:
+    """``mcp = FastMCP(...)``: the variable shares its name with the ``mcp`` package."""
+
+    _KB = {
+        "mcp.server.fastmcp.FastMCP": {
+            "id": "mcp.server.fastmcp.FastMCP",
+            "concept": "mcp_server",
+            "framework": "mcp",
+            "label": "class",
+        },
+        "mcp.server.fastmcp.FastMCP.resource": {
+            "id": "mcp.server.fastmcp.FastMCP.resource",
+            "concept": "mcp_server",
+            "framework": "mcp",
+            "label": "method",
+        },
+        "mcp.server.fastmcp.FastMCP.add_tool": {
+            "id": "mcp.server.fastmcp.FastMCP.add_tool",
+            "concept": "mcp_server",
+            "framework": "mcp",
+            "label": "method",
+        },
+    }
+
+    _SOURCE = (
+        "from mcp.server.fastmcp import FastMCP\n"
+        "from .session import create_session\n"
+        'mcp = FastMCP("demo")\n'
+        "mcp.add_tool(create_session)\n"
+        "\n"
+        '@mcp.resource(uri="demo://a", name="Template")\n'
+        "def get_template() -> str:\n"
+        '    return ""\n'
+    )
+
+    def _scan(self, tmp_path: Path):
+        path = tmp_path / "server.py"
+        path.write_text(self._SOURCE)
+        result = parse_source_code(str(path), self._SOURCE)
+        return _process_file_with_cache(result, self._KB)
+
+    def test_resource_decorator_is_not_a_server(self, tmp_path: Path):
+        comps = self._scan(tmp_path)
+        servers = [c for c in comps if c.component_type == AIComponentType.MCP_SERVER]
+        assert [(s.name, s.line_number) for s in servers] == [("demo", 3)]
+
+    def test_constructor_keeps_exact_catalog_id(self, tmp_path: Path):
+        comps = self._scan(tmp_path)
+        [server] = [c for c in comps if c.component_type == AIComponentType.MCP_SERVER]
+        assert server.metadata["kb_id"] == "mcp.server.fastmcp.FastMCP"
+
+    def test_add_tool_registration_still_emits_tool(self, tmp_path: Path):
+        comps = self._scan(tmp_path)
+        tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert [(t.name, t.line_number) for t in tools] == [("create_session", 4)]
+        assert tools[0].metadata["extracted_via"] == "add_tool(_pos_0)"
