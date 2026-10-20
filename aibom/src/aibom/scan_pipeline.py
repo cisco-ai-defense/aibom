@@ -430,12 +430,19 @@ def _propagate_removals(
         return received
 
     lookup_pool = all_candidates if all_candidates is not None else received
-    # A tool anchored at an import line is that file's reference: its removal
-    # reaches only the same file.
+    # Agents created at several sites are distinct instances: a removal
+    # cascades only to references in the removed instance's own file. A tool
+    # anchored at an import line is that file's reference, so its removal
+    # reaches only the same file too.
+    split_keys = _multi_site_agent_keys(lookup_pool)
     restrict_files: dict[tuple, set[str]] = {}
     for c in sent:
-        if c.instance_id in removed_ids and _is_import_anchored_tool(c):
-            restrict_files.setdefault(_consolidation_key(c), set()).add(c.file_path)
+        if c.instance_id in removed_ids and (
+            _consolidation_key(c) in split_keys or _is_import_anchored_tool(c)
+        ):
+            restrict_files.setdefault(_consolidation_key(c), set()).add(
+                c.file_path
+            )
     drop_ids: set[str] = set()
     for c in lookup_pool:
         if _is_protected_dependency(c):
@@ -452,6 +459,8 @@ def _propagate_removals(
         if restrict_import[key] and not _is_import_only_candidate(c):
             continue
         if restrict_test[key] and not _is_test_file(c.file_path):
+            continue
+        if key in restrict_files and c.file_path not in restrict_files[key]:
             continue
         drop_ids.add(c.instance_id)
 
@@ -1071,6 +1080,86 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
     return components
 
 
+def _is_agent_creation_site(c: "AIComponent") -> bool:
+    """True for an agent row captured at an agent constructor call.
+
+    Only ``call_pattern`` (e.g. ``strands.Agent``) counts. A ``kb_id`` alone
+    marks import rows too, and ``assigned_to`` alone also marks non-agent
+    calls that a catalog row typed as agent (``client = genai.Client()``);
+    splitting on those would surface each mistyped call as its own agent.
+    """
+    if c.component_type.value != "agent":
+        return False
+    return bool((c.metadata or {}).get("call_pattern"))
+
+
+def _multi_site_agent_keys(components: list["AIComponent"]) -> set[tuple]:
+    """Consolidation keys whose agents are created at more than one site.
+
+    Variable names are not identities for agents: ``agent = Agent(...)`` in
+    twelve scripts is twelve agents. Keys listed here are split per instance.
+    """
+    sites: dict[tuple, set[tuple[str, int]]] = {}
+    for c in components:
+        if _is_agent_creation_site(c):
+            key = _consolidation_key(c)
+            sites.setdefault(key, set()).add((c.file_path, c.line_number))
+    return {key for key, found in sites.items() if len(found) > 1}
+
+
+def _agent_instance_keys(components: list["AIComponent"]) -> dict[int, tuple]:
+    """Map ``id(component)`` to an instance-scoped consolidation key.
+
+    Only agents whose name has several creation sites get an entry. Each
+    creation site keys on its own (file, line). Other references (imports,
+    ``agent.run(...)``) join the nearest preceding creation site in the same
+    file, or the first one in that file. References in a file with no creation
+    site join the site that whole-name consolidation would have chosen.
+    """
+    split = _multi_site_agent_keys(components)
+    if not split:
+        return {}
+    sites: dict[tuple, list[int]] = {}
+    fallback: dict[tuple, "AIComponent"] = {}
+    for c in components:
+        key = _consolidation_key(c)
+        if key not in split or not _is_agent_creation_site(c):
+            continue
+        sites.setdefault((key, c.file_path), []).append(c.line_number)
+        rank = (
+            c.heuristic_confidence,
+            0 if _is_test_file(c.file_path) else 1,
+            -c.line_number,
+        )
+        best = fallback.get(key)
+        if best is None or rank > (
+            best.heuristic_confidence,
+            0 if _is_test_file(best.file_path) else 1,
+            -best.line_number,
+        ):
+            fallback[key] = c
+    for lines in sites.values():
+        lines.sort()
+
+    keys: dict[int, tuple] = {}
+    for c in components:
+        key = _consolidation_key(c)
+        if key not in split:
+            continue
+        lines = sites.get((key, c.file_path))
+        if lines:
+            if _is_agent_creation_site(c):
+                line = c.line_number
+            else:
+                before = [n for n in lines if n <= c.line_number]
+                line = before[-1] if before else lines[0]
+            keys[id(c)] = key + (c.file_path, line)
+        else:
+            site = fallback[key]
+            keys[id(c)] = key + (site.file_path, site.line_number)
+    return keys
+
+
 def _consolidate_components(
     components: list["AIComponent"],
 ) -> list["AIComponent"]:
@@ -1089,8 +1178,9 @@ def _consolidate_components(
     from collections import OrderedDict
 
     groups: OrderedDict[tuple, list["AIComponent"]] = OrderedDict()
+    instance_keys = _agent_instance_keys(components)
     for c in components:
-        key = _consolidation_key(c)
+        key = instance_keys.get(id(c)) or _consolidation_key(c)
         if _is_import_anchored_tool(c):
             # Each file imports its own reference to the tool.
             key = key + (c.file_path,)
