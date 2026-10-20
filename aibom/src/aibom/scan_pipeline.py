@@ -789,6 +789,85 @@ def _is_registration_call_tool(comp: AIComponent) -> bool:
     return via.startswith(_REGISTRATION_CALL_PREFIXES)
 
 
+# Registration calls whose argument may be a loop variable over a tool inventory;
+# ``FunctionTool.from_function(tool)`` wraps it before ``add_tool``.
+_LOOP_REGISTRATION_PREFIXES = _REGISTRATION_CALL_PREFIXES + ("from_function(",)
+
+
+def _expand_loop_registered_tools(
+    components: list[AIComponent], scan_paths: list[str]
+) -> list[AIComponent]:
+    """Replace a tool registered in a loop with one tool per function it registers.
+
+    ``for tool in inventory: mcp.add_tool(tool)`` yields a single scanner row
+    named after the loop variable. When the inventory can be followed to the
+    functions it lists, each becomes a tool anchored at its ``def``; when it
+    cannot, the loop-variable row is dropped rather than reported as a tool.
+    """
+    from .registration_flow import LoopRegistrationResolver
+
+    roots = sorted(
+        (Path(p).resolve() for p in scan_paths if Path(p).is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
+    resolvers: dict[Path, LoopRegistrationResolver] = {}
+    out: list[AIComponent] = []
+    expanded = dropped = 0
+    for comp in components:
+        via = str((comp.metadata or {}).get("extracted_via") or "")
+        path = Path(comp.file_path or "")
+        if (
+            comp.component_type != AIComponentType.TOOL
+            or not comp.line_number
+            or path.suffix != ".py"
+            or not via.startswith(_LOOP_REGISTRATION_PREFIXES)
+        ):
+            out.append(comp)
+            continue
+        resolved = path.resolve()
+        root = next((r for r in roots if resolved.is_relative_to(r)), None)
+        if root is None:
+            out.append(comp)
+            continue
+        resolver = resolvers.setdefault(root, LoopRegistrationResolver(root))
+        refs = resolver.resolve(resolved, comp.line_number, comp.name)
+        if refs is None:
+            out.append(comp)
+            continue
+        if not refs:
+            dropped += 1
+            continue
+        for ref in refs:
+            file_path = str(ref.path)
+            out.append(
+                comp.model_copy(
+                    update={
+                        "name": ref.name,
+                        "file_path": file_path,
+                        "line_number": ref.line,
+                        "instance_id": f"{ref.name}_{file_path}_{ref.line}",
+                        "metadata": {
+                            **(comp.metadata or {}),
+                            "registered_in_loop": True,
+                            "reported_file": comp.file_path,
+                            "reported_line": comp.line_number,
+                        },
+                    }
+                )
+            )
+        expanded += 1
+    if expanded or dropped:
+        _LOGGER.info(
+            "Loop-registered tools: expanded %d registration(s) into %d tool(s); "
+            "dropped %d unresolved",
+            expanded,
+            len(out) - (len(components) - expanded - dropped),
+            dropped,
+        )
+    return out
+
+
 def _import_target_file(importer: Path, module: str, level: int) -> Path | None:
     """File that ``from <module> import ...`` in *importer* refers to, if local."""
     parts = module.split(".") if module else []
@@ -1957,6 +2036,8 @@ class ScanPipeline:
         )
 
         resolved = resolve_components(components, env_idx)
+        # Before classification, so classifiers see the registered functions.
+        resolved = _expand_loop_registered_tools(resolved, self.scan_paths)
 
         ext_deps = detect_external_repo_deps(self.scan_paths)
         if ext_deps:
