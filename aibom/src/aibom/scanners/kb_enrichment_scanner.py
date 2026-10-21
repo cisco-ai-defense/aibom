@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..catalog_db import CatalogDB
-from ..cst_parser import parse_source_code
+from ..cst_parser import literal_branches, parse_source_code
 from ..db_loader import DatabaseLoadError, ensure_local_database
 from ..models import (
     AIComponent,
@@ -901,6 +901,7 @@ class KBEnrichmentScanner(BaseScanner):
                 components.extend(_detect_tool_schemas(result))
                 components.extend(_detect_prompt_kwargs(result))
                 components.extend(_detect_model_kwargs(result))
+                components.extend(_detect_config_getter_defaults(result))
                 components.extend(_detect_import_based_assets(result))
                 components.extend(_detect_guardrail_calls(result))
 
@@ -1832,11 +1833,20 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
         found_model = False
         for kwarg_name in _MODEL_KWARG_NAMES:
-            val, var = kwarg_value(call_obs.arguments.get(kwarg_name))
-            if not val or len(val) < 3:
-                continue
-            reg = registry_lookup(val)
-            if reg:
+            raw = call_obs.arguments.get(kwarg_name)
+            # ``model="a" if cond else "b"`` contributes both branches; a
+            # variable resolves through the module's string constants.
+            candidates = [(v, None) for v in literal_branches(raw)]
+            if not candidates:
+                val, var = kwarg_value(raw)
+                candidates = [(val, var)] if val else []
+            for val, var in candidates:
+                val = val.strip().strip("'\"")
+                if not val or len(val) < 3:
+                    continue
+                reg = registry_lookup(val)
+                if not reg:
+                    continue
                 seen.add(key)
                 components.append(
                     AIComponent(
@@ -1856,6 +1866,7 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                     )
                 )
                 found_model = True
+            if found_model:
                 break
 
         if not found_model and short in _BARE_CLIENT_HINTS:
@@ -1878,6 +1889,121 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                 )
             )
 
+    return components
+
+
+# Typed config getters such as ``self._get_str("model", "gpt-4")``: the first
+# positional argument is the setting key, the default follows it.
+_CONFIG_GETTER_NAMES: frozenset[str] = frozenset(
+    {
+        "_get",
+        "_get_str",
+        "get_str",
+        "_get_string",
+        "get_string",
+        "_get_enum",
+        "get_enum",
+        "_get_config",
+        "get_config",
+        "_get_setting",
+        "get_setting",
+    }
+)
+_CONFIG_MODEL_KEYS: frozenset[str] = frozenset(
+    {"model", "model_name", "model_id", "llm_model", "chat_model", "deployment_name"}
+)
+_CONFIG_EMBEDDING_KEYS: frozenset[str] = frozenset(
+    {"embedding_model", "embedding_model_name", "embed_model", "embeddings_model"}
+)
+_CONFIG_ENDPOINT_KEYS: frozenset[str] = frozenset(
+    {
+        "api_base",
+        "base_url",
+        "endpoint",
+        "endpoint_url",
+        "api_endpoint",
+        "azure_endpoint",
+    }
+)
+
+
+def _config_getter_default(short: str, args: dict[str, Any]) -> Any:
+    if "default" in args:
+        return args["default"]
+    # ``_get_enum(key, options, default)`` puts the options list first.
+    return args.get("_pos_2" if short.endswith("_enum") else "_pos_1")
+
+
+def _detect_config_getter_defaults(
+    result: "CodeAnalysisResult",
+) -> list[AIComponent]:
+    """Extract models, embeddings and LLM endpoints from config-getter defaults.
+
+    Matches ``<obj>._get_str("model", <default>)``-style calls whose key names
+    a model, embedding model or API base. Each string literal the default can
+    evaluate to (both branches of a conditional expression) is a candidate;
+    model ids must look like one, endpoints must be http(s) URLs.
+    """
+    from .model_detector import is_known_embedding_model_name, registry_lookup
+
+    components: list[AIComponent] = []
+    seen: set[tuple[AIComponentType, str]] = set()
+
+    for call_obs, line in _call_sites(result):
+        qn = call_obs.qualified_name or ""
+        short = qn.rsplit(".", 1)[-1]
+        if short not in _CONFIG_GETTER_NAMES:
+            continue
+        args = call_obs.arguments or {}
+        key = _arg_literal(args.get("_pos_0") or args.get("key"))
+        if not key:
+            continue
+        key = key.lower()
+        if key in _CONFIG_MODEL_KEYS:
+            ctype = AIComponentType.MODEL
+        elif key in _CONFIG_EMBEDDING_KEYS:
+            ctype = AIComponentType.EMBEDDING
+        elif key in _CONFIG_ENDPOINT_KEYS:
+            ctype = AIComponentType.LLM_ENDPOINT
+        else:
+            continue
+
+        for val in literal_branches(_config_getter_default(short, args)):
+            val = val.strip()
+            if not val or (ctype, val) in seen:
+                continue
+            metadata: dict[str, Any] = {
+                "detection_method": "config_getter_default",
+                "config_getter": short,
+                "config_key": key,
+            }
+            if ctype == AIComponentType.LLM_ENDPOINT:
+                if not val.startswith(("http://", "https://")):
+                    continue
+                metadata["endpoint_url"] = val
+            elif ctype == AIComponentType.EMBEDDING:
+                if not (is_known_embedding_model_name(val) or "embed" in val.lower()):
+                    continue
+            elif not _looks_like_model_id(val):
+                continue
+            else:
+                reg = registry_lookup(val)
+                if reg:
+                    metadata["provider"] = reg.get("provider", "")
+            seen.add((ctype, val))
+            components.append(
+                AIComponent(
+                    name=val,
+                    component_type=ctype,
+                    file_path=result.file_path,
+                    line_number=line,
+                    model_name=val if ctype == AIComponentType.MODEL else None,
+                    embedding_model=val if ctype == AIComponentType.EMBEDDING else None,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    heuristic_confidence=0.8,
+                    metadata=metadata,
+                )
+            )
     return components
 
 

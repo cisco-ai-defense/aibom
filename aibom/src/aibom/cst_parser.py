@@ -154,7 +154,36 @@ def _extract_argument_value(node: cst.BaseExpression) -> Any:
             return {"_call": func_name, "_args": inner_parts}
         return {"_call": "unknown", "_args": inner_parts}
 
+    if isinstance(node, cst.IfExp):
+        # ``a if cond else b``: keep both branches so literal defaults such as
+        # ``shared if shared is not None else "gpt-4"`` stay visible.
+        return {
+            "_ifexp": [
+                _extract_argument_value(node.body),
+                _extract_argument_value(node.orelse),
+            ]
+        }
+
     return f"COMPLEX_TYPE:{type(node).__name__}"
+
+
+def literal_branches(value: Any) -> List[str]:
+    """Return the string literals an extracted argument value can evaluate to.
+
+    A plain string literal yields itself; a conditional expression yields the
+    literals of its branches. Variable, attribute and other non-literal
+    sentinels yield nothing.
+    """
+    if isinstance(value, str):
+        if value.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
+            return []
+        return [value]
+    if isinstance(value, dict) and isinstance(value.get("_ifexp"), list):
+        out: List[str] = []
+        for branch in value["_ifexp"]:
+            out.extend(literal_branches(branch))
+        return out
+    return []
 
 
 class SymbolVisitor(cst.CSTVisitor):
