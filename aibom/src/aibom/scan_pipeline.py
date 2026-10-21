@@ -156,6 +156,31 @@ _CONTEXT_FREE_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _drop_unresolved_model_candidates(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Drop model rows that only a classifier could confirm (no-LLM runs).
+
+    Without a classifier, two kinds of ``model`` candidate stay unresolved:
+    in-repo classes that matched a catalog entry on the last segment of their
+    name only (``partial_kb_id``), and client / loader symbols (catalog
+    matches and bare provider clients) for which no model id was resolved.
+    Neither names a model, so they are removed instead of being reported.
+    """
+    kept: list["AIComponent"] = []
+    for c in components:
+        if c.component_type == AIComponentType.MODEL and not c.model_name:
+            meta = c.metadata or {}
+            if (
+                meta.get("partial_kb_id")
+                or meta.get("kb_id")
+                or meta.get("detection_method") == "bare_provider_client"
+            ):
+                continue
+        kept.append(c)
+    return kept
+
+
 def _partition_agentic_secrets(
     components: list["AIComponent"],
     review_secrets: bool = False,
@@ -2186,7 +2211,9 @@ class ScanPipeline:
         components: list[AIComponent],
         relationships: list[ComponentRelationship],
     ) -> tuple[list[AIComponent], list[ComponentRelationship], list[Any]]:
-        if not self.llm_config or not components:
+        if not self.llm_config:
+            return _drop_unresolved_model_candidates(components), relationships, []
+        if not components:
             return components, relationships, []
 
         _LOGGER.info(
