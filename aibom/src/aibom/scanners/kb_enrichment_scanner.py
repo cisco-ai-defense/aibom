@@ -1612,6 +1612,52 @@ _ENDPOINT_KWARG_NAMES: frozenset[str] = frozenset(
     }
 )
 
+_GETENV_CALLS: frozenset[str] = frozenset(
+    {"os.getenv", "getenv", "os.environ.get", "environ.get"}
+)
+
+
+def _string_value(node: ast.expr) -> str | None:
+    """The string a constant or ``os.getenv(NAME, "default")`` read evaluates to."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call) and ast.unparse(node.func) in _GETENV_CALLS:
+        default = node.args[1] if len(node.args) > 1 else None
+        for kw in node.keywords:
+            if kw.arg == "default":
+                default = kw.value
+        if isinstance(default, ast.Constant) and isinstance(default.value, str):
+            return default.value
+    return None
+
+
+def _module_string_constants(file_path: str) -> dict[str, str]:
+    """Module-level names bound to one string, either a literal or an env default.
+
+    Names assigned more than one distinct value are left out: the value a
+    constructor sees cannot be told without running the code.
+    """
+    try:
+        tree = ast.parse(read_python_source(Path(file_path)))
+    except (OSError, SyntaxError, ValueError):
+        return {}
+    values: dict[str, set[str | None]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                values.setdefault(target.id, set()).add(_string_value(value))
+    return {
+        name: next(iter(vals))
+        for name, vals in values.items()
+        if len(vals) == 1 and next(iter(vals))
+    }
+
 _KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset(
     {
         "ChatOpenAI",
@@ -1704,7 +1750,9 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
     Classification rules (no dual emission):
     1. Constructor has ``base_url`` / ``azure_endpoint`` / ``api_base`` / ``endpoint_url``
        with a concrete URL -> **LLM_ENDPOINT**.
-    2. Constructor has ``model=`` with a registry-known value -> **MODEL**.
+    2. Constructor has ``model=`` with a registry-known value -> **MODEL**. A
+       variable resolves through a module-level string constant or an
+       ``os.getenv(NAME, "default")`` default.
     3. Known client class with neither model nor URL kwargs -> **needs_agentic MODEL**
        (bare client; prune if agentic layer cannot resolve a model ID).
     """
@@ -1712,6 +1760,19 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     components: list[AIComponent] = []
     seen: set[tuple[str, int]] = set()
+    constants: dict[str, str] | None = None
+
+    def kwarg_value(raw: Any) -> tuple[str | None, str | None]:
+        """(value, variable) of a kwarg; a variable resolves via module constants."""
+        nonlocal constants
+        if not isinstance(raw, str) or raw.startswith(("ATTRIBUTE:", "COMPLEX_TYPE:")):
+            return None, None
+        if not raw.startswith("VARIABLE:"):
+            return raw.strip().strip("'\""), None
+        if constants is None:
+            constants = _module_string_constants(result.file_path)
+        var = raw.removeprefix("VARIABLE:")
+        return constants.get(var), var
 
     all_calls = [(c, c.line_number) for c in result.calls]
     all_calls += [(a.call, a.line_number) for a in result.assignments]
@@ -1758,12 +1819,7 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
         found_model = False
         for kwarg_name in _MODEL_KWARG_NAMES:
-            val = call_obs.arguments.get(kwarg_name)
-            if not isinstance(val, str):
-                continue
-            if val.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
-                continue
-            val = val.strip().strip("'\"")
+            val, var = kwarg_value(call_obs.arguments.get(kwarg_name))
             if not val or len(val) < 3:
                 continue
             reg = registry_lookup(val)
@@ -1782,6 +1838,7 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                             "provider": reg.get("provider", ""),
                             "extracted_from_kwarg": kwarg_name,
                             "constructor": short,
+                            **({"model_id_variable": var} if var else {}),
                         },
                     )
                 )

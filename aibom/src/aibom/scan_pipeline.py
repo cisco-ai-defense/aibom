@@ -74,7 +74,7 @@ from .cross_ref import (
 from .custom_catalog import CustomCatalogConfig
 from .llm_factory import ensure_llm_runtime_available
 from .models import ScanContext
-from .models.enums import AIComponentType, RelationshipType
+from .models.enums import AIComponentType, DetectionSource, RelationshipType
 from .models.scan import AIComponent, ComponentRelationship
 from .scanners import run_scanners
 from .scanners.dependency_scanner import discover_ai_package_set, is_known_ai_package
@@ -1154,6 +1154,66 @@ def _consolidate_components(
         result.append(merged)
 
     return result
+
+
+# Bedrock model ids: an optional cross-region inference-profile prefix, the
+# provider, the base model id, and a version suffix
+# (``us.anthropic.claude-3-5-haiku-20241022-v1:0``).
+_BEDROCK_MODEL_ID_RE = re.compile(
+    r"^(?P<region>(?:us|us-gov|eu|apac|ap|ca|jp|au|global)\.)?"
+    r"(?:anthropic|amazon|meta|mistral|cohere|ai21|deepseek|writer|qwen|openai)\."
+    r"(?P<base>[a-z0-9][a-z0-9.\-]*?)(?P<version>-v\d+(?::\d+)?)?$",
+    re.IGNORECASE,
+)
+
+
+def _bedrock_base_model_id(model_id: str) -> str | None:
+    """Base model id of a Bedrock model or inference-profile id, else ``None``."""
+    m = _BEDROCK_MODEL_ID_RE.match(model_id.strip())
+    if not m or not (m.group("region") or m.group("version")):
+        return None
+    base = m.group("base")
+    return base if any(ch.isdigit() for ch in base) else None
+
+
+def _canonicalize_bedrock_model_ids(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Name MODEL / EMBEDDING rows that carry a Bedrock id by their base model id.
+
+    ``us.anthropic.claude-3-5-haiku-20241022-v1:0`` and
+    ``anthropic.claude-3-5-haiku-20241022-v1:0`` are the Bedrock routes to
+    ``claude-3-5-haiku-20241022``. The Bedrock id is kept in
+    ``metadata["bedrock_model_id"]``.
+    """
+    for c in components:
+        if c.component_type not in (AIComponentType.MODEL, AIComponentType.EMBEDDING):
+            continue
+        base = _bedrock_base_model_id(c.name)
+        if not base:
+            continue
+        c.metadata = {**(c.metadata or {}), "bedrock_model_id": c.name}
+        if c.model_name in (None, c.name):
+            c.model_name = base
+        c.name = base
+    return components
+
+
+def _is_unresolved_model_class(c: "AIComponent") -> bool:
+    """True for a MODEL row that names a client class, not a model.
+
+    The scanner reports a provider class (``AnthropicModel(model_id=VAR)``)
+    whose model id it could not read, either as a bare-client row or as a
+    catalog class row; resolving the id is left to the LLM stage.
+    """
+    if c.component_type != AIComponentType.MODEL or c.model_name:
+        return False
+    meta = c.metadata or {}
+    if meta.get("detection_method") == "bare_provider_client":
+        return True
+    return c.detection_source == DetectionSource.KB_ENRICHMENT and (
+        c.kb_label == "class" and c.kb_concept == "model"
+    )
 
 
 def _canonicalize_env_var_names(
@@ -2420,6 +2480,18 @@ class ScanPipeline:
             )
 
         components = _align_tool_anchors(components)
+        components = _canonicalize_bedrock_model_ids(components)
+
+        if not self.llm_config:
+            # No LLM stage will resolve a client class to its model id, so a
+            # row named after the class would ship as a model as-is.
+            before_cls = len(components)
+            components = [c for c in components if not _is_unresolved_model_class(c)]
+            if before_cls != len(components):
+                _LOGGER.info(
+                    "No-LLM: dropped %d model row(s) naming an unresolved client class",
+                    before_cls - len(components),
+                )
 
         before = len(components)
         components = _consolidate_components(components)

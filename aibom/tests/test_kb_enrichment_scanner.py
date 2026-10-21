@@ -830,6 +830,51 @@ class TestStrandsProviderClassCoverage:
         assert models[0].metadata["provider"] == "openai"
 
 
+    def test_model_id_variable_resolves_to_env_default(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "import os\n"
+            "from strands.models.anthropic import AnthropicModel\n"
+            'MODEL_ID = os.getenv("ANTHROPIC_CLAUDE_4", "claude-sonnet-4-20250514")\n'
+            "model = AnthropicModel(model_id=MODEL_ID)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [model] = _detect_model_kwargs(result)
+        assert model.name == model.model_name == "claude-sonnet-4-20250514"
+        assert model.line_number == 4
+        assert model.metadata["model_id_variable"] == "MODEL_ID"
+
+    def test_model_id_variable_resolves_to_module_literal(
+        self, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.openai import OpenAIModel\n"
+            'MODEL: str = "gpt-4o"\n'
+            "model = OpenAIModel(model_id=MODEL)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [model] = _detect_model_kwargs(result)
+        assert model.name == "gpt-4o"
+
+    def test_model_id_variable_with_two_values_stays_bare(
+        self, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.openai import OpenAIModel\n"
+            'MODEL = "gpt-4o"\n'
+            "if FAST:\n"
+            '    MODEL = "gpt-4o-mini"\n'
+            "MODEL = MODEL\n"
+            "model = OpenAIModel(model_id=MODEL)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [model] = _detect_model_kwargs(result)
+        assert model.name == "OpenAIModel"
+        assert model.metadata["detection_method"] == "bare_provider_client"
+
+
 class TestStrandsAgentFrameworkPrefix:
     """Module-level ``agent = Agent(...)`` from Strands must become an AGENT.
 

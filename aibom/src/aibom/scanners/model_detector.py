@@ -750,6 +750,21 @@ _PY_GETENV_WITH_DEFAULT_RE = re.compile(
     r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
 )
 
+# The same read assigned to a model-named variable, whatever the env var is
+# called: ``ANTHROPIC_MODEL_ID = os.getenv("ANTHROPIC_CLAUDE_4", "claude-...")``.
+# The target name carries the model signal that the env var name lacks.
+_PY_ASSIGN_GETENV_WITH_DEFAULT_RE = re.compile(
+    r"(?m)^[ \t]*"
+    r"(?:"
+    r"model|model_name|model_id|deployment_name"
+    r"|"
+    r"(?:[A-Z][A-Z0-9_]*_)?(?:MODEL|MODEL_ID|MODEL_NAME|DEPLOYMENT|DEPLOYMENT_NAME|LLM_MODEL)"
+    r")"
+    r"\s*=\s*(?:os\.)?(?:getenv|environ\.get)\s*\(\s*"
+    r"(?P<envq>[\"'])[A-Za-z_][A-Za-z0-9_]*(?P=envq)\s*,\s*"
+    r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
+)
+
 _PY_CTOR_RE = re.compile(
     r"\b(?:ChatOpenAI|ChatAnthropic|ChatGoogleGenerativeAI|AzureChatOpenAI|"
     r"OpenAI|Anthropic|GenerativeModel)\s*\("
@@ -1157,6 +1172,7 @@ def _extract_python_models(text: str) -> list[tuple[str, int]]:
         _PY_ASSIGN_RE,
         _PY_CTOR_RE,
         _PY_GETENV_WITH_DEFAULT_RE,
+        _PY_ASSIGN_GETENV_WITH_DEFAULT_RE,
         _PY_SUBSCRIPT_MODEL_RE,
         _PY_POSITIONAL_SPEC_RE,
     ):

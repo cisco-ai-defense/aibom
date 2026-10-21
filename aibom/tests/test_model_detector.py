@@ -392,6 +392,26 @@ class TestModelDetector:
         comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
         assert comps == [], f"false positive on {source!r}"
 
+    def test_py_getenv_default_into_model_variable_captures_literal(
+        self, tmp_path: Path
+    ) -> None:
+        """A model-named target carries the signal an unrelated env var name lacks."""
+        source = (
+            'ANTHROPIC_MODEL_ID = os.getenv("ANTHROPIC_CLAUDE_4", '
+            '"claude-sonnet-4-20250514")\n'
+        )
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        assert [(c.model_name, c.line_number) for c in comps] == [
+            ("claude-sonnet-4-20250514", 1)
+        ]
+
+    def test_py_getenv_default_into_unrelated_variable_is_ignored(
+        self, tmp_path: Path
+    ) -> None:
+        source = 'REGION = os.getenv("AWS_REGION", "gpt-4o")\n'
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        assert comps == []
+
     def test_py_getenv_default_ignores_non_model_env_vars(
         self, tmp_path: Path
     ) -> None:

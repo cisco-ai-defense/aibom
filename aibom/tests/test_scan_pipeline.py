@@ -3293,3 +3293,75 @@ class TestAlignToolAnchors:
         )
         [aligned] = _align_tool_anchors([agent])
         assert aligned.line_number == 1
+
+
+class TestModelIdCanonicalization:
+    def test_bedrock_profile_id_becomes_base_model_id(self):
+        from aibom.scan_pipeline import _canonicalize_bedrock_model_ids
+
+        profile = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+        model = AIComponent(
+            name=profile,
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=3,
+            model_name=profile,
+        )
+        [out] = _canonicalize_bedrock_model_ids([model])
+        assert out.name == out.model_name == "claude-3-5-haiku-20241022"
+        assert out.metadata["bedrock_model_id"] == profile
+
+    def test_bedrock_base_model_id(self):
+        from aibom.scan_pipeline import _bedrock_base_model_id
+
+        assert (
+            _bedrock_base_model_id("anthropic.claude-3-7-sonnet-20250219-v1:0")
+            == "claude-3-7-sonnet-20250219"
+        )
+        assert (
+            _bedrock_base_model_id("meta.llama3-1-8b-instruct-v1:0")
+            == "llama3-1-8b-instruct"
+        )
+        for other in ("gpt-4o", "anthropic.Anthropic", "claude-3-5-haiku-20241022"):
+            assert _bedrock_base_model_id(other) is None
+
+    def test_unresolved_model_class_rows(self):
+        from aibom.models import DetectionSource
+        from aibom.scan_pipeline import _is_unresolved_model_class
+
+        bare = AIComponent(
+            name="AnthropicModel",
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=4,
+            metadata={"detection_method": "bare_provider_client"},
+        )
+        catalog_class = AIComponent(
+            name="strands.models.openai.OpenAIModel",
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=4,
+            detection_source=DetectionSource.KB_ENRICHMENT,
+            kb_concept="model",
+            kb_label="class",
+            metadata={"kb_id": "strands.models.openai.OpenAIModel"},
+        )
+        literal = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=4,
+            model_name="gpt-4o",
+        )
+        assert _is_unresolved_model_class(bare)
+        assert _is_unresolved_model_class(catalog_class)
+        assert not _is_unresolved_model_class(literal)
+
+    def test_no_llm_scan_drops_unresolved_model_class(self, tmp_path: Path):
+        (tmp_path / "agent.py").write_text(
+            "from strands.models.openai import OpenAIModel\n"
+            "model = OpenAIModel(model_id=load_model_id())\n"
+        )
+        result = ScanPipeline(scan_paths=[str(tmp_path)]).run()
+        models = [c for c in result.components if c.component_type.value == "model"]
+        assert models == []
