@@ -1414,7 +1414,12 @@ def _consolidate_vector_stores(
 ) -> list["AIComponent"]:
     from collections import OrderedDict
 
-    tech_groups: OrderedDict[str, list["AIComponent"]] = OrderedDict()
+    # Keyed on location as well as technology: separate stores of the same
+    # technology (e.g. two FAISS indexes) are distinct assets; only rows that
+    # describe the same store site are folded together.
+    tech_groups: OrderedDict[tuple[str, str, int], list["AIComponent"]] = (
+        OrderedDict()
+    )
     rest: list["AIComponent"] = []
 
     for c in components:
@@ -1422,11 +1427,12 @@ def _consolidate_vector_stores(
         if tech is None:
             rest.append(c)
         else:
-            tech_groups.setdefault(tech, []).append(c)
+            group_key = (tech, c.file_path, c.line_number)
+            tech_groups.setdefault(group_key, []).append(c)
 
     merged: list["AIComponent"] = list(rest)
 
-    for tech, group in tech_groups.items():
+    for (tech, _file, _line), group in tech_groups.items():
         if len(group) == 1:
             c = group[0]
             meta = dict(c.metadata)
