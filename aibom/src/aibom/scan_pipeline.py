@@ -405,12 +405,20 @@ def _propagate_removals(
         return received
 
     lookup_pool = all_candidates if all_candidates is not None else received
+    # A tool anchored at an import line is that file's reference: its removal
+    # reaches only the same file.
+    restrict_files: dict[tuple, set[str]] = {}
+    for c in sent:
+        if c.instance_id in removed_ids and _is_import_anchored_tool(c):
+            restrict_files.setdefault(_consolidation_key(c), set()).add(c.file_path)
     drop_ids: set[str] = set()
     for c in lookup_pool:
         if _is_protected_dependency(c):
             continue
         key = _consolidation_key(c)
         if key not in restrict_import:
+            continue
+        if key in restrict_files and c.file_path not in restrict_files[key]:
             continue
         # Drop only if the sibling satisfies every restriction the removal
         # carries: an import-only-restricted removal drops only import-only
@@ -710,21 +718,29 @@ def _scope_statements(node: ast.AST):
 def _scope_bindings(node: ast.AST) -> dict[str, list[tuple[int, str]]]:
     """Name -> [(line, kind)] for every binding in *node*'s own scope.
 
-    ``kind`` is ``"def"`` for function definitions and ``"other"`` for imports,
-    assignments, parameters, class definitions and other name bindings.
+    ``kind`` is ``"def"`` for function definitions, ``"class"`` for class
+    definitions, ``"import"`` for imports, ``"call"`` for a name assigned the
+    result of a call, and ``"other"`` for parameters and other name bindings.
     """
     out: dict[str, list[tuple[int, str]]] = {}
+    call_targets: set[int] = set()
     for child in _scope_statements(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             out.setdefault(child.name, []).append((child.lineno, "def"))
         elif isinstance(child, ast.ClassDef):
-            out.setdefault(child.name, []).append((child.lineno, "other"))
+            out.setdefault(child.name, []).append((child.lineno, "class"))
         elif isinstance(child, (ast.Import, ast.ImportFrom)):
             for alias in child.names:
                 name = (alias.asname or alias.name).split(".")[0]
-                out.setdefault(name, []).append((child.lineno, "other"))
+                out.setdefault(name, []).append((child.lineno, "import"))
+        elif isinstance(child, (ast.Assign, ast.AnnAssign)) and isinstance(
+            child.value, ast.Call
+        ):
+            targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+            call_targets.update(id(t) for t in targets)
         elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-            out.setdefault(child.id, []).append((child.lineno, "other"))
+            kind = "call" if id(child) in call_targets else "other"
+            out.setdefault(child.id, []).append((child.lineno, kind))
         elif isinstance(child, ast.ExceptHandler) and child.name:
             out.setdefault(child.name, []).append((child.lineno, "other"))
         elif isinstance(child, ast.arg):
@@ -754,6 +770,11 @@ class _FileScopes:
 
     def def_line_for(self, name: str, line: int) -> int | None:
         """Line of the ``def`` that *name* refers to at *line*, or None if not a local def."""
+        bound = self.binding_for(name, line)
+        return bound[0] if bound and bound[1] == "def" else None
+
+    def binding_for(self, name: str, line: int) -> tuple[int, str] | None:
+        """(line, kind) of the binding *name* refers to at *line*; None if unbound."""
         chain = sorted(
             (sc for sc in self.scopes if sc[0] <= line <= sc[1]),
             key=lambda sc: sc[0],
@@ -770,11 +791,9 @@ class _FileScopes:
                 preceding = [b for b in found if b[0] <= line]
                 if not preceding:
                     return None  # bound only later in this scope
-                bound_line, kind = max(preceding)
-            else:
-                # enclosing scope has finished running when this code executes
-                bound_line, kind = max(found)
-            return bound_line if kind == "def" else None
+                return max(preceding)
+            # enclosing scope has finished running when this code executes
+            return max(found)
         return None
 
 
@@ -787,6 +806,19 @@ _MAX_REEXPORT_DEPTH = 3
 def _is_registration_call_tool(comp: AIComponent) -> bool:
     via = str((comp.metadata or {}).get("extracted_via") or "")
     return via.startswith(_REGISTRATION_CALL_PREFIXES)
+
+
+def _is_tools_kwarg_tool(comp: AIComponent) -> bool:
+    """True for a tool the scanner read from an agent's ``tools=[...]`` list."""
+    return (comp.metadata or {}).get("extracted_via") == "agent_tools_kwarg"
+
+
+def _is_import_anchored_tool(comp: AIComponent) -> bool:
+    """True for a tool anchored at the import line of the file that uses it."""
+    return (
+        comp.component_type == AIComponentType.TOOL
+        and (comp.metadata or {}).get("anchor") == "import"
+    )
 
 
 # Registration calls whose argument may be a loop variable over a tool inventory;
@@ -936,8 +968,10 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
     assignments and definitions that only appear later keep the registration line.
     A tool registered through ``add_tool(fn)`` / ``register_tool(fn)`` /
     ``register_function(fn)`` whose name is imported follows the import to the
-    ``def`` in the defining module. Tools handed to an agent's ``tools=[...]`` keep
-    the registration line.
+    ``def`` in the defining module. A tool handed to an agent's ``tools=[...]``
+    under an imported name is anchored at that import line; one bound to neither
+    an import, a ``def``, a class nor a call result (a local list of tools, a
+    parameter) is dropped.
     """
     trees: dict[Path, ast.Module | None] = {}
     cache: dict[str, tuple[_FileScopes | None, list[str]]] = {}
@@ -956,6 +990,7 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
         return cache[path]
 
     moved = 0
+    dropped: set[int] = set()
     for comp in components:
         if (
             comp.component_type != AIComponentType.TOOL
@@ -974,6 +1009,14 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
                 target = j + 1
         elif scopes is not None:
             target = scopes.def_line_for(comp.name, comp.line_number)
+            if target is None and _is_tools_kwarg_tool(comp):
+                bound = scopes.binding_for(comp.name, comp.line_number)
+                if bound and bound[1] == "import":
+                    target = bound[0]
+                    comp.metadata = {**(comp.metadata or {}), "anchor": "import"}
+                elif not bound or bound[1] not in ("class", "call"):
+                    dropped.add(id(comp))
+                    continue
             if target is None and _is_registration_call_tool(comp):
                 found = _imported_def(Path(comp.file_path), comp.name, trees)
                 if found is not None:
@@ -994,6 +1037,12 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
         _LOGGER.info(
             "Tool anchor alignment: moved %d tool(s) to their defining line", moved
         )
+    if dropped:
+        _LOGGER.info(
+            "Tool anchor alignment: dropped %d tools= name(s) bound to no tool",
+            len(dropped),
+        )
+        components = [c for c in components if id(c) not in dropped]
     return components
 
 
@@ -1017,6 +1066,9 @@ def _consolidate_components(
     groups: OrderedDict[tuple, list["AIComponent"]] = OrderedDict()
     for c in components:
         key = _consolidation_key(c)
+        if _is_import_anchored_tool(c):
+            # Each file imports its own reference to the tool.
+            key = key + (c.file_path,)
         groups.setdefault(key, []).append(c)
 
     result: list["AIComponent"] = []

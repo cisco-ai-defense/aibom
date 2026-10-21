@@ -2984,9 +2984,17 @@ class TestAlignToolAnchors:
         assert aligned.line_number == 2
         assert "reported_file" not in (aligned.metadata or {})
 
-    def test_agent_tools_kwarg_keeps_import_resolvable_registration_line(
-        self, tmp_path: Path
-    ):
+    @staticmethod
+    def _tools_kwarg(name: str, path: Path, line: int) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=AIComponentType.TOOL,
+            file_path=str(path),
+            line_number=line,
+            metadata={"extracted_via": "agent_tools_kwarg"},
+        )
+
+    def test_agent_tools_kwarg_anchors_at_import_line(self, tmp_path: Path):
         from aibom.scan_pipeline import _align_tool_anchors
 
         (tmp_path / "tools.py").write_text("def lookup(q):\n    return q\n")
@@ -2994,16 +3002,105 @@ class TestAlignToolAnchors:
         src.write_text(
             "from tools import lookup\n" "\n" "agent = Agent(tools=[lookup])\n"
         )
-        tool = AIComponent(
-            name="lookup",
-            component_type=AIComponentType.TOOL,
-            file_path=str(src),
-            line_number=3,
-            metadata={"extracted_via": "agent_tools_kwarg"},
-        )
-        [aligned] = _align_tool_anchors([tool])
+        [aligned] = _align_tool_anchors([self._tools_kwarg("lookup", src, 3)])
         assert aligned.file_path == str(src)
-        assert aligned.line_number == 3
+        assert aligned.line_number == 1
+        assert aligned.metadata["anchor"] == "import"
+        assert aligned.metadata["reported_line"] == 3
+
+    def test_agent_tools_kwarg_package_import_anchors_at_import_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands import Agent\n"
+            "from strands_tools import file_read, file_write\n"
+            "\n"
+            "agent = Agent(tools=[file_read, file_write])\n"
+        )
+        aligned = _align_tool_anchors(
+            [
+                self._tools_kwarg("file_read", src, 4),
+                self._tools_kwarg("file_write", src, 4),
+            ]
+        )
+        assert [c.line_number for c in aligned] == [2, 2]
+
+    def test_agent_tools_kwarg_drops_local_tool_list(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands_tools import file_read\n"
+            "with docs, pricing:\n"
+            "    tools = docs.list_tools_sync() + pricing.list_tools_sync()\n"
+            "    agent = Agent(tools=[file_read, tools])\n"
+        )
+        aligned = _align_tool_anchors(
+            [self._tools_kwarg("file_read", src, 4), self._tools_kwarg("tools", src, 4)]
+        )
+        assert [(c.name, c.line_number) for c in aligned] == [("file_read", 1)]
+
+    def test_agent_tools_kwarg_drops_parameter(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "def build(llm, composio_tools):\n"
+            "    return Agent(llm=llm, tools=[composio_tools])\n"
+        )
+        assert _align_tool_anchors([self._tools_kwarg("composio_tools", src, 2)]) == []
+
+    def test_agent_tools_kwarg_keeps_call_result_at_registration_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text("search = SearchTool()\n" "agent = Agent(tools=[search])\n")
+        [aligned] = _align_tool_anchors([self._tools_kwarg("search", src, 2)])
+        assert aligned.line_number == 2
+        assert "anchor" not in aligned.metadata
+
+    def test_import_anchored_tool_is_kept_per_file(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors, _consolidate_components
+
+        rows = []
+        for name in ("a.py", "b.py"):
+            src = tmp_path / name
+            src.write_text(
+                "from strands_tools import calculator\n"
+                "agent = Agent(tools=[calculator])\n"
+            )
+            rows.append(self._tools_kwarg("calculator", src, 2))
+        merged = _consolidate_components(_align_tool_anchors(rows))
+        assert sorted((Path(c.file_path).name, c.line_number) for c in merged) == [
+            ("a.py", 1),
+            ("b.py", 1),
+        ]
+
+    def test_import_anchored_tool_removal_stays_in_its_file(self):
+        from aibom.scan_pipeline import _propagate_removals
+
+        a, b = (
+            AIComponent(
+                name="calculator",
+                component_type=AIComponentType.TOOL,
+                file_path=f"{name}.py",
+                line_number=1,
+                metadata={"extracted_via": "agent_tools_kwarg", "anchor": "import"},
+            )
+            for name in ("a", "b")
+        )
+        result = _propagate_removals(
+            sent=[a],
+            received=[b],
+            all_candidates=[a, b],
+            pre_fanout_removed_ids={a.instance_id},
+        )
+        assert result == [b]
 
     def test_decorator_anchor_prefers_decorated_function(self, tmp_path: Path):
         from aibom.scan_pipeline import _align_tool_anchors
