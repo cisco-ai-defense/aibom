@@ -151,3 +151,93 @@ class TestMcpDetector:
         comps, _ = run_scanner(McpDetector, tmp_path, {"http.py": src})
         clients = [c for c in comps if c.component_type == AIComponentType.MCP_CLIENT]
         assert clients == []
+
+    def test_resource_and_prompt_decorators_are_not_tools(self, tmp_path: Path) -> None:
+        src = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            'mcp = FastMCP("demo")\n'
+            "\n"
+            "@mcp.tool()\n"
+            "def search(q: str) -> str:\n"
+            "    return q\n"
+            "\n"
+            '@mcp.resource("demo://template")\n'
+            "def template() -> str:\n"
+            '    return ""\n'
+            "\n"
+            "@mcp.prompt()\n"
+            "def review(code: str) -> str:\n"
+            "    return code\n"
+        )
+        comps, _ = run_scanner(McpDetector, tmp_path, {"srv.py": src})
+        tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert [t.name for t in tools] == ["search"]
+
+
+class TestMcpClientInstances:
+    _STDIO_CLIENTS = (
+        "from mcp import stdio_client, StdioServerParameters\n"
+        "from strands.tools.mcp import MCPClient\n"
+        "\n"
+        "docs_client = MCPClient(\n"
+        "    lambda: stdio_client(\n"
+        "        StdioServerParameters(\n"
+        '            command="uvx", args=["example.docs-mcp-server@latest"]\n'
+        "        )\n"
+        "    )\n"
+        ")\n"
+        "pricing_client = MCPClient(\n"
+        "    lambda: stdio_client(\n"
+        '        StdioServerParameters(command="example-pricing-server")\n'
+        "    )\n"
+        ")\n"
+    )
+
+    def test_each_client_and_launched_server_is_reported(self, tmp_path: Path):
+        comps, _ = run_scanner(McpDetector, tmp_path, {"lab.py": self._STDIO_CLIENTS})
+        clients = [
+            (c.name, c.line_number)
+            for c in comps
+            if c.component_type == AIComponentType.MCP_CLIENT
+        ]
+        servers = [
+            (c.name, c.line_number, c.transport)
+            for c in comps
+            if c.component_type == AIComponentType.MCP_SERVER
+        ]
+        assert clients == [("docs_client", 4), ("pricing_client", 11)]
+        assert servers == [
+            ("example.docs-mcp-server", 4, "stdio"),
+            ("example-pricing-server", 11, "stdio"),
+        ]
+
+    def test_scoped_npm_server_keeps_scope_and_drops_version(self, tmp_path: Path):
+        src = (
+            "from strands.tools.mcp import MCPClient\n"
+            "client = MCPClient(\n"
+            "    lambda: stdio_client(\n"
+            "        StdioServerParameters(\n"
+            '            command="npx", args=["-y", "@scope/pkg@1.2.3"]\n'
+            "        )\n"
+            "    )\n"
+            ")\n"
+        )
+        comps, _ = run_scanner(McpDetector, tmp_path, {"lab.py": src})
+        servers = [
+            c.name for c in comps if c.component_type == AIComponentType.MCP_SERVER
+        ]
+        assert servers == ["@scope/pkg"]
+
+    def test_client_without_stdio_launch_reports_no_server(self, tmp_path: Path):
+        comps, _ = run_scanner(
+            McpDetector,
+            tmp_path,
+            {
+                "lab.py": "from strands.tools.mcp import MCPClient\n"
+                "client = MCPClient(\n"
+                '    lambda: streamablehttp_client("http://localhost")\n'
+                ")\n"
+            },
+        )
+        assert [c.component_type for c in comps] == [AIComponentType.MCP_CLIENT]
+        assert comps[0].name == "client"

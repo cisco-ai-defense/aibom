@@ -2859,3 +2859,552 @@ class TestATREnrichmentFlag:
         assert tagged, "expected ATR enrichment to tag the skill"
         enrichment = tagged[0].metadata["security_enrichment"]
         assert enrichment["atlas_techniques"] == ["AML.T0010"]
+
+
+class TestAlignToolAnchors:
+    def test_decorated_tool_moves_to_def_line(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "server.py"
+        src.write_text(
+            "from mcp.server.fastmcp import FastMCP\n"
+            'mcp = FastMCP("demo")\n'
+            "\n"
+            "@mcp.tool()\n"
+            "async def search(q: str) -> str:\n"
+            "    return q\n"
+        )
+        tool = AIComponent(
+            name="search",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 5
+        assert aligned.metadata["reported_line"] == 4
+
+    def test_registered_tool_moves_to_same_file_def(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "def get_weather(city):\n"
+            "    return city\n"
+            "\n"
+            "agent = Agent(tools=[get_weather])\n"
+        )
+        tool = AIComponent(
+            name="get_weather",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 1
+
+    def test_tool_defined_elsewhere_keeps_registration_line(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from tools import lookup\n" "\n" "agent = Agent(tools=[lookup])\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=3,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 3
+        assert "reported_line" not in (aligned.metadata or {})
+
+    @staticmethod
+    def _registered(name: str, path: Path, line: int) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=AIComponentType.TOOL,
+            file_path=str(path),
+            line_number=line,
+            metadata={"extracted_via": "add_tool(_pos_0)"},
+        )
+
+    def test_add_tool_follows_relative_import_to_def(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "session.py").write_text(
+            "import json\n" "\n" "async def create_session(name):\n" "    return name\n"
+        )
+        server = pkg / "__init__.py"
+        server.write_text(
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from .session import create_session\n"
+            'mcp = FastMCP("demo")\n'
+            "mcp.add_tool(create_session)\n"
+        )
+        [aligned] = _align_tool_anchors([self._registered("create_session", server, 4)])
+        assert aligned.file_path == str(pkg / "session.py")
+        assert aligned.line_number == 3
+        assert aligned.metadata["reported_file"] == str(server)
+        assert aligned.metadata["reported_line"] == 4
+
+    def test_add_tool_follows_absolute_import_and_reexport(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        pkg = tmp_path / "src" / "app"
+        (pkg / "agent").mkdir(parents=True)
+        (pkg / "agent" / "__init__.py").write_text("from .impl import forecast\n")
+        (pkg / "agent" / "impl.py").write_text(
+            "\n" "def forecast(x):\n" "    return x\n"
+        )
+        server = pkg / "server.py"
+        server.write_text(
+            "from app.agent import forecast as run_forecast\n"
+            "\n"
+            "mcp.add_tool(run_forecast)\n"
+        )
+        [aligned] = _align_tool_anchors([self._registered("run_forecast", server, 3)])
+        assert aligned.file_path == str(pkg / "agent" / "impl.py")
+        assert aligned.line_number == 2
+
+    def test_add_tool_import_does_not_resolve_outside_scan_root(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        (tmp_path / "tools.py").write_text("def lookup(q):\n    return q\n")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        server = repo / "server.py"
+        server.write_text("from tools import lookup\n" "mcp.add_tool(lookup)\n")
+        tool = self._registered("lookup", server, 2)
+        [aligned] = _align_tool_anchors([tool], [str(repo)])
+        assert aligned.file_path == str(server)
+        assert aligned.line_number == 2
+
+    def test_add_tool_with_unresolvable_import_keeps_registration_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        server = tmp_path / "server.py"
+        server.write_text(
+            "from some_installed_pkg.tools import search\n" "mcp.add_tool(search)\n"
+        )
+        [aligned] = _align_tool_anchors([self._registered("search", server, 2)])
+        assert aligned.file_path == str(server)
+        assert aligned.line_number == 2
+        assert "reported_file" not in (aligned.metadata or {})
+
+    @staticmethod
+    def _tools_kwarg(name: str, path: Path, line: int) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=AIComponentType.TOOL,
+            file_path=str(path),
+            line_number=line,
+            metadata={"extracted_via": "agent_tools_kwarg"},
+        )
+
+    def test_agent_tools_kwarg_anchors_at_import_line(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        (tmp_path / "tools.py").write_text("def lookup(q):\n    return q\n")
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from tools import lookup\n" "\n" "agent = Agent(tools=[lookup])\n"
+        )
+        [aligned] = _align_tool_anchors([self._tools_kwarg("lookup", src, 3)])
+        assert aligned.file_path == str(src)
+        assert aligned.line_number == 1
+        assert aligned.metadata["anchor"] == "import"
+        assert aligned.metadata["reported_line"] == 3
+
+    def test_agent_tools_kwarg_star_import_anchors_at_import_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands_tools import *\n" "\n" "agent = Agent(tools=[calculator])\n"
+        )
+        [aligned] = _align_tool_anchors([self._tools_kwarg("calculator", src, 3)])
+        assert aligned.line_number == 1
+        assert aligned.metadata["anchor"] == "import"
+
+    def test_agent_tools_kwarg_dotted_name_anchors_at_module_import(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "import my_tools\n" "\n" "agent = Agent(tools=[my_tools.lookup])\n"
+        )
+        [aligned] = _align_tool_anchors(
+            [self._tools_kwarg("my_tools.lookup", src, 3)]
+        )
+        assert aligned.line_number == 1
+        assert aligned.metadata["anchor"] == "import"
+
+    def test_agent_tools_kwarg_package_import_anchors_at_import_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands import Agent\n"
+            "from strands_tools import file_read, file_write\n"
+            "\n"
+            "agent = Agent(tools=[file_read, file_write])\n"
+        )
+        aligned = _align_tool_anchors(
+            [
+                self._tools_kwarg("file_read", src, 4),
+                self._tools_kwarg("file_write", src, 4),
+            ]
+        )
+        assert [c.line_number for c in aligned] == [2, 2]
+
+    def test_agent_tools_kwarg_drops_local_tool_list(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands_tools import file_read\n"
+            "with docs, pricing:\n"
+            "    tools = docs.list_tools_sync() + pricing.list_tools_sync()\n"
+            "    agent = Agent(tools=[file_read, tools])\n"
+        )
+        aligned = _align_tool_anchors(
+            [self._tools_kwarg("file_read", src, 4), self._tools_kwarg("tools", src, 4)]
+        )
+        assert [(c.name, c.line_number) for c in aligned] == [("file_read", 1)]
+
+    def test_agent_tools_kwarg_drops_parameter(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "def build(llm, composio_tools):\n"
+            "    return Agent(llm=llm, tools=[composio_tools])\n"
+        )
+        assert _align_tool_anchors([self._tools_kwarg("composio_tools", src, 2)]) == []
+
+    def test_agent_tools_kwarg_keeps_call_result_at_registration_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text("search = SearchTool()\n" "agent = Agent(tools=[search])\n")
+        [aligned] = _align_tool_anchors([self._tools_kwarg("search", src, 2)])
+        assert aligned.line_number == 2
+        assert "anchor" not in aligned.metadata
+
+    def test_import_anchored_tool_is_kept_per_file(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors, _consolidate_components
+
+        rows = []
+        for name in ("a.py", "b.py"):
+            src = tmp_path / name
+            src.write_text(
+                "from strands_tools import calculator\n"
+                "agent = Agent(tools=[calculator])\n"
+            )
+            rows.append(self._tools_kwarg("calculator", src, 2))
+        merged = _consolidate_components(_align_tool_anchors(rows))
+        assert sorted((Path(c.file_path).name, c.line_number) for c in merged) == [
+            ("a.py", 1),
+            ("b.py", 1),
+        ]
+
+    def test_import_anchored_tool_removal_stays_in_its_file(self):
+        from aibom.scan_pipeline import _propagate_removals
+
+        a, b = (
+            AIComponent(
+                name="calculator",
+                component_type=AIComponentType.TOOL,
+                file_path=f"{name}.py",
+                line_number=1,
+                metadata={"extracted_via": "agent_tools_kwarg", "anchor": "import"},
+            )
+            for name in ("a", "b")
+        )
+        result = _propagate_removals(
+            sent=[a],
+            received=[b],
+            all_candidates=[a, b],
+            pre_fanout_removed_ids={a.instance_id},
+        )
+        assert result == [b]
+
+    def test_decorator_anchor_prefers_decorated_function(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "server.py"
+        src.write_text(
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            '@mcp.tool(name="lookup")\n'
+            "def search(q):\n"
+            "    return q\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 5
+
+    def test_imported_tool_not_moved_to_unrelated_local_def(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from tools import lookup\n"
+            "agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=2,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 2
+
+    def test_registered_tool_uses_def_bound_at_registration(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x * 2\n"
+        )
+        tool = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=4,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        assert aligned.line_number == 1
+
+    def _align_one(self, tmp_path: Path, source: str, name: str, line: int) -> int:
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(source)
+        tool = AIComponent(
+            name=name,
+            component_type=AIComponentType.TOOL,
+            file_path=str(src),
+            line_number=line,
+        )
+        [aligned] = _align_tool_anchors([tool])
+        return aligned.line_number
+
+    def test_local_def_replacing_import_is_used(self, tmp_path: Path):
+        source = (
+            "from tools import lookup\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "agent = Agent(tools=[lookup])\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 6) == 3
+
+    def test_nested_def_in_other_scope_is_ignored(self, tmp_path: Path):
+        source = (
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "def helper():\n"
+            "    def lookup(y):\n"
+            "        return y\n"
+            "\n"
+            "agent = Agent(tools=[lookup])\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 8) == 1
+
+    def test_later_def_after_assignment_keeps_registration_line(self, tmp_path: Path):
+        source = (
+            "lookup = existing_tool\n"
+            "agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 2) == 2
+
+    def test_later_module_def_keeps_module_level_registration_line(
+        self, tmp_path: Path
+    ):
+        source = (
+            "agent = Agent(tools=[lookup])\n" "\n" "def lookup(x):\n" "    return x\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 1) == 1
+
+    def test_registration_inside_function_uses_module_def(self, tmp_path: Path):
+        source = (
+            "def main():\n"
+            "    agent = Agent(tools=[lookup])\n"
+            "\n"
+            "def lookup(x):\n"
+            "    return x\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 2) == 4
+
+    def test_parameter_shadows_module_def(self, tmp_path: Path):
+        source = (
+            "def lookup(x):\n"
+            "    return x\n"
+            "\n"
+            "def build(lookup):\n"
+            "    return Agent(tools=[lookup])\n"
+        )
+        assert self._align_one(tmp_path, source, "lookup", 5) == 5
+
+    def test_consolidated_evidence_keeps_reported_line(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        first = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/a.py",
+            line_number=1,
+        )
+        moved = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/b.py",
+            line_number=9,
+            metadata={"reported_line": 20},
+        )
+        [merged] = _consolidate_components([first, moved])
+        assert merged.metadata["evidence"][0]["line"] == 9
+        assert merged.metadata["evidence"][0]["reported_line"] == 20
+
+    def test_consolidated_evidence_keeps_reported_file(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        first = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/a.py",
+            line_number=1,
+        )
+        moved = AIComponent(
+            name="lookup",
+            component_type=AIComponentType.TOOL,
+            file_path="/r/tools.py",
+            line_number=9,
+            metadata={"reported_file": "/r/server.py", "reported_line": 20},
+        )
+        [merged] = _consolidate_components([first, moved])
+        assert merged.metadata["evidence"][0]["reported_file"] == "/r/server.py"
+
+    def test_non_tools_are_untouched(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text("@decorator\n" "def build():\n" "    pass\n")
+        agent = AIComponent(
+            name="build",
+            component_type=AIComponentType.AGENT,
+            file_path=str(src),
+            line_number=1,
+        )
+        [aligned] = _align_tool_anchors([agent])
+        assert aligned.line_number == 1
+
+
+class TestModelIdCanonicalization:
+    def test_bedrock_profile_id_becomes_base_model_id(self):
+        from aibom.scan_pipeline import _canonicalize_bedrock_model_ids
+
+        profile = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+        model = AIComponent(
+            name=profile,
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=3,
+            model_name=profile,
+        )
+        [out] = _canonicalize_bedrock_model_ids([model])
+        assert out.name == out.model_name == "claude-3-5-haiku-20241022"
+        assert out.metadata["bedrock_model_id"] == profile
+
+    def test_bedrock_base_model_id(self):
+        from aibom.scan_pipeline import _bedrock_base_model_id
+
+        assert (
+            _bedrock_base_model_id("anthropic.claude-3-7-sonnet-20250219-v1:0")
+            == "claude-3-7-sonnet-20250219"
+        )
+        assert (
+            _bedrock_base_model_id("meta.llama3-1-8b-instruct-v1:0")
+            == "llama3-1-8b-instruct"
+        )
+        for other in ("gpt-4o", "anthropic.Anthropic", "claude-3-5-haiku-20241022"):
+            assert _bedrock_base_model_id(other) is None
+
+    def test_unresolved_model_class_rows(self):
+        from aibom.models import DetectionSource
+        from aibom.scan_pipeline import _is_unresolved_model_class
+
+        bare = AIComponent(
+            name="AnthropicModel",
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=4,
+            metadata={"detection_method": "bare_provider_client"},
+        )
+        catalog_class = AIComponent(
+            name="strands.models.openai.OpenAIModel",
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=4,
+            detection_source=DetectionSource.KB_ENRICHMENT,
+            kb_concept="model",
+            kb_label="class",
+            metadata={"kb_id": "strands.models.openai.OpenAIModel"},
+        )
+        literal = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path="agent.py",
+            line_number=4,
+            model_name="gpt-4o",
+        )
+        assert _is_unresolved_model_class(bare)
+        assert _is_unresolved_model_class(catalog_class)
+        assert not _is_unresolved_model_class(literal)
+
+    def test_no_llm_scan_drops_unresolved_model_class(self, tmp_path: Path):
+        (tmp_path / "agent.py").write_text(
+            "from strands.models.openai import OpenAIModel\n"
+            "model = OpenAIModel(model_id=load_model_id())\n"
+        )
+        result = ScanPipeline(scan_paths=[str(tmp_path)]).run()
+        models = [c for c in result.components if c.component_type.value == "model"]
+        assert models == []

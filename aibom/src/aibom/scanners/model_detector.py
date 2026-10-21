@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import bisect
 import io
 import json
@@ -732,7 +733,8 @@ _PY_ASSIGN_RE = re.compile(
     r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
 )
 
-# ``os.getenv(...)`` / ``os.environ.get(...)`` with a quoted default value
+# ``os.getenv(...)`` / ``os.environ.get(...)`` (or a project helper named
+# ``get_env*``, e.g. ``get_env_variable``) with a quoted default value
 # whose env var name looks model-related. Strands and similar agent
 # frameworks commonly read the deployed model ID from the environment with a
 # hard-coded literal fallback — that literal is the real model in practice.
@@ -741,10 +743,25 @@ _PY_ASSIGN_RE = re.compile(
 # like ``os.getenv("LOG_LEVEL", "info")`` do not falsely register "info" as
 # a model ID.
 _PY_GETENV_WITH_DEFAULT_RE = re.compile(
-    r"(?:os\.)?(?:getenv|environ\.get)\s*\(\s*"
+    r"(?:os\.)?(?:getenv|environ\.get|get_env\w*)\s*\(\s*"
     r"(?P<envq>[\"'])"
     r"(?P<env>(?:[A-Z][A-Z0-9_]*_)?(?:MODEL|MODEL_ID|MODEL_NAME|DEPLOYMENT|DEPLOYMENT_NAME|LLM_MODEL))"
     r"(?P=envq)\s*,\s*"
+    r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
+)
+
+# The same read assigned to a model-named variable, whatever the env var is
+# called: ``ANTHROPIC_MODEL_ID = os.getenv("ANTHROPIC_CLAUDE_4", "claude-...")``.
+# The target name carries the model signal that the env var name lacks.
+_PY_ASSIGN_GETENV_WITH_DEFAULT_RE = re.compile(
+    r"(?m)^[ \t]*"
+    r"(?:"
+    r"model|model_name|model_id|deployment_name"
+    r"|"
+    r"(?:[A-Z][A-Z0-9_]*_)?(?:MODEL|MODEL_ID|MODEL_NAME|DEPLOYMENT|DEPLOYMENT_NAME|LLM_MODEL)"
+    r")"
+    r"\s*=\s*(?:os\.)?(?:getenv|environ\.get)\s*\(\s*"
+    r"(?P<envq>[\"'])[A-Za-z_][A-Za-z0-9_]*(?P=envq)\s*,\s*"
     r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
 )
 
@@ -837,6 +854,10 @@ def _is_plausible_model_id(s: str) -> bool:
         return False
     low = s.lower()
     if low in _SKIP_STRINGS or low.startswith("${"):
+        return False
+    # Model ids never contain whitespace; such values are prose placeholders
+    # (e.g. "place your deployment name here").
+    if re.search(r"\s", s):
         return False
     if not re.search(r"[a-zA-Z]", s):
         return False
@@ -1044,7 +1065,8 @@ def _walk_mapping(
         return
     if isinstance(obj, dict):
         for k, v in obj.items():
-            lk = str(k).lower()
+            # Dotted keys (``"llm.model"``) are matched on their last segment.
+            lk = str(k).lower().rsplit(".", 1)[-1]
             if (
                 lk in _JSON_KEY_HINT
                 and isinstance(v, str)
@@ -1155,6 +1177,7 @@ def _extract_python_models(text: str) -> list[tuple[str, int]]:
         _PY_ASSIGN_RE,
         _PY_CTOR_RE,
         _PY_GETENV_WITH_DEFAULT_RE,
+        _PY_ASSIGN_GETENV_WITH_DEFAULT_RE,
         _PY_SUBSCRIPT_MODEL_RE,
         _PY_POSITIONAL_SPEC_RE,
     ):
@@ -1171,6 +1194,66 @@ def _extract_python_models(text: str) -> list[tuple[str, int]]:
                 if _in_spans(noncode, m.start()):
                     continue
             found.append((s, _line_number(text, m.start())))
+    return found
+
+
+# Variable names that hold a model identifier, or a collection of them, but that
+# the strict ``_PY_ASSIGN_RE`` vocabulary does not cover: ``aggregator_model``,
+# ``reference_models``, ``self.fallback_model_ids``, ``AVAILABLE_MODELS``.
+_PY_MODEL_VAR_NAME_RE = re.compile(
+    r"(?i)(?:^|_)(?:models?|model_ids?|model_names?|model_list|llm_models?)$"
+)
+
+# Real model ids carry a version digit or a separator (``gpt-4o``,
+# ``org/name``, ``claude-3.5``). Bare words such as ``base`` or ``chat`` collide
+# with catalog rows and are rejected.
+_MODEL_ID_SHAPE_RE = re.compile(r"[\d/:.-]")
+
+
+def _model_var_name(target: ast.expr) -> str:
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return ""
+
+
+def _extract_python_model_var_literals(text: str) -> list[tuple[str, int]]:
+    """Return string literals assigned to model-named variables.
+
+    Covers plain assignments (``aggregator_model = "..."``) and list, tuple,
+    set, or dict-value literals (``reference_models = ["...", "..."]``). The
+    names are looser than ``_PY_ASSIGN_RE``, so callers must only keep values
+    that resolve in the model registry.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []
+    found: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not any(
+            _PY_MODEL_VAR_NAME_RE.search(_model_var_name(t)) for t in targets
+        ):
+            continue
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            elts = value.elts
+        elif isinstance(value, ast.Dict):
+            elts = value.values
+        else:
+            elts = [value]
+        for elt in elts:
+            if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                continue
+            s = _normalize_candidate(elt.value)
+            if _is_plausible_model_id(s) and _MODEL_ID_SHAPE_RE.search(s):
+                found.append((s, elt.lineno))
     return found
 
 
@@ -1262,6 +1345,8 @@ class ModelDetector(BaseScanner):
             if suffix in (".py", ".ipynb"):
                 for val, ln in _extract_python_models(text):
                     extracted.append((val, ln, "string_literal"))
+                for val, ln in _extract_python_model_var_literals(text):
+                    extracted.append((val, ln, "model_variable"))
             elif name_lower == ".env" or fpath.name.endswith(".env"):
                 for val, ln in _extract_env_models(text):
                     extracted.append((val, ln, "env_var"))
@@ -1280,8 +1365,10 @@ class ModelDetector(BaseScanner):
                 key = (fp_str, model_name)
                 if key in seen:
                     continue
-                seen.add(key)
                 reg = registry_lookup(model_name)
+                if reg is None and method == "model_variable":
+                    continue
+                seen.add(key)
                 components.append(
                     _make_component(model_name, fp_str, line_no, method, reg)
                 )

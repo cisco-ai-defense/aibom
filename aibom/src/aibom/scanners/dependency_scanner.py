@@ -51,6 +51,7 @@ KNOWN_AI_PACKAGES: dict[str, set[str]] = {
         "anthropic",
         "google-generativeai",
         "google-cloud-aiplatform",
+        "together",
         "crewai",
         "autogen",
         "autogen-agentchat",

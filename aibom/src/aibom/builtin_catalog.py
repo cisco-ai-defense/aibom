@@ -16,8 +16,7 @@ Schema mirrors the dict produced by
 
 All entries go through the same concept allowlist
 (:data:`aibom.scanners.kb_enrichment_scanner.ALLOWED_CONCEPTS`), so only
-``agent``/``model``/``tool``/``memory``/``prompt`` entries surface as
-components.
+entries whose concept is on that list surface as components.
 """
 
 from __future__ import annotations
@@ -88,17 +87,18 @@ _STRANDS_MODEL_ENTRIES: List[Dict[str, Any]] = [
     for cls_name in _STRANDS_MODEL_CLASSES
 ]
 
-# MCP client class exposed via ``strands.tools.mcp``.
+# MCP client class exposed via ``strands.tools.mcp``. An ``MCPClient`` connects
+# to an MCP server; the tools it lists are the server's, not the client itself.
 _STRANDS_MCP_ENTRIES: List[Dict[str, Any]] = [
     _entry(
         "strands.tools.mcp.MCPClient",
-        concept="tool",
+        concept="mcp_client",
         label="class",
         framework="strands",
     ),
     _entry(
         "strands.tools.mcp.mcp_client.MCPClient",
-        concept="tool",
+        concept="mcp_client",
         label="class",
         framework="strands",
     ),

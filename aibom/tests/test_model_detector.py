@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -392,6 +393,26 @@ class TestModelDetector:
         comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
         assert comps == [], f"false positive on {source!r}"
 
+    def test_py_getenv_default_into_model_variable_captures_literal(
+        self, tmp_path: Path
+    ) -> None:
+        """A model-named target carries the signal an unrelated env var name lacks."""
+        source = (
+            'ANTHROPIC_MODEL_ID = os.getenv("ANTHROPIC_CLAUDE_4", '
+            '"claude-sonnet-4-20250514")\n'
+        )
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        assert [(c.model_name, c.line_number) for c in comps] == [
+            ("claude-sonnet-4-20250514", 1)
+        ]
+
+    def test_py_getenv_default_into_unrelated_variable_is_ignored(
+        self, tmp_path: Path
+    ) -> None:
+        source = 'REGION = os.getenv("AWS_REGION", "gpt-4o")\n'
+        comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        assert comps == []
+
     def test_py_getenv_default_ignores_non_model_env_vars(
         self, tmp_path: Path
     ) -> None:
@@ -462,6 +483,73 @@ class TestModelDetector:
             f"{model_id}: family={comps[0].metadata.get('family')!r}"
         )
         assert comps[0].metadata["registry_source"] == "builtin"
+
+
+class TestModelVariableLiterals:
+    """Literals bound to model-named variables, kept only on a registry hit."""
+
+    _REGISTRY = {
+        "qwen2-72b-instruct": {"provider": "qwen", "family": "qwen2"},
+        "mixtral-8x22b-instruct-v0.1": {"provider": "mistral", "family": "mixtral"},
+        "base": {"provider": "speechco", "family": "base"},
+    }
+
+    def _scan(self, tmp_path: Path, source: str) -> list[str]:
+        with (
+            patch(
+                "aibom.scanners.model_detector._get_live_registry",
+                return_value=self._REGISTRY,
+            ),
+            patch(
+                "aibom.scanners.model_detector._query_hf_hub", return_value=None
+            ),
+        ):
+            comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        return sorted(c.model_name for c in comps)
+
+    def test_list_and_suffixed_assignment(self, tmp_path: Path) -> None:
+        source = (
+            "reference_models = [\n"
+            '    "Qwen/Qwen2-72B-Instruct",\n'
+            '    "mistralai/Mixtral-8x22B-Instruct-v0.1",\n'
+            "]\n"
+            'aggregator_model = "mistralai/Mixtral-8x22B-Instruct-v0.1"\n'
+        )
+        assert self._scan(tmp_path, source) == [
+            "Qwen/Qwen2-72B-Instruct",
+            "mistralai/Mixtral-8x22B-Instruct-v0.1",
+        ]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'self.fallback_model_ids = ("Qwen/Qwen2-72B-Instruct",)\n',
+            'AVAILABLE_MODELS: list[str] = ["Qwen/Qwen2-72B-Instruct"]\n',
+            'tier_models = {"fast": "Qwen/Qwen2-72B-Instruct"}\n',
+        ],
+    )
+    def test_attribute_annotated_and_dict_targets(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        assert self._scan(tmp_path, source) == ["Qwen/Qwen2-72B-Instruct"]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            # Not in the registry: never promoted to a model.
+            'reference_models = ["acme/internal-v2", "my-custom-thing"]\n',
+            # Registry hit, but a bare word without a version or separator.
+            'fallback_model = "base"\n',
+            # Registry hit, but the variable name is not model-related.
+            'providers = ["Qwen/Qwen2-72B-Instruct"]\n',
+            # Dict keys are labels, not model ids.
+            'tier_models = {"Qwen/Qwen2-72B-Instruct": 1}\n',
+        ],
+    )
+    def test_rejects_unregistered_or_unrelated(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        assert self._scan(tmp_path, source) == [], f"false positive on {source!r}"
 
 
 class TestIsKnownEmbeddingModelName:
@@ -622,3 +710,17 @@ class TestRegistryLookupValueLiteralGuard:
             assert _is_known_model(v), (
                 f"_is_known_model({v!r}) must remain True (regression guard)"
             )
+
+
+class TestDottedJsonKeys:
+    def test_dotted_model_key_matches_last_segment(self, tmp_path: Path) -> None:
+        config = {"llm.api_key": "", "llm.model": "gpt-4o-mini"}
+        files = {"app_config.json": json.dumps(config, indent=2)}
+        comps, _ = run_scanner(ModelDetector, tmp_path, files)
+        assert {c.name for c in comps} == {"gpt-4o-mini"}
+
+    def test_prose_placeholder_is_not_a_model(self, tmp_path: Path) -> None:
+        config = {"llm.model": "place your deployment name here"}
+        files = {"template.json": json.dumps(config)}
+        comps, _ = run_scanner(ModelDetector, tmp_path, files)
+        assert comps == []
