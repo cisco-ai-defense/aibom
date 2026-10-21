@@ -934,8 +934,13 @@ def _expand_loop_registered_tools(
     return out
 
 
-def _import_target_file(importer: Path, module: str, level: int) -> Path | None:
-    """File that ``from <module> import ...`` in *importer* refers to, if local."""
+def _import_target_file(
+    importer: Path, module: str, level: int, root: Path | None = None
+) -> Path | None:
+    """File that ``from <module> import ...`` in *importer* refers to, if local.
+
+    With *root*, only files inside the scanned tree are considered.
+    """
     parts = module.split(".") if module else []
     if level:
         base = importer.parent
@@ -943,20 +948,26 @@ def _import_target_file(importer: Path, module: str, level: int) -> Path | None:
             base = base.parent
         bases = [base]
     else:
-        bases = list(importer.parents)
+        bases = [
+            p for p in importer.parents if root is None or p.is_relative_to(root)
+        ]
     for base in bases:
         target = base.joinpath(*parts)
         candidates = [target / "__init__.py"]
         if parts:
             candidates.insert(0, target.with_suffix(".py"))
         for cand in candidates:
-            if cand.is_file():
+            if cand.is_file() and (root is None or cand.is_relative_to(root)):
                 return cand
     return None
 
 
 def _imported_def(
-    path: Path, name: str, trees: dict[Path, ast.Module | None], depth: int = 0
+    path: Path,
+    name: str,
+    trees: dict[Path, ast.Module | None],
+    depth: int = 0,
+    root: Path | None = None,
 ) -> tuple[Path, int] | None:
     """(file, line) of the ``def`` a module-level ``from ... import name`` binds to.
 
@@ -986,13 +997,15 @@ def _imported_def(
     if not isinstance(binding, ast.ImportFrom):
         return None
     alias = next(a for a in binding.names if (a.asname or a.name) == name)
-    target = _import_target_file(path, binding.module or "", binding.level)
+    target = _import_target_file(path, binding.module or "", binding.level, root)
     if target is None:
         return None
-    return _imported_def(target, alias.name, trees, depth + 1)
+    return _imported_def(target, alias.name, trees, depth + 1, root)
 
 
-def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
+def _align_tool_anchors(
+    components: list[AIComponent], scan_paths: list[str] | None = None
+) -> list[AIComponent]:
     """Anchor Python tools at their defining ``def`` statement.
 
     Scanners report tools at the decorator line or at the registration call
@@ -1009,6 +1022,12 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
     """
     trees: dict[Path, ast.Module | None] = {}
     cache: dict[str, tuple[_FileScopes | None, list[str]]] = {}
+    # Imports resolve only inside the scanned tree, never to files above it.
+    roots = sorted(
+        (Path(p).absolute() for p in scan_paths or [] if Path(p).is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
 
     def file_info(path: str) -> tuple[_FileScopes | None, list[str]]:
         if path not in cache:
@@ -1044,7 +1063,12 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
         elif scopes is not None:
             target = scopes.def_line_for(comp.name, comp.line_number)
             if target is None and _is_tools_kwarg_tool(comp):
-                bound = scopes.binding_for(comp.name, comp.line_number)
+                # ``tools=[mod.fn]`` is bound by ``mod``; a star import can
+                # bind any name.
+                head = comp.name.split(".")[0]
+                bound = scopes.binding_for(head, comp.line_number)
+                if bound is None:
+                    bound = scopes.binding_for("*", comp.line_number)
                 if bound and bound[1] == "import":
                     target = bound[0]
                     comp.metadata = {**(comp.metadata or {}), "anchor": "import"}
@@ -1052,7 +1076,9 @@ def _align_tool_anchors(components: list[AIComponent]) -> list[AIComponent]:
                     dropped.add(id(comp))
                     continue
             if target is None and _is_registration_call_tool(comp):
-                found = _imported_def(Path(comp.file_path), comp.name, trees)
+                importer = Path(comp.file_path).absolute()
+                root = next((r for r in roots if importer.is_relative_to(r)), None)
+                found = _imported_def(importer, comp.name, trees, root=root)
                 if found is not None:
                     comp.metadata = {
                         **(comp.metadata or {}),
@@ -2602,7 +2628,7 @@ class ScanPipeline:
                 reclassified,
             )
 
-        components = _align_tool_anchors(components)
+        components = _align_tool_anchors(components, self.scan_paths)
         components = _canonicalize_bedrock_model_ids(components)
 
         if not self.llm_config:

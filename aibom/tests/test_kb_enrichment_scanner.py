@@ -866,7 +866,6 @@ class TestStrandsProviderClassCoverage:
             'MODEL = "gpt-4o"\n'
             "if FAST:\n"
             '    MODEL = "gpt-4o-mini"\n'
-            "MODEL = MODEL\n"
             "model = OpenAIModel(model_id=MODEL)\n"
         )
         result = parse_source_code(str(src), src.read_text())

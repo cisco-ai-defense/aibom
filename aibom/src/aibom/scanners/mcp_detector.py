@@ -250,9 +250,12 @@ def _mcp_client_instances(text: str, fp: str) -> list[AIComponent]:
         args_m = _RE_ARGS_KWARG.search(span)
         args = _RE_QUOTED.findall(args_m.group(1)) if args_m else []
         package = next((a for a in args if a and not a.startswith("-")), "")
+        # Strip a trailing ``@version``; a leading ``@`` is an npm scope.
+        at = package.rfind("@")
+        name = (package[:at] if at > 0 else package) or command.group(1)
         out.append(
             AIComponent(
-                name=package.split("@", 1)[0] if package else command.group(1),
+                name=name,
                 component_type=AIComponentType.MCP_SERVER,
                 file_path=fp,
                 line_number=line,

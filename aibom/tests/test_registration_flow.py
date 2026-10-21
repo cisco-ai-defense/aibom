@@ -190,6 +190,20 @@ class TestLoopRegistrationResolver:
         assert refs == []
 
 
+    def test_index_skips_vendored_directories(self, tmp_path: Path):
+        from aibom.registration_flow import _RepoIndex
+
+        _write(
+            tmp_path,
+            {
+                "node_modules/pkg/vendored.py": "def vendored(q):\n    return q\n",
+                ".venv/lib/site.py": "x = 1\n",
+                "app/server.py": "def serve():\n    pass\n",
+            },
+        )
+        files = _RepoIndex(tmp_path).files
+        assert files == [tmp_path / "app" / "server.py"]
+
 class TestExpandLoopRegisteredTools:
     @staticmethod
     def _row(path: Path, line: int, via: str = "add_tool(_pos_0)") -> AIComponent:

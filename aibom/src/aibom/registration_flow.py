@@ -36,6 +36,7 @@ cannot follow contributes nothing.
 from __future__ import annotations
 
 import ast
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,13 +103,18 @@ class _RepoIndex:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.files: list[Path] = []
-        for path in sorted(root.rglob("*.py")):
-            rel = path.relative_to(root).parts
-            if any(should_skip_dir(p) for p in rel[:-1]):
-                continue
-            if _is_test_path(path, root):
-                continue
-            self.files.append(path)
+        # Prune skipped directories (virtualenvs, node_modules) during the walk.
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if not should_skip_dir(d))
+            for fname in sorted(filenames):
+                if not fname.endswith(".py"):
+                    continue
+                path = Path(dirpath) / fname
+                if _is_test_path(path, root):
+                    continue
+                self.files.append(path)
+                if len(self.files) >= _MAX_FILES:
+                    break
             if len(self.files) >= _MAX_FILES:
                 break
         self._trees: dict[Path, ast.Module | None] = {}

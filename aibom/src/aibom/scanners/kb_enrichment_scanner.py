@@ -1643,6 +1643,25 @@ def _string_value(node: ast.expr) -> str | None:
     return None
 
 
+def _module_scope_statements(tree: ast.Module):
+    """Yield module-scope statements, including those nested in if/try/with/loops.
+
+    Function and class bodies are separate scopes and are not entered.
+    """
+    stack = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        children = [
+            c
+            for c in ast.iter_child_nodes(node)
+            if isinstance(c, (ast.stmt, ast.ExceptHandler))
+        ]
+        stack.extend(reversed(children))
+
+
 def _module_string_constants(file_path: str) -> dict[str, str]:
     """Module-level names bound to one string, either a literal or an env default.
 
@@ -1654,7 +1673,7 @@ def _module_string_constants(file_path: str) -> dict[str, str]:
     except (OSError, SyntaxError, ValueError):
         return {}
     values: dict[str, set[str | None]] = {}
-    for node in tree.body:
+    for node in _module_scope_statements(tree):
         if isinstance(node, ast.Assign):
             targets, value = node.targets, node.value
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
@@ -1669,6 +1688,7 @@ def _module_string_constants(file_path: str) -> dict[str, str]:
         for name, vals in values.items()
         if len(vals) == 1 and next(iter(vals))
     }
+
 
 _KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset(
     {

@@ -2970,6 +2970,21 @@ class TestAlignToolAnchors:
         assert aligned.file_path == str(pkg / "agent" / "impl.py")
         assert aligned.line_number == 2
 
+    def test_add_tool_import_does_not_resolve_outside_scan_root(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        (tmp_path / "tools.py").write_text("def lookup(q):\n    return q\n")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        server = repo / "server.py"
+        server.write_text("from tools import lookup\n" "mcp.add_tool(lookup)\n")
+        tool = self._registered("lookup", server, 2)
+        [aligned] = _align_tool_anchors([tool], [str(repo)])
+        assert aligned.file_path == str(server)
+        assert aligned.line_number == 2
+
     def test_add_tool_with_unresolvable_import_keeps_registration_line(
         self, tmp_path: Path
     ):
@@ -3007,6 +3022,34 @@ class TestAlignToolAnchors:
         assert aligned.line_number == 1
         assert aligned.metadata["anchor"] == "import"
         assert aligned.metadata["reported_line"] == 3
+
+    def test_agent_tools_kwarg_star_import_anchors_at_import_line(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands_tools import *\n" "\n" "agent = Agent(tools=[calculator])\n"
+        )
+        [aligned] = _align_tool_anchors([self._tools_kwarg("calculator", src, 3)])
+        assert aligned.line_number == 1
+        assert aligned.metadata["anchor"] == "import"
+
+    def test_agent_tools_kwarg_dotted_name_anchors_at_module_import(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_tool_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "import my_tools\n" "\n" "agent = Agent(tools=[my_tools.lookup])\n"
+        )
+        [aligned] = _align_tool_anchors(
+            [self._tools_kwarg("my_tools.lookup", src, 3)]
+        )
+        assert aligned.line_number == 1
+        assert aligned.metadata["anchor"] == "import"
 
     def test_agent_tools_kwarg_package_import_anchors_at_import_line(
         self, tmp_path: Path

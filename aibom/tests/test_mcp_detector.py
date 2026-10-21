@@ -211,6 +211,23 @@ class TestMcpClientInstances:
             ("example-pricing-server", 11, "stdio"),
         ]
 
+    def test_scoped_npm_server_keeps_scope_and_drops_version(self, tmp_path: Path):
+        src = (
+            "from strands.tools.mcp import MCPClient\n"
+            "client = MCPClient(\n"
+            "    lambda: stdio_client(\n"
+            "        StdioServerParameters(\n"
+            '            command="npx", args=["-y", "@scope/pkg@1.2.3"]\n'
+            "        )\n"
+            "    )\n"
+            ")\n"
+        )
+        comps, _ = run_scanner(McpDetector, tmp_path, {"lab.py": src})
+        servers = [
+            c.name for c in comps if c.component_type == AIComponentType.MCP_SERVER
+        ]
+        assert servers == ["@scope/pkg"]
+
     def test_client_without_stdio_launch_reports_no_server(self, tmp_path: Path):
         comps, _ = run_scanner(
             McpDetector,
