@@ -26,6 +26,7 @@ carry the workload.
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..catalog_db import CatalogDB
-from ..cst_parser import parse_source_code
+from ..cst_parser import literal_branches, parse_source_code
 from ..db_loader import DatabaseLoadError, ensure_local_database
 from ..models import (
     AIComponent,
@@ -120,6 +121,11 @@ _ID_PATH_OVERRIDES: list[tuple[str, AIComponentType | None]] = [
 ]
 
 
+_MCP_TYPES: frozenset[AIComponentType] = frozenset(
+    {AIComponentType.MCP_CLIENT, AIComponentType.MCP_SERVER}
+)
+
+
 _EXCLUDED_CLASS_NAMES: frozenset[str] = frozenset(
     {
         "RecursiveCharacterTextSplitter",
@@ -158,6 +164,10 @@ def _refine_type_from_kb_id(
         return None
     for segment, override in _ID_PATH_OVERRIDES:
         if segment in kb_id:
+            # An MCP client or server keeps its type in a ``.tools.`` package
+            # (``strands.tools.mcp.MCPClient``).
+            if override is not None and concept_type in _MCP_TYPES:
+                return concept_type
             return override
     return concept_type
 
@@ -891,6 +901,7 @@ class KBEnrichmentScanner(BaseScanner):
                 components.extend(_detect_tool_schemas(result))
                 components.extend(_detect_prompt_kwargs(result))
                 components.extend(_detect_model_kwargs(result))
+                components.extend(_detect_config_getter_defaults(result))
                 components.extend(_detect_import_based_assets(result))
                 components.extend(_detect_guardrail_calls(result))
 
@@ -1152,6 +1163,38 @@ def _detect_cache_ai_co_occurrence(
     return candidates
 
 
+def _imports_local_module(importer: str, imp_line: str) -> bool:
+    """True when *imp_line* imports from a module that lives in the scanned tree.
+
+    Relative imports always do. An absolute ``from a.b import X`` does when
+    ``a/b.py`` or ``a/b/__init__.py`` exists beside the importer or in one of
+    its parent directories.
+    """
+    try:
+        node = ast.parse(imp_line.strip()).body[0]
+    except (SyntaxError, ValueError, IndexError):
+        return False
+    if isinstance(node, ast.ImportFrom):
+        if node.level:
+            return True
+        modules = [node.module or ""]
+    elif isinstance(node, ast.Import):
+        modules = [alias.name for alias in node.names]
+    else:
+        return False
+    for module in modules:
+        parts = [part for part in module.split(".") if part]
+        if not parts:
+            continue
+        for base in Path(importer).parents:
+            target = base.joinpath(*parts)
+            if target.with_suffix(".py").is_file():
+                return True
+            if (target / "__init__.py").is_file():
+                return True
+    return False
+
+
 def _detect_import_based_assets(
     result: "CodeAnalysisResult",
 ) -> list[AIComponent]:
@@ -1179,6 +1222,7 @@ def _detect_import_based_assets(
         extra_types: frozenset[AIComponentType] = frozenset()
         matched_name = ""
         name_ambiguous = False
+        name_inferred = False
 
         for mod_key, entry in _IMPORT_MODULE_TYPE_MAP.items():
             if mod_key in imp_lower:
@@ -1208,9 +1252,20 @@ def _detect_import_based_assets(
                 if inferred != AIComponentType.MODEL:
                     comp_type = inferred
                     matched_name = cleaned
+                    name_inferred = True
                     break
 
         if comp_type is None:
+            continue
+
+        # A name-inferred agent imported from the project's own code is a
+        # reference to a class defined and constructed elsewhere in the scan;
+        # the asset is reported at that definition or construction site.
+        if (
+            comp_type == AIComponentType.AGENT
+            and name_inferred
+            and _imports_local_module(result.file_path, imp_line)
+        ):
             continue
 
         line_no = stored_line
@@ -1564,8 +1619,56 @@ _ENDPOINT_KWARG_NAMES: frozenset[str] = frozenset(
         "azure_endpoint",
         "api_base",
         "endpoint_url",
+        # Ollama clients (``OllamaModel``, ``ChatOllama``) take the server URL as host.
+        "host",
     }
 )
+
+_GETENV_CALLS: frozenset[str] = frozenset(
+    {"os.getenv", "getenv", "os.environ.get", "environ.get"}
+)
+
+
+def _string_value(node: ast.expr) -> str | None:
+    """The string a constant or ``os.getenv(NAME, "default")`` read evaluates to."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call) and ast.unparse(node.func) in _GETENV_CALLS:
+        default = node.args[1] if len(node.args) > 1 else None
+        for kw in node.keywords:
+            if kw.arg == "default":
+                default = kw.value
+        if isinstance(default, ast.Constant) and isinstance(default.value, str):
+            return default.value
+    return None
+
+
+def _module_string_constants(file_path: str) -> dict[str, str]:
+    """Module-level names bound to one string, either a literal or an env default.
+
+    Names assigned more than one distinct value are left out: the value a
+    constructor sees cannot be told without running the code.
+    """
+    try:
+        tree = ast.parse(read_python_source(Path(file_path)))
+    except (OSError, SyntaxError, ValueError):
+        return {}
+    values: dict[str, set[str | None]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                values.setdefault(target.id, set()).add(_string_value(value))
+    return {
+        name: next(iter(vals))
+        for name, vals in values.items()
+        if len(vals) == 1 and next(iter(vals))
+    }
 
 _KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset(
     {
@@ -1658,8 +1761,11 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     Classification rules (no dual emission):
     1. Constructor has ``base_url`` / ``azure_endpoint`` / ``api_base`` / ``endpoint_url``
-       with a concrete URL -> **LLM_ENDPOINT**.
-    2. Constructor has ``model=`` with a registry-known value -> **MODEL**.
+       / ``host`` with a concrete URL -> **LLM_ENDPOINT**. A URL read from a
+       variable is also emitted, and the model kwargs are still read (rule 2).
+    2. Constructor has ``model=`` with a registry-known value -> **MODEL**. A
+       variable resolves through a module-level string constant or an
+       ``os.getenv(NAME, "default")`` default.
     3. Known client class with neither model nor URL kwargs -> **needs_agentic MODEL**
        (bare client; prune if agentic layer cannot resolve a model ID).
     """
@@ -1667,6 +1773,19 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     components: list[AIComponent] = []
     seen: set[tuple[str, int]] = set()
+    constants: dict[str, str] | None = None
+
+    def kwarg_value(raw: Any) -> tuple[str | None, str | None]:
+        """(value, variable) of a kwarg; a variable resolves via module constants."""
+        nonlocal constants
+        if not isinstance(raw, str) or raw.startswith(("ATTRIBUTE:", "COMPLEX_TYPE:")):
+            return None, None
+        if not raw.startswith("VARIABLE:"):
+            return raw.strip().strip("'\""), None
+        if constants is None:
+            constants = _module_string_constants(result.file_path)
+        var = raw.removeprefix("VARIABLE:")
+        return constants.get(var), var
 
     all_calls = [(c, c.line_number) for c in result.calls]
     all_calls += [(a.call, a.line_number) for a in result.assignments]
@@ -1682,15 +1801,12 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
             continue
 
         endpoint_url: str | None = None
+        endpoint_var: str | None = None
         for ek in _ENDPOINT_KWARG_NAMES:
-            raw = call_obs.arguments.get(ek)
-            if isinstance(raw, str) and not raw.startswith(
-                ("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")
-            ):
-                cleaned = raw.strip().strip("'\"")
-                if cleaned.startswith(("http://", "https://")):
-                    endpoint_url = cleaned
-                    break
+            cleaned, var = kwarg_value(call_obs.arguments.get(ek))
+            if cleaned and cleaned.startswith(("http://", "https://")):
+                endpoint_url, endpoint_var = cleaned, var
+                break
 
         if endpoint_url:
             seen.add(key)
@@ -1706,23 +1822,31 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                     metadata={
                         "endpoint_url": endpoint_url,
                         "constructor": short,
+                        **({"endpoint_variable": endpoint_var} if endpoint_var else {}),
                     },
                 )
             )
-            continue
+            # A literal URL keeps rule 1. One read from a variable was never
+            # visible to that rule, so the model kwargs are still read below.
+            if not endpoint_var:
+                continue
 
         found_model = False
         for kwarg_name in _MODEL_KWARG_NAMES:
-            val = call_obs.arguments.get(kwarg_name)
-            if not isinstance(val, str):
-                continue
-            if val.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
-                continue
-            val = val.strip().strip("'\"")
-            if not val or len(val) < 3:
-                continue
-            reg = registry_lookup(val)
-            if reg:
+            raw = call_obs.arguments.get(kwarg_name)
+            # ``model="a" if cond else "b"`` contributes both branches; a
+            # variable resolves through the module's string constants.
+            candidates = [(v, None) for v in literal_branches(raw)]
+            if not candidates:
+                val, var = kwarg_value(raw)
+                candidates = [(val, var)] if val else []
+            for val, var in candidates:
+                val = val.strip().strip("'\"")
+                if not val or len(val) < 3:
+                    continue
+                reg = registry_lookup(val)
+                if not reg:
+                    continue
                 seen.add(key)
                 components.append(
                     AIComponent(
@@ -1737,10 +1861,12 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                             "provider": reg.get("provider", ""),
                             "extracted_from_kwarg": kwarg_name,
                             "constructor": short,
+                            **({"model_id_variable": var} if var else {}),
                         },
                     )
                 )
                 found_model = True
+            if found_model:
                 break
 
         if not found_model and short in _BARE_CLIENT_HINTS:
@@ -1763,6 +1889,121 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                 )
             )
 
+    return components
+
+
+# Typed config getters such as ``self._get_str("model", "gpt-4")``: the first
+# positional argument is the setting key, the default follows it.
+_CONFIG_GETTER_NAMES: frozenset[str] = frozenset(
+    {
+        "_get",
+        "_get_str",
+        "get_str",
+        "_get_string",
+        "get_string",
+        "_get_enum",
+        "get_enum",
+        "_get_config",
+        "get_config",
+        "_get_setting",
+        "get_setting",
+    }
+)
+_CONFIG_MODEL_KEYS: frozenset[str] = frozenset(
+    {"model", "model_name", "model_id", "llm_model", "chat_model", "deployment_name"}
+)
+_CONFIG_EMBEDDING_KEYS: frozenset[str] = frozenset(
+    {"embedding_model", "embedding_model_name", "embed_model", "embeddings_model"}
+)
+_CONFIG_ENDPOINT_KEYS: frozenset[str] = frozenset(
+    {
+        "api_base",
+        "base_url",
+        "endpoint",
+        "endpoint_url",
+        "api_endpoint",
+        "azure_endpoint",
+    }
+)
+
+
+def _config_getter_default(short: str, args: dict[str, Any]) -> Any:
+    if "default" in args:
+        return args["default"]
+    # ``_get_enum(key, options, default)`` puts the options list first.
+    return args.get("_pos_2" if short.endswith("_enum") else "_pos_1")
+
+
+def _detect_config_getter_defaults(
+    result: "CodeAnalysisResult",
+) -> list[AIComponent]:
+    """Extract models, embeddings and LLM endpoints from config-getter defaults.
+
+    Matches ``<obj>._get_str("model", <default>)``-style calls whose key names
+    a model, embedding model or API base. Each string literal the default can
+    evaluate to (both branches of a conditional expression) is a candidate;
+    model ids must look like one, endpoints must be http(s) URLs.
+    """
+    from .model_detector import is_known_embedding_model_name, registry_lookup
+
+    components: list[AIComponent] = []
+    seen: set[tuple[AIComponentType, str]] = set()
+
+    for call_obs, line in _call_sites(result):
+        qn = call_obs.qualified_name or ""
+        short = qn.rsplit(".", 1)[-1]
+        if short not in _CONFIG_GETTER_NAMES:
+            continue
+        args = call_obs.arguments or {}
+        key = _arg_literal(args.get("_pos_0") or args.get("key"))
+        if not key:
+            continue
+        key = key.lower()
+        if key in _CONFIG_MODEL_KEYS:
+            ctype = AIComponentType.MODEL
+        elif key in _CONFIG_EMBEDDING_KEYS:
+            ctype = AIComponentType.EMBEDDING
+        elif key in _CONFIG_ENDPOINT_KEYS:
+            ctype = AIComponentType.LLM_ENDPOINT
+        else:
+            continue
+
+        for val in literal_branches(_config_getter_default(short, args)):
+            val = val.strip()
+            if not val or (ctype, val) in seen:
+                continue
+            metadata: dict[str, Any] = {
+                "detection_method": "config_getter_default",
+                "config_getter": short,
+                "config_key": key,
+            }
+            if ctype == AIComponentType.LLM_ENDPOINT:
+                if not val.startswith(("http://", "https://")):
+                    continue
+                metadata["endpoint_url"] = val
+            elif ctype == AIComponentType.EMBEDDING:
+                if not (is_known_embedding_model_name(val) or "embed" in val.lower()):
+                    continue
+            elif not _looks_like_model_id(val):
+                continue
+            else:
+                reg = registry_lookup(val)
+                if reg:
+                    metadata["provider"] = reg.get("provider", "")
+            seen.add((ctype, val))
+            components.append(
+                AIComponent(
+                    name=val,
+                    component_type=ctype,
+                    file_path=result.file_path,
+                    line_number=line,
+                    model_name=val if ctype == AIComponentType.MODEL else None,
+                    embedding_model=val if ctype == AIComponentType.EMBEDDING else None,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    heuristic_confidence=0.8,
+                    metadata=metadata,
+                )
+            )
     return components
 
 
@@ -2729,11 +2970,18 @@ def _obs(
 
 
 def _resolve_chain(name: str, variable_map: dict[str, str]) -> str:
-    """Resolve ``var.method`` → ``FullyQualified.method`` via the variable map."""
+    """Resolve ``var.method`` → ``FullyQualified.method`` via the variable map.
+
+    A name already qualified with the variable's value is left alone: in
+    ``mcp = FastMCP(...)`` the variable ``mcp`` shares its name with the ``mcp``
+    package, and re-resolving ``mcp.server.fastmcp.FastMCP.resource`` would
+    otherwise double the prefix and miss the exact catalog entry.
+    """
     if "." in name:
         head, tail = name.split(".", 1)
-        if head in variable_map:
-            return f"{variable_map[head]}.{tail}"
+        target = variable_map.get(head)
+        if target and name != target and not name.startswith(target + "."):
+            return f"{target}.{tail}"
     return name
 
 

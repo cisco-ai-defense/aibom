@@ -109,7 +109,7 @@ class TestAgenticPromptHardening:
 
     def test_prompt_lists_agent_negative_patterns(self) -> None:
         prompt = _normalized_aibom_prompt()
-        assert "a class that calls an llm once" in prompt
+        assert "class (not a framework agent instance) that calls an llm" in prompt
         assert "sequentialchain" in prompt
         assert "the name is misleading" in prompt
 
@@ -237,3 +237,23 @@ class TestAgenticPromptHardening:
             "other_detected_components rather than risk emitting a "
             "fabricated iid"
         )
+
+    def test_prompt_keeps_framework_agent_instances_without_tools(self) -> None:
+        """Framework-constructed agents count even without ``tools=``.
+
+        ADK ``LlmAgent`` / ``Agent`` and similar instances are run by their
+        framework's runner, so the loop is not visible next to the constructor.
+        The single-call REMOVE rules must apply only to user-defined classes.
+        """
+        prompt = _normalized_aibom_prompt()
+        assert "framework agent instances (exception to the three-condition rule)" in (
+            prompt
+        )
+        assert "even when it has no ``tools=`` argument" in prompt
+        assert "google adk ``llmagent``" in prompt
+        assert "with or without a tool list" in prompt
+        assert (
+            "a user-defined class (not a framework agent instance) that calls an llm "
+            "once and returns the response → remove"
+        ) in prompt
+        assert "does not cover a bare ``import`` of the class" in prompt
