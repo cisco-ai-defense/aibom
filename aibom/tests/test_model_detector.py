@@ -464,6 +464,73 @@ class TestModelDetector:
         assert comps[0].metadata["registry_source"] == "builtin"
 
 
+class TestModelVariableLiterals:
+    """Literals bound to model-named variables, kept only on a registry hit."""
+
+    _REGISTRY = {
+        "qwen2-72b-instruct": {"provider": "qwen", "family": "qwen2"},
+        "mixtral-8x22b-instruct-v0.1": {"provider": "mistral", "family": "mixtral"},
+        "base": {"provider": "speechco", "family": "base"},
+    }
+
+    def _scan(self, tmp_path: Path, source: str) -> list[str]:
+        with (
+            patch(
+                "aibom.scanners.model_detector._get_live_registry",
+                return_value=self._REGISTRY,
+            ),
+            patch(
+                "aibom.scanners.model_detector._query_hf_hub", return_value=None
+            ),
+        ):
+            comps, _ = run_scanner(ModelDetector, tmp_path, {"app.py": source})
+        return sorted(c.model_name for c in comps)
+
+    def test_list_and_suffixed_assignment(self, tmp_path: Path) -> None:
+        source = (
+            "reference_models = [\n"
+            '    "Qwen/Qwen2-72B-Instruct",\n'
+            '    "mistralai/Mixtral-8x22B-Instruct-v0.1",\n'
+            "]\n"
+            'aggregator_model = "mistralai/Mixtral-8x22B-Instruct-v0.1"\n'
+        )
+        assert self._scan(tmp_path, source) == [
+            "Qwen/Qwen2-72B-Instruct",
+            "mistralai/Mixtral-8x22B-Instruct-v0.1",
+        ]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'self.fallback_model_ids = ("Qwen/Qwen2-72B-Instruct",)\n',
+            'AVAILABLE_MODELS: list[str] = ["Qwen/Qwen2-72B-Instruct"]\n',
+            'tier_models = {"fast": "Qwen/Qwen2-72B-Instruct"}\n',
+        ],
+    )
+    def test_attribute_annotated_and_dict_targets(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        assert self._scan(tmp_path, source) == ["Qwen/Qwen2-72B-Instruct"]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            # Not in the registry: never promoted to a model.
+            'reference_models = ["acme/internal-v2", "my-custom-thing"]\n',
+            # Registry hit, but a bare word without a version or separator.
+            'fallback_model = "base"\n',
+            # Registry hit, but the variable name is not model-related.
+            'providers = ["Qwen/Qwen2-72B-Instruct"]\n',
+            # Dict keys are labels, not model ids.
+            'tier_models = {"Qwen/Qwen2-72B-Instruct": 1}\n',
+        ],
+    )
+    def test_rejects_unregistered_or_unrelated(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        assert self._scan(tmp_path, source) == [], f"false positive on {source!r}"
+
+
 class TestIsKnownEmbeddingModelName:
     """Unit tests for is_known_embedding_model_name.
 

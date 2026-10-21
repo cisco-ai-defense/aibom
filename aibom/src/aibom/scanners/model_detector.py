@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import bisect
 import io
 import json
@@ -1174,6 +1175,66 @@ def _extract_python_models(text: str) -> list[tuple[str, int]]:
     return found
 
 
+# Variable names that hold a model identifier, or a collection of them, but that
+# the strict ``_PY_ASSIGN_RE`` vocabulary does not cover: ``aggregator_model``,
+# ``reference_models``, ``self.fallback_model_ids``, ``AVAILABLE_MODELS``.
+_PY_MODEL_VAR_NAME_RE = re.compile(
+    r"(?i)(?:^|_)(?:models?|model_ids?|model_names?|model_list|llm_models?)$"
+)
+
+# Real model ids carry a version digit or a separator (``gpt-4o``,
+# ``org/name``, ``claude-3.5``). Bare words such as ``base`` or ``chat`` collide
+# with catalog rows and are rejected.
+_MODEL_ID_SHAPE_RE = re.compile(r"[\d/:.-]")
+
+
+def _model_var_name(target: ast.expr) -> str:
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return ""
+
+
+def _extract_python_model_var_literals(text: str) -> list[tuple[str, int]]:
+    """Return string literals assigned to model-named variables.
+
+    Covers plain assignments (``aggregator_model = "..."``) and list, tuple,
+    set, or dict-value literals (``reference_models = ["...", "..."]``). The
+    names are looser than ``_PY_ASSIGN_RE``, so callers must only keep values
+    that resolve in the model registry.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []
+    found: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not any(
+            _PY_MODEL_VAR_NAME_RE.search(_model_var_name(t)) for t in targets
+        ):
+            continue
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            elts = value.elts
+        elif isinstance(value, ast.Dict):
+            elts = value.values
+        else:
+            elts = [value]
+        for elt in elts:
+            if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                continue
+            s = _normalize_candidate(elt.value)
+            if _is_plausible_model_id(s) and _MODEL_ID_SHAPE_RE.search(s):
+                found.append((s, elt.lineno))
+    return found
+
+
 def _make_component(
     model_name: str,
     file_path: str,
@@ -1262,6 +1323,8 @@ class ModelDetector(BaseScanner):
             if suffix in (".py", ".ipynb"):
                 for val, ln in _extract_python_models(text):
                     extracted.append((val, ln, "string_literal"))
+                for val, ln in _extract_python_model_var_literals(text):
+                    extracted.append((val, ln, "model_variable"))
             elif name_lower == ".env" or fpath.name.endswith(".env"):
                 for val, ln in _extract_env_models(text):
                     extracted.append((val, ln, "env_var"))
@@ -1280,8 +1343,10 @@ class ModelDetector(BaseScanner):
                 key = (fp_str, model_name)
                 if key in seen:
                     continue
-                seen.add(key)
                 reg = registry_lookup(model_name)
+                if reg is None and method == "model_variable":
+                    continue
+                seen.add(key)
                 components.append(
                     _make_component(model_name, fp_str, line_no, method, reg)
                 )
