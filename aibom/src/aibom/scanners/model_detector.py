@@ -733,7 +733,8 @@ _PY_ASSIGN_RE = re.compile(
     r"(?P<q>[\"'])(?P<val>[^\"'\\]*(?:\\.[^\"'\\]*)*)(?P=q)",
 )
 
-# ``os.getenv(...)`` / ``os.environ.get(...)`` with a quoted default value
+# ``os.getenv(...)`` / ``os.environ.get(...)`` (or a project helper named
+# ``get_env*``, e.g. ``get_env_variable``) with a quoted default value
 # whose env var name looks model-related. Strands and similar agent
 # frameworks commonly read the deployed model ID from the environment with a
 # hard-coded literal fallback — that literal is the real model in practice.
@@ -742,7 +743,7 @@ _PY_ASSIGN_RE = re.compile(
 # like ``os.getenv("LOG_LEVEL", "info")`` do not falsely register "info" as
 # a model ID.
 _PY_GETENV_WITH_DEFAULT_RE = re.compile(
-    r"(?:os\.)?(?:getenv|environ\.get)\s*\(\s*"
+    r"(?:os\.)?(?:getenv|environ\.get|get_env\w*)\s*\(\s*"
     r"(?P<envq>[\"'])"
     r"(?P<env>(?:[A-Z][A-Z0-9_]*_)?(?:MODEL|MODEL_ID|MODEL_NAME|DEPLOYMENT|DEPLOYMENT_NAME|LLM_MODEL))"
     r"(?P=envq)\s*,\s*"

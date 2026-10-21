@@ -26,6 +26,7 @@ carry the workload.
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from dataclasses import dataclass, field
@@ -1152,6 +1153,38 @@ def _detect_cache_ai_co_occurrence(
     return candidates
 
 
+def _imports_local_module(importer: str, imp_line: str) -> bool:
+    """True when *imp_line* imports from a module that lives in the scanned tree.
+
+    Relative imports always do. An absolute ``from a.b import X`` does when
+    ``a/b.py`` or ``a/b/__init__.py`` exists beside the importer or in one of
+    its parent directories.
+    """
+    try:
+        node = ast.parse(imp_line.strip()).body[0]
+    except (SyntaxError, ValueError, IndexError):
+        return False
+    if isinstance(node, ast.ImportFrom):
+        if node.level:
+            return True
+        modules = [node.module or ""]
+    elif isinstance(node, ast.Import):
+        modules = [alias.name for alias in node.names]
+    else:
+        return False
+    for module in modules:
+        parts = [part for part in module.split(".") if part]
+        if not parts:
+            continue
+        for base in Path(importer).parents:
+            target = base.joinpath(*parts)
+            if target.with_suffix(".py").is_file():
+                return True
+            if (target / "__init__.py").is_file():
+                return True
+    return False
+
+
 def _detect_import_based_assets(
     result: "CodeAnalysisResult",
 ) -> list[AIComponent]:
@@ -1179,6 +1212,7 @@ def _detect_import_based_assets(
         extra_types: frozenset[AIComponentType] = frozenset()
         matched_name = ""
         name_ambiguous = False
+        name_inferred = False
 
         for mod_key, entry in _IMPORT_MODULE_TYPE_MAP.items():
             if mod_key in imp_lower:
@@ -1208,9 +1242,20 @@ def _detect_import_based_assets(
                 if inferred != AIComponentType.MODEL:
                     comp_type = inferred
                     matched_name = cleaned
+                    name_inferred = True
                     break
 
         if comp_type is None:
+            continue
+
+        # A name-inferred agent imported from the project's own code is a
+        # reference to a class defined and constructed elsewhere in the scan;
+        # the asset is reported at that definition or construction site.
+        if (
+            comp_type == AIComponentType.AGENT
+            and name_inferred
+            and _imports_local_module(result.file_path, imp_line)
+        ):
             continue
 
         line_no = stored_line

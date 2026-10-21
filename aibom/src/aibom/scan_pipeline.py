@@ -1032,12 +1032,20 @@ def _consolidate_components(
             result.append(c)
             continue
 
+        # Among equally ranked agent sites spread over several files, the
+        # file that creates the agent most often is its factory; anchor there
+        # rather than at whichever file has the lowest line number.
+        per_file: dict[str, int] = {}
+        if group[0].component_type.value == "agent":
+            for c in group:
+                per_file[c.file_path] = per_file.get(c.file_path, 0) + 1
         best = max(
             group,
             key=lambda c: (
                 c.heuristic_confidence,
                 1 if _has_instantiation_marker(c) else 0,
                 0 if _is_test_file(c.file_path) else 1,
+                per_file.get(c.file_path, 0),
                 -c.line_number,
             ),
         )
