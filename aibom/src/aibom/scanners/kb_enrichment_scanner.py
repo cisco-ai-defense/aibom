@@ -1618,6 +1618,8 @@ _ENDPOINT_KWARG_NAMES: frozenset[str] = frozenset(
         "azure_endpoint",
         "api_base",
         "endpoint_url",
+        # Ollama clients (``OllamaModel``, ``ChatOllama``) take the server URL as host.
+        "host",
     }
 )
 
@@ -1758,7 +1760,8 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     Classification rules (no dual emission):
     1. Constructor has ``base_url`` / ``azure_endpoint`` / ``api_base`` / ``endpoint_url``
-       with a concrete URL -> **LLM_ENDPOINT**.
+       / ``host`` with a concrete URL -> **LLM_ENDPOINT**. A URL read from a
+       variable is also emitted, and the model kwargs are still read (rule 2).
     2. Constructor has ``model=`` with a registry-known value -> **MODEL**. A
        variable resolves through a module-level string constant or an
        ``os.getenv(NAME, "default")`` default.
@@ -1797,15 +1800,12 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
             continue
 
         endpoint_url: str | None = None
+        endpoint_var: str | None = None
         for ek in _ENDPOINT_KWARG_NAMES:
-            raw = call_obs.arguments.get(ek)
-            if isinstance(raw, str) and not raw.startswith(
-                ("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")
-            ):
-                cleaned = raw.strip().strip("'\"")
-                if cleaned.startswith(("http://", "https://")):
-                    endpoint_url = cleaned
-                    break
+            cleaned, var = kwarg_value(call_obs.arguments.get(ek))
+            if cleaned and cleaned.startswith(("http://", "https://")):
+                endpoint_url, endpoint_var = cleaned, var
+                break
 
         if endpoint_url:
             seen.add(key)
@@ -1821,10 +1821,14 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                     metadata={
                         "endpoint_url": endpoint_url,
                         "constructor": short,
+                        **({"endpoint_variable": endpoint_var} if endpoint_var else {}),
                     },
                 )
             )
-            continue
+            # A literal URL keeps rule 1. One read from a variable was never
+            # visible to that rule, so the model kwargs are still read below.
+            if not endpoint_var:
+                continue
 
         found_model = False
         for kwarg_name in _MODEL_KWARG_NAMES:

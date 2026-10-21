@@ -875,6 +875,36 @@ class TestStrandsProviderClassCoverage:
         assert model.metadata["detection_method"] == "bare_provider_client"
 
 
+    def test_ollama_host_variable_is_endpoint_and_model(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "import os\n"
+            "from strands.models.ollama import OllamaModel\n"
+            'OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")\n'
+            'OLLAMA_MODEL_ID = os.getenv("OLLAMA_MODEL_ID", "llama3.2:3b")\n'
+            "model = OllamaModel(host=OLLAMA_HOST, model_id=OLLAMA_MODEL_ID)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        found = {
+            (c.component_type, c.name, c.line_number)
+            for c in _detect_model_kwargs(result)
+        }
+        assert found == {
+            (AIComponentType.LLM_ENDPOINT, "http://localhost:11434", 5),
+            (AIComponentType.MODEL, "llama3.2:3b", 5),
+        }
+
+    def test_literal_endpoint_still_suppresses_model(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.ollama import OllamaModel\n"
+            'model = OllamaModel(host="http://localhost:11434", model_id="llama3")\n'
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [endpoint] = _detect_model_kwargs(result)
+        assert endpoint.component_type == AIComponentType.LLM_ENDPOINT
+
+
 class TestStrandsAgentFrameworkPrefix:
     """Module-level ``agent = Agent(...)`` from Strands must become an AGENT.
 
