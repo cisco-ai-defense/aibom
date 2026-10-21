@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -709,3 +710,17 @@ class TestRegistryLookupValueLiteralGuard:
             assert _is_known_model(v), (
                 f"_is_known_model({v!r}) must remain True (regression guard)"
             )
+
+
+class TestDottedJsonKeys:
+    def test_dotted_model_key_matches_last_segment(self, tmp_path: Path) -> None:
+        config = {"llm.api_key": "", "llm.model": "gpt-4o-mini"}
+        files = {"app_config.json": json.dumps(config, indent=2)}
+        comps, _ = run_scanner(ModelDetector, tmp_path, files)
+        assert {c.name for c in comps} == {"gpt-4o-mini"}
+
+    def test_prose_placeholder_is_not_a_model(self, tmp_path: Path) -> None:
+        config = {"llm.model": "place your deployment name here"}
+        files = {"template.json": json.dumps(config)}
+        comps, _ = run_scanner(ModelDetector, tmp_path, files)
+        assert comps == []

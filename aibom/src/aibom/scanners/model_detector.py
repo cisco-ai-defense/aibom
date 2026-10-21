@@ -855,6 +855,10 @@ def _is_plausible_model_id(s: str) -> bool:
     low = s.lower()
     if low in _SKIP_STRINGS or low.startswith("${"):
         return False
+    # Model ids never contain whitespace; such values are prose placeholders
+    # (e.g. "place your deployment name here").
+    if re.search(r"\s", s):
+        return False
     if not re.search(r"[a-zA-Z]", s):
         return False
     return True
@@ -1061,7 +1065,8 @@ def _walk_mapping(
         return
     if isinstance(obj, dict):
         for k, v in obj.items():
-            lk = str(k).lower()
+            # Dotted keys (``"llm.model"``) are matched on their last segment.
+            lk = str(k).lower().rsplit(".", 1)[-1]
             if (
                 lk in _JSON_KEY_HINT
                 and isinstance(v, str)
