@@ -196,6 +196,79 @@ def _first_match_line(pattern: re.Pattern[str], text: str) -> Optional[int]:
     return _line_for_match(text, m.start())
 
 
+_RE_MCP_CLIENT_ASSIGN = re.compile(
+    r"(?m)^[ \t]*(?P<target>[A-Za-z_]\w*)\s*=\s*(?P<call>MCPClient)\s*\("
+)
+_RE_STDIO_SERVER_PARAMS = re.compile(r"\bStdioServerParameters\s*\(")
+_RE_COMMAND_KWARG = re.compile(r"""\bcommand\s*=\s*["']([^"']+)["']""")
+_RE_ARGS_KWARG = re.compile(r"""\bargs\s*=\s*\[([^\]]*)\]""")
+_RE_QUOTED = re.compile(r"""["']([^"']*)["']""")
+
+
+def _call_span(text: str, open_paren: int) -> str:
+    """Text of the call whose ``(`` is at *open_paren*, up to its matching ``)``."""
+    depth = 0
+    for i in range(open_paren, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren : i + 1]
+    return text[open_paren:]
+
+
+def _mcp_client_instances(text: str, fp: str) -> list[AIComponent]:
+    """One client per ``x = MCPClient(...)``, plus the server it launches over stdio.
+
+    A client that starts its server over stdio
+    (``MCPClient(lambda: stdio_client(StdioServerParameters(...)))``) names it in
+    ``StdioServerParameters(command=..., args=[...])``. That server is reported at
+    the ``MCPClient(`` line, named after its first non-flag argument (the
+    package being run) or else the command.
+    """
+    out: list[AIComponent] = []
+    for m in _RE_MCP_CLIENT_ASSIGN.finditer(text):
+        line = _line_for_match(text, m.start("call"))
+        out.append(
+            AIComponent(
+                name=m.group("target"),
+                component_type=AIComponentType.MCP_CLIENT,
+                file_path=fp,
+                line_number=line,
+                framework="mcp",
+                detection_source=DetectionSource.CODE_ANALYSIS,
+                metadata={"patterns": ["MCPClient"], "assigned_to": m.group("target")},
+            )
+        )
+        span = _call_span(text, m.end() - 1)
+        if not _RE_STDIO_SERVER_PARAMS.search(span):
+            continue
+        command = _RE_COMMAND_KWARG.search(span)
+        if not command:
+            continue
+        args_m = _RE_ARGS_KWARG.search(span)
+        args = _RE_QUOTED.findall(args_m.group(1)) if args_m else []
+        package = next((a for a in args if a and not a.startswith("-")), "")
+        out.append(
+            AIComponent(
+                name=package.split("@", 1)[0] if package else command.group(1),
+                component_type=AIComponentType.MCP_SERVER,
+                file_path=fp,
+                line_number=line,
+                framework="mcp",
+                detection_source=DetectionSource.CODE_ANALYSIS,
+                transport="stdio",
+                metadata={
+                    "command": command.group(1),
+                    "args": args,
+                    "launched_by": m.group("target"),
+                },
+            )
+        )
+    return out
+
+
 def _components_from_python(path: Path) -> list[AIComponent]:
     try:
         text = read_python_source(path)
@@ -264,6 +337,9 @@ def _components_from_python(path: Path) -> list[AIComponent]:
             )
         )
 
+    instances = _mcp_client_instances(text, fp)
+    out.extend(instances)
+
     has_mcp = bool(m_imp or m_srv_imp or m_fastmcp_imp or _RE_FASTMCP.search(text))
     _RE_DEF_AFTER_DECORATOR = re.compile(r"(?:async\s+)?def\s+(\w+)")
     for i, mdec in enumerate(_RE_MCP_TOOL_DECORATOR.finditer(text)):
@@ -331,8 +407,15 @@ def _components_from_python(path: Path) -> list[AIComponent]:
     )
     if m_cs and (_RE_MCP_CLIENT_MODULE.search(text) or m_imp or has_mcp_transport):
         client_hits.append(("ClientSession", _line_for_match(text, m_cs.start())))
+    instance_lines = {
+        c.line_number
+        for c in instances
+        if c.component_type == AIComponentType.MCP_CLIENT
+    }
     if client_hits:
         client_hits.sort(key=lambda x: x[1])
+    # The file-level client stands in for clients not reported per instance.
+    if client_hits and client_hits[0][1] not in instance_lines:
         out.append(
             AIComponent(
                 name=f"{path.stem}_mcp_client",

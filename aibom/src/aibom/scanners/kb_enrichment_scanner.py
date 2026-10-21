@@ -121,6 +121,11 @@ _ID_PATH_OVERRIDES: list[tuple[str, AIComponentType | None]] = [
 ]
 
 
+_MCP_TYPES: frozenset[AIComponentType] = frozenset(
+    {AIComponentType.MCP_CLIENT, AIComponentType.MCP_SERVER}
+)
+
+
 _EXCLUDED_CLASS_NAMES: frozenset[str] = frozenset(
     {
         "RecursiveCharacterTextSplitter",
@@ -159,6 +164,10 @@ def _refine_type_from_kb_id(
         return None
     for segment, override in _ID_PATH_OVERRIDES:
         if segment in kb_id:
+            # An MCP client or server keeps its type in a ``.tools.`` package
+            # (``strands.tools.mcp.MCPClient``).
+            if override is not None and concept_type in _MCP_TYPES:
+                return concept_type
             return override
     return concept_type
 

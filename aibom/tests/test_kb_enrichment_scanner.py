@@ -1194,3 +1194,21 @@ class TestVariableNamedLikeItsPackage:
         tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
         assert [(t.name, t.line_number) for t in tools] == [("create_session", 4)]
         assert tools[0].metadata["extracted_via"] == "add_tool(_pos_0)"
+
+
+class TestMcpCatalogTypes:
+    def test_strands_mcp_client_keeps_client_type_under_tools_package(self) -> None:
+        from aibom.builtin_catalog import BUILTIN_CATALOG_ENTRIES
+        from aibom.scanners.kb_enrichment_scanner import _refine_type_from_kb_id
+
+        kb_id = "strands.tools.mcp.MCPClient"
+        entry = next(e for e in BUILTIN_CATALOG_ENTRIES if e["id"] == kb_id)
+        assert entry["concept"] == "mcp_client"
+        assert (
+            _refine_type_from_kb_id(entry["id"], AIComponentType.MCP_CLIENT)
+            == AIComponentType.MCP_CLIENT
+        )
+        assert (
+            _refine_type_from_kb_id("strands.tools.Tool", AIComponentType.AGENT)
+            == AIComponentType.TOOL
+        )

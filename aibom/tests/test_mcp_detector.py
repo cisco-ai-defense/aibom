@@ -172,3 +172,55 @@ class TestMcpDetector:
         comps, _ = run_scanner(McpDetector, tmp_path, {"srv.py": src})
         tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
         assert [t.name for t in tools] == ["search"]
+
+
+class TestMcpClientInstances:
+    _STDIO_CLIENTS = (
+        "from mcp import stdio_client, StdioServerParameters\n"
+        "from strands.tools.mcp import MCPClient\n"
+        "\n"
+        "docs_client = MCPClient(\n"
+        "    lambda: stdio_client(\n"
+        "        StdioServerParameters(\n"
+        '            command="uvx", args=["example.docs-mcp-server@latest"]\n'
+        "        )\n"
+        "    )\n"
+        ")\n"
+        "pricing_client = MCPClient(\n"
+        "    lambda: stdio_client(\n"
+        '        StdioServerParameters(command="example-pricing-server")\n'
+        "    )\n"
+        ")\n"
+    )
+
+    def test_each_client_and_launched_server_is_reported(self, tmp_path: Path):
+        comps, _ = run_scanner(McpDetector, tmp_path, {"lab.py": self._STDIO_CLIENTS})
+        clients = [
+            (c.name, c.line_number)
+            for c in comps
+            if c.component_type == AIComponentType.MCP_CLIENT
+        ]
+        servers = [
+            (c.name, c.line_number, c.transport)
+            for c in comps
+            if c.component_type == AIComponentType.MCP_SERVER
+        ]
+        assert clients == [("docs_client", 4), ("pricing_client", 11)]
+        assert servers == [
+            ("example.docs-mcp-server", 4, "stdio"),
+            ("example-pricing-server", 11, "stdio"),
+        ]
+
+    def test_client_without_stdio_launch_reports_no_server(self, tmp_path: Path):
+        comps, _ = run_scanner(
+            McpDetector,
+            tmp_path,
+            {
+                "lab.py": "from strands.tools.mcp import MCPClient\n"
+                "client = MCPClient(\n"
+                '    lambda: streamablehttp_client("http://localhost")\n'
+                ")\n"
+            },
+        )
+        assert [c.component_type for c in comps] == [AIComponentType.MCP_CLIENT]
+        assert comps[0].name == "client"
