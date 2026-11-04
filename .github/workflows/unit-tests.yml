@@ -35,3 +35,26 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+  package-metadata:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aibom
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python for uv
+        uses: astral-sh/setup-uv@v8.3.2
+
+      - name: Stage README and LICENSE as the publish workflow does
+        run: |
+          cp ../README.md README.md
+          cp ../LICENSE LICENSE
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Check license metadata in built distributions
+        run: uv run --no-project python scripts/check_dist_metadata.py

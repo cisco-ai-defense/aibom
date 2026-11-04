@@ -26,10 +26,14 @@ jobs:
         uses: astral-sh/setup-uv@v8.3.2
       - name: Install Python 3.13
         run: uv python install 3.13
-      - name: Stage README for package metadata
-        run: cp ../README.md README.md
+      - name: Stage README and LICENSE for package metadata
+        run: |
+          cp ../README.md README.md
+          cp ../LICENSE LICENSE
       - name: Build
         run: uv build
+      - name: Check license metadata in built distributions
+        run: uv run --no-project python scripts/check_dist_metadata.py
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
