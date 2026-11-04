@@ -26,6 +26,7 @@ carry the workload.
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..catalog_db import CatalogDB
-from ..cst_parser import parse_source_code
+from ..cst_parser import literal_branches, parse_source_code
 from ..db_loader import DatabaseLoadError, ensure_local_database
 from ..models import (
     AIComponent,
@@ -42,7 +43,7 @@ from ..models import (
     DetectionSource,
     ScanContext,
 )
-from ..structures import CodeAnalysisResult
+from ..structures import CallObservation, CodeAnalysisResult
 from .base import BaseScanner
 from .file_cache import read_python_source, read_text_cached
 
@@ -120,6 +121,11 @@ _ID_PATH_OVERRIDES: list[tuple[str, AIComponentType | None]] = [
 ]
 
 
+_MCP_TYPES: frozenset[AIComponentType] = frozenset(
+    {AIComponentType.MCP_CLIENT, AIComponentType.MCP_SERVER}
+)
+
+
 _EXCLUDED_CLASS_NAMES: frozenset[str] = frozenset(
     {
         "RecursiveCharacterTextSplitter",
@@ -158,6 +164,10 @@ def _refine_type_from_kb_id(
         return None
     for segment, override in _ID_PATH_OVERRIDES:
         if segment in kb_id:
+            # An MCP client or server keeps its type in a ``.tools.`` package
+            # (``strands.tools.mcp.MCPClient``).
+            if override is not None and concept_type in _MCP_TYPES:
+                return concept_type
             return override
     return concept_type
 
@@ -891,6 +901,7 @@ class KBEnrichmentScanner(BaseScanner):
                 components.extend(_detect_tool_schemas(result))
                 components.extend(_detect_prompt_kwargs(result))
                 components.extend(_detect_model_kwargs(result))
+                components.extend(_detect_config_getter_defaults(result))
                 components.extend(_detect_import_based_assets(result))
                 components.extend(_detect_guardrail_calls(result))
 
@@ -898,6 +909,7 @@ class KBEnrichmentScanner(BaseScanner):
                 components.extend(_emit_suggestive_candidates(py_file, source))
 
             components.extend(_detect_cache_ai_co_occurrence(tier1_files))
+            components = _drop_superseded_import_candidates(components)
 
         components = [
             c
@@ -1151,6 +1163,38 @@ def _detect_cache_ai_co_occurrence(
     return candidates
 
 
+def _imports_local_module(importer: str, imp_line: str) -> bool:
+    """True when *imp_line* imports from a module that lives in the scanned tree.
+
+    Relative imports always do. An absolute ``from a.b import X`` does when
+    ``a/b.py`` or ``a/b/__init__.py`` exists beside the importer or in one of
+    its parent directories.
+    """
+    try:
+        node = ast.parse(imp_line.strip()).body[0]
+    except (SyntaxError, ValueError, IndexError):
+        return False
+    if isinstance(node, ast.ImportFrom):
+        if node.level:
+            return True
+        modules = [node.module or ""]
+    elif isinstance(node, ast.Import):
+        modules = [alias.name for alias in node.names]
+    else:
+        return False
+    for module in modules:
+        parts = [part for part in module.split(".") if part]
+        if not parts:
+            continue
+        for base in Path(importer).parents:
+            target = base.joinpath(*parts)
+            if target.with_suffix(".py").is_file():
+                return True
+            if (target / "__init__.py").is_file():
+                return True
+    return False
+
+
 def _detect_import_based_assets(
     result: "CodeAnalysisResult",
 ) -> list[AIComponent]:
@@ -1178,6 +1222,7 @@ def _detect_import_based_assets(
         extra_types: frozenset[AIComponentType] = frozenset()
         matched_name = ""
         name_ambiguous = False
+        name_inferred = False
 
         for mod_key, entry in _IMPORT_MODULE_TYPE_MAP.items():
             if mod_key in imp_lower:
@@ -1207,9 +1252,20 @@ def _detect_import_based_assets(
                 if inferred != AIComponentType.MODEL:
                     comp_type = inferred
                     matched_name = cleaned
+                    name_inferred = True
                     break
 
         if comp_type is None:
+            continue
+
+        # A name-inferred agent imported from the project's own code is a
+        # reference to a class defined and constructed elsewhere in the scan;
+        # the asset is reported at that definition or construction site.
+        if (
+            comp_type == AIComponentType.AGENT
+            and name_inferred
+            and _imports_local_module(result.file_path, imp_line)
+        ):
             continue
 
         line_no = stored_line
@@ -1563,8 +1619,76 @@ _ENDPOINT_KWARG_NAMES: frozenset[str] = frozenset(
         "azure_endpoint",
         "api_base",
         "endpoint_url",
+        # Ollama clients (``OllamaModel``, ``ChatOllama``) take the server URL as host.
+        "host",
     }
 )
+
+_GETENV_CALLS: frozenset[str] = frozenset(
+    {"os.getenv", "getenv", "os.environ.get", "environ.get"}
+)
+
+
+def _string_value(node: ast.expr) -> str | None:
+    """The string a constant or ``os.getenv(NAME, "default")`` read evaluates to."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call) and ast.unparse(node.func) in _GETENV_CALLS:
+        default = node.args[1] if len(node.args) > 1 else None
+        for kw in node.keywords:
+            if kw.arg == "default":
+                default = kw.value
+        if isinstance(default, ast.Constant) and isinstance(default.value, str):
+            return default.value
+    return None
+
+
+def _module_scope_statements(tree: ast.Module):
+    """Yield module-scope statements, including those nested in if/try/with/loops.
+
+    Function and class bodies are separate scopes and are not entered.
+    """
+    stack = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        children = [
+            c
+            for c in ast.iter_child_nodes(node)
+            if isinstance(c, (ast.stmt, ast.ExceptHandler))
+        ]
+        stack.extend(reversed(children))
+
+
+def _module_string_constants(file_path: str) -> dict[str, str]:
+    """Module-level names bound to one string, either a literal or an env default.
+
+    Names assigned more than one distinct value are left out: the value a
+    constructor sees cannot be told without running the code.
+    """
+    try:
+        tree = ast.parse(read_python_source(Path(file_path)))
+    except (OSError, SyntaxError, ValueError):
+        return {}
+    values: dict[str, set[str | None]] = {}
+    for node in _module_scope_statements(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                values.setdefault(target.id, set()).add(_string_value(value))
+    return {
+        name: next(iter(vals))
+        for name, vals in values.items()
+        if len(vals) == 1 and next(iter(vals))
+    }
+
 
 _KNOWN_AI_CLIENT_CLASSES: frozenset[str] = frozenset(
     {
@@ -1657,8 +1781,11 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     Classification rules (no dual emission):
     1. Constructor has ``base_url`` / ``azure_endpoint`` / ``api_base`` / ``endpoint_url``
-       with a concrete URL -> **LLM_ENDPOINT**.
-    2. Constructor has ``model=`` with a registry-known value -> **MODEL**.
+       / ``host`` with a concrete URL -> **LLM_ENDPOINT**. A URL read from a
+       variable is also emitted, and the model kwargs are still read (rule 2).
+    2. Constructor has ``model=`` with a registry-known value -> **MODEL**. A
+       variable resolves through a module-level string constant or an
+       ``os.getenv(NAME, "default")`` default.
     3. Known client class with neither model nor URL kwargs -> **needs_agentic MODEL**
        (bare client; prune if agentic layer cannot resolve a model ID).
     """
@@ -1666,6 +1793,19 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
 
     components: list[AIComponent] = []
     seen: set[tuple[str, int]] = set()
+    constants: dict[str, str] | None = None
+
+    def kwarg_value(raw: Any) -> tuple[str | None, str | None]:
+        """(value, variable) of a kwarg; a variable resolves via module constants."""
+        nonlocal constants
+        if not isinstance(raw, str) or raw.startswith(("ATTRIBUTE:", "COMPLEX_TYPE:")):
+            return None, None
+        if not raw.startswith("VARIABLE:"):
+            return raw.strip().strip("'\""), None
+        if constants is None:
+            constants = _module_string_constants(result.file_path)
+        var = raw.removeprefix("VARIABLE:")
+        return constants.get(var), var
 
     all_calls = [(c, c.line_number) for c in result.calls]
     all_calls += [(a.call, a.line_number) for a in result.assignments]
@@ -1681,15 +1821,12 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
             continue
 
         endpoint_url: str | None = None
+        endpoint_var: str | None = None
         for ek in _ENDPOINT_KWARG_NAMES:
-            raw = call_obs.arguments.get(ek)
-            if isinstance(raw, str) and not raw.startswith(
-                ("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")
-            ):
-                cleaned = raw.strip().strip("'\"")
-                if cleaned.startswith(("http://", "https://")):
-                    endpoint_url = cleaned
-                    break
+            cleaned, var = kwarg_value(call_obs.arguments.get(ek))
+            if cleaned and cleaned.startswith(("http://", "https://")):
+                endpoint_url, endpoint_var = cleaned, var
+                break
 
         if endpoint_url:
             seen.add(key)
@@ -1705,23 +1842,31 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                     metadata={
                         "endpoint_url": endpoint_url,
                         "constructor": short,
+                        **({"endpoint_variable": endpoint_var} if endpoint_var else {}),
                     },
                 )
             )
-            continue
+            # A literal URL keeps rule 1. One read from a variable was never
+            # visible to that rule, so the model kwargs are still read below.
+            if not endpoint_var:
+                continue
 
         found_model = False
         for kwarg_name in _MODEL_KWARG_NAMES:
-            val = call_obs.arguments.get(kwarg_name)
-            if not isinstance(val, str):
-                continue
-            if val.startswith(("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")):
-                continue
-            val = val.strip().strip("'\"")
-            if not val or len(val) < 3:
-                continue
-            reg = registry_lookup(val)
-            if reg:
+            raw = call_obs.arguments.get(kwarg_name)
+            # ``model="a" if cond else "b"`` contributes both branches; a
+            # variable resolves through the module's string constants.
+            candidates = [(v, None) for v in literal_branches(raw)]
+            if not candidates:
+                val, var = kwarg_value(raw)
+                candidates = [(val, var)] if val else []
+            for val, var in candidates:
+                val = val.strip().strip("'\"")
+                if not val or len(val) < 3:
+                    continue
+                reg = registry_lookup(val)
+                if not reg:
+                    continue
                 seen.add(key)
                 components.append(
                     AIComponent(
@@ -1736,10 +1881,12 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                             "provider": reg.get("provider", ""),
                             "extracted_from_kwarg": kwarg_name,
                             "constructor": short,
+                            **({"model_id_variable": var} if var else {}),
                         },
                     )
                 )
                 found_model = True
+            if found_model:
                 break
 
         if not found_model and short in _BARE_CLIENT_HINTS:
@@ -1762,6 +1909,121 @@ def _detect_model_kwargs(result: "CodeAnalysisResult") -> list[AIComponent]:
                 )
             )
 
+    return components
+
+
+# Typed config getters such as ``self._get_str("model", "gpt-4")``: the first
+# positional argument is the setting key, the default follows it.
+_CONFIG_GETTER_NAMES: frozenset[str] = frozenset(
+    {
+        "_get",
+        "_get_str",
+        "get_str",
+        "_get_string",
+        "get_string",
+        "_get_enum",
+        "get_enum",
+        "_get_config",
+        "get_config",
+        "_get_setting",
+        "get_setting",
+    }
+)
+_CONFIG_MODEL_KEYS: frozenset[str] = frozenset(
+    {"model", "model_name", "model_id", "llm_model", "chat_model", "deployment_name"}
+)
+_CONFIG_EMBEDDING_KEYS: frozenset[str] = frozenset(
+    {"embedding_model", "embedding_model_name", "embed_model", "embeddings_model"}
+)
+_CONFIG_ENDPOINT_KEYS: frozenset[str] = frozenset(
+    {
+        "api_base",
+        "base_url",
+        "endpoint",
+        "endpoint_url",
+        "api_endpoint",
+        "azure_endpoint",
+    }
+)
+
+
+def _config_getter_default(short: str, args: dict[str, Any]) -> Any:
+    if "default" in args:
+        return args["default"]
+    # ``_get_enum(key, options, default)`` puts the options list first.
+    return args.get("_pos_2" if short.endswith("_enum") else "_pos_1")
+
+
+def _detect_config_getter_defaults(
+    result: "CodeAnalysisResult",
+) -> list[AIComponent]:
+    """Extract models, embeddings and LLM endpoints from config-getter defaults.
+
+    Matches ``<obj>._get_str("model", <default>)``-style calls whose key names
+    a model, embedding model or API base. Each string literal the default can
+    evaluate to (both branches of a conditional expression) is a candidate;
+    model ids must look like one, endpoints must be http(s) URLs.
+    """
+    from .model_detector import is_known_embedding_model_name, registry_lookup
+
+    components: list[AIComponent] = []
+    seen: set[tuple[AIComponentType, str]] = set()
+
+    for call_obs, line in _call_sites(result):
+        qn = call_obs.qualified_name or ""
+        short = qn.rsplit(".", 1)[-1]
+        if short not in _CONFIG_GETTER_NAMES:
+            continue
+        args = call_obs.arguments or {}
+        key = _arg_literal(args.get("_pos_0") or args.get("key"))
+        if not key:
+            continue
+        key = key.lower()
+        if key in _CONFIG_MODEL_KEYS:
+            ctype = AIComponentType.MODEL
+        elif key in _CONFIG_EMBEDDING_KEYS:
+            ctype = AIComponentType.EMBEDDING
+        elif key in _CONFIG_ENDPOINT_KEYS:
+            ctype = AIComponentType.LLM_ENDPOINT
+        else:
+            continue
+
+        for val in literal_branches(_config_getter_default(short, args)):
+            val = val.strip()
+            if not val or (ctype, val) in seen:
+                continue
+            metadata: dict[str, Any] = {
+                "detection_method": "config_getter_default",
+                "config_getter": short,
+                "config_key": key,
+            }
+            if ctype == AIComponentType.LLM_ENDPOINT:
+                if not val.startswith(("http://", "https://")):
+                    continue
+                metadata["endpoint_url"] = val
+            elif ctype == AIComponentType.EMBEDDING:
+                if not (is_known_embedding_model_name(val) or "embed" in val.lower()):
+                    continue
+            elif not _looks_like_model_id(val):
+                continue
+            else:
+                reg = registry_lookup(val)
+                if reg:
+                    metadata["provider"] = reg.get("provider", "")
+            seen.add((ctype, val))
+            components.append(
+                AIComponent(
+                    name=val,
+                    component_type=ctype,
+                    file_path=result.file_path,
+                    line_number=line,
+                    model_name=val if ctype == AIComponentType.MODEL else None,
+                    embedding_model=val if ctype == AIComponentType.EMBEDDING else None,
+                    detection_source=DetectionSource.CODE_ANALYSIS,
+                    heuristic_confidence=0.8,
+                    metadata=metadata,
+                )
+            )
     return components
 
 
@@ -1882,6 +2144,10 @@ def _collect_symbols(result: CodeAnalysisResult, symbols: set[str]) -> None:
     for ctx in result.context_managers:
         if ctx.context_expr_qualified_name:
             symbols.add(_resolve_chain(ctx.context_expr_qualified_name, variable_map))
+    # Standalone calls feed the argument-aware pass (_detect_catalog_constructor_args).
+    for call in result.calls:
+        if call.qualified_name:
+            symbols.add(_resolve_chain(call.qualified_name, variable_map))
 
 
 def _batch_kb_lookup(
@@ -1913,6 +2179,299 @@ def _batch_kb_lookup(
             kb_by_id[eid] = entry
 
     return kb_by_id
+
+
+def _drop_superseded_import_candidates(
+    components: list[AIComponent],
+) -> list[AIComponent]:
+    """Drop ``from x import Agent``-style candidates when the same file instantiates that class.
+
+    The import-based pass emits a weak candidate per imported AI class; once the
+    instance itself has been emitted (call pattern / KB match), the import row is
+    a duplicate of that instance under the class name.
+    """
+    instantiated: set[tuple[str, str]] = set()
+    for c in components:
+        meta = c.metadata or {}
+        ctor = (
+            meta.get("call_pattern")
+            or meta.get("kb_id")
+            or meta.get("catalog_constructor")
+        )
+        if ctor and "import_statement" not in meta:
+            instantiated.add((c.file_path, str(ctor).rsplit(".", 1)[-1]))
+    return [
+        c
+        for c in components
+        if not (
+            (c.metadata or {}).get("import_statement")
+            and (c.file_path, c.name) in instantiated
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Argument-aware extraction for catalogued constructors
+# ---------------------------------------------------------------------------
+# A catalog hit only says "this class is an agent/model/tool"; the inventory
+# asset is the *instance*: the agent's ``name=``, the model id passed via
+# ``id=``/``model=``, and each function handed to ``tools=[...]`` or a
+# registration call.
+
+_INSTANCE_NAME_KWARGS: tuple[str, ...] = ("name", "agent_name")
+_CTOR_MODEL_KWARGS: tuple[str, ...] = ("model", "model_id", "model_name", "id")
+_AGENT_MODEL_KWARGS: tuple[str, ...] = ("model", "model_id", "model_name")
+_TOOL_REGISTRATION_CALLS: frozenset[str] = frozenset(
+    {"add_tool", "register_function", "register_tool", "from_function"}
+)
+_TOOL_WRAPPER_CLASSES: frozenset[str] = frozenset(
+    {"FunctionTool", "StructuredTool", "Tool"}
+)
+_TOOL_FN_KWARGS: tuple[str, ...] = ("_pos_0", "func", "function", "fn", "f")
+_MODEL_ID_HINT = re.compile(
+    r"(gpt|o[134](-|$)|claude|gemini|gemma|llama|mistral|mixtral|qwen|deepseek|grok|sonar|"
+    r"phi-|command|nova|titan|kimi|glm)",
+    re.IGNORECASE,
+)
+
+
+def _arg_literal(value: Any) -> str | None:
+    """Return a string literal argument, or None for variables and complex values."""
+    if not isinstance(value, str) or value.startswith(
+        ("VARIABLE:", "ATTRIBUTE:", "COMPLEX_TYPE:")
+    ):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _arg_variable(value: Any) -> str | None:
+    """Return the variable name of a ``VARIABLE:`` argument, else None."""
+    if isinstance(value, str) and value.startswith("VARIABLE:"):
+        return value[len("VARIABLE:") :]
+    return None
+
+
+def _instance_name(args: dict[str, Any], allow_positional: bool) -> str | None:
+    """Instance name from ``name=`` / ``agent_name=``, or the first positional literal."""
+    for key in _INSTANCE_NAME_KWARGS:
+        lit = _arg_literal(args.get(key))
+        if lit:
+            return lit
+    if allow_positional:
+        return _arg_literal(args.get("_pos_0"))
+    return None
+
+
+def _call_sites(result: CodeAnalysisResult) -> list[tuple[CallObservation, int]]:
+    """Every call in the file with its line, including calls on assignment lines."""
+    sites = [(c, c.line_number) for c in result.calls]
+    sites += [(a.call, a.line_number) for a in result.assignments]
+    return sites
+
+
+def _apply_instance_names(
+    components: list[AIComponent], result: CodeAnalysisResult
+) -> list[AIComponent]:
+    """Rename agent / MCP-server instances to their ``name=`` argument when given.
+
+    Nested calls on the same line (``Agent(model=OpenAIChat(id=...))``) are recorded
+    as separate calls, so each component takes the arguments of its own constructor:
+    the call whose class matches the component's constructor, else the assignment's
+    (outermost) call on that line.
+    """
+    # line -> [(constructor class, arguments)], assignment calls first
+    calls_at: dict[int, list[tuple[str, dict[str, Any]]]] = {}
+    sites = [(a.call, a.line_number) for a in result.assignments]
+    sites += [(c, c.line_number) for c in result.calls]
+    for call, line in sites:
+        if call.arguments:
+            short = (call.qualified_name or "").rsplit(".", 1)[-1]
+            for ln in {line, call.line_number}:
+                calls_at.setdefault(ln, []).append((short, call.arguments))
+    assigned_lines = {a.line_number for a in result.assignments} | {
+        a.call.line_number for a in result.assignments
+    }
+
+    def own_args(comp: AIComponent) -> dict[str, Any]:
+        candidates = calls_at.get(comp.line_number) or []
+        meta = comp.metadata or {}
+        ctor = (
+            meta.get("kb_id")
+            or meta.get("call_pattern")
+            or meta.get("catalog_constructor")
+        )
+        if ctor:
+            ctor_short = str(ctor).rsplit(".", 1)[-1]
+            return next((args for short, args in candidates if short == ctor_short), {})
+        if candidates and comp.line_number in assigned_lines:
+            return candidates[0][1]
+        return {}
+
+    out = []
+    for comp in components:
+        if comp.component_type in (AIComponentType.AGENT, AIComponentType.MCP_SERVER):
+            args = own_args(comp)
+            positional = comp.component_type == AIComponentType.MCP_SERVER or (
+                comp.framework or ""
+            ).startswith("autogen")
+            new_name = _instance_name(args, positional)
+            if new_name and new_name != comp.name:
+                meta = dict(comp.metadata or {})
+                meta["instance_name_from"] = "name_kwarg"
+                meta["variable_or_class_name"] = comp.name
+                comp = comp.model_copy(update={"name": new_name, "metadata": meta})
+        out.append(comp)
+    return out
+
+
+def _nested_model_literals(value: Any, depth: int = 0) -> list[str]:
+    """``model`` values inside dict/list literals, e.g. autogen ``llm_config``."""
+    if depth > 4:
+        return []
+    found: list[str] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k == "model":
+                lit = _arg_literal(v)
+                if lit:
+                    found.append(lit)
+            else:
+                found += _nested_model_literals(v, depth + 1)
+    elif isinstance(value, list):
+        for v in value:
+            found += _nested_model_literals(v, depth + 1)
+    return found
+
+
+def _looks_like_model_id(value: str) -> bool:
+    """True when a literal is a known model id or names a known model family."""
+    from .model_detector import registry_lookup
+
+    if len(value) > 120 or value.startswith(("http://", "https://")) or " " in value:
+        return False
+    return bool(registry_lookup(value) or _MODEL_ID_HINT.search(value))
+
+
+def _detect_catalog_constructor_args(
+    result: CodeAnalysisResult,
+    variable_map: dict[str, str],
+    kb_by_id: dict[str, dict[str, Any]],
+    imported_frameworks: set[str],
+    suffix_idx: dict[str, list[dict[str, Any]]],
+    existing: list[AIComponent],
+) -> list[AIComponent]:
+    """Emit instance-level assets from the arguments of catalogued calls."""
+    out: list[AIComponent] = []
+    seen: set[tuple[AIComponentType, str]] = {
+        (c.component_type, c.name) for c in existing
+    }
+    agent_lines = {
+        c.line_number for c in existing if c.component_type == AIComponentType.AGENT
+    }
+
+    def emit(
+        ctype: AIComponentType, name: str, line: int, qn: str, how: str, **extra: Any
+    ) -> None:
+        if (ctype, name) in seen:
+            return
+        seen.add((ctype, name))
+        out.append(
+            AIComponent(
+                name=name,
+                component_type=ctype,
+                file_path=result.file_path,
+                line_number=line,
+                framework=qn.split(".")[0] if "." in qn else "",
+                detection_source=DetectionSource.CODE_ANALYSIS,
+                metadata={"catalog_constructor": qn, "extracted_via": how},
+                **extra,
+            )
+        )
+
+    for call, line in _call_sites(result):
+        qn = _resolve_chain(call.qualified_name or "", variable_map)
+        if not qn:
+            continue
+        match = _match_observation_rich(qn, kb_by_id, imported_frameworks, suffix_idx)
+        if not match.is_confirmed:
+            continue
+        entry = match.entry or {}
+        concept = (entry.get("concept") or "").lower()
+        is_method = _kb_entry_describes_method(entry)
+        args = call.arguments or {}
+        short = qn.rsplit(".", 1)[-1]
+
+        # tools: registration calls / wrapper classes take the function itself
+        if short in _TOOL_REGISTRATION_CALLS or (
+            not is_method and short in _TOOL_WRAPPER_CLASSES
+        ):
+            for key in _TOOL_FN_KWARGS:
+                fn = _arg_variable(args.get(key))
+                if fn and fn not in variable_map:
+                    emit(AIComponentType.TOOL, fn, line, qn, f"{short}({key})")
+                    break
+        if is_method:
+            continue
+
+        if concept == "agent":
+            # tools=[fn, ...]: plain functions handed to the agent
+            tools_arg = args.get("tools")
+            if isinstance(tools_arg, list):
+                for elem in tools_arg:
+                    fn = _arg_variable(elem)
+                    if (
+                        fn is None
+                        and isinstance(elem, dict)
+                        and elem.get("_call", "").rsplit(".", 1)[-1]
+                        in _TOOL_WRAPPER_CLASSES
+                    ):
+                        inner = elem.get("_args") or []
+                        fn = _arg_variable(inner[0]) if inner else None
+                    if fn and fn not in variable_map:
+                        emit(AIComponentType.TOOL, fn, line, qn, "agent_tools_kwarg")
+            for key in _AGENT_MODEL_KWARGS:
+                lit = _arg_literal(args.get(key))
+                if lit and _looks_like_model_id(lit):
+                    emit(
+                        AIComponentType.MODEL,
+                        lit,
+                        line,
+                        qn,
+                        f"agent_{key}_kwarg",
+                        model_name=lit,
+                    )
+            for lit in _nested_model_literals(args.get("llm_config")):
+                if _looks_like_model_id(lit):
+                    emit(
+                        AIComponentType.MODEL,
+                        lit,
+                        line,
+                        qn,
+                        "llm_config.model",
+                        model_name=lit,
+                    )
+            # inline agents (members=[Agent(name=...)]) never reach the assignment path
+            if line not in agent_lines:
+                name = _instance_name(args, qn.startswith("autogen"))
+                if name:
+                    emit(
+                        AIComponentType.AGENT, name, line, qn, "inline_agent_name_kwarg"
+                    )
+        elif concept == "model":
+            for key in _CTOR_MODEL_KWARGS:
+                lit = _arg_literal(args.get(key))
+                if lit and _looks_like_model_id(lit):
+                    emit(
+                        AIComponentType.MODEL,
+                        lit,
+                        line,
+                        qn,
+                        f"{key}_kwarg",
+                        model_name=lit,
+                    )
+                    break
+    return out
 
 
 def _process_file_with_cache(
@@ -2148,6 +2707,12 @@ def _process_file_with_cache(
             )
             seen.add(key)
 
+    components = _apply_instance_names(components, result)
+    components.extend(
+        _detect_catalog_constructor_args(
+            result, variable_map, kb_by_id, imported_frameworks, suffix_idx, components
+        )
+    )
     return components
 
 
@@ -2425,11 +2990,18 @@ def _obs(
 
 
 def _resolve_chain(name: str, variable_map: dict[str, str]) -> str:
-    """Resolve ``var.method`` → ``FullyQualified.method`` via the variable map."""
+    """Resolve ``var.method`` → ``FullyQualified.method`` via the variable map.
+
+    A name already qualified with the variable's value is left alone: in
+    ``mcp = FastMCP(...)`` the variable ``mcp`` shares its name with the ``mcp``
+    package, and re-resolving ``mcp.server.fastmcp.FastMCP.resource`` would
+    otherwise double the prefix and miss the exact catalog entry.
+    """
     if "." in name:
         head, tail = name.split(".", 1)
-        if head in variable_map:
-            return f"{variable_map[head]}.{tail}"
+        target = variable_map.get(head)
+        if target and name != target and not name.startswith(target + "."):
+            return f"{target}.{tail}"
     return name
 
 

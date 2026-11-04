@@ -629,7 +629,9 @@ Apply these checks when processing each component by type:
      control flow, real tool/action execution, and an iterative loop around
      the reason-act-observe cycle.  ``react_loop_matches`` in the dossier
      highlight the exact line range for the detected loop.
-  c. If the class only makes a single LLM call without looping or tool
+  c. If a user-defined class (not a framework agent instance; see
+   *Framework agent instances* below) only makes a single LLM call
+   without looping or tool
      dispatch, REMOVE it.  Reclassify to ``tool`` only if the class is
      itself registered as a callable tool for another agent (``@tool``
      decorator, listed in ``tools=[...]``).
@@ -672,6 +674,22 @@ A class is an ``agent`` only when ALL THREE conditions are true:
    ``create_openai_tools_agent``, ``AssistantAgent``, ``UserProxyAgent``,
    ``Crew``), or LangGraph graphs with conditional edges driven by the LLM.
    A single LLM call followed by a fixed post-processing step is NOT a loop.
+
+### Framework agent instances (exception to the three-condition rule)
+
+An instance created by an agent framework's agent constructor IS an
+``agent``, even when it has no ``tools=`` argument and even when the loop is
+not visible in the code you were shown. The framework's runner executes the
+reason-act-observe loop (for example ``Runner.run_async``, ``agent.run()``,
+``initiate_chat``, ``Crew.kickoff``). This covers: Google ADK ``LlmAgent`` /
+``Agent`` / ``SequentialAgent`` / ``ParallelAgent`` / ``LoopAgent``, Agno
+``Agent``, Strands ``Agent``, OpenAI Agents SDK ``Agent``, CrewAI ``Agent``,
+and AutoGen / AG2 ``ConversableAgent`` / ``AssistantAgent`` with an
+``llm_config`` (not ``llm_config=False``). Confirm these; do NOT remove them
+for lacking tools or a visible loop. The three conditions above apply to
+user-defined classes. This exception does NOT cover a bare ``import`` of the
+class, a subclass whose own body shows no LLM use, or a class that is merely
+named ``*Agent``.
 
 The ``agent_evidence_dossier`` directly reports the matches that satisfy each
 condition.  Use it:
@@ -740,13 +758,17 @@ component types:
   ``create_react_agent``, ``create_tool_calling_agent``,
   ``create_openai_tools_agent``, ``Agent(tools=[...])``, ``AssistantAgent``,
   ``UserProxyAgent``, ``Crew``.
+- Framework agent instances (ADK ``LlmAgent`` / ``Agent``, Agno / Strands /
+  OpenAI Agents SDK / CrewAI ``Agent``, AutoGen ``ConversableAgent`` with an
+  ``llm_config``), with or without a tool list.
 - LangGraph / LangChain graphs whose next node is chosen from LLM output.
 - A class that hosts **both** an MCP client and a ReAct loop that dispatches
   tools returned by the LLM.
 
 ### IS NOT an agent (remove or reclassify)
 
-- A class that calls an LLM once and returns the response → REMOVE.
+- A user-defined class (not a framework agent instance) that calls an LLM
+  once and returns the response → REMOVE.
   Reclassify to ``tool`` only if another agent actually invokes it via
   ``@tool`` / ``tools=[...]``.
 - A prompt-template → LLM → parse pipeline with no loop → REMOVE.

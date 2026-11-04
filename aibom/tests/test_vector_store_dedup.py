@@ -9,7 +9,7 @@ from aibom.scan_pipeline import _consolidate_vector_stores
 
 
 class TestConsolidateVectorStores:
-    def test_multiple_weaviate_wrappers_merge_to_one(self) -> None:
+    def test_rows_at_one_site_merge_to_one(self) -> None:
         comps = [
             AIComponent(
                 name="WeaviateRetriever",
@@ -21,16 +21,10 @@ class TestConsolidateVectorStores:
             AIComponent(
                 name="WeaviateVectorStore",
                 component_type=AIComponentType.VECTOR_STORE,
-                file_path="b.py",
-                line_number=2,
+                file_path="a.py",
+                line_number=1,
                 heuristic_confidence=0.9,
-            ),
-            AIComponent(
-                name="WeaviateManager",
-                component_type=AIComponentType.VECTOR_STORE,
-                file_path="c.py",
-                line_number=3,
-                heuristic_confidence=0.5,
+                metadata={"evidence": [{"file": "c.py", "line": 3}]},
             ),
         ]
         out = _consolidate_vector_stores(comps)
@@ -38,11 +32,29 @@ class TestConsolidateVectorStores:
         w = out[0]
         assert w.name == "WeaviateVectorStore"
         assert w.metadata.get("store_technology") == "weaviate"
-        assert w.metadata.get("consolidated_count") == 3
+        assert w.metadata.get("consolidated_count") == 2
         ev = w.metadata.get("evidence") or []
         files = {(e["file"], e["line"]) for e in ev}
-        assert ("a.py", 1) in files
         assert ("c.py", 3) in files
+
+    def test_same_technology_at_different_sites_stays_separate(self) -> None:
+        comps = [
+            AIComponent(
+                name="langchain_community.vectorstores.FAISS.load_local",
+                component_type=AIComponentType.VECTOR_STORE,
+                file_path=path,
+                line_number=line,
+            )
+            for path, line in (("retriever.py", 52), ("indexer.py", 336))
+        ]
+        out = _consolidate_vector_stores(comps)
+        assert len(out) == 2
+        assert {(c.file_path, c.line_number) for c in out} == {
+            ("retriever.py", 52),
+            ("indexer.py", 336),
+        }
+        assert all(c.metadata.get("store_technology") == "faiss" for c in out)
+        assert all("consolidated_count" not in c.metadata for c in out)
 
     def test_mixed_technologies_remain_separate(self) -> None:
         comps = [
@@ -89,9 +101,10 @@ class TestConsolidateVectorStores:
             AIComponent(
                 name="QdrantWrapper",
                 component_type=AIComponentType.VECTOR_STORE,
-                file_path="two.py",
-                line_number=20,
+                file_path="one.py",
+                line_number=10,
                 heuristic_confidence=0.6,
+                metadata={"evidence": [{"file": "two.py", "line": 20}]},
             ),
         ]
         out = _consolidate_vector_stores(comps)

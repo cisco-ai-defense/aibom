@@ -541,6 +541,125 @@ class TestConsolidation:
         assert "consolidated_count" not in result[0].metadata
 
 
+def _agent_site(path: str, line: int, *, created: bool = True) -> AIComponent:
+    """An ``agent`` row; ``created`` marks a constructor site (``x = Agent()``)."""
+    return AIComponent(
+        name="agent",
+        component_type=AIComponentType.AGENT,
+        file_path=path,
+        line_number=line,
+        heuristic_confidence=0.8,
+        metadata={"call_pattern": "strands.Agent"} if created else {},
+    )
+
+
+class TestAgentInstanceIdentity:
+    """Same-named agents created at different sites stay separate assets."""
+
+    def test_same_named_agents_in_different_files_stay_separate(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        agents = [_agent_site(f"/repo/lab{i}/main.py", 10 + i) for i in range(12)]
+        result = _consolidate_components(agents)
+        assert sorted((c.file_path, c.line_number) for c in result) == sorted(
+            (c.file_path, c.line_number) for c in agents
+        )
+
+    def test_references_join_the_instance_in_their_file(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        a = _agent_site("/repo/a.py", 20)
+        b = _agent_site("/repo/b.py", 30)
+        import_in_a = _agent_site("/repo/a.py", 3, created=False)
+        usage_in_b = _agent_site("/repo/b.py", 40, created=False)
+        usage_elsewhere = _agent_site("/repo/run.py", 5, created=False)
+        result = _consolidate_components(
+            [a, b, import_in_a, usage_in_b, usage_elsewhere]
+        )
+        by_site = {(c.file_path, c.line_number): c for c in result}
+        assert set(by_site) == {("/repo/a.py", 20), ("/repo/b.py", 30)}
+        assert by_site[("/repo/b.py", 30)].metadata["consolidated_count"] == 2
+        total = sum(c.metadata.get("evidence_count", 1) for c in result)
+        assert total == 5
+
+    def test_single_creation_site_still_consolidates(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        result = _consolidate_components(
+            [_agent_site("/repo/a.py", 20), _agent_site("/repo/b.py", 3, created=False)]
+        )
+        assert len(result) == 1
+
+    def test_import_rows_with_kb_id_are_not_creation_sites(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        imports = [
+            AIComponent(
+                name="agent",
+                component_type=AIComponentType.AGENT,
+                file_path=f"/repo/{name}.py",
+                line_number=1,
+                heuristic_confidence=0.5,
+                metadata={"kb_id": "strands.Agent"},
+            )
+            for name in ("a", "b")
+        ]
+        assert len(_consolidate_components(imports)) == 1
+
+    def test_assigned_non_agent_calls_are_not_creation_sites(self):
+        """``client = genai.Client()`` rows a catalog typed as agent stay merged."""
+        from aibom.scan_pipeline import _consolidate_components
+
+        clients = [
+            AIComponent(
+                name="google.genai.Client",
+                component_type=AIComponentType.AGENT,
+                file_path="/repo/tools.py",
+                line_number=line,
+                heuristic_confidence=0.6,
+                metadata={"assigned_to": f"fn{line}.<locals>.client"},
+            )
+            for line in (69, 164)
+        ]
+        assert len(_consolidate_components(clients)) == 1
+
+    def test_models_still_consolidate_by_name(self):
+        from aibom.scan_pipeline import _consolidate_components
+
+        models = [
+            AIComponent(
+                name="gpt-5",
+                component_type=AIComponentType.MODEL,
+                file_path=f"/repo/{name}.py",
+                line_number=4,
+                heuristic_confidence=0.9,
+                metadata={"call_pattern": "openai.OpenAI"},
+            )
+            for name in ("a", "b", "c")
+        ]
+        assert len(_consolidate_components(models)) == 1
+
+    def test_removing_one_instance_keeps_the_others(self):
+        from aibom.scan_pipeline import _propagate_removals
+
+        a = _agent_site("/repo/a.py", 20)
+        b = _agent_site("/repo/b.py", 30)
+        usage_in_a = _agent_site("/repo/a.py", 25, created=False)
+        sent = [a, b, usage_in_a]
+        received = [b, usage_in_a]
+        result = _propagate_removals(sent, received, all_candidates=sent)
+        assert [(c.file_path, c.line_number) for c in result] == [("/repo/b.py", 30)]
+
+    def test_removal_of_a_single_site_agent_still_cascades(self):
+        from aibom.scan_pipeline import _propagate_removals
+
+        a = _agent_site("/repo/a.py", 20)
+        usage_elsewhere = _agent_site("/repo/run.py", 5, created=False)
+        sent = [a, usage_elsewhere]
+        result = _propagate_removals(sent, [usage_elsewhere], all_candidates=sent)
+        assert result == []
+
+
 # ====================================================================
 # Fix 2: Data-class suffix exclusion
 # ====================================================================

@@ -181,6 +181,7 @@ class TestDependencyScanner:
                     '"google-genai>=1.0"\n'
                     '"openai-agents>=0.2"\n'
                     '"llmetry>=0.1"\n'
+                    '"together>=1.2"\n'
                 ),
             },
         )
@@ -189,6 +190,7 @@ class TestDependencyScanner:
         assert "google-genai" in names
         assert "openai-agents" in names
         assert "llmetry" in names
+        assert "together" in names
 
     def test_recognizes_strands_packages(self, tmp_path: Path) -> None:
         """AWS Strands agent framework packages must be detected.

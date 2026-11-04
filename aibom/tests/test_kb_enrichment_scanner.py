@@ -830,6 +830,80 @@ class TestStrandsProviderClassCoverage:
         assert models[0].metadata["provider"] == "openai"
 
 
+    def test_model_id_variable_resolves_to_env_default(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "import os\n"
+            "from strands.models.anthropic import AnthropicModel\n"
+            'MODEL_ID = os.getenv("ANTHROPIC_CLAUDE_4", "claude-sonnet-4-20250514")\n'
+            "model = AnthropicModel(model_id=MODEL_ID)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [model] = _detect_model_kwargs(result)
+        assert model.name == model.model_name == "claude-sonnet-4-20250514"
+        assert model.line_number == 4
+        assert model.metadata["model_id_variable"] == "MODEL_ID"
+
+    def test_model_id_variable_resolves_to_module_literal(
+        self, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.openai import OpenAIModel\n"
+            'MODEL: str = "gpt-4o"\n'
+            "model = OpenAIModel(model_id=MODEL)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [model] = _detect_model_kwargs(result)
+        assert model.name == "gpt-4o"
+
+    def test_model_id_variable_with_two_values_stays_bare(
+        self, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.openai import OpenAIModel\n"
+            'MODEL = "gpt-4o"\n'
+            "if FAST:\n"
+            '    MODEL = "gpt-4o-mini"\n'
+            "model = OpenAIModel(model_id=MODEL)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [model] = _detect_model_kwargs(result)
+        assert model.name == "OpenAIModel"
+        assert model.metadata["detection_method"] == "bare_provider_client"
+
+
+    def test_ollama_host_variable_is_endpoint_and_model(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "import os\n"
+            "from strands.models.ollama import OllamaModel\n"
+            'OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")\n'
+            'OLLAMA_MODEL_ID = os.getenv("OLLAMA_MODEL_ID", "llama3.2:3b")\n'
+            "model = OllamaModel(host=OLLAMA_HOST, model_id=OLLAMA_MODEL_ID)\n"
+        )
+        result = parse_source_code(str(src), src.read_text())
+        found = {
+            (c.component_type, c.name, c.line_number)
+            for c in _detect_model_kwargs(result)
+        }
+        assert found == {
+            (AIComponentType.LLM_ENDPOINT, "http://localhost:11434", 5),
+            (AIComponentType.MODEL, "llama3.2:3b", 5),
+        }
+
+    def test_literal_endpoint_still_suppresses_model(self, tmp_path: Path) -> None:
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "from strands.models.ollama import OllamaModel\n"
+            'model = OllamaModel(host="http://localhost:11434", model_id="llama3")\n'
+        )
+        result = parse_source_code(str(src), src.read_text())
+        [endpoint] = _detect_model_kwargs(result)
+        assert endpoint.component_type == AIComponentType.LLM_ENDPOINT
+
+
 class TestStrandsAgentFrameworkPrefix:
     """Module-level ``agent = Agent(...)`` from Strands must become an AGENT.
 
@@ -988,3 +1062,182 @@ class TestGuardrailDetection:
         for mod in ("agentsec", "aidefense", "nemoguardrails", "guardrails"):
             assert mod in _IMPORT_MODULE_TYPE_MAP
             assert _IMPORT_MODULE_TYPE_MAP[mod].primary is AIComponentType.GUARDRAIL
+
+
+class TestArgumentAwareExtraction:
+    """Instance-level assets read from the arguments of catalogued constructors."""
+
+    _KB = {
+        "agno.agent.Agent": {
+            "id": "agno.agent.Agent",
+            "concept": "agent",
+            "framework": "agno",
+            "label": "class",
+        },
+        "agno.models.openai.OpenAIChat": {
+            "id": "agno.models.openai.OpenAIChat",
+            "concept": "model",
+            "framework": "agno",
+            "label": "class",
+        },
+    }
+
+    def _scan(self, tmp_path: Path, source: str):
+        path = tmp_path / "app.py"
+        path.write_text(source)
+        result = parse_source_code(str(path), source)
+        return _process_file_with_cache(result, self._KB)
+
+    def test_agent_name_model_and_tools_from_constructor_args(self, tmp_path: Path):
+        comps = self._scan(
+            tmp_path,
+            "from agno.agent import Agent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            "\n"
+            "def get_weather(city: str) -> str:\n"
+            "    return city\n"
+            "\n"
+            "assistant = Agent(\n"
+            '    name="Weather Bot",\n'
+            '    model=OpenAIChat(id="gpt-4o"),\n'
+            "    tools=[get_weather],\n"
+            ")\n",
+        )
+        by_type = {(c.component_type, c.name) for c in comps}
+        assert (AIComponentType.AGENT, "Weather Bot") in by_type
+        assert (AIComponentType.MODEL, "gpt-4o") in by_type
+        assert (AIComponentType.TOOL, "get_weather") in by_type
+        agent = next(c for c in comps if c.name == "Weather Bot")
+        assert agent.metadata["instance_name_from"] == "name_kwarg"
+
+    def test_one_line_constructor_uses_its_own_name_not_nested_call(
+        self, tmp_path: Path
+    ):
+        comps = self._scan(
+            tmp_path,
+            "from agno.agent import Agent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            'assistant = Agent(name="Weather Bot", model=OpenAIChat(id="gpt-4o"))\n',
+        )
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert [a.name for a in agents] == ["Weather Bot"]
+
+    def test_positional_name_not_taken_from_nested_call(self, tmp_path: Path):
+        path = tmp_path / "app.py"
+        source = (
+            "from autogen import ConversableAgent\n"
+            "from agno.models.openai import OpenAIChat\n"
+            'bot = ConversableAgent(llm=OpenAIChat("gpt-4o"))\n'
+        )
+        path.write_text(source)
+        kb = {
+            **self._KB,
+            "autogen.ConversableAgent": {
+                "id": "autogen.ConversableAgent",
+                "concept": "agent",
+                "framework": "autogen",
+                "label": "class",
+            },
+        }
+        comps = _process_file_with_cache(parse_source_code(str(path), source), kb)
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert agents
+        assert all(a.name != "gpt-4o" for a in agents)
+
+    def test_non_model_literal_is_not_emitted_as_model(self, tmp_path: Path):
+        comps = self._scan(
+            tmp_path,
+            "from agno.models.openai import OpenAIChat\n"
+            "\n"
+            'llm = OpenAIChat(id="my-deployment")\n',
+        )
+        assert not [
+            c
+            for c in comps
+            if c.component_type == AIComponentType.MODEL and c.name == "my-deployment"
+        ]
+
+    def test_agent_without_name_kwarg_keeps_scanner_name(self, tmp_path: Path):
+        comps = self._scan(
+            tmp_path,
+            "from agno.agent import Agent\n" "\n" "assistant = Agent()\n",
+        )
+        agents = [c for c in comps if c.component_type == AIComponentType.AGENT]
+        assert agents
+        assert all("instance_name_from" not in (c.metadata or {}) for c in agents)
+
+
+class TestVariableNamedLikeItsPackage:
+    """``mcp = FastMCP(...)``: the variable shares its name with the ``mcp`` package."""
+
+    _KB = {
+        "mcp.server.fastmcp.FastMCP": {
+            "id": "mcp.server.fastmcp.FastMCP",
+            "concept": "mcp_server",
+            "framework": "mcp",
+            "label": "class",
+        },
+        "mcp.server.fastmcp.FastMCP.resource": {
+            "id": "mcp.server.fastmcp.FastMCP.resource",
+            "concept": "mcp_server",
+            "framework": "mcp",
+            "label": "method",
+        },
+        "mcp.server.fastmcp.FastMCP.add_tool": {
+            "id": "mcp.server.fastmcp.FastMCP.add_tool",
+            "concept": "mcp_server",
+            "framework": "mcp",
+            "label": "method",
+        },
+    }
+
+    _SOURCE = (
+        "from mcp.server.fastmcp import FastMCP\n"
+        "from .session import create_session\n"
+        'mcp = FastMCP("demo")\n'
+        "mcp.add_tool(create_session)\n"
+        "\n"
+        '@mcp.resource(uri="demo://a", name="Template")\n'
+        "def get_template() -> str:\n"
+        '    return ""\n'
+    )
+
+    def _scan(self, tmp_path: Path):
+        path = tmp_path / "server.py"
+        path.write_text(self._SOURCE)
+        result = parse_source_code(str(path), self._SOURCE)
+        return _process_file_with_cache(result, self._KB)
+
+    def test_resource_decorator_is_not_a_server(self, tmp_path: Path):
+        comps = self._scan(tmp_path)
+        servers = [c for c in comps if c.component_type == AIComponentType.MCP_SERVER]
+        assert [(s.name, s.line_number) for s in servers] == [("demo", 3)]
+
+    def test_constructor_keeps_exact_catalog_id(self, tmp_path: Path):
+        comps = self._scan(tmp_path)
+        [server] = [c for c in comps if c.component_type == AIComponentType.MCP_SERVER]
+        assert server.metadata["kb_id"] == "mcp.server.fastmcp.FastMCP"
+
+    def test_add_tool_registration_still_emits_tool(self, tmp_path: Path):
+        comps = self._scan(tmp_path)
+        tools = [c for c in comps if c.component_type == AIComponentType.TOOL]
+        assert [(t.name, t.line_number) for t in tools] == [("create_session", 4)]
+        assert tools[0].metadata["extracted_via"] == "add_tool(_pos_0)"
+
+
+class TestMcpCatalogTypes:
+    def test_strands_mcp_client_keeps_client_type_under_tools_package(self) -> None:
+        from aibom.builtin_catalog import BUILTIN_CATALOG_ENTRIES
+        from aibom.scanners.kb_enrichment_scanner import _refine_type_from_kb_id
+
+        kb_id = "strands.tools.mcp.MCPClient"
+        entry = next(e for e in BUILTIN_CATALOG_ENTRIES if e["id"] == kb_id)
+        assert entry["concept"] == "mcp_client"
+        assert (
+            _refine_type_from_kb_id(entry["id"], AIComponentType.MCP_CLIENT)
+            == AIComponentType.MCP_CLIENT
+        )
+        assert (
+            _refine_type_from_kb_id("strands.tools.Tool", AIComponentType.AGENT)
+            == AIComponentType.TOOL
+        )

@@ -25,6 +25,7 @@ Stages:
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 import time
@@ -73,7 +74,7 @@ from .cross_ref import (
 from .custom_catalog import CustomCatalogConfig
 from .llm_factory import ensure_llm_runtime_available
 from .models import ScanContext
-from .models.enums import AIComponentType, RelationshipType
+from .models.enums import AIComponentType, DetectionSource, RelationshipType
 from .models.scan import AIComponent, ComponentRelationship
 from .scanners import run_scanners
 from .scanners.dependency_scanner import discover_ai_package_set, is_known_ai_package
@@ -153,6 +154,31 @@ _CONTEXT_FREE_TYPES: frozenset[str] = frozenset(
         "embedding",
     }
 )
+
+
+def _drop_unresolved_model_candidates(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Drop model rows that only a classifier could confirm (no-LLM runs).
+
+    Without a classifier, two kinds of ``model`` candidate stay unresolved:
+    in-repo classes that matched a catalog entry on the last segment of their
+    name only (``partial_kb_id``), and client / loader symbols (catalog
+    matches and bare provider clients) for which no model id was resolved.
+    Neither names a model, so they are removed instead of being reported.
+    """
+    kept: list["AIComponent"] = []
+    for c in components:
+        if c.component_type == AIComponentType.MODEL and not c.model_name:
+            meta = c.metadata or {}
+            if (
+                meta.get("partial_kb_id")
+                or meta.get("kb_id")
+                or meta.get("detection_method") == "bare_provider_client"
+            ):
+                continue
+        kept.append(c)
+    return kept
 
 
 def _partition_agentic_secrets(
@@ -404,12 +430,27 @@ def _propagate_removals(
         return received
 
     lookup_pool = all_candidates if all_candidates is not None else received
+    # Agents created at several sites are distinct instances: a removal
+    # cascades only to references in the removed instance's own file. A tool
+    # anchored at an import line is that file's reference, so its removal
+    # reaches only the same file too.
+    split_keys = _multi_site_agent_keys(lookup_pool)
+    restrict_files: dict[tuple, set[str]] = {}
+    for c in sent:
+        if c.instance_id in removed_ids and (
+            _consolidation_key(c) in split_keys or _is_import_anchored_tool(c)
+        ):
+            restrict_files.setdefault(_consolidation_key(c), set()).add(
+                c.file_path
+            )
     drop_ids: set[str] = set()
     for c in lookup_pool:
         if _is_protected_dependency(c):
             continue
         key = _consolidation_key(c)
         if key not in restrict_import:
+            continue
+        if key in restrict_files and c.file_path not in restrict_files[key]:
             continue
         # Drop only if the sibling satisfies every restriction the removal
         # carries: an import-only-restricted removal drops only import-only
@@ -418,6 +459,8 @@ def _propagate_removals(
         if restrict_import[key] and not _is_import_only_candidate(c):
             continue
         if restrict_test[key] and not _is_test_file(c.file_path):
+            continue
+        if key in restrict_files and c.file_path not in restrict_files[key]:
             continue
         drop_ids.add(c.instance_id)
 
@@ -694,6 +737,455 @@ def _has_instantiation_marker(c: "AIComponent") -> bool:
     )
 
 
+_DEF_LINE_RE = re.compile(r"\s*(async\s+)?def\s")
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _scope_statements(node: ast.AST):
+    """Yield the nodes of *node*'s own scope, not descending into nested scopes."""
+    for child in ast.iter_child_nodes(node):
+        yield child
+        if not isinstance(child, _SCOPE_NODES + (ast.Lambda,)):
+            yield from _scope_statements(child)
+
+
+def _scope_bindings(node: ast.AST) -> dict[str, list[tuple[int, str]]]:
+    """Name -> [(line, kind)] for every binding in *node*'s own scope.
+
+    ``kind`` is ``"def"`` for function definitions, ``"class"`` for class
+    definitions, ``"import"`` for imports, ``"call"`` for a name assigned the
+    result of a call, and ``"other"`` for parameters and other name bindings.
+    """
+    out: dict[str, list[tuple[int, str]]] = {}
+    call_targets: set[int] = set()
+    for child in _scope_statements(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.setdefault(child.name, []).append((child.lineno, "def"))
+        elif isinstance(child, ast.ClassDef):
+            out.setdefault(child.name, []).append((child.lineno, "class"))
+        elif isinstance(child, (ast.Import, ast.ImportFrom)):
+            for alias in child.names:
+                name = (alias.asname or alias.name).split(".")[0]
+                out.setdefault(name, []).append((child.lineno, "import"))
+        elif isinstance(child, (ast.Assign, ast.AnnAssign)) and isinstance(
+            child.value, ast.Call
+        ):
+            targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+            call_targets.update(id(t) for t in targets)
+        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            kind = "call" if id(child) in call_targets else "other"
+            out.setdefault(child.id, []).append((child.lineno, kind))
+        elif isinstance(child, ast.ExceptHandler) and child.name:
+            out.setdefault(child.name, []).append((child.lineno, "other"))
+        elif isinstance(child, ast.arg):
+            # parameters are bound before any statement in the body runs
+            out.setdefault(child.arg, []).append((0, "other"))
+    return out
+
+
+class _FileScopes:
+    """Lexical scopes of one Python file, for resolving which ``def`` a name refers to."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        # (start, end, is_class, bindings); the module scope spans every line
+        self.scopes: list[tuple[int, int, bool, dict[str, list[tuple[int, str]]]]] = [
+            (0, 10**9, False, _scope_bindings(tree))
+        ]
+        for node in ast.walk(tree):
+            if isinstance(node, _SCOPE_NODES):
+                self.scopes.append(
+                    (
+                        node.lineno,
+                        getattr(node, "end_lineno", None) or node.lineno,
+                        isinstance(node, ast.ClassDef),
+                        _scope_bindings(node),
+                    )
+                )
+
+    def def_line_for(self, name: str, line: int) -> int | None:
+        """Line of the ``def`` that *name* refers to at *line*, or None if not a local def."""
+        bound = self.binding_for(name, line)
+        return bound[0] if bound and bound[1] == "def" else None
+
+    def binding_for(self, name: str, line: int) -> tuple[int, str] | None:
+        """(line, kind) of the binding *name* refers to at *line*; None if unbound."""
+        chain = sorted(
+            (sc for sc in self.scopes if sc[0] <= line <= sc[1]),
+            key=lambda sc: sc[0],
+            reverse=True,
+        )
+        for depth, (_, _, is_class, bindings) in enumerate(chain):
+            if depth and is_class:
+                continue  # class bodies are not visible to nested functions
+            found = bindings.get(name)
+            if not found:
+                continue
+            if depth == 0:
+                # own scope: the binding in effect at the registration line
+                preceding = [b for b in found if b[0] <= line]
+                if not preceding:
+                    return None  # bound only later in this scope
+                return max(preceding)
+            # enclosing scope has finished running when this code executes
+            return max(found)
+        return None
+
+
+# Registration calls that take the tool function itself (``mcp.add_tool(fn)``), as
+# recorded by the scanner's argument-aware pass in ``extracted_via``.
+_REGISTRATION_CALL_PREFIXES = ("add_tool(", "register_tool(", "register_function(")
+_MAX_REEXPORT_DEPTH = 3
+
+
+def _is_registration_call_tool(comp: AIComponent) -> bool:
+    via = str((comp.metadata or {}).get("extracted_via") or "")
+    return via.startswith(_REGISTRATION_CALL_PREFIXES)
+
+
+def _is_tools_kwarg_tool(comp: AIComponent) -> bool:
+    """True for a tool the scanner read from an agent's ``tools=[...]`` list."""
+    return (comp.metadata or {}).get("extracted_via") == "agent_tools_kwarg"
+
+
+def _is_import_anchored_tool(comp: AIComponent) -> bool:
+    """True for a tool anchored at the import line of the file that uses it."""
+    return (
+        comp.component_type == AIComponentType.TOOL
+        and (comp.metadata or {}).get("anchor") == "import"
+    )
+
+
+# Registration calls whose argument may be a loop variable over a tool inventory;
+# ``FunctionTool.from_function(tool)`` wraps it before ``add_tool``.
+_LOOP_REGISTRATION_PREFIXES = _REGISTRATION_CALL_PREFIXES + ("from_function(",)
+
+
+def _expand_loop_registered_tools(
+    components: list[AIComponent], scan_paths: list[str]
+) -> list[AIComponent]:
+    """Replace a tool registered in a loop with one tool per function it registers.
+
+    ``for tool in inventory: mcp.add_tool(tool)`` yields a single scanner row
+    named after the loop variable. When the inventory can be followed to the
+    functions it lists, each becomes a tool anchored at its ``def``; when it
+    cannot, the loop-variable row is dropped rather than reported as a tool.
+    """
+    from .registration_flow import LoopRegistrationResolver
+
+    roots = sorted(
+        (Path(p).resolve() for p in scan_paths if Path(p).is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
+    resolvers: dict[Path, LoopRegistrationResolver] = {}
+    out: list[AIComponent] = []
+    expanded = dropped = 0
+    for comp in components:
+        via = str((comp.metadata or {}).get("extracted_via") or "")
+        path = Path(comp.file_path or "")
+        if (
+            comp.component_type != AIComponentType.TOOL
+            or not comp.line_number
+            or path.suffix != ".py"
+            or not via.startswith(_LOOP_REGISTRATION_PREFIXES)
+        ):
+            out.append(comp)
+            continue
+        resolved = path.resolve()
+        root = next((r for r in roots if resolved.is_relative_to(r)), None)
+        if root is None:
+            out.append(comp)
+            continue
+        resolver = resolvers.setdefault(root, LoopRegistrationResolver(root))
+        refs = resolver.resolve(resolved, comp.line_number, comp.name)
+        if refs is None:
+            out.append(comp)
+            continue
+        if not refs:
+            dropped += 1
+            continue
+        for ref in refs:
+            file_path = str(ref.path)
+            out.append(
+                comp.model_copy(
+                    update={
+                        "name": ref.name,
+                        "file_path": file_path,
+                        "line_number": ref.line,
+                        "instance_id": f"{ref.name}_{file_path}_{ref.line}",
+                        "metadata": {
+                            **(comp.metadata or {}),
+                            "registered_in_loop": True,
+                            "reported_file": comp.file_path,
+                            "reported_line": comp.line_number,
+                        },
+                    }
+                )
+            )
+        expanded += 1
+    if expanded or dropped:
+        _LOGGER.info(
+            "Loop-registered tools: expanded %d registration(s) into %d tool(s); "
+            "dropped %d unresolved",
+            expanded,
+            len(out) - (len(components) - expanded - dropped),
+            dropped,
+        )
+    return out
+
+
+def _import_target_file(
+    importer: Path, module: str, level: int, root: Path | None = None
+) -> Path | None:
+    """File that ``from <module> import ...`` in *importer* refers to, if local.
+
+    With *root*, only files inside the scanned tree are considered.
+    """
+    parts = module.split(".") if module else []
+    if level:
+        base = importer.parent
+        for _ in range(level - 1):
+            base = base.parent
+        bases = [base]
+    else:
+        bases = [
+            p for p in importer.parents if root is None or p.is_relative_to(root)
+        ]
+    for base in bases:
+        target = base.joinpath(*parts)
+        candidates = [target / "__init__.py"]
+        if parts:
+            candidates.insert(0, target.with_suffix(".py"))
+        for cand in candidates:
+            if cand.is_file() and (root is None or cand.is_relative_to(root)):
+                return cand
+    return None
+
+
+def _imported_def(
+    path: Path,
+    name: str,
+    trees: dict[Path, ast.Module | None],
+    depth: int = 0,
+    root: Path | None = None,
+) -> tuple[Path, int] | None:
+    """(file, line) of the ``def`` a module-level ``from ... import name`` binds to.
+
+    Follows re-exports through package ``__init__`` files up to a small depth.
+    """
+    if depth > _MAX_REEXPORT_DEPTH:
+        return None
+    if path not in trees:
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            trees[path] = ast.parse(source)
+        except (OSError, SyntaxError, ValueError):
+            trees[path] = None
+    tree = trees[path]
+    if tree is None:
+        return None
+    binding: ast.stmt | None = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == name:
+                binding = node
+        elif isinstance(node, ast.ImportFrom):
+            if any((a.asname or a.name) == name for a in node.names):
+                binding = node
+    if isinstance(binding, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return (path, binding.lineno) if depth else None
+    if not isinstance(binding, ast.ImportFrom):
+        return None
+    alias = next(a for a in binding.names if (a.asname or a.name) == name)
+    target = _import_target_file(path, binding.module or "", binding.level, root)
+    if target is None:
+        return None
+    return _imported_def(target, alias.name, trees, depth + 1, root)
+
+
+def _align_tool_anchors(
+    components: list[AIComponent], scan_paths: list[str] | None = None
+) -> list[AIComponent]:
+    """Anchor Python tools at their defining ``def`` statement.
+
+    Scanners report tools at the decorator line or at the registration call
+    (``Agent(tools=[fn])``, ``add_tool(fn)``). A decorator-line anchor moves to the
+    function it decorates. A registered tool moves to the same-file ``def`` that the
+    name is bound to at the registration line, following Python scoping; imports,
+    assignments and definitions that only appear later keep the registration line.
+    A tool registered through ``add_tool(fn)`` / ``register_tool(fn)`` /
+    ``register_function(fn)`` whose name is imported follows the import to the
+    ``def`` in the defining module. A tool handed to an agent's ``tools=[...]``
+    under an imported name is anchored at that import line; one bound to neither
+    an import, a ``def``, a class nor a call result (a local list of tools, a
+    parameter) is dropped.
+    """
+    trees: dict[Path, ast.Module | None] = {}
+    cache: dict[str, tuple[_FileScopes | None, list[str]]] = {}
+    # Imports resolve only inside the scanned tree, never to files above it.
+    roots = sorted(
+        (Path(p).absolute() for p in scan_paths or [] if Path(p).is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
+
+    def file_info(path: str) -> tuple[_FileScopes | None, list[str]]:
+        if path not in cache:
+            scopes: _FileScopes | None = None
+            lines: list[str] = []
+            try:
+                source = Path(path).read_text(encoding="utf-8", errors="ignore")
+                lines = source.splitlines()
+                scopes = _FileScopes(ast.parse(source))
+            except (OSError, SyntaxError, ValueError):
+                pass
+            cache[path] = (scopes, lines)
+        return cache[path]
+
+    moved = 0
+    dropped: set[int] = set()
+    for comp in components:
+        if (
+            comp.component_type != AIComponentType.TOOL
+            or not comp.line_number
+            or not str(comp.file_path or "").endswith(".py")
+        ):
+            continue
+        scopes, lines = file_info(str(comp.file_path))
+        target: int | None = None
+        idx = comp.line_number - 1
+        if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("@"):
+            j = idx
+            while j < len(lines) and not _DEF_LINE_RE.match(lines[j]):
+                j += 1
+            if j < len(lines):
+                target = j + 1
+        elif scopes is not None:
+            target = scopes.def_line_for(comp.name, comp.line_number)
+            if target is None and _is_tools_kwarg_tool(comp):
+                # ``tools=[mod.fn]`` is bound by ``mod``; a star import can
+                # bind any name.
+                head = comp.name.split(".")[0]
+                bound = scopes.binding_for(head, comp.line_number)
+                if bound is None:
+                    bound = scopes.binding_for("*", comp.line_number)
+                if bound and bound[1] == "import":
+                    target = bound[0]
+                    comp.metadata = {**(comp.metadata or {}), "anchor": "import"}
+                elif not bound or bound[1] not in ("class", "call"):
+                    dropped.add(id(comp))
+                    continue
+            if target is None and _is_registration_call_tool(comp):
+                importer = Path(comp.file_path).absolute()
+                root = next((r for r in roots if importer.is_relative_to(r)), None)
+                found = _imported_def(importer, comp.name, trees, root=root)
+                if found is not None:
+                    comp.metadata = {
+                        **(comp.metadata or {}),
+                        "reported_file": comp.file_path,
+                        "reported_line": comp.line_number,
+                    }
+                    comp.file_path = str(found[0])
+                    comp.line_number = found[1]
+                    moved += 1
+                    continue
+        if target and target != comp.line_number:
+            comp.metadata = {**(comp.metadata or {}), "reported_line": comp.line_number}
+            comp.line_number = target
+            moved += 1
+    if moved:
+        _LOGGER.info(
+            "Tool anchor alignment: moved %d tool(s) to their defining line", moved
+        )
+    if dropped:
+        _LOGGER.info(
+            "Tool anchor alignment: dropped %d tools= name(s) bound to no tool",
+            len(dropped),
+        )
+        components = [c for c in components if id(c) not in dropped]
+    return components
+
+
+def _is_agent_creation_site(c: "AIComponent") -> bool:
+    """True for an agent row captured at an agent constructor call.
+
+    Only ``call_pattern`` (e.g. ``strands.Agent``) counts. A ``kb_id`` alone
+    marks import rows too, and ``assigned_to`` alone also marks non-agent
+    calls that a catalog row typed as agent (``client = genai.Client()``);
+    splitting on those would surface each mistyped call as its own agent.
+    """
+    if c.component_type.value != "agent":
+        return False
+    return bool((c.metadata or {}).get("call_pattern"))
+
+
+def _multi_site_agent_keys(components: list["AIComponent"]) -> set[tuple]:
+    """Consolidation keys whose agents are created at more than one site.
+
+    Variable names are not identities for agents: ``agent = Agent(...)`` in
+    twelve scripts is twelve agents. Keys listed here are split per instance.
+    """
+    sites: dict[tuple, set[tuple[str, int]]] = {}
+    for c in components:
+        if _is_agent_creation_site(c):
+            key = _consolidation_key(c)
+            sites.setdefault(key, set()).add((c.file_path, c.line_number))
+    return {key for key, found in sites.items() if len(found) > 1}
+
+
+def _agent_instance_keys(components: list["AIComponent"]) -> dict[int, tuple]:
+    """Map ``id(component)`` to an instance-scoped consolidation key.
+
+    Only agents whose name has several creation sites get an entry. Each
+    creation site keys on its own (file, line). Other references (imports,
+    ``agent.run(...)``) join the nearest preceding creation site in the same
+    file, or the first one in that file. References in a file with no creation
+    site join the site that whole-name consolidation would have chosen.
+    """
+    split = _multi_site_agent_keys(components)
+    if not split:
+        return {}
+    sites: dict[tuple, list[int]] = {}
+    fallback: dict[tuple, "AIComponent"] = {}
+    for c in components:
+        key = _consolidation_key(c)
+        if key not in split or not _is_agent_creation_site(c):
+            continue
+        sites.setdefault((key, c.file_path), []).append(c.line_number)
+        rank = (
+            c.heuristic_confidence,
+            0 if _is_test_file(c.file_path) else 1,
+            -c.line_number,
+        )
+        best = fallback.get(key)
+        if best is None or rank > (
+            best.heuristic_confidence,
+            0 if _is_test_file(best.file_path) else 1,
+            -best.line_number,
+        ):
+            fallback[key] = c
+    for lines in sites.values():
+        lines.sort()
+
+    keys: dict[int, tuple] = {}
+    for c in components:
+        key = _consolidation_key(c)
+        if key not in split:
+            continue
+        lines = sites.get((key, c.file_path))
+        if lines:
+            if _is_agent_creation_site(c):
+                line = c.line_number
+            else:
+                before = [n for n in lines if n <= c.line_number]
+                line = before[-1] if before else lines[0]
+            keys[id(c)] = key + (c.file_path, line)
+        else:
+            site = fallback[key]
+            keys[id(c)] = key + (site.file_path, site.line_number)
+    return keys
+
+
 def _consolidate_components(
     components: list["AIComponent"],
 ) -> list["AIComponent"]:
@@ -712,8 +1204,12 @@ def _consolidate_components(
     from collections import OrderedDict
 
     groups: OrderedDict[tuple, list["AIComponent"]] = OrderedDict()
+    instance_keys = _agent_instance_keys(components)
     for c in components:
-        key = _consolidation_key(c)
+        key = instance_keys.get(id(c)) or _consolidation_key(c)
+        if _is_import_anchored_tool(c):
+            # Each file imports its own reference to the tool.
+            key = key + (c.file_path,)
         groups.setdefault(key, []).append(c)
 
     result: list["AIComponent"] = []
@@ -729,12 +1225,20 @@ def _consolidate_components(
             result.append(c)
             continue
 
+        # Among equally ranked agent sites spread over several files, the
+        # file that creates the agent most often is its factory; anchor there
+        # rather than at whichever file has the lowest line number.
+        per_file: dict[str, int] = {}
+        if group[0].component_type.value == "agent":
+            for c in group:
+                per_file[c.file_path] = per_file.get(c.file_path, 0) + 1
         best = max(
             group,
             key=lambda c: (
                 c.heuristic_confidence,
                 1 if _has_instantiation_marker(c) else 0,
                 0 if _is_test_file(c.file_path) else 1,
+                per_file.get(c.file_path, 0),
                 -c.line_number,
             ),
         )
@@ -756,6 +1260,16 @@ def _consolidate_components(
                         "line": c.line_number,
                         "service": _service_dir(c.file_path),
                         "test_only": is_test,
+                        **(
+                            {"reported_line": c.metadata["reported_line"]}
+                            if (c.metadata or {}).get("reported_line")
+                            else {}
+                        ),
+                        **(
+                            {"reported_file": c.metadata["reported_file"]}
+                            if (c.metadata or {}).get("reported_file")
+                            else {}
+                        ),
                     }
                 )
 
@@ -781,6 +1295,66 @@ def _consolidate_components(
         result.append(merged)
 
     return result
+
+
+# Bedrock model ids: an optional cross-region inference-profile prefix, the
+# provider, the base model id, and a version suffix
+# (``us.anthropic.claude-3-5-haiku-20241022-v1:0``).
+_BEDROCK_MODEL_ID_RE = re.compile(
+    r"^(?P<region>(?:us|us-gov|eu|apac|ap|ca|jp|au|global)\.)?"
+    r"(?:anthropic|amazon|meta|mistral|cohere|ai21|deepseek|writer|qwen|openai)\."
+    r"(?P<base>[a-z0-9][a-z0-9.\-]*?)(?P<version>-v\d+(?::\d+)?)?$",
+    re.IGNORECASE,
+)
+
+
+def _bedrock_base_model_id(model_id: str) -> str | None:
+    """Base model id of a Bedrock model or inference-profile id, else ``None``."""
+    m = _BEDROCK_MODEL_ID_RE.match(model_id.strip())
+    if not m or not (m.group("region") or m.group("version")):
+        return None
+    base = m.group("base")
+    return base if any(ch.isdigit() for ch in base) else None
+
+
+def _canonicalize_bedrock_model_ids(
+    components: list["AIComponent"],
+) -> list["AIComponent"]:
+    """Name MODEL / EMBEDDING rows that carry a Bedrock id by their base model id.
+
+    ``us.anthropic.claude-3-5-haiku-20241022-v1:0`` and
+    ``anthropic.claude-3-5-haiku-20241022-v1:0`` are the Bedrock routes to
+    ``claude-3-5-haiku-20241022``. The Bedrock id is kept in
+    ``metadata["bedrock_model_id"]``.
+    """
+    for c in components:
+        if c.component_type not in (AIComponentType.MODEL, AIComponentType.EMBEDDING):
+            continue
+        base = _bedrock_base_model_id(c.name)
+        if not base:
+            continue
+        c.metadata = {**(c.metadata or {}), "bedrock_model_id": c.name}
+        if c.model_name in (None, c.name):
+            c.model_name = base
+        c.name = base
+    return components
+
+
+def _is_unresolved_model_class(c: "AIComponent") -> bool:
+    """True for a MODEL row that names a client class, not a model.
+
+    The scanner reports a provider class (``AnthropicModel(model_id=VAR)``)
+    whose model id it could not read, either as a bare-client row or as a
+    catalog class row; resolving the id is left to the LLM stage.
+    """
+    if c.component_type != AIComponentType.MODEL or c.model_name:
+        return False
+    meta = c.metadata or {}
+    if meta.get("detection_method") == "bare_provider_client":
+        return True
+    return c.detection_source == DetectionSource.KB_ENRICHMENT and (
+        c.kb_label == "class" and c.kb_concept == "model"
+    )
 
 
 def _canonicalize_env_var_names(
@@ -981,7 +1555,12 @@ def _consolidate_vector_stores(
 ) -> list["AIComponent"]:
     from collections import OrderedDict
 
-    tech_groups: OrderedDict[str, list["AIComponent"]] = OrderedDict()
+    # Keyed on location as well as technology: separate stores of the same
+    # technology (e.g. two FAISS indexes) are distinct assets; only rows that
+    # describe the same store site are folded together.
+    tech_groups: OrderedDict[tuple[str, str, int], list["AIComponent"]] = (
+        OrderedDict()
+    )
     rest: list["AIComponent"] = []
 
     for c in components:
@@ -989,11 +1568,12 @@ def _consolidate_vector_stores(
         if tech is None:
             rest.append(c)
         else:
-            tech_groups.setdefault(tech, []).append(c)
+            group_key = (tech, c.file_path, c.line_number)
+            tech_groups.setdefault(group_key, []).append(c)
 
     merged: list["AIComponent"] = list(rest)
 
-    for tech, group in tech_groups.items():
+    for (tech, _file, _line), group in tech_groups.items():
         if len(group) == 1:
             c = group[0]
             meta = dict(c.metadata)
@@ -1723,6 +2303,8 @@ class ScanPipeline:
         )
 
         resolved = resolve_components(components, env_idx)
+        # Before classification, so classifiers see the registered functions.
+        resolved = _expand_loop_registered_tools(resolved, self.scan_paths)
 
         ext_deps = detect_external_repo_deps(self.scan_paths)
         if ext_deps:
@@ -1745,7 +2327,9 @@ class ScanPipeline:
         components: list[AIComponent],
         relationships: list[ComponentRelationship],
     ) -> tuple[list[AIComponent], list[ComponentRelationship], list[Any]]:
-        if not self.llm_config or not components:
+        if not self.llm_config:
+            return _drop_unresolved_model_candidates(components), relationships, []
+        if not components:
             return components, relationships, []
 
         _LOGGER.info(
@@ -2043,6 +2627,20 @@ class ScanPipeline:
                 "via registry (mode=embedding)",
                 reclassified,
             )
+
+        components = _align_tool_anchors(components, self.scan_paths)
+        components = _canonicalize_bedrock_model_ids(components)
+
+        if not self.llm_config:
+            # No LLM stage will resolve a client class to its model id, so a
+            # row named after the class would ship as a model as-is.
+            before_cls = len(components)
+            components = [c for c in components if not _is_unresolved_model_class(c)]
+            if before_cls != len(components):
+                _LOGGER.info(
+                    "No-LLM: dropped %d model row(s) naming an unresolved client class",
+                    before_cls - len(components),
+                )
 
         before = len(components)
         components = _consolidate_components(components)
