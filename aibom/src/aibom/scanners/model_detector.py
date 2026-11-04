@@ -421,6 +421,9 @@ BUILTIN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "family": "gpt-3.5",
         "deprecated": False,
     },
+    # ``o1-preview`` was retired by OpenAI and has been dropped from the live
+    # LiteLLM catalog, so the curated registry must keep resolving it.
+    r"^o1-preview(-\d{4}-\d{2}-\d{2})?$": {"provider": "openai", "family": "o1", "deprecated": True},
     r"^o1-pro$": {"provider": "openai", "family": "o1", "deprecated": False},
     r"^o1-mini$": {"provider": "openai", "family": "o1", "deprecated": False},
     r"^o1$": {"provider": "openai", "family": "o1", "deprecated": False},
