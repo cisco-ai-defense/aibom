@@ -792,6 +792,73 @@ class TestAgenticScope:
         assert result.components[0].needs_agentic is True
         assert result.components[0].agentic_hint == "agentic_stage_error"
 
+    @staticmethod
+    def _failed_stage_run(tmp_path: Path, components: list[AIComponent]):
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+        )
+        with (
+            patch.object(pipeline, "_stage_scan", return_value=(components, [])),
+            patch.object(
+                pipeline,
+                "_stage_cross_ref",
+                return_value=(components, CrossRefIndex(), CrossRefIndex(), []),
+            ),
+            patch("aibom.scan_pipeline.ensure_llm_runtime_available"),
+            patch(
+                "aibom.agentic.agent.run_agentic_enrichment",
+                side_effect=RuntimeError("provider unavailable"),
+            ),
+        ):
+            return pipeline.run()
+
+    @staticmethod
+    def _client_class_row(tmp_path: Path) -> AIComponent:
+        return AIComponent(
+            name="OpenAIModel",
+            component_type=AIComponentType.MODEL,
+            file_path=str(tmp_path / "app.py"),
+            line_number=2,
+            metadata={"detection_method": "bare_provider_client"},
+        )
+
+    def test_stage_failure_does_not_count_dropped_client_class_as_degraded(
+        self, tmp_path: Path
+    ) -> None:
+        kept = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path=str(tmp_path / "app.py"),
+            line_number=1,
+            model_name="gpt-4o",
+        )
+        result = self._failed_stage_run(
+            tmp_path, [kept, self._client_class_row(tmp_path)]
+        )
+
+        assert [c.name for c in result.components] == ["gpt-4o"]
+        assert result.agentic_status == "degraded"
+        assert result.agentic_degraded_count == 1
+        assert result.agentic_degradation_reasons == {"agentic_stage_error": 1}
+        assert result.agentic_removed_count == 1
+        assert (
+            result.agentic_reviewed_count
+            + result.agentic_removed_count
+            + result.agentic_degraded_count
+            == result.agentic_input_count
+        )
+
+    def test_stage_failure_stays_degraded_when_every_degraded_row_is_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        result = self._failed_stage_run(tmp_path, [self._client_class_row(tmp_path)])
+
+        assert result.components == []
+        assert result.agentic_degraded_count == 0
+        assert result.agentic_degradation_reasons == {}
+        assert result.agentic_status == "degraded"
+
     def test_stage_failure_before_dedup_preserves_accounting(
         self, tmp_path: Path
     ) -> None:
@@ -3565,6 +3632,73 @@ class TestAlignComponentAnchors:
         prompt = self._comp(AIComponentType.PROMPT, "prompt", cfg, 1)
         aligned = _align_component_anchors([model, prompt], [str(tmp_path)])
         assert [c.line_number for c in aligned] == [2, 1]
+
+
+    def test_keyword_argument_is_not_a_nearby_definition(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "app.py"
+        src.write_text(
+            "response = client.create(\n"
+            '    model="gpt-4o",\n'
+            "    tools=tools,\n"
+            ")\n"
+        )
+        comp = self._comp(AIComponentType.TOOL, "tools", src, 1)
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert aligned.line_number == 1
+        assert "reported_line" not in (aligned.metadata or {})
+
+    def test_assignment_within_reach_is_still_a_nearby_definition(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "app.py"
+        src.write_text("import os\nx = 1\ntools = [os.getcwd]\n")
+        comp = self._comp(AIComponentType.TOOL, "tools", src, 2)
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert aligned.line_number == 3
+
+    def test_second_move_keeps_the_original_reported_position(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "app.py"
+        src.write_text("x = 1\n\nagent = Agent()\n")
+        comp = self._comp(
+            AIComponentType.AGENT,
+            "agent",
+            src,
+            2,
+            metadata={"reported_line": 40},
+        )
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert aligned.line_number == 3
+        assert aligned.metadata["reported_line"] == 40
+
+    def test_import_is_not_followed_to_a_file_outside_a_file_only_scan(
+        self, tmp_path: Path
+    ):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        pkg = tmp_path / "app"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        memory = pkg / "memory.py"
+        memory.write_text("class ConversationMemory:\n    pass\n")
+        loop = pkg / "loop.py"
+        loop.write_text("from app.memory import ConversationMemory\n")
+
+        comp = self._comp(AIComponentType.MEMORY, "ConversationMemory", loop, 1)
+        [aligned] = _align_component_anchors([comp], [str(loop)])
+        assert aligned.file_path == str(loop)
+        assert aligned.line_number == 1
+        assert "reported_file" not in (aligned.metadata or {})
+
+        comp = self._comp(AIComponentType.MEMORY, "ConversationMemory", loop, 1)
+        [aligned] = _align_component_anchors([comp], [str(loop), str(memory)])
+        assert aligned.file_path == str(memory.absolute())
+        assert aligned.line_number == 1
 
 
 class TestUnresolvedModelClassWithLLM:

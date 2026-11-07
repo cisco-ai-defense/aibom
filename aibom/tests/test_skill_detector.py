@@ -127,3 +127,31 @@ class TestPortableSkills:
             {".claude/skills/review/SKILL.md": self._SKILL.format(name="review")},
         )
         assert [(c.skill_format, c.line_number) for c in comps] == [("claude", 1)]
+
+    def test_unrecognized_skill_md_does_not_hide_skills_below_it(
+        self, tmp_path: Path
+    ) -> None:
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {
+                "SKILL.md": "# Team notes\n\nNot a skill.\n",
+                "skills/pdf/SKILL.md": self._SKILL.format(name="pdf"),
+            },
+        )
+        assert [c.name for c in comps] == ["pdf"]
+
+    def test_plugin_skill_with_frontmatter_reported_once(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {
+                ".claude/plugins/review/SKILL.md": self._SKILL.format(name="review"),
+                ".devin/triage/SKILL.md": self._SKILL.format(name="triage"),
+            },
+        )
+        assert sorted((c.skill_format, c.name) for c in comps) == [
+            ("claude", "review"),
+            ("devin", "triage"),
+        ]
+        assert len({c.instance_id for c in comps}) == len(comps)

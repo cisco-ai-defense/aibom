@@ -687,9 +687,62 @@ def _parse_package_lock_json(
     return out
 
 
+_YARN_ENTRY_VERSION = re.compile(r"""^ {2}version:?\s+"?([^"\s]+)"?\s*$""")
+
+
+def _yarn_entry_version(lines: list[str], header_index: int) -> Optional[str]:
+    """Resolved ``version`` in the body of the yarn.lock entry after *header_index*.
+
+    The header names a selector (``openai@^4.0.0``), which is a range, not the
+    version that was installed.
+    """
+    for line in lines[header_index + 1 :]:
+        if not line.strip() or not line.startswith(" "):
+            break
+        m = _YARN_ENTRY_VERSION.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _package_lock_root_versions(text: str) -> dict[str, str]:
+    """Version of each package installed at the project root of a package-lock.json.
+
+    The root entry (``node_modules/<name>``) is what resolves the project's own
+    ``dependencies``. A same-named package nested under another dependency
+    (``node_modules/a/node_modules/<name>``) serves that dependency instead and
+    may not satisfy the manifest's range, so it is never used here.
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    packages = data.get("packages")
+    if isinstance(packages, dict) and packages:
+        for path_key, meta in packages.items():
+            key = path_key.replace("\\", "/")
+            if not key.startswith("node_modules/") or key.count("node_modules/") != 1:
+                continue
+            ver = meta.get("version") if isinstance(meta, dict) else None
+            if isinstance(ver, str):
+                out.setdefault(key[len("node_modules/") :], ver)
+        return out
+    deps = data.get("dependencies")
+    if isinstance(deps, dict):
+        for name, meta in deps.items():
+            ver = meta.get("version") if isinstance(meta, dict) else None
+            if isinstance(ver, str):
+                out[name] = ver
+    return out
+
+
 def _parse_yarn_lock(text: str) -> list[tuple[str, str, int, Optional[str], str]]:
     out: list[tuple[str, str, int, Optional[str], str]] = []
-    for idx, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    for idx, line in enumerate(lines, start=1):
         if line.startswith("#") or not line.strip():
             continue
         if re.match(r"^[\w@./-]+@[^:]+:\s*$", line.strip()):
@@ -701,7 +754,7 @@ def _parse_yarn_lock(text: str) -> list[tuple[str, str, int, Optional[str], str]
             ver = head[at_idx + 1 :]
             if name.startswith('"') and name.endswith('"'):
                 name = name[1:-1]
-            out.append((name, ver, idx, ver, "npm"))
+            out.append((name, ver, idx, _yarn_entry_version(lines, idx - 1), "npm"))
     return out
 
 
@@ -987,6 +1040,15 @@ _LOCK_FILE_MANIFESTS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _lock_versions(path: Path) -> list[tuple[str, str, int, Optional[str], str]]:
+    """Entries of a lock file that sits next to its manifest, for version lookup."""
+    if path.name.lower() == "package-lock.json":
+        text = read_manifest_text(path)
+        roots = _package_lock_root_versions(text) if text is not None else {}
+        return [(name, ver, 1, ver, "npm") for name, ver in roots.items()]
+    return _parse_manifest(path)
+
+
 def _lock_has_manifest(path: Path) -> bool:
     manifests = _LOCK_FILE_MANIFESTS.get(path.name.lower(), ())
     return any((path.parent / m).is_file() for m in manifests)
@@ -1160,7 +1222,7 @@ class DependencyScanner(BaseScanner):
                 )
                 seen[dedup_key] = comp
         for path in version_only_locks:
-            for name, _spec, _line, locked_ver, ecosystem in _parse_manifest(path):
+            for name, _spec, _line, locked_ver, ecosystem in _lock_versions(path):
                 prev = seen.get(_display_name(ecosystem, name).lower())
                 if prev is not None and not prev.sdk_version and locked_ver:
                     prev.sdk_version = locked_ver

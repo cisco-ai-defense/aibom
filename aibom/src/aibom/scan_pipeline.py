@@ -1090,7 +1090,7 @@ def _align_tool_anchors(
                     moved += 1
                     continue
         if target and target != comp.line_number:
-            comp.metadata = {**(comp.metadata or {}), "reported_line": comp.line_number}
+            _remember_reported_position(comp, comp.line_number)
             comp.line_number = target
             moved += 1
     if moved:
@@ -1192,7 +1192,12 @@ class _AnchorSource:
         self.imports: list[ast.stmt] = []
         self.decorated: list[ast.stmt] = []
         self.spans: list[ast.AST] = []
+        # First line of every ``def``, ``class`` and assignment statement. A
+        # ``name=value`` keyword argument on a continuation line is not one.
+        self.definition_lines: set[int] = set()
         for node in ast.walk(tree):
+            if isinstance(node, _SCOPE_NODES + (ast.Assign, ast.AnnAssign)):
+                self.definition_lines.add(node.lineno)
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 self.imports.append(node)
             elif isinstance(node, _SCOPE_NODES) and node.decorator_list:
@@ -1236,11 +1241,29 @@ class _AnchorSource:
                 rf"|\s*{name}\s*(?::[^=]+)?=(?!=)"
             )
             for j in range(max(1, n - radius), n + radius + 1):
-                if pattern.match(self.line(j)) and (
-                    best is None or abs(j - n) < abs(best - n)
+                if (
+                    j in self.definition_lines
+                    and pattern.match(self.line(j))
+                    and (best is None or abs(j - n) < abs(best - n))
                 ):
                     best = j
         return best
+
+
+def _remember_reported_position(
+    comp: AIComponent, line: int, file_path: str | None = None
+) -> None:
+    """Record where the scanner first reported *comp*, once.
+
+    A component can be moved more than once (tool alignment, then component
+    alignment); the evidence must keep the scanner's own position, not an
+    intermediate one.
+    """
+    meta = dict(comp.metadata or {})
+    meta.setdefault("reported_line", line)
+    if file_path is not None:
+        meta.setdefault("reported_file", file_path)
+    comp.metadata = meta
 
 
 def _align_component_anchors(
@@ -1275,9 +1298,21 @@ def _align_component_anchors(
                 sources[path] = None
         return sources[path]
 
+    scanned_files = {
+        Path(p).absolute() for p in scan_paths or [] if Path(p).is_file()
+    }
+
     def follow(importer: Path, name: str) -> tuple[Path, int] | None:
         root = next((r for r in roots if importer.is_relative_to(r)), None)
-        return _module_definition(importer, name, trees, root=root)
+        found = _module_definition(importer, name, trees, root=root)
+        if found is None:
+            return None
+        # A file-only scan has no root to confine the lookup to, so the
+        # definition must itself be a scanned file; never report an unscanned one.
+        in_scan = found[0] in scanned_files or any(
+            found[0].is_relative_to(r) for r in roots
+        )
+        return found if in_scan else None
 
     moved = 0
     for comp in components:
@@ -1305,11 +1340,7 @@ def _align_component_anchors(
             ]
             found = follow(importer, bound[0]) if bound else None
             if found is not None and found != (importer, reported):
-                comp.metadata = {
-                    **(comp.metadata or {}),
-                    "reported_file": comp.file_path,
-                    "reported_line": reported,
-                }
+                _remember_reported_position(comp, reported, comp.file_path)
                 comp.file_path, comp.line_number = str(found[0]), found[1]
                 moved += 1
             continue
@@ -1332,18 +1363,14 @@ def _align_component_anchors(
             if bound and bound[1] == "import":
                 found = follow(importer, names[0])
                 if found is not None and found[0] != importer:
-                    comp.metadata = {
-                        **(comp.metadata or {}),
-                        "reported_file": comp.file_path,
-                        "reported_line": reported,
-                    }
+                    _remember_reported_position(comp, reported, comp.file_path)
                     comp.file_path, comp.line_number = str(found[0]), found[1]
                     moved += 1
                     continue
             elif bound and bound[0] and bound[1] in ("other", "call"):
                 target = bound[0]
         if target != reported:
-            comp.metadata = {**(comp.metadata or {}), "reported_line": reported}
+            _remember_reported_position(comp, reported)
             comp.line_number = target
             moved += 1
     if moved:
@@ -2150,6 +2177,7 @@ class ScanPipeline:
         self.telemetry_source_id = telemetry_source_id
         self.telemetry_source_kind = telemetry_source_kind
         self._agentic_degraded_count = 0
+        self._agentic_stage_degraded = False
         self._agentic_degradation_reasons: dict[str, int] = {}
         self._agentic_reviewed_count = 0
         self._agentic_removed_count = 0
@@ -2189,6 +2217,7 @@ class ScanPipeline:
     def run(self) -> PipelineResult:
         clear_cache()
         self._agentic_degraded_count = 0
+        self._agentic_stage_degraded = False
         self._agentic_degradation_reasons = {}
         self._agentic_reviewed_count = 0
         self._agentic_removed_count = 0
@@ -2337,7 +2366,7 @@ class ScanPipeline:
 
         tu = getattr(self, "_agentic_token_usage", None)
         agentic_degraded_count = getattr(self, "_agentic_degraded_count", 0)
-        if agentic_degraded_count:
+        if agentic_degraded_count or getattr(self, "_agentic_stage_degraded", False):
             agentic_status = "degraded"
         elif not self.llm_config or self._agentic_input_count == 0:
             agentic_status = "skipped"
@@ -2831,6 +2860,31 @@ class ScanPipeline:
     # Stage 4: Assemble — consolidate, filter, count
     # ------------------------------------------------------------------
 
+    def _discount_removed_degraded(self, removed: list[AIComponent]) -> None:
+        """Stop counting rows dropped from the BOM as left degraded.
+
+        The degraded count and its reasons describe the rows the BOM keeps. A
+        row the agentic stage could not decide but that assembly then removed
+        is not in the BOM, so it must not be reported as one. The stage still
+        failed to review it, so the run keeps its ``degraded`` status.
+        """
+        gone = [c for c in removed if c.instance_id in self._agentic_degraded_ids]
+        if not gone:
+            return
+        self._agentic_stage_degraded = True
+        reasons = dict(self._agentic_degradation_reasons)
+        for comp in gone:
+            reason = comp.agentic_hint or _MISSING_AGENTIC_VERDICT
+            if reasons.get(reason, 0) > 1:
+                reasons[reason] -= 1
+            else:
+                reasons.pop(reason, None)
+        self._agentic_degradation_reasons = reasons
+        self._agentic_degraded_count = max(0, self._agentic_degraded_count - len(gone))
+        # Removed from the BOM, so they count as removed and the stage totals
+        # (reviewed + removed + degraded) still add up to the input.
+        self._agentic_removed_count += len(gone)
+
     def _stage_assemble(
         self, components: list[AIComponent]
     ) -> tuple[list[AIComponent], int]:
@@ -2883,12 +2937,13 @@ class ScanPipeline:
         # A row still named after a client class has no model id: the scanner
         # could not read one and no LLM verdict replaced it, so it would ship
         # as a model as-is.
-        before_cls = len(components)
-        components = [c for c in components if not _is_unresolved_model_class(c)]
-        if before_cls != len(components):
+        dropped_cls = [c for c in components if _is_unresolved_model_class(c)]
+        if dropped_cls:
+            components = [c for c in components if not _is_unresolved_model_class(c)]
+            self._discount_removed_degraded(dropped_cls)
             _LOGGER.info(
                 "Dropped %d model row(s) naming an unresolved client class",
-                before_cls - len(components),
+                len(dropped_cls),
             )
 
         before = len(components)

@@ -322,6 +322,98 @@ class TestLockFiles:
         )
         assert [c.name for c in comps] == ["openai"]
 
+    def test_package_lock_uses_the_root_entry_not_a_nested_copy(
+        self, tmp_path: Path
+    ) -> None:
+        lock = {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"openai": "^4.0.0"}},
+                "node_modules/langchain/node_modules/openai": {"version": "3.3.0"},
+                "node_modules/openai": {"version": "4.52.0"},
+            },
+        }
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "package-lock.json": json.dumps(lock),
+            },
+        )
+        assert [c.name for c in comps] == ["openai"]
+        assert comps[0].sdk_version == "4.52.0"
+        assert comps[0].metadata["locked_version"] == "4.52.0"
+
+    def test_legacy_package_lock_uses_the_top_level_entry(self, tmp_path: Path) -> None:
+        lock = {
+            "lockfileVersion": 1,
+            "dependencies": {
+                "a": {
+                    "version": "1.0.0",
+                    "dependencies": {"openai": {"version": "3.3.0"}},
+                },
+                "openai": {"version": "4.52.0"},
+            },
+        }
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "package-lock.json": json.dumps(lock),
+            },
+        )
+        assert comps[0].sdk_version == "4.52.0"
+
+    def test_package_lock_without_a_root_entry_leaves_the_version_unset(
+        self, tmp_path: Path
+    ) -> None:
+        lock = {
+            "packages": {
+                "": {},
+                "node_modules/langchain/node_modules/openai": {"version": "3.3.0"},
+            }
+        }
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "package-lock.json": json.dumps(lock),
+            },
+        )
+        assert comps[0].sdk_version is None
+
+    _YARN_LOCK = (
+        "# yarn lockfile v1\n\n\n"
+        "openai@^4.0.0:\n"
+        '  version "4.52.0"\n'
+        '  resolved "https://registry.example.test/openai-4.52.0.tgz"\n'
+        "  dependencies:\n"
+        '    version "9.9.9"\n'
+    )
+
+    def test_yarn_lock_next_to_manifest_supplies_the_resolved_version(
+        self, tmp_path: Path
+    ) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "yarn.lock": self._YARN_LOCK,
+            },
+        )
+        assert comps[0].sdk_version == "4.52.0"
+        assert comps[0].metadata["locked_version"] == "4.52.0"
+
+    def test_yarn_lock_without_manifest_reports_the_resolved_version(
+        self, tmp_path: Path
+    ) -> None:
+        comps, _ = run_scanner(DependencyScanner, tmp_path, {"yarn.lock": self._YARN_LOCK})
+        assert [(c.name, c.sdk_version) for c in comps] == [("openai", "4.52.0")]
+
 
 class TestManifestEncoding:
     def test_utf16_requirements_with_bom(self, tmp_path: Path) -> None:

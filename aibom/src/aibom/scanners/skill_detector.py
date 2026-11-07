@@ -147,13 +147,20 @@ def _skill_frontmatter(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _iter_skill_md(root: Path):
-    """Each SKILL.md under *root*, not descending into a skill's own folder."""
+    """Each portable SKILL.md under *root*, not descending into a skill's folder.
+
+    Only a recognized skill (valid frontmatter) closes its folder to the walk.
+    A SKILL.md without it, e.g. a notes file at the scan root, must not hide
+    the skills below it.
+    """
     for dirpath, dirnames, filenames in os.walk(root):
         if "SKILL.md" in filenames:
-            dirnames[:] = []
-            yield Path(dirpath) / "SKILL.md"
-        else:
-            dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+            skill_md = Path(dirpath) / "SKILL.md"
+            if _skill_frontmatter(skill_md) is not None:
+                dirnames[:] = []
+                yield skill_md
+                continue
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
 
 
 def _run_optional_skill_scanner(paths: list[str]) -> None:
@@ -375,7 +382,13 @@ def _collect_from_root(
             scan_roots.append(str(copilot.resolve()))
 
     for skill_md in _iter_skill_md(root):
-        if str(skill_md.resolve()) in seen or _is_excluded(skill_md, scan_root, spec):
+        # A plugin directory is already recorded under its own path; its SKILL.md
+        # would otherwise be reported a second time with the same identity.
+        if (
+            str(skill_md.resolve()) in seen
+            or str(skill_md.parent.resolve()) in seen
+            or _is_excluded(skill_md, scan_root, spec)
+        ):
             continue
         front = _skill_frontmatter(skill_md)
         if front is None:
