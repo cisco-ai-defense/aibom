@@ -3408,3 +3408,188 @@ class TestModelIdCanonicalization:
         result = ScanPipeline(scan_paths=[str(tmp_path)]).run()
         models = [c for c in result.components if c.component_type.value == "model"]
         assert models == []
+
+
+class TestAlignComponentAnchors:
+    @staticmethod
+    def _comp(ctype, name, path, line, **kwargs) -> AIComponent:
+        return AIComponent(
+            name=name,
+            component_type=ctype,
+            file_path=str(path),
+            line_number=line,
+            **kwargs,
+        )
+
+    def test_import_line_follows_to_in_tree_definition(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        pkg = tmp_path / "app"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "memory.py").write_text(
+            "import json\n\n\nclass ConversationMemory:\n    pass\n"
+        )
+        loop = pkg / "loop.py"
+        loop.write_text("from app.memory import ConversationMemory\n")
+        comp = self._comp(AIComponentType.MEMORY, "ConversationMemory", loop, 1)
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert aligned.file_path == str((pkg / "memory.py").absolute())
+        assert aligned.line_number == 4
+        assert aligned.metadata["reported_line"] == 1
+
+    def test_import_anchored_tool_keeps_its_import_line(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        (tmp_path / "tools.py").write_text("def search(q):\n    return q\n")
+        src = tmp_path / "agent.py"
+        src.write_text("from tools import search\n")
+        comp = self._comp(AIComponentType.TOOL, "search", src, 1)
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert (aligned.file_path, aligned.line_number) == (str(src), 1)
+
+    def test_import_of_external_package_is_left_alone(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "graph.py"
+        src.write_text("from langgraph.prebuilt import ToolNode\n")
+        comp = self._comp(AIComponentType.TOOL, "ToolNode", src, 1)
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert (aligned.file_path, aligned.line_number) == (str(src), 1)
+
+    def test_blank_and_decorator_lines_move_to_definition(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "limits.py"
+        src.write_text(
+            "import functools\n"
+            "\n"
+            "\n"
+            "class TokenBudget:\n"
+            "    pass\n"
+            "\n"
+            "\n"
+            "@functools.cache\n"
+            "def evidence_gate(state):\n"
+            "    return state\n"
+        )
+        budget = self._comp(AIComponentType.GUARDRAIL, "TokenBudget", src, 3)
+        gate = self._comp(AIComponentType.GUARDRAIL, "evidence_gate", src, 8)
+        aligned = _align_component_anchors([budget, gate], [str(tmp_path)])
+        assert [c.line_number for c in aligned] == [4, 9]
+
+    def test_continuation_line_moves_to_call_start(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "agent = AssistantAgent(\n"
+            '    name="CareerMentorAgent",\n'
+            '    system_message="Help with careers.",\n'
+            ")\n"
+        )
+        comp = self._comp(AIComponentType.AGENT, "CareerMentorAgent", src, 2)
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert aligned.line_number == 1
+
+    def test_entries_of_one_literal_stay_distinct(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "tools.py"
+        src.write_text(
+            "tools = [\n"
+            "    {\n"
+            '        "name": "read_file",\n'
+            "    },\n"
+            "    {\n"
+            '        "name": "write_file",\n'
+            "    },\n"
+            "]\n"
+        )
+        read = self._comp(AIComponentType.TOOL, "read_file", src, 3)
+        write = self._comp(AIComponentType.TOOL, "write_file", src, 6)
+        aligned = _align_component_anchors([read, write], [str(tmp_path)])
+        assert [c.line_number for c in aligned] == [2, 5]
+
+    def test_nearby_definition_of_the_name(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "agent.py"
+        src.write_text(
+            "import os\n"
+            "MODEL = os.getenv('MODEL')\n"
+            "\n"
+            'SYSTEM_PROMPT = "You are a helpful assistant."\n'
+        )
+        comp = self._comp(AIComponentType.PROMPT, "SYSTEM_PROMPT", src, 2)
+        [aligned] = _align_component_anchors([comp], [str(tmp_path)])
+        assert aligned.line_number == 4
+
+    def test_prompt_at_use_site_moves_to_assignment(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        (tmp_path / "prompts.py").write_text(
+            'GREETING = "Say hello."\n\nSYSTEM = "You are a planner."\n'
+        )
+        local = tmp_path / "local.py"
+        local.write_text(
+            'qa_prompt = "Answer from the context."\n'
+            "\n"
+            "def run(client):\n"
+            "    return client.create(\n"
+            "        system=qa_prompt,\n"
+            "    )\n"
+        )
+        uses_import = tmp_path / "main.py"
+        uses_import.write_text(
+            "from prompts import SYSTEM\n"
+            "\n"
+            "def run(client):\n"
+            "    return client.create(system=SYSTEM)\n"
+        )
+        qa = self._comp(AIComponentType.PROMPT, "qa_prompt", local, 5)
+        imported = self._comp(AIComponentType.PROMPT, "SYSTEM", uses_import, 4)
+        aligned = _align_component_anchors([qa, imported], [str(tmp_path)])
+        assert (aligned[0].file_path, aligned[0].line_number) == (str(local), 1)
+        assert aligned[1].file_path == str((tmp_path / "prompts.py").absolute())
+        assert aligned[1].line_number == 3
+
+    def test_id_types_and_non_python_files_untouched(self, tmp_path: Path):
+        from aibom.scan_pipeline import _align_component_anchors
+
+        src = tmp_path / "app.py"
+        src.write_text('client.create(\n    model="gpt-4o",\n)\n')
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("\nprompt: hello\n")
+        model = self._comp(AIComponentType.MODEL, "gpt-4o", src, 2)
+        prompt = self._comp(AIComponentType.PROMPT, "prompt", cfg, 1)
+        aligned = _align_component_anchors([model, prompt], [str(tmp_path)])
+        assert [c.line_number for c in aligned] == [2, 1]
+
+
+class TestUnresolvedModelClassWithLLM:
+    def test_llm_run_drops_unresolved_model_class(self, tmp_path: Path):
+        from aibom.models import DetectionSource
+
+        pipeline = ScanPipeline(
+            scan_paths=[str(tmp_path)],
+            llm_config={"model": "test/model", "api_key": "fake"},
+        )
+        catalog_class = AIComponent(
+            name="crewai.LLM",
+            component_type=AIComponentType.MODEL,
+            file_path=str(tmp_path / "agents.py"),
+            line_number=3,
+            detection_source=DetectionSource.KB_ENRICHMENT,
+            kb_concept="model",
+            kb_label="class",
+        )
+        literal = AIComponent(
+            name="gpt-4o",
+            component_type=AIComponentType.MODEL,
+            file_path=str(tmp_path / "agents.py"),
+            line_number=4,
+            model_name="gpt-4o",
+        )
+        components, _ = pipeline._stage_assemble([catalog_class, literal])
+        assert [c.name for c in components] == ["gpt-4o"]

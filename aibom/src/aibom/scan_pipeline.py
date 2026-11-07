@@ -1106,6 +1106,254 @@ def _align_tool_anchors(
     return components
 
 
+# Types identified by a normalised id; their line is not a defining statement.
+_ID_ANCHOR_TYPES = frozenset(
+    {
+        AIComponentType.DEPENDENCY,
+        AIComponentType.MODEL,
+        AIComponentType.EMBEDDING,
+        AIComponentType.LLM_ENDPOINT,
+        AIComponentType.MODEL_ENDPOINT,
+    }
+)
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+_CONTAINER_NODES = (ast.Call, ast.Dict, ast.List, ast.Tuple, ast.Set)
+_SIMPLE_STMT_NODES = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Return)
+
+
+def _module_definition(
+    path: Path,
+    name: str,
+    trees: dict[Path, ast.Module | None],
+    depth: int = 0,
+    root: Path | None = None,
+) -> tuple[Path, int] | None:
+    """(file, line) of the module-level statement that defines *name* in *path*.
+
+    A ``def``, ``class`` or assignment counts as the definition. A
+    ``from ... import name`` is followed to the module it imports from, up to
+    a small re-export depth, staying inside *root*.
+    """
+    if depth > _MAX_REEXPORT_DEPTH:
+        return None
+    if path not in trees:
+        try:
+            trees[path] = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, SyntaxError, ValueError):
+            trees[path] = None
+    tree = trees[path]
+    if tree is None:
+        return None
+    found: ast.stmt | None = None
+    for node in tree.body:
+        if isinstance(node, _SCOPE_NODES) and node.name == name:
+            found = node
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            found = node
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        ):
+            found = node
+        elif isinstance(node, ast.ImportFrom) and any(
+            (a.asname or a.name) == name for a in node.names
+        ):
+            found = node
+    if found is None:
+        return None
+    if not isinstance(found, ast.ImportFrom):
+        return path, found.lineno
+    alias = next(a for a in found.names if (a.asname or a.name) == name)
+    target = _import_target_file(path, found.module or "", found.level, root)
+    if target is None:
+        return None
+    return _module_definition(target, alias.name, trees, depth + 1, root)
+
+
+def _anchor_names(comp: AIComponent) -> list[str]:
+    """Identifiers a component may be bound to in source, most specific first."""
+    names: list[str] = []
+    for raw in ((comp.metadata or {}).get("variable_or_class_name"), comp.name):
+        leaf = str(raw or "").split(".")[-1]
+        if _IDENTIFIER_RE.fullmatch(leaf) and leaf not in names:
+            names.append(leaf)
+    return names
+
+
+class _AnchorSource:
+    """Lines and statement layout of one Python file, for anchor alignment."""
+
+    def __init__(self, tree: ast.Module, lines: list[str]) -> None:
+        self.lines = lines
+        self.scopes = _FileScopes(tree)
+        self.imports: list[ast.stmt] = []
+        self.decorated: list[ast.stmt] = []
+        self.spans: list[ast.AST] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                self.imports.append(node)
+            elif isinstance(node, _SCOPE_NODES) and node.decorator_list:
+                self.decorated.append(node)
+            if isinstance(node, _CONTAINER_NODES + _SIMPLE_STMT_NODES):
+                self.spans.append(node)
+
+    def line(self, n: int) -> str:
+        return self.lines[n - 1] if 0 < n <= len(self.lines) else ""
+
+    def import_at(self, n: int) -> ast.stmt | None:
+        return next(
+            (i for i in self.imports if i.lineno <= n <= (i.end_lineno or i.lineno)),
+            None,
+        )
+
+    def statement_start(self, n: int) -> int:
+        """First line of the innermost call, literal or statement spanning *n*."""
+        for node in self.decorated:
+            first = min(d.lineno for d in node.decorator_list)
+            if first <= n < node.lineno:
+                return node.lineno
+        inner: ast.AST | None = None
+        for node in self.spans:
+            end = getattr(node, "end_lineno", None) or node.lineno
+            if node.lineno <= n <= end and (
+                inner is None
+                or end - node.lineno
+                < (getattr(inner, "end_lineno", None) or inner.lineno) - inner.lineno
+            ):
+                inner = node
+        return inner.lineno if inner is not None else n
+
+    def nearby_definition(
+        self, names: list[str], n: int, radius: int = 3
+    ) -> int | None:
+        best: int | None = None
+        for name in names:
+            pattern = re.compile(
+                rf"\s*(?:(?:async\s+)?def|class)\s+{name}\b"
+                rf"|\s*{name}\s*(?::[^=]+)?=(?!=)"
+            )
+            for j in range(max(1, n - radius), n + radius + 1):
+                if pattern.match(self.line(j)) and (
+                    best is None or abs(j - n) < abs(best - n)
+                ):
+                    best = j
+        return best
+
+
+def _align_component_anchors(
+    components: list[AIComponent], scan_paths: list[str] | None = None
+) -> list[AIComponent]:
+    """Anchor components defined in Python code at their defining statement.
+
+    Applies to every type identified by its location rather than by an id
+    (agents, tools, prompts, memory, guardrails, ...). An anchor on an import
+    line follows the import to the definition when that is inside the scanned
+    tree; tools keep their import anchor. An anchor on a blank, comment or
+    decorator line, or on a continuation line of a call or statement, moves to
+    the statement's first line. When the anchor line does not mention the
+    component, a definition of its name within three lines is used. A prompt
+    anchored where its variable is used moves to the assignment, following an
+    import if needed.
+    """
+    trees: dict[Path, ast.Module | None] = {}
+    sources: dict[str, _AnchorSource | None] = {}
+    roots = sorted(
+        (Path(p).absolute() for p in scan_paths or [] if Path(p).is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
+
+    def source_for(path: str) -> _AnchorSource | None:
+        if path not in sources:
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+                sources[path] = _AnchorSource(ast.parse(text), text.splitlines())
+            except (OSError, SyntaxError, ValueError):
+                sources[path] = None
+        return sources[path]
+
+    def follow(importer: Path, name: str) -> tuple[Path, int] | None:
+        root = next((r for r in roots if importer.is_relative_to(r)), None)
+        return _module_definition(importer, name, trees, root=root)
+
+    moved = 0
+    for comp in components:
+        if (
+            comp.component_type in _ID_ANCHOR_TYPES
+            or not comp.line_number
+            or not str(comp.file_path or "").endswith(".py")
+        ):
+            continue
+        src = source_for(str(comp.file_path))
+        if src is None:
+            continue
+        reported, names = comp.line_number, _anchor_names(comp)
+        importer = Path(comp.file_path).absolute()
+        imp = src.import_at(reported)
+        if imp is not None and comp.component_type == AIComponentType.TOOL:
+            # A tool imported and handed to an agent is deliberately anchored
+            # at the import (see _align_tool_anchors).
+            continue
+        if imp is not None:
+            bound = [
+                a.asname or a.name
+                for a in getattr(imp, "names", [])
+                if (a.asname or a.name) in names
+            ]
+            found = follow(importer, bound[0]) if bound else None
+            if found is not None and found != (importer, reported):
+                comp.metadata = {
+                    **(comp.metadata or {}),
+                    "reported_file": comp.file_path,
+                    "reported_line": reported,
+                }
+                comp.file_path, comp.line_number = str(found[0]), found[1]
+                moved += 1
+            continue
+        target = reported
+        text = src.line(target).strip()
+        if not text or text.startswith("#"):
+            target = next(
+                (
+                    j
+                    for j in range(target + 1, target + 4)
+                    if src.line(j).strip() and not src.line(j).strip().startswith("#")
+                ),
+                target,
+            )
+        target = src.statement_start(target)
+        if names and not any(re.search(rf"\b{n}\b", src.line(target)) for n in names):
+            target = src.nearby_definition(names, target) or target
+        if comp.component_type == AIComponentType.PROMPT and names:
+            bound = src.scopes.binding_for(names[0], target)
+            if bound and bound[1] == "import":
+                found = follow(importer, names[0])
+                if found is not None and found[0] != importer:
+                    comp.metadata = {
+                        **(comp.metadata or {}),
+                        "reported_file": comp.file_path,
+                        "reported_line": reported,
+                    }
+                    comp.file_path, comp.line_number = str(found[0]), found[1]
+                    moved += 1
+                    continue
+            elif bound and bound[0] and bound[1] in ("other", "call"):
+                target = bound[0]
+        if target != reported:
+            comp.metadata = {**(comp.metadata or {}), "reported_line": reported}
+            comp.line_number = target
+            moved += 1
+    if moved:
+        _LOGGER.info(
+            "Anchor alignment: moved %d component(s) to their defining statement",
+            moved,
+        )
+    return components
+
+
 def _is_agent_creation_site(c: "AIComponent") -> bool:
     """True for an agent row captured at an agent constructor call.
 
@@ -2629,18 +2877,19 @@ class ScanPipeline:
             )
 
         components = _align_tool_anchors(components, self.scan_paths)
+        components = _align_component_anchors(components, self.scan_paths)
         components = _canonicalize_bedrock_model_ids(components)
 
-        if not self.llm_config:
-            # No LLM stage will resolve a client class to its model id, so a
-            # row named after the class would ship as a model as-is.
-            before_cls = len(components)
-            components = [c for c in components if not _is_unresolved_model_class(c)]
-            if before_cls != len(components):
-                _LOGGER.info(
-                    "No-LLM: dropped %d model row(s) naming an unresolved client class",
-                    before_cls - len(components),
-                )
+        # A row still named after a client class has no model id: the scanner
+        # could not read one and no LLM verdict replaced it, so it would ship
+        # as a model as-is.
+        before_cls = len(components)
+        components = [c for c in components if not _is_unresolved_model_class(c)]
+        if before_cls != len(components):
+            _LOGGER.info(
+                "Dropped %d model row(s) naming an unresolved client class",
+                before_cls - len(components),
+            )
 
         before = len(components)
         components = _consolidate_components(components)
