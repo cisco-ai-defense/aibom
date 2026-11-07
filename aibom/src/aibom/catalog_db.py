@@ -21,8 +21,6 @@ import duckdb
 
 LOGGER = logging.getLogger(__name__)
 
-_CATALOG_COLS = "id, label, concept, framework, sig_name, type, catalog_label"
-
 
 def is_excluded(name: str, patterns: List[str]) -> bool:
     """Return True if *name* suffix-matches or equals any pattern in *patterns*."""
@@ -52,6 +50,22 @@ class CatalogDB:
 
         self._connection.execute(
             f"CREATE VIEW component_catalog AS SELECT * FROM kb.component_catalog"
+        )
+
+        # ``catalog_label`` is present in the legacy schema but omitted from the
+        # kb-v2 schema. Project the real column when present, otherwise ``NULL``
+        # so suffix lookups work against both schemas.
+        kb_cols = {
+            r[1]
+            for r in self._connection.execute(
+                "PRAGMA table_info('component_catalog')"
+            ).fetchall()
+        }
+        catalog_label_expr = (
+            "catalog_label" if "catalog_label" in kb_cols else "NULL AS catalog_label"
+        )
+        self._catalog_cols = (
+            f"id, label, concept, framework, sig_name, type, {catalog_label_expr}"
         )
 
         self._custom_index: Dict[str, Dict[str, Any]] = {}
@@ -280,7 +294,7 @@ class CatalogDB:
         if matched_ids:
             id_list = list(matched_ids)
             cursor = self._connection.execute(
-                f"SELECT {_CATALOG_COLS} FROM kb.component_catalog "
+                f"SELECT {self._catalog_cols} FROM kb.component_catalog "
                 "WHERE id IN (SELECT UNNEST(?)) "
                 f"AND {label_filter} "
                 "ORDER BY id",

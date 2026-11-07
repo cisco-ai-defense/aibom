@@ -22,12 +22,15 @@ import duckdb
 from aibom.catalog_db import CatalogDB
 
 
-def _create_catalog(path: Path, *, with_token_table: bool = True) -> None:
+def _create_catalog(
+    path: Path, *, with_token_table: bool = True, with_catalog_label: bool = True
+) -> None:
     """Build a minimal test catalog.
 
     When *with_token_table* is True (the default), the pre-built
     ``component_catalog_last_seg`` table is included, simulating a
     new-format KB.  Set to False to test the old-KB fallback path.
+    Set *with_catalog_label* to False for the schema without that column.
     """
     con = duckdb.connect(str(path))
     con.execute(
@@ -52,6 +55,8 @@ def _create_catalog(path: Path, *, with_token_table: bool = True) -> None:
             ('other.Unused', 'Unused', NULL, 'other', 'Unused', 'class', 'Unused');
         """
     )
+    if not with_catalog_label:
+        con.execute("ALTER TABLE component_catalog DROP COLUMN catalog_label")
     if with_token_table:
         con.execute(
             """
@@ -75,6 +80,20 @@ def test_find_components_by_suffixes_returns_matches():
         assert "pkg.Agent" in ids
         assert "pkg.Tool.run" in ids
         assert "other.Unused" not in ids
+
+
+def test_find_components_by_suffixes_without_catalog_label_column():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "catalog.duckdb"
+        _create_catalog(db_file, with_catalog_label=False)
+
+        with CatalogDB(db_file) as connector:
+            results = connector.find_components_by_suffixes(["Agent", "Tool.run"])
+
+        by_id = {row["id"]: row for row in results}
+        assert set(by_id) == {"pkg.Agent", "pkg.Tool.run"}
+        assert by_id["pkg.Agent"]["concept"] == "agent"
+        assert by_id["pkg.Agent"]["catalog_label"] is None
 
 
 def test_find_components_by_suffixes_empty_input():
