@@ -17,13 +17,16 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
+import yaml  # type: ignore[import-untyped]
 from pathspec import PathSpec
 
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
+from ..utils.path_filter import should_skip_dir
 from .base import BaseScanner
 
 _LOGGER = logging.getLogger(__name__)
@@ -114,6 +117,52 @@ def _read_skill_doc(path: Path) -> tuple[Optional[str], Optional[str], list[str]
     return _parse_skill_markdown(text)
 
 
+def _skill_frontmatter(path: Path) -> Optional[dict[str, Any]]:
+    """YAML frontmatter of a SKILL.md that declares a ``name`` and ``description``.
+
+    That frontmatter is the portable Agent Skills format, used by skill folders
+    that live outside any one tool's directory (``skills/<name>/SKILL.md``).
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    end = next((i for i, ln in enumerate(lines[1:], 1) if ln.strip() == "---"), None)
+    if end is None:
+        return None
+    try:
+        data = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError:
+        return None
+    if (
+        not isinstance(data, dict)
+        or not data.get("name")
+        or not data.get("description")
+    ):
+        return None
+    return data
+
+
+def _iter_skill_md(root: Path):
+    """Each portable SKILL.md under *root*, not descending into a skill's folder.
+
+    Only a recognized skill (valid frontmatter) closes its folder to the walk.
+    A SKILL.md without it, e.g. a notes file at the scan root, must not hide
+    the skills below it.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        if "SKILL.md" in filenames:
+            skill_md = Path(dirpath) / "SKILL.md"
+            if _skill_frontmatter(skill_md) is not None:
+                dirnames[:] = []
+                yield skill_md
+                continue
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+
+
 def _run_optional_skill_scanner(paths: list[str]) -> None:
     try:
         from skill_scanner import SkillScanner
@@ -162,6 +211,7 @@ def _component_for_skill_md(
         name=name,
         component_type=AIComponentType.SKILL,
         file_path=str(skill_md.resolve()),
+        line_number=1,
         skill_format=skill_format,
         description=desc,
         detection_source=DetectionSource.CONFIG_FILE,
@@ -198,6 +248,7 @@ def _component_for_plugin_dir(
         name=name,
         component_type=AIComponentType.SKILL,
         file_path=fp,
+        line_number=1,
         skill_format=skill_format,
         description=desc,
         detection_source=DetectionSource.CONFIG_FILE,
@@ -229,6 +280,7 @@ def _component_for_single_file(
         name=name,
         component_type=AIComponentType.SKILL,
         file_path=str(path.resolve()),
+        line_number=1,
         skill_format=skill_format,
         description=desc,
         detection_source=DetectionSource.CONFIG_FILE,
@@ -328,6 +380,25 @@ def _collect_from_root(
         if c:
             components.append(c)
             scan_roots.append(str(copilot.resolve()))
+
+    for skill_md in _iter_skill_md(root):
+        # A plugin directory is already recorded under its own path; its SKILL.md
+        # would otherwise be reported a second time with the same identity.
+        if (
+            str(skill_md.resolve()) in seen
+            or str(skill_md.parent.resolve()) in seen
+            or _is_excluded(skill_md, scan_root, spec)
+        ):
+            continue
+        front = _skill_frontmatter(skill_md)
+        if front is None:
+            continue
+        c = _component_for_skill_md(skill_md, "agent_skill", scan_root, spec, seen)
+        if c:
+            c.name = str(front["name"])
+            c.description = c.description or str(front["description"])[:200]
+            components.append(c)
+            scan_roots.append(str(skill_md.parent.resolve()))
 
     for agents in root.glob("**/AGENTS.md"):
         c = _component_for_single_file(

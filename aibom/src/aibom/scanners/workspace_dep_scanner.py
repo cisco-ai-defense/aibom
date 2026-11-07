@@ -25,6 +25,7 @@ from pathlib import Path
 from ..models import AIComponent, ComponentRelationship, ScanContext
 from ..models.enums import AIComponentType, DetectionSource
 from .base import BaseScanner
+from .dependency_scanner import read_manifest_text
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -183,10 +184,10 @@ def _resolve_uv_workspace_member(base: Path, pkg: str) -> Path:
 def _scan_requirements_txt(path: Path) -> list[AIComponent]:
     out: list[AIComponent] = []
     base = path.parent
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    text = read_manifest_text(path)
+    if text is None:
         return out
+    lines = text.splitlines()
 
     for i, line in enumerate(lines, start=1):
         stripped = line.strip()
@@ -275,10 +276,10 @@ def _scan_package_json(path: Path) -> list[AIComponent]:
 def _scan_go_mod(path: Path) -> list[AIComponent]:
     out: list[AIComponent] = []
     base = path.parent
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    text = read_manifest_text(path)
+    if text is None:
         return out
+    lines = text.splitlines()
 
     for i, line in enumerate(lines, start=1):
         stripped = line.strip()

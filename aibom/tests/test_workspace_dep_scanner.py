@@ -69,6 +69,17 @@ class TestWorkspaceDepScanner:
         assert comps[0].metadata["ecosystem"] == "python"
         assert comps[0].metadata["local_path"] == str(sub.resolve())
 
+    def test_utf16_requirements_editable_path(
+        self, tmp_path: Path, scanner: WorkspaceDepScanner,
+    ) -> None:
+        sub = tmp_path / "submod"
+        sub.mkdir()
+        (tmp_path / "requirements.txt").write_bytes(
+            "flask==3.0.0\r\n-e ./submod\r\n".encode("utf-16")
+        )
+        comps, _ = scanner.scan(ScanContext(paths=[str(tmp_path)]))
+        assert [c.metadata["local_path"] for c in comps] == [str(sub.resolve())]
+
     def test_uv_workspace_source(
         self, tmp_path: Path, scanner: WorkspaceDepScanner,
     ) -> None:

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
@@ -301,9 +302,8 @@ def _parse_requirements_txt(
             if p in visited or not p.is_file():
                 continue
             visited.add(p)
-            try:
-                sub = p.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            sub = read_manifest_text(p)
+            if sub is None:
                 continue
             out.extend(_parse_requirements_txt(sub, p.parent, visited))
             continue
@@ -350,8 +350,70 @@ def _parse_pipfile(text: str) -> list[tuple[str, str, int, Optional[str], str]]:
     return out
 
 
+_TOML_TABLE_HEADER = re.compile(r"^\s*\[([^\[\]]+)\]\s*$")
+_TOML_ARRAY_KEY = re.compile(r"""^\s*("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)\s*=\s*\[""")
+_TOML_ARRAY_TOKEN = re.compile(r""""([^"]*)"|'([^']*)'|(\[)|(\])""")
+
+
+def _strip_toml_comment(line: str) -> str:
+    quote: Optional[str] = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i]
+    return line
+
+
+def _pep621_dependency_specs(text: str) -> list[tuple[str, int]]:
+    """(requirement, line) for each entry of a PEP 621 dependency array.
+
+    Covers ``dependencies = [...]`` in the ``[project]`` table and every
+    ``extra = [...]`` array in ``[project.optional-dependencies]``, whether the
+    array is written on one line or spread over several.
+    """
+    out: list[tuple[str, int]] = []
+    table: Optional[str] = None
+    depth = 0
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = _strip_toml_comment(raw)
+        if not depth:
+            header = _TOML_TABLE_HEADER.match(line)
+            if header:
+                table = header.group(1).strip()
+                continue
+            key = _TOML_ARRAY_KEY.match(line)
+            if not key:
+                continue
+            name = key.group(1).strip("\"'")
+            if not (
+                (table == "project" and name == "dependencies")
+                or table == "project.optional-dependencies"
+            ):
+                continue
+            line = line[key.end() - 1 :]
+        for tok in _TOML_ARRAY_TOKEN.finditer(line):
+            if tok.group(3):
+                depth += 1
+            elif tok.group(4):
+                depth -= 1
+                if not depth:
+                    break
+            else:
+                spec = tok.group(1) if tok.group(1) is not None else tok.group(2)
+                out.append((spec, lineno))
+    return out
+
+
 def _parse_pyproject_toml(text: str) -> list[tuple[str, str, int, Optional[str], str]]:
     out: list[tuple[str, str, int, Optional[str], str]] = []
+    for spec, lineno in _pep621_dependency_specs(text):
+        name, raw_spec, pinned, ver = _parse_pep508_name_version(spec)
+        if name:
+            out.append((name, raw_spec, lineno, ver if pinned else None, "pypi"))
     lower = text.lower()
     for marker in ("[project.dependencies]",):
         pos = lower.find(marker.lower())
@@ -625,9 +687,62 @@ def _parse_package_lock_json(
     return out
 
 
+_YARN_ENTRY_VERSION = re.compile(r"""^ {2}version:?\s+"?([^"\s]+)"?\s*$""")
+
+
+def _yarn_entry_version(lines: list[str], header_index: int) -> Optional[str]:
+    """Resolved ``version`` in the body of the yarn.lock entry after *header_index*.
+
+    The header names a selector (``openai@^4.0.0``), which is a range, not the
+    version that was installed.
+    """
+    for line in lines[header_index + 1 :]:
+        if not line.strip() or not line.startswith(" "):
+            break
+        m = _YARN_ENTRY_VERSION.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _package_lock_root_versions(text: str) -> dict[str, str]:
+    """Version of each package installed at the project root of a package-lock.json.
+
+    The root entry (``node_modules/<name>``) is what resolves the project's own
+    ``dependencies``. A same-named package nested under another dependency
+    (``node_modules/a/node_modules/<name>``) serves that dependency instead and
+    may not satisfy the manifest's range, so it is never used here.
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    packages = data.get("packages")
+    if isinstance(packages, dict) and packages:
+        for path_key, meta in packages.items():
+            key = path_key.replace("\\", "/")
+            if not key.startswith("node_modules/") or key.count("node_modules/") != 1:
+                continue
+            ver = meta.get("version") if isinstance(meta, dict) else None
+            if isinstance(ver, str):
+                out.setdefault(key[len("node_modules/") :], ver)
+        return out
+    deps = data.get("dependencies")
+    if isinstance(deps, dict):
+        for name, meta in deps.items():
+            ver = meta.get("version") if isinstance(meta, dict) else None
+            if isinstance(ver, str):
+                out[name] = ver
+    return out
+
+
 def _parse_yarn_lock(text: str) -> list[tuple[str, str, int, Optional[str], str]]:
     out: list[tuple[str, str, int, Optional[str], str]] = []
-    for idx, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    for idx, line in enumerate(lines, start=1):
         if line.startswith("#") or not line.strip():
             continue
         if re.match(r"^[\w@./-]+@[^:]+:\s*$", line.strip()):
@@ -639,7 +754,7 @@ def _parse_yarn_lock(text: str) -> list[tuple[str, str, int, Optional[str], str]
             ver = head[at_idx + 1 :]
             if name.startswith('"') and name.endswith('"'):
                 name = name[1:-1]
-            out.append((name, ver, idx, ver, "npm"))
+            out.append((name, ver, idx, _yarn_entry_version(lines, idx - 1), "npm"))
     return out
 
 
@@ -913,6 +1028,32 @@ _MANIFEST_PARSERS: dict[str, _ManifestParser] = {
 }
 
 
+# Lock files and the manifests they resolve. A lock file next to its manifest
+# lists the whole resolved tree, transitive packages included, so it only
+# supplies versions for packages the manifest declares.
+_LOCK_FILE_MANIFESTS: dict[str, tuple[str, ...]] = {
+    "poetry.lock": ("pyproject.toml",),
+    "uv.lock": ("pyproject.toml",),
+    "package-lock.json": ("package.json",),
+    "yarn.lock": ("package.json",),
+    "pnpm-lock.yaml": ("package.json",),
+}
+
+
+def _lock_versions(path: Path) -> list[tuple[str, str, int, Optional[str], str]]:
+    """Entries of a lock file that sits next to its manifest, for version lookup."""
+    if path.name.lower() == "package-lock.json":
+        text = read_manifest_text(path)
+        roots = _package_lock_root_versions(text) if text is not None else {}
+        return [(name, ver, 1, ver, "npm") for name, ver in roots.items()]
+    return _parse_manifest(path)
+
+
+def _lock_has_manifest(path: Path) -> bool:
+    manifests = _LOCK_FILE_MANIFESTS.get(path.name.lower(), ())
+    return any((path.parent / m).is_file() for m in manifests)
+
+
 def _is_known_ai(ecosystem: str, name: str) -> bool:
     """Check if a package is in the known-AI hint list (not a gate)."""
     if ecosystem == "nuget":
@@ -979,20 +1120,33 @@ def _iter_scan_paths(context: ScanContext) -> Iterator[Path]:
                 yield f
 
 
+def read_manifest_text(path: Path) -> Optional[str]:
+    """Read a manifest as text, honouring a UTF-8 or UTF-16 byte-order mark.
+
+    Some editors save requirements files as UTF-16. Decoded as UTF-8 they have
+    a NUL between every character, so no package name would parse.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16", errors="replace")
+    if raw.startswith(codecs.BOM_UTF8):
+        raw = raw[len(codecs.BOM_UTF8) :]
+    return raw.decode("utf-8", errors="replace")
+
+
 def _parse_manifest(path: Path) -> list[tuple[str, str, int, Optional[str], str]]:
     name = path.name.lower()
     if name.endswith(".csproj"):
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return []
-        return _parse_csproj(text)
+        text = read_manifest_text(path)
+        return _parse_csproj(text) if text is not None else []
     parser = _MANIFEST_PARSERS.get(name)
     if not parser:
         return []
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    text = read_manifest_text(path)
+    if text is None:
         return []
     return parser(path, text)
 
@@ -1029,10 +1183,17 @@ class DependencyScanner(BaseScanner):
         self, context: ScanContext
     ) -> tuple[list[AIComponent], list[ComponentRelationship]]:
         seen: dict[str, AIComponent] = {}
+        manifests: list[Path] = []
+        version_only_locks: list[Path] = []
         for path in _iter_scan_paths(context):
             key = path.name.lower()
             if key not in _MANIFEST_PARSERS and not key.endswith(".csproj"):
                 continue
+            if key in _LOCK_FILE_MANIFESTS and _lock_has_manifest(path):
+                version_only_locks.append(path)
+            else:
+                manifests.append(path)
+        for path in manifests:
             for name, raw_spec, line_no, pinned_ver, ecosystem in _parse_manifest(path):
                 if not _is_known_ai(ecosystem, name):
                     continue
@@ -1060,4 +1221,10 @@ class DependencyScanner(BaseScanner):
                     metadata=meta,
                 )
                 seen[dedup_key] = comp
+        for path in version_only_locks:
+            for name, _spec, _line, locked_ver, ecosystem in _lock_versions(path):
+                prev = seen.get(_display_name(ecosystem, name).lower())
+                if prev is not None and not prev.sdk_version and locked_ver:
+                    prev.sdk_version = locked_ver
+                    prev.metadata["locked_version"] = locked_ver
         return list(seen.values()), []

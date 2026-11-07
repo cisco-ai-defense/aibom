@@ -80,3 +80,78 @@ class TestSkillDetector:
         triggers = comps[0].metadata.get("trigger_patterns") or []
         assert any("Use when" in t for t in triggers)
         assert any("Activate when" in t for t in triggers)
+
+
+class TestPortableSkills:
+    _SKILL = (
+        "---\nname: {name}\ndescription: Use when working with {name}.\n---\n"
+        "\n# {name}\n"
+    )
+
+    def test_skill_md_with_frontmatter_outside_tool_dirs(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {
+                "skills/pdf/SKILL.md": self._SKILL.format(name="pdf"),
+                "power/skills/setup/SKILL.md": self._SKILL.format(name="setup"),
+            },
+        )
+        by_name = {c.name: c for c in comps}
+        assert set(by_name) == {"pdf", "setup"}
+        assert {c.skill_format for c in comps} == {"agent_skill"}
+        assert all(c.line_number == 1 for c in comps)
+
+    def test_skill_md_without_frontmatter_is_not_a_skill(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            SkillDetector, tmp_path, {"docs/SKILL.md": "# How we hire\n\nNotes.\n"}
+        )
+        assert comps == []
+
+    def test_nested_and_vendored_skill_md_skipped(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {
+                "skills/pdf/SKILL.md": self._SKILL.format(name="pdf"),
+                "skills/pdf/refs/SKILL.md": self._SKILL.format(name="nested"),
+                "node_modules/pkg/SKILL.md": self._SKILL.format(name="vendored"),
+            },
+        )
+        assert [c.name for c in comps] == ["pdf"]
+
+    def test_tool_specific_skill_reported_once(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {".claude/skills/review/SKILL.md": self._SKILL.format(name="review")},
+        )
+        assert [(c.skill_format, c.line_number) for c in comps] == [("claude", 1)]
+
+    def test_unrecognized_skill_md_does_not_hide_skills_below_it(
+        self, tmp_path: Path
+    ) -> None:
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {
+                "SKILL.md": "# Team notes\n\nNot a skill.\n",
+                "skills/pdf/SKILL.md": self._SKILL.format(name="pdf"),
+            },
+        )
+        assert [c.name for c in comps] == ["pdf"]
+
+    def test_plugin_skill_with_frontmatter_reported_once(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            SkillDetector,
+            tmp_path,
+            {
+                ".claude/plugins/review/SKILL.md": self._SKILL.format(name="review"),
+                ".devin/triage/SKILL.md": self._SKILL.format(name="triage"),
+            },
+        )
+        assert sorted((c.skill_format, c.name) for c in comps) == [
+            ("claude", "review"),
+            ("devin", "triage"),
+        ]
+        assert len({c.instance_id for c in comps}) == len(comps)

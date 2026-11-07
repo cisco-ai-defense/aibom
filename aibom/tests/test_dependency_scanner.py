@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 from pathlib import Path
 
+from aibom.models import ScanContext
 from aibom.scanners.dependency_scanner import DependencyScanner
 
 from .conftest import run_scanner
@@ -223,3 +225,205 @@ class TestDependencyScanner:
         )
         names = {c.name for c in comps}
         assert "strands-agents" in names
+
+
+class TestPep621Dependencies:
+    def test_project_dependencies_array_multiline(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "pyproject.toml": (
+                    "[project]\n"
+                    'name = "demo"\n'
+                    "dependencies = [\n"
+                    '    "flask>=3.0",\n'
+                    '    "openai>=1.0",  # client\n'
+                    "    'anthropic[bedrock]==0.40.0',\n"
+                    "]\n"
+                ),
+            },
+        )
+        by_name = {c.name: c for c in comps}
+        assert set(by_name) == {"openai", "anthropic"}
+        assert by_name["openai"].line_number == 5
+        assert by_name["anthropic"].line_number == 6
+        assert by_name["anthropic"].sdk_version == "0.40.0"
+
+    def test_project_dependencies_inline_and_optional(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "pyproject.toml": (
+                    "[project]\n"
+                    'dependencies = ["openai>=1.0", "requests"]\n'
+                    "\n"
+                    "[project.optional-dependencies]\n"
+                    'agents = ["langgraph>=0.2"]\n'
+                    "dev = [\n"
+                    '    "pytest",\n'
+                    "]\n"
+                ),
+            },
+        )
+        lines = {c.name: c.line_number for c in comps}
+        assert lines == {"openai": 2, "langgraph": 5}
+
+    def test_dependencies_key_outside_project_table_ignored(
+        self, tmp_path: Path
+    ) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "pyproject.toml": (
+                    "[tool.other]\n"
+                    'dependencies = ["openai"]\n'
+                    "[build-system]\n"
+                    'requires = ["anthropic"]\n'
+                ),
+            },
+        )
+        assert comps == []
+
+
+class TestLockFiles:
+    def test_lock_next_to_manifest_adds_no_packages(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "pyproject.toml": '[project]\ndependencies = ["langgraph>=0.2"]\n',
+                "uv.lock": (
+                    "[[package]]\n"
+                    'name = "langgraph"\n'
+                    'version = "0.2.5"\n'
+                    "\n"
+                    "[[package]]\n"
+                    'name = "openai"\n'
+                    'version = "1.40.0"\n'
+                ),
+            },
+        )
+        assert [c.name for c in comps] == ["langgraph"]
+        dep = comps[0]
+        assert dep.file_path.endswith("pyproject.toml")
+        assert dep.sdk_version == "0.2.5"
+        assert dep.metadata["locked_version"] == "0.2.5"
+
+    def test_lock_without_manifest_still_reports_packages(self, tmp_path: Path) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "poetry.lock": '[[package]]\nname = "openai"\nversion = "1.40.0"\n',
+            },
+        )
+        assert [c.name for c in comps] == ["openai"]
+
+    def test_package_lock_uses_the_root_entry_not_a_nested_copy(
+        self, tmp_path: Path
+    ) -> None:
+        lock = {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"openai": "^4.0.0"}},
+                "node_modules/langchain/node_modules/openai": {"version": "3.3.0"},
+                "node_modules/openai": {"version": "4.52.0"},
+            },
+        }
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "package-lock.json": json.dumps(lock),
+            },
+        )
+        assert [c.name for c in comps] == ["openai"]
+        assert comps[0].sdk_version == "4.52.0"
+        assert comps[0].metadata["locked_version"] == "4.52.0"
+
+    def test_legacy_package_lock_uses_the_top_level_entry(self, tmp_path: Path) -> None:
+        lock = {
+            "lockfileVersion": 1,
+            "dependencies": {
+                "a": {
+                    "version": "1.0.0",
+                    "dependencies": {"openai": {"version": "3.3.0"}},
+                },
+                "openai": {"version": "4.52.0"},
+            },
+        }
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "package-lock.json": json.dumps(lock),
+            },
+        )
+        assert comps[0].sdk_version == "4.52.0"
+
+    def test_package_lock_without_a_root_entry_leaves_the_version_unset(
+        self, tmp_path: Path
+    ) -> None:
+        lock = {
+            "packages": {
+                "": {},
+                "node_modules/langchain/node_modules/openai": {"version": "3.3.0"},
+            }
+        }
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "package-lock.json": json.dumps(lock),
+            },
+        )
+        assert comps[0].sdk_version is None
+
+    _YARN_LOCK = (
+        "# yarn lockfile v1\n\n\n"
+        "openai@^4.0.0:\n"
+        '  version "4.52.0"\n'
+        '  resolved "https://registry.example.test/openai-4.52.0.tgz"\n'
+        "  dependencies:\n"
+        '    version "9.9.9"\n'
+    )
+
+    def test_yarn_lock_next_to_manifest_supplies_the_resolved_version(
+        self, tmp_path: Path
+    ) -> None:
+        comps, _ = run_scanner(
+            DependencyScanner,
+            tmp_path,
+            {
+                "package.json": json.dumps({"dependencies": {"openai": "^4.0.0"}}),
+                "yarn.lock": self._YARN_LOCK,
+            },
+        )
+        assert comps[0].sdk_version == "4.52.0"
+        assert comps[0].metadata["locked_version"] == "4.52.0"
+
+    def test_yarn_lock_without_manifest_reports_the_resolved_version(
+        self, tmp_path: Path
+    ) -> None:
+        comps, _ = run_scanner(DependencyScanner, tmp_path, {"yarn.lock": self._YARN_LOCK})
+        assert [(c.name, c.sdk_version) for c in comps] == [("openai", "4.52.0")]
+
+
+class TestManifestEncoding:
+    def test_utf16_requirements_with_bom(self, tmp_path: Path) -> None:
+        text = "flask==3.0.0\r\nanthropic==0.104.1\r\nlanggraph==1.0.1\r\n"
+        (tmp_path / "requirements.txt").write_bytes(text.encode("utf-16"))
+        comps, _ = DependencyScanner().scan(ScanContext(paths=[str(tmp_path)]))
+        lines = {c.name: c.line_number for c in comps}
+        assert lines == {"anthropic": 2, "langgraph": 3}
+
+    def test_utf8_bom_requirements(self, tmp_path: Path) -> None:
+        (tmp_path / "requirements.txt").write_bytes(codecs.BOM_UTF8 + b"openai>=1.0\n")
+        comps, _ = DependencyScanner().scan(ScanContext(paths=[str(tmp_path)]))
+        assert [c.name for c in comps] == ["openai"]
